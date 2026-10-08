@@ -450,14 +450,18 @@ projectRoutes.patch("/:id", async (c) => {
 	return c.json(updated);
 });
 
-projectRoutes.delete("/:id", async (c) => {
+/**
+ * Shared project teardown used by HTTP DELETE and product host (NovelFork deleteBook).
+ * Must stay exported — bridge re-exports this as deleteProjectById.
+ */
+export async function deleteProjectById(id: string, signal?: AbortSignal): Promise<void> {
 	requireSqliteProjectMutation("Project deletion");
-	const id = c.req.param("id");
-	// Deletion cascades through every chapter, worktree, container, port allocation
-	// and conversation, so it sits in the management tier rather than write.
-	const project = await requireProjectAccess(c, id, "manage");
+	const project = await db.query.projects.findFirst({
+		where: eq(projects.id, id),
+	});
+	if (!project) throw new NotFoundError("Project", id);
 
-	return withProjectRetirement(
+	await withProjectRetirement(
 		id,
 		project.gitPath,
 		async () => {
@@ -660,8 +664,16 @@ projectRoutes.delete("/:id", async (c) => {
 				});
 			}
 			logger.info("Project deleted", { projectId: id, name: project.name });
-			return c.json({ ok: true });
 		},
-		c.req.raw.signal,
+		signal,
 	);
+}
+
+projectRoutes.delete("/:id", async (c) => {
+	const id = c.req.param("id");
+	// Deletion cascades through every chapter, worktree, container, port allocation
+	// and conversation, so it sits in the management tier rather than write.
+	await requireProjectAccess(c, id, "manage");
+	await deleteProjectById(id, c.req.raw.signal);
+	return c.json({ ok: true });
 });
