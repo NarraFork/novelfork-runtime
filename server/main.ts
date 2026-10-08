@@ -41,6 +41,7 @@ import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
+import { getRuntimeProductIntegration } from "./lib/product-host";
 import { projectDbManager } from "./lib/project-db";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import {
@@ -61,6 +62,7 @@ import {
 } from "./lib/startup-readiness";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
+import { BUILD_PRODUCT } from "./lib/version";
 import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
 import {
 	findExcludingRange,
@@ -410,8 +412,7 @@ if (isProd) {
 	if (isCompiledBinary) {
 		try {
 			// Dynamic import so it doesn't fail when the generated file doesn't exist (dev / bundle mode)
-			const generatedFrontendModulePath = "./generated/embedded-frontend";
-			const generatedModule = (await import(generatedFrontendModulePath)) as {
+			const generatedModule = (await import("@server/generated/embedded-frontend")) as {
 				embeddedAssets?: Record<string, string>;
 			};
 			const rawAssets = generatedModule.embeddedAssets ?? {};
@@ -1201,7 +1202,7 @@ if (portExplicit) {
 	}
 }
 
-logger.info(`NarraFork server running on ${getProtocol()}://${currentHost}:${actualPort}`, {
+logger.info(`${BUILD_PRODUCT} server running on ${getProtocol()}://${currentHost}:${actualPort}`, {
 	isProd,
 	isCompiledBinary,
 	metaUrl: import.meta.url,
@@ -1312,7 +1313,7 @@ async function openAsApp(url: string) {
 	const proto = getProtocol();
 	const url = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
 	console.log("");
-	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
+	console.log(`  \x1b[1m\x1b[38;5;105m⛏  ${BUILD_PRODUCT}\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
 	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
 	console.log("");
@@ -1415,6 +1416,14 @@ function startQuestionAnswerRecovery(): void {
 	void recoverPendingQuestionAnswerDeliveries().catch((error) => {
 		logger.error("Pending question answer recovery failed", { error: String(error) });
 	});
+}
+
+// Initialize an optional host integration before narrator recovery so it can prepare
+// its own storage and compatibility state without coupling the Runtime to a product.
+try {
+	await getRuntimeProductIntegration().initialize?.();
+} catch (err) {
+	logger.error("Runtime product integration initialization failed", { error: String(err) });
 }
 
 // Read planned-update protection before generic cleanup can mutate process-owned rows. The
@@ -1770,6 +1779,9 @@ async function performGracefulShutdown(
 		chapterCleanup.clearAllTimers();
 		worktreeWatcher.shutdown();
 		projectDbManager.closeAll();
+		await shutdownStep(tracker, "runtimeProductIntegration.shutdown", () =>
+			getRuntimeProductIntegration().shutdown?.(),
+		);
 		// The background integrity probe is a separate PROCESS holding a read-only handle on the
 		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
 		// replacement process may swap the database file (startup recovery) or rewrite it (admin
