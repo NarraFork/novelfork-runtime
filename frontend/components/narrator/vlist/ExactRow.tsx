@@ -23,6 +23,7 @@ import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
 import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
+import { useRuntimeToolResultRenderer } from "../RuntimeToolResultRendererContext";
 import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
@@ -79,6 +80,27 @@ const TERMINABLE_TOOLS = new Set(["Bash", "Shell", "Execute"]);
  * True when a running tool can be stopped from the header — shell commands and
  * MCP tools, mirroring the chunked InlineTerminateControl's own test.
  */
+/**
+ * Input for a host-provided product-tool card, read from `spec.data`. Kept outside the
+ * memoized row: `spec.data` needs no memo comparison because it is measured into
+ * `measured`, whose identity the comparator already checks (see the comparator note).
+ */
+function productToolRendererInput(
+	item: VListItem,
+): { toolName: string; renderer: string; result: unknown } | null {
+	const data = (item.spec.data ?? {}) as {
+		toolName?: unknown;
+		runtimeRenderer?: unknown;
+		runtimeRendererResult?: unknown;
+	};
+	if (typeof data.runtimeRenderer !== "string" || !data.runtimeRenderer.trim()) return null;
+	return {
+		toolName: typeof data.toolName === "string" ? data.toolName : "",
+		renderer: data.runtimeRenderer,
+		result: data.runtimeRendererResult,
+	};
+}
+
 function canTerminateTool(toolName: string): boolean {
 	return TERMINABLE_TOOLS.has(toolName) || toolName.startsWith("mcp__");
 }
@@ -413,6 +435,7 @@ export const ExactRow = memo(
 				extra.fullTextError = status.error;
 			}
 		}
+		const runtimeToolResultRenderer = useRuntimeToolResultRenderer();
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
 		injectUserBubbleHeader(kind, extra);
@@ -777,6 +800,14 @@ export const ExactRow = memo(
 			const measured = item.measured as MeasuredToolCall;
 			if (canTerminateTool(measured.toolName)) {
 				extra.onTerminate = onTerminate;
+			}
+		}
+		// Host-provided native result cards for product tools marked with `runtimeRenderer`.
+		if (kind === "tool-call" && runtimeToolResultRenderer) {
+			const input = productToolRendererInput(item);
+			if (input) {
+				const rendered = runtimeToolResultRenderer(input);
+				if (rendered != null) extra.detailSlot = rendered;
 			}
 		}
 		// Editable timeout: only a RUNNING card that actually has a deadline can be
