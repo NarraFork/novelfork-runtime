@@ -126,6 +126,10 @@ const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
 
+// Restored from upstream main (4e04d2f2): the v0.8.3 release anchor dropped this
+// declaration while keeping its use below, which threw ReferenceError on settings load.
+const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = [];
+
 /** The superseded 1MB `agent.requestDumpMaxSize` default, rewritten on load. */
 const LEGACY_REQUEST_DUMP_MAX_SIZE = 1024 * 1024;
 
