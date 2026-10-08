@@ -36,6 +36,7 @@ import {
 } from "../../plugins/PluginUiSurfaceContext";
 import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
+import { useRuntimeFileOpenInterceptor } from "../RuntimeFileOpenInterceptorContext";
 import {
 	type FileOpenOptions,
 	type FilePanelParams,
@@ -258,6 +259,10 @@ export function NarratorDockProvider({
 	children: React.ReactNode;
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
+	// Embedding hosts may open some files in their own editor instead of the file panel.
+	const fileOpenInterceptor = useRuntimeFileOpenInterceptor();
+	const fileOpenInterceptorRef = useRef(fileOpenInterceptor);
+	fileOpenInterceptorRef.current = fileOpenInterceptor;
 	const [fileReferenceSelection, setFileReferenceSelection] =
 		useState<FileReferenceEditorSelection | null>(null);
 	const [detailsProps, setDetailsProps] = useState<NarratorDetailsPanelExternalProps | null>(null);
@@ -460,6 +465,15 @@ export function NarratorDockProvider({
 			const api = apiRef.current;
 			if (!api || !filePath) return;
 			const deviceId = options.deviceId ?? "local";
+			if (
+				fileOpenInterceptorRef.current?.({
+					filePath,
+					deviceId,
+					toolEdit: options.toolEdit !== undefined,
+				})
+			) {
+				return;
+			}
 			// Absent means the host's authority (legacy panels keep their existing ids).
 			const fileNarratorId =
 				options.fileNarratorId === narratorId ? undefined : options.fileNarratorId;
