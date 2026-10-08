@@ -36,8 +36,13 @@ export interface ActivationResult {
 }
 
 /** Build the extraction command for tar.gz archives (zip is handled in-process). */
+/** Convert Node's Windows paths to the forward-slash form GNU tar understands. */
+function tarPath(path: string): string {
+	return process.platform === "win32" ? path.replaceAll("\\", "/") : path;
+}
+
 function tarExtractCmd(archive: string, destDir: string): string[] {
-	return ["tar", "-xzf", archive, "-C", destDir];
+	return ["tar", "--force-local", "-xzf", tarPath(archive), "-C", tarPath(destDir)];
 }
 
 /**

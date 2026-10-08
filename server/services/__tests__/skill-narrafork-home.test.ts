@@ -41,7 +41,8 @@ describe("global skill scanning honors NARRAFORK_HOME", () => {
 	it("is running with NARRAFORK_HOME outside the home directory", () => {
 		// Guards the premise: if these ever coincide, the assertions below would pass
 		// against the old hardcoded path too and stop testing anything.
-		expect(getNarraforkHome()).not.toBe(resolve(homedir(), ".narrafork"));
+		const realHostHome = process.env.NARRAFORK_ORIGINAL_HOME?.trim() || process.env.NARRAFORK_TEST_REAL_HOME?.trim() || homedir();
+		expect(getNarraforkHome()).not.toBe(resolve(realHostHome, ".narrafork"));
 	});
 
 	it("discovers a skill written to $NARRAFORK_HOME/skills", async () => {

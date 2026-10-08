@@ -1,3 +1,4 @@
+import { getRuntimeProductIntegration } from "@server/lib/product-host";
 import { type ToolProvider, toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
@@ -60,7 +61,10 @@ import { writeTool } from "./write";
  *
  * Map key = tool name as it appears in the registry (e.g. "Terminal").
  */
+const contributionOptionalTools = getRuntimeProductIntegration().narrator?.toolDefinitions() ?? [];
+
 export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
+	...contributionOptionalTools.map((tool) => [tool.name, tool] as const),
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],

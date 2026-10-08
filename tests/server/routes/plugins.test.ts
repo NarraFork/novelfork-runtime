@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { MiddlewareHandler } from "hono";
+import { resolve } from "node:path";
 import {
 	createPluginRoutes,
 	type PluginManager,
@@ -361,9 +362,13 @@ describe("plugin routes", () => {
 		expect(installed.status).toBe(201);
 		expect(manager.calls.at(-1)).toEqual({
 			method: "install",
-			value: "/safe/plugin-imports/demo.nfplugin",
+			// The route confines the path with node:path resolve(), which yields Windows
+			// separators (and a drive letter) on win32; derive the expectation the same way so
+			// the confinement assertion stays meaningful cross-platform instead of pinning a
+			// POSIX literal.
+			value: resolve("/safe/plugin-imports", "demo.nfplugin"),
 		});
-		expect(JSON.stringify(await installed.json())).not.toContain("/safe/plugin-imports");
+		expect(JSON.stringify(await installed.json())).not.toContain(resolve("/safe/plugin-imports"));
 
 		for (const path of ["../escape.nfplugin", "/etc/passwd.nfplugin", "demo.tar.gz"]) {
 			const response = await app.request("/install", {

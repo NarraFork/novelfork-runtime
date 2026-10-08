@@ -7,6 +7,7 @@ import {
 	collectPostgresMigrationData,
 	materializePostgresMigrations,
 	renderPostgresMigrationData,
+	resolveMigrationsFolder,
 	resolveMigrationsForDriver,
 	runMigrationsForDriver,
 } from "../../run-migrations";
@@ -95,10 +96,9 @@ describe("isolated PostgreSQL migration bundle", () => {
 	});
 
 	test("default remains SQLite; explicit PG source is independent", async () => {
-		expect(await resolveMigrationsForDriver()).toEqual({
-			folder: "./drizzle",
-			source: "filesystem",
-		});
+		// Fork layer: the SQLite folder is NARRAFORK_MIGRATIONS_DIR, then runtime-migrations/,
+		// then ./drizzle (resolveFilesystemMigrationsFolder), so compare with that resolver.
+		expect(await resolveMigrationsForDriver()).toEqual(await resolveMigrationsFolder());
 		const pg = await resolveMigrationsForDriver("postgresql");
 		expect(pg).toEqual({ folder: "./drizzle-postgres", source: "filesystem" });
 	});

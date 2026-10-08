@@ -2170,6 +2170,14 @@ export interface RenderToolCallProps {
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
 	/**
+	 * Optional host-provided presentation for a product tool result. When present,
+	 * it replaces the measured generic detail body so NovelFork can render native
+	 * cards for tools marked with `runtimeRenderer`.
+	 */
+	detailSlot?: ReactNode;
+	/** Marker for the host renderer that produced `detailSlot`. */
+	runtimeRenderer?: string;
+	/**
 	 * This card is the newest `spec://tasks.json` board AND the narrator is running,
 	 * so its in-progress row is describing live work and may animate.
 	 *
@@ -2334,6 +2342,8 @@ export function RenderToolCall({
 	viewTargets,
 	viewControls,
 	specTasksLive,
+	detailSlot,
+	runtimeRenderer,
 }: RenderToolCallProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	const {
@@ -2431,7 +2441,11 @@ export function RenderToolCall({
 				onTerminate={onTerminate}
 				terminateLabel={merged.terminate}
 			/>
-			{effectiveOpened && detail ? (
+			{effectiveOpened && detailSlot ? (
+				<Box mt="xs" data-runtime-renderer={runtimeRenderer ?? ""}>
+					{detailSlot}
+				</Box>
+			) : effectiveOpened && detail ? (
 				<Box mt={DETAIL_TOP_MARGIN} style={{ position: "relative" }}>
 					{/* The detail region's own top block already carries the mt gap,
 					    so we render it flush and let its frame own the spacing. */}

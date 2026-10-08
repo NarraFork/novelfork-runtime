@@ -10,11 +10,17 @@
  */
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { getDbPath, openDatabase } from "../connection";
 
-const realDbPath = resolve(homedir(), ".narrafork", "narrafork.db");
+const realHome =
+	process.env.NARRAFORK_TEST_REAL_HOME ??
+	process.env.NARRAFORK_HOME ??
+	process.env.HOME ??
+	process.env.USERPROFILE;
+if (!realHome) throw new Error("tests/preload.ts did not preserve a real home directory");
+const realDbPath = resolve(realHome, ".narrafork", "narrafork.db");
 
 describe("openDatabase production guard", () => {
 	test("refuses the real ~/.narrafork database while NODE_ENV=test", () => {
@@ -25,7 +31,7 @@ describe("openDatabase production guard", () => {
 
 	test("still refuses when NARRAFORK_HOME is pointed at the real directory", () => {
 		const previous = process.env.NARRAFORK_HOME;
-		process.env.NARRAFORK_HOME = resolve(homedir(), ".narrafork");
+		process.env.NARRAFORK_HOME = resolve(realHome, ".narrafork");
 		try {
 			expect(getDbPath()).toBe(realDbPath);
 			expect(() => openDatabase()).toThrow(/Refusing to open the real NarraFork database/);

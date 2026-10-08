@@ -60,7 +60,7 @@ function realNarraforkHome(): string {
 	// temp dir, so the original home is preserved in NARRAFORK_ORIGINAL_HOME and
 	// used here — otherwise the real-database guard would treat the isolated test
 	// path as the production data dir and refuse every writable connection.
-	const originalHome = process.env.NARRAFORK_ORIGINAL_HOME?.trim();
+	const originalHome = process.env.NARRAFORK_ORIGINAL_HOME?.trim() || process.env.NARRAFORK_TEST_REAL_HOME?.trim();
 	return canonicalPath(resolve(originalHome ?? homedir(), ".narrafork"));
 }
 

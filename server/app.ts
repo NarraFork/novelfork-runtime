@@ -12,6 +12,7 @@ import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
+import { getRuntimeProductIntegration } from "./lib/product-host";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
@@ -101,7 +102,8 @@ export interface AppEnv {
 	};
 }
 
-const app = new Hono<AppEnv>();
+const app = new Hono();
+const productIntegration = getRuntimeProductIntegration();
 
 const SLOW_API_REQUEST_MS = 1_000;
 
@@ -313,6 +315,9 @@ app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
 // to the internal UI/API surface.
 app.use("/api/*", requireSessionAuth);
 
+// An optional host integration can protect or add authenticated product capabilities.
+productIntegration.mountAuthenticatedGuards?.(app);
+
 // When git is not installed, only block routes that are known to execute git.
 // Most settings, account, AI provider, standalone narrator, search, upload, and
 // database-only routes should remain usable so first-time setup is not blocked by Git.
@@ -363,6 +368,7 @@ app.route("/api/projects", projectRoutes);
 app.route("/api/chapters", chapterRoutes);
 app.route("/api/chapters", gitRoutes);
 app.route("/api/chapter-edges", chapterEdgeRoutes);
+productIntegration.mountAuthenticatedRoutes?.(app);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
@@ -409,6 +415,7 @@ app.route("/api/knowledge/packs", knowledgePackRoutes);
 app.route("/api/knowledge", knowledgeRoutes);
 app.route("/api/storage", storageRoutes);
 app.route("/api/runtime", runtimeRoutes);
+productIntegration.mountRuntimeBindingRoutes?.(app);
 app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/scheduled-tasks", scheduledTaskRoutes);

@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { SHIKI_LANGUAGE_ALIASES } from "./shiki-language-aliases";
 import { resolveShikiLanguage } from "./shiki-language-loader";
 
@@ -56,7 +57,7 @@ describe("SHIKI_LANGUAGE_ALIASES", () => {
  */
 describe("the build-time substitution plugin's id matching", () => {
 	test("compares separator-normalized paths, so Windows ids match too", async () => {
-		const source = await Bun.file(new URL("../vite.config.ts", import.meta.url).pathname).text();
+		const source = await Bun.file(fileURLToPath(new URL("../vite.config.ts", import.meta.url))).text();
 		// The target path is normalized once at module scope...
 		expect(source).toContain("const SHIKI_LANGUAGE_ALIASES_MODULE = normalizeModulePath(");
 		// ...and the incoming id is normalized before the comparison.

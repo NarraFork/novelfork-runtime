@@ -259,6 +259,18 @@ const baseRuntimeOptions = {
 	cwd: fixtureCwd,
 };
 
+// Windows cannot install the POSIX rlimit shim, so buildLocalProcessCommand fails closed there
+// (that fail-closed path has its own dedicated test below). The real-process supervisor fixtures
+// exercise restart budgets and protocol handling, not resource limiting, so on Windows they must
+// opt into unbounded execution to spawn at all. POSIX hosts keep the enforced resource limits.
+const realProcessRunnerOptions =
+	process.platform === "win32"
+		? ({ runnerOptions: { allowUnboundedResourceUsage: true } } as const)
+		: ({} as const);
+// A cold `bun` child spawn is ~0.3-1s on Windows, and these fixtures need several
+// spawn -> handshake -> crash/restart cycles, which overruns bun's default 5s per-test budget.
+const realProcessTestTimeoutMs = 20_000;
+
 afterEach(() => {
 	// Let process-exit microtasks and stream readers settle between tests.
 	return sleep(5);
@@ -363,16 +375,23 @@ describe("LocalProcessRunner", () => {
 			spawn,
 			allowedCwds: [fixtureCwd],
 			envAllowlist: ["PATH", "LANG"],
+			// Pin the platform so the POSIX rlimit shim and detached process-group semantics are
+			// exercised deterministically on every host. On Windows the runner intentionally fails
+			// closed (no rlimit shim); that behaviour has its own dedicated test below, so pinning
+			// here keeps this arg/cwd/env-allowlist coverage identical across platforms.
+			platform: "linux",
 		});
 		const handle = await runner.start({
 			command: ["bun", fixturePath, "normal"],
 			cwd: fixtureCwd,
 			env: { PATH: "/safe", LANG: "zh_CN.UTF-8", HOME: "/secret", JWT_SECRET: "jwt" },
 		});
-		expect(captured?.command).toEqual(buildLocalProcessCommand(["bun", fixturePath, "normal"]));
+		expect(captured?.command).toEqual(
+			buildLocalProcessCommand(["bun", fixturePath, "normal"], undefined, "linux"),
+		);
 		expect(captured?.options.cwd).toBe(fixtureCwd);
 		expect(captured?.options.env).toEqual({ PATH: "/safe", LANG: "zh_CN.UTF-8" });
-		expect(captured?.options.detached).toBe(process.platform !== "win32");
+		expect(captured?.options.detached).toBe(true);
 		handle.kill();
 		await handle.exited;
 	});
@@ -411,6 +430,10 @@ describe("LocalProcessRunner", () => {
 			spawn: () => raw.process,
 			stderrRingBytes: 8,
 			maxStdoutBytes: 16,
+			// The stderr ring buffer and stdout output-limit kill are platform-independent; pin the
+			// platform so the runner does not hit the Windows fail-closed rlimit guard (covered by
+			// its own test below) before this behaviour can run.
+			platform: "linux",
 		});
 		const handle = await runner.start({
 			command: ["fixture"],
@@ -769,16 +792,18 @@ describe("RuntimeSupervisor", () => {
 		});
 		const runtime = supervisor.register({
 			...baseRuntimeOptions,
+			...realProcessRunnerOptions,
 			command: [bunPath, fixturePath, "crash"],
 		});
 		await supervisor.start("com.example.runtime");
-		await eventually(() => runtime.state === "quarantine", 1_500);
+		await eventually(() => runtime.state === "quarantine", process.platform === "win32" ? 12_000 : 1_500);
 		expect(supervisor.getDiagnostics("com.example.runtime")[0]?.state).toBe("quarantine");
-	});
+	}, realProcessTestTimeoutMs);
 
 	it("handles slow and malformed real-process fixtures", async () => {
 		const slow = new PluginRuntime({
 			...baseRuntimeOptions,
+			...realProcessRunnerOptions,
 			command: [bunPath, fixturePath, "slow"],
 			timeouts: { handshakeMs: 20, activationMs: 20, rpcMs: 20 },
 		});
@@ -788,10 +813,11 @@ describe("RuntimeSupervisor", () => {
 		const malformedSupervisor = new RuntimeSupervisor({ restartJitterRatio: 0 });
 		const malformed = malformedSupervisor.register({
 			...baseRuntimeOptions,
+			...realProcessRunnerOptions,
 			command: [bunPath, fixturePath, "malformed"],
 			timeouts: { handshakeMs: 500, activationMs: 50, rpcMs: 50 },
 		});
 		await expect(malformedSupervisor.start("com.example.runtime")).rejects.toThrow();
-		await eventually(() => malformed.state === "quarantine", 1_000);
-	});
+		await eventually(() => malformed.state === "quarantine", process.platform === "win32" ? 5_000 : 1_000);
+	}, realProcessTestTimeoutMs);
 });

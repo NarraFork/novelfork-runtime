@@ -42,6 +42,7 @@ import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
+import { getRuntimeProductIntegration } from "../lib/product-host";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
@@ -192,6 +193,39 @@ export type NarratorClientMessage =
 			requestId?: string;
 	  }
 	| { type: "update_timeout"; narratorId: string; toolUseId: string; timeoutMs: number };
+
+type NarratorStateAccessGuardedClientMessageType =
+	| "buffer_message"
+	| "cancel_buffer"
+	| "update_buffer"
+	| "remove_buffer"
+	| "presence_join"
+	| "presence_leave"
+	| "sync_check"
+	| "update_timeout";
+
+type NarratorStateAccessMessage = Extract<
+	NarratorClientMessage,
+	{ type: NarratorStateAccessGuardedClientMessageType; narratorId: string }
+>;
+
+const narratorStateAccessGuardedMessageTypes = new Set<string>([
+	"buffer_message",
+	"cancel_buffer",
+	"update_buffer",
+	"remove_buffer",
+	"presence_join",
+	"presence_leave",
+	"sync_check",
+	"update_timeout",
+]);
+const runtimeProductIntegration = getRuntimeProductIntegration();
+
+function requiresNarratorStateAccess(
+	message: NarratorClientMessage,
+): message is NarratorStateAccessMessage {
+	return narratorStateAccessGuardedMessageTypes.has(message.type);
+}
 
 // === Connection registry ===
 
@@ -959,6 +993,49 @@ function canAddSubscriptions(ws: NarratorWS, narratorIds: string[]): boolean {
 	} satisfies NarratorWsSubscriptionLimitError;
 	safeSend(ws, error);
 	return false;
+}
+
+function sendAccessDenied(ws: NarratorWS, narratorId?: string): void {
+	const event = runtimeProductIntegration.createNarratorAccessDeniedEvent?.(narratorId) ?? {
+		type: "error" as const,
+		code: "NARRATOR_ACCESS_DENIED",
+		message: "Narrator access denied",
+		...(narratorId ? { narratorId } : {}),
+	};
+	safeSend(ws, { ...event });
+}
+
+async function guardNarratorStateAccess(ws: NarratorWS, narratorId: string): Promise<boolean> {
+	try {
+		const canAccess = runtimeProductIntegration.canAccessNarratorState;
+		if (!canAccess || (await canAccess({ userId: ws.data.userId, narratorId }))) return true;
+	} catch {
+		// Product authorization failures are fail-closed before narrator state is read.
+	}
+	sendAccessDenied(ws, narratorId);
+	return false;
+}
+
+async function guardNarratorPermissionAccess(ws: NarratorWS, requestId: string): Promise<boolean> {
+	try {
+		const canAccess = runtimeProductIntegration.canAccessPermission;
+		if (!canAccess || (await canAccess({ userId: ws.data.userId, requestId }))) return true;
+	} catch {
+		// Product authorization failures are fail-closed before permission resolution.
+	}
+	sendAccessDenied(ws);
+	return false;
+}
+
+async function filterAuthorizedNarratorIds(
+	ws: NarratorWS,
+	narratorIds: string[],
+): Promise<string[]> {
+	const allowed: string[] = [];
+	for (const narratorId of narratorIds) {
+		if (await guardNarratorStateAccess(ws, narratorId)) allowed.push(narratorId);
+	}
+	return allowed;
 }
 
 type NarratorStatusRow = {
@@ -1956,15 +2033,16 @@ export const handleNarratorWS = {
 		// Update heartbeat timestamp on any valid message
 		ws.data.lastPongAt = Date.now();
 
-		// Frames that act on one narrator are authorized here, once, instead of in each
-		// case. Queueing or editing buffered input is indistinguishable from sending a
-		// message, so it needs write access; presence announces "I am looking at this",
-		// so read is enough. Decision frames (`permission_decision`, `merge_decision`)
-		// name only a request/session id, so their owner is resolved first — see
-		// `authorizeNarratorFrame`. `subscribe` authorizes itself (it takes a list, and
-		// reports per-id denials), and `sync_check` is covered transitively because it
-		// requires an already-authorized subscription.
+		// The Runtime ACL authorizes narrator-scoped frames and indirect decisions first.
+		// Product hosts may impose an additional narrator/permission boundary, so both
+		// checks must pass before a handler can inspect or mutate state.
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
+		if (
+			requiresNarratorStateAccess(msg) &&
+			!(await guardNarratorStateAccess(ws, msg.narratorId))
+		) {
+			return;
+		}
 
 		switch (msg.type) {
 			case "git_workspace_subscribe":
@@ -1978,13 +2056,14 @@ export const handleNarratorWS = {
 				const kind = msg.kind ?? "messages";
 				const requestId = msg.requestId;
 				if (!canAddSubscriptions(ws, msg.narratorIds)) break;
-
 				// Authorize BEFORE anything is added to the subscription set. This socket
 				// carries a user identity but the ids come from the client, so without this
 				// any authenticated user could stream a private narrator's whole timeline by
 				// guessing (or observing) its id — the catch-up path below happily replays
 				// history to whoever is subscribed.
-				const allowedIds = await authorizeReadableNarrators(ws, msg.narratorIds, requestId);
+				const productAuthorizedIds = await filterAuthorizedNarratorIds(ws, msg.narratorIds);
+				if (productAuthorizedIds.length === 0) break;
+				const allowedIds = await authorizeReadableNarrators(ws, productAuthorizedIds, requestId);
 				if (allowedIds.length === 0) break;
 
 				const messageNarratorId =
@@ -2052,6 +2131,7 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "permission_decision": {
+				if (!(await guardNarratorPermissionAccess(ws, msg.requestId))) break;
 				logger.debug("WS permission_decision received", {
 					requestId: msg.requestId,
 					decision: msg.decision,

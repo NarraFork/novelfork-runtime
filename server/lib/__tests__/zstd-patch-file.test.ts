@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyZstdPatchToFile, generateZstdPatch, type ZstdPatchMeta } from "../zstd-patch";
 
+// All six cases exercise the external zstd CLI through generate/apply helpers.
+const zstdCliAvailable = Boolean(Bun.which("zstd"));
+const cliTest = test.skipIf(!zstdCliAvailable);
+
 /**
  * The server applies patches file-to-file so a ~100MB binary never becomes synchronous work on
  * the request thread. These tests cover that path: success, the guards that must reject a bad
@@ -35,7 +39,7 @@ describe("file-based zstd patch application", () => {
 		return { oldPath, newBytes, meta };
 	}
 
-	test("reconstructs the new binary and reports its verified digest", async () => {
+	cliTest("reconstructs the new binary and reports its verified digest", async () => {
 		const { oldPath, newBytes, meta } = makeBinaries();
 		const outputPath = join(dir, "out.bin");
 
@@ -52,7 +56,7 @@ describe("file-based zstd patch application", () => {
 		expect(Buffer.compare(readFileSync(outputPath), newBytes)).toBe(0);
 	});
 
-	test("refuses a target larger than the caller's byte ceiling before doing any work", async () => {
+	cliTest("refuses a target larger than the caller's byte ceiling before doing any work", async () => {
 		const { oldPath, meta } = makeBinaries();
 		await expect(
 			applyZstdPatchToFile({
@@ -65,7 +69,7 @@ describe("file-based zstd patch application", () => {
 		).rejects.toThrow(/exceeds the 1024-byte limit/);
 	});
 
-	test("rejects a size mismatch between the produced file and the declared metadata", async () => {
+	cliTest("rejects a size mismatch between the produced file and the declared metadata", async () => {
 		const { oldPath, meta } = makeBinaries();
 		await expect(
 			applyZstdPatchToFile({
@@ -77,7 +81,7 @@ describe("file-based zstd patch application", () => {
 		).rejects.toThrow(/file size mismatch/);
 	});
 
-	test("rejects a digest mismatch so a tampered payload is never placed", async () => {
+	cliTest("rejects a digest mismatch so a tampered payload is never placed", async () => {
 		const { oldPath, meta } = makeBinaries();
 		await expect(
 			applyZstdPatchToFile({
@@ -89,7 +93,7 @@ describe("file-based zstd patch application", () => {
 		).rejects.toThrow(/SHA512 mismatch/);
 	});
 
-	test("an aborted signal stops the work instead of running to completion", async () => {
+	cliTest("an aborted signal stops the work instead of running to completion", async () => {
 		const { oldPath, meta } = makeBinaries();
 		const controller = new AbortController();
 		controller.abort();
@@ -105,7 +109,7 @@ describe("file-based zstd patch application", () => {
 		).rejects.toThrow();
 	});
 
-	test("surfaces a bounded diagnostic when the CLI cannot read its inputs", async () => {
+	cliTest("surfaces a bounded diagnostic when the CLI cannot read its inputs", async () => {
 		const { meta } = makeBinaries();
 		await expect(
 			applyZstdPatchToFile({

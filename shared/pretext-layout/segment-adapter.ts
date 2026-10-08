@@ -56,6 +56,7 @@ import type { RenderLod } from "./prepared-block";
 import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
 import {
 	type ContentBlockLike,
+	getReasoningEncryptionState,
 	groupReasoningRuns,
 	hasStructuredReasoning,
 	parseReasoningSegments,
@@ -1155,24 +1156,15 @@ function markdownData(block: AdapterContentBlock): string {
 	return resolveAssistantTextDisplay(text, block.citations ?? undefined).display;
 }
 
+function reasoningBlockText(block: AdapterContentBlock): string {
+	return block.text || block.thinking || "";
+}
+
 /**
  * The CANONICAL text of one reasoning run — the single string both levels parse.
- *
- * The two levels used to disagree structurally: `adaptContentBlocks` (L3+) joins a
- * run's blocks and parses the concatenation, while the activity fold pushed blocks
- * one by one and parsed each alone. For a run whose `**title**` is split across a
- * block boundary the two see different step counts (measured: 1 step joined vs 2
- * parsed separately), so step `sN` on one side can be a different step than `sN` on
- * the other. That is why the cross-level identity was gated to single-block runs.
- *
- * Routing both sides through this function removes the disagreement at its source
- * instead of declining to animate: parse the same string, get the same steps, and
- * the gate becomes unnecessary. The separator must stay `\n\n` — a run's blocks are
- * consecutive paragraphs of one thought, and joining them with a single newline
- * would let a title absorb the following paragraph.
  */
 export function canonicalReasoningRunText(blocks: readonly AdapterContentBlock[]): string {
-	return joinRunText(blocks.map((block) => block.thinking ?? block.text ?? ""));
+	return joinRunText(blocks.map(reasoningBlockText));
 }
 
 /** Join one run's per-block strings. Blank blocks drop out; see the separator note. */
@@ -1180,34 +1172,21 @@ function joinRunText(parts: readonly string[]): string {
 	return parts.filter((value) => value.length > 0).join("\n\n");
 }
 
-/**
- * A run's translation, or null when it is not fully translated.
- *
- * All-or-nothing on purpose: a partially translated run would otherwise render some
- * steps in one language and some in another. The denominator counts only NON-EMPTY
- * blocks, matching what `joinRunText` keeps.
- */
 function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]): string | null {
 	const translatedParts = blocks.map((block) => block.translatedText).filter(Boolean) as string[];
-	const nonEmpty = blocks.filter((block) => (block.thinking ?? block.text ?? "").length > 0).length;
+	const nonEmpty = blocks.filter((block) => reasoningBlockText(block).length > 0).length;
 	return translatedParts.length === nonEmpty && nonEmpty > 0 ? joinRunText(translatedParts) : null;
 }
 
-/**
- * The exact string a run's STEPS are parsed from, at every level.
- *
- * A translated run displays its translation, and translation can change the step
- * structure (measured: a 2-step original whose translation parses to 3 steps). L3+
- * has always parsed `translatedText ?? text`; the fold parsed the raw original, so
- * `s1` addressed a different step on each side — a silent mis-pair that would morph
- * one step into an unrelated one. Both sides now resolve the text here.
- */
 export function reasoningRunDisplayText(blocks: readonly AdapterContentBlock[]): string {
 	return canonicalReasoningRunTranslation(blocks) ?? canonicalReasoningRunText(blocks);
 }
 
-function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
-	const text = canonicalReasoningRunText(blocks);
+function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean, ctx?: AdapterContext) {
+	const rawText = canonicalReasoningRunText(blocks);
+	const encryptionState = getReasoningEncryptionState(blocks);
+	const text =
+		rawText || (encryptionState === "only" && ctx ? sysLabel(ctx, "reasoningEncryptedPlaceholder") : rawText);
 	const translatedText = canonicalReasoningRunTranslation(blocks);
 	const displayText = translatedText ?? text;
 	return {
@@ -1906,7 +1885,7 @@ function adaptMessage(
 				if (runIndex != null) runIndices.push(runIndex);
 			}
 			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
-			const data = reasoningData(reasoningBlocks, streaming);
+			const data = reasoningData(reasoningBlocks, streaming, ctx);
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
 			// languages wrap to different heights and the exact path paints at the
@@ -2139,6 +2118,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// count lines). Interpolated entries keep literal {count}/{reasoning}/{tools}
 	// placeholders that the composers substitute with live values.
 	reasoning: "Reasoning",
+	reasoningEncryptedPlaceholder: "Reasoning content is encrypted",
 	reasoningSteps: "{count} steps",
 	toolCalls: "Tool calls",
 	toolCallsCount: "{count}",
@@ -4083,6 +4063,7 @@ function buildToolCardData(
 			? { toolUseId: item.tc.toolUseId, toolDetailRef: resolveToolDetailRef(item) }
 			: {}),
 		...(errorMessage ? { errorMessage } : {}),
+		...runtimeRendererFields(item.tc, outputJson, metadata),
 		...toolTimingFields(item.tc, category, metadata),
 		// How much of this payload is STILL a preview (the full one has not been
 		// fetched). Counted AFTER the substitutions above, so a fetched payload
@@ -4131,6 +4112,45 @@ function buildToolCardData(
 			// render-layer chrome is injected through renderLabels instead.
 			...(ctx.labels ? { labels: ctx.labels } : {}),
 		}),
+	};
+}
+
+function runtimeRendererFields(
+	tc: AdapterToolItem["tc"],
+	outputJson: unknown,
+	metadata: unknown,
+): Record<string, unknown> {
+	const outputMetadata =
+		outputJson && typeof outputJson === "object" && !Array.isArray(outputJson)
+			? (outputJson as { _metadata?: unknown })._metadata
+			: undefined;
+	const value =
+		(metadata && typeof metadata === "object"
+			? (metadata as { runtimeRenderer?: unknown }).runtimeRenderer
+			: undefined) ??
+		(outputMetadata && typeof outputMetadata === "object"
+			? (outputMetadata as { runtimeRenderer?: unknown }).runtimeRenderer
+			: undefined) ??
+		(tc as { _metadata?: { runtimeRenderer?: unknown } })._metadata?.runtimeRenderer;
+	if (typeof value !== "string" || !value.trim()) return {};
+	const raw =
+		outputJson && typeof outputJson === "object" && !Array.isArray(outputJson)
+			? ((outputJson as { _text?: unknown })._text ?? outputJson)
+			: outputJson;
+	let result: unknown = raw;
+	if (typeof raw === "string") {
+		try {
+			result = JSON.parse(raw);
+		} catch {
+			result = raw;
+		}
+	}
+	return {
+		runtimeRenderer: value,
+		runtimeRendererResult:
+			result && typeof result === "object" && !Array.isArray(result)
+				? { ...(result as Record<string, unknown>), renderer: value }
+				: { renderer: value, data: result },
 	};
 }
 

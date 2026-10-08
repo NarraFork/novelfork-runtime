@@ -150,7 +150,7 @@ skillRoutes.get("/", async (c) => {
 
 /**
  * POST /api/skills?projectId=xxx
- * Create a project-level skill in <project>/.narrafork/skills/<name>/SKILL.md.
+ * Create a project-level skill in <project>/.novelfork/skills/<name>/SKILL.md.
  */
 skillRoutes.post("/", async (c) => {
 	const projectGitPath = await getProjectGitPath(c, c.req.query("projectId"), "write");

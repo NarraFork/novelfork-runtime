@@ -12,6 +12,8 @@ import {
 } from "../../server/lib/release-baseline";
 import { applyZstdPatch, generateZstdPatch } from "../../server/lib/zstd-patch";
 
+const cliTest = test.skipIf(!Bun.which("zstd"));
+
 describe("release baseline integrity", () => {
 	test("selects the newest lower platform-specific version", () => {
 		const directory = mkdtempSync(join(tmpdir(), "nf-release-baseline-"));
@@ -108,7 +110,7 @@ describe("release baseline integrity", () => {
 		}
 	});
 
-	test("records the source identity in new patches and replays successfully", () => {
+	cliTest("records the source identity in new patches and replays successfully", () => {
 		const oldBuffer = Buffer.from("published-source-binary".repeat(4096));
 		const newBuffer = Buffer.from("new-target-binary".repeat(4096));
 		const { patch, meta } = generateZstdPatch(oldBuffer, newBuffer, {

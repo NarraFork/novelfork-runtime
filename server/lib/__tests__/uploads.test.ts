@@ -408,7 +408,7 @@ describe("uploads helpers", () => {
 		}
 	});
 
-	test("saveUploadedImage repairs a non-writable narrator directory", async () => {
+	test.skipIf(process.platform === "win32")("saveUploadedImage repairs a non-writable narrator directory", async () => {
 		const testDir = mkdtempSync(resolve(tmpdir(), "narrafork-uploads-chmod-"));
 		try {
 			setUploadsDirForTests(testDir);

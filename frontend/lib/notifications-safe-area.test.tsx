@@ -78,6 +78,9 @@ beforeEach(() => {
 afterEach(async () => {
 	await act(async () => notifications.clean());
 	await act(async () => root?.unmount());
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
 	container?.remove();
 	root = undefined;
 	container = undefined;
@@ -95,7 +98,7 @@ describe("Notifications top safe-area contract", () => {
 		await act(async () => {
 			root?.render(
 				<MantineProvider env="test">
-					<AppNotifications />
+					<AppNotifications transitionDuration={0} />
 				</MantineProvider>,
 			);
 		});

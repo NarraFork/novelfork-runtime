@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	cleanupPartialImageGenerationResults,
 	decodeStandardBase64Image,
@@ -17,7 +17,7 @@ describe("image generation artifacts", () => {
 		expect(sanitizeImageGenerationPathPart("../ig/..")).toBe("___ig___");
 		expect(sanitizeImageGenerationPathPart("")).toBe("generated_image");
 		expect(imageGenerationArtifactPath("session/../1", "../ig/..")).toContain(
-			"session____1/___ig___.png",
+			join("session____1", "___ig___.png"),
 		);
 	});
 

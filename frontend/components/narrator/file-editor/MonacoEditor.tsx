@@ -70,7 +70,7 @@ interface Runtime {
 }
 
 /** Resolve Mantine variables to actual CSS colours, which Monaco's theme parser requires. */
-function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
+function resolveTheme(host: HTMLElement, dark: boolean): editor.IStandaloneThemeData {
 	const style = host.ownerDocument.defaultView?.getComputedStyle(host);
 	const color = (variable: string, fallback: string) => {
 		const value = style?.getPropertyValue(variable).trim() || fallback;
@@ -80,7 +80,7 @@ function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 			return `#${[...value.slice(1)].map((digit) => digit + digit).join("")}`;
 		return /^#[\da-f]{6}(?:[\da-f]{2})?$/i.test(value) ? value : fallback;
 	};
-	api.editor.defineTheme("narrafork", {
+	return {
 		base: dark ? "vs-dark" : "vs",
 		inherit: true,
 		rules: [],
@@ -91,8 +91,7 @@ function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 			"editorGutter.background": color("--mantine-color-body", dark ? "#242424" : "#ffffff"),
 			"editorCursor.foreground": color("--mantine-color-text", dark ? "#c9c9c9" : "#000000"),
 		},
-	});
-	api.editor.setTheme("narrafork");
+	};
 }
 
 /** Monaco owns the only mutable document. Props are explicit loads, never controlled input echoes. */
@@ -150,9 +149,18 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			let languageStatus = await loadMonacoLanguage(api, initialLanguagePath);
 			if (cancelled) return;
 			const initial = latest.current;
+			let appliedTheme = "";
+			const updateTheme = () => {
+				const theme = resolveTheme(host, darkRef.current);
+				const key = JSON.stringify(theme);
+				if (key === appliedTheme) return;
+				appliedTheme = key;
+				api.editor.defineTheme("narrafork", theme);
+				api.editor.setTheme("narrafork");
+			};
 			// This order is critical. createModel consults the standalone configuration service.
 			// Updating options AFTER model creation cannot re-enable large-file tokenization.
-			updateTheme(api, host, darkRef.current);
+			updateTheme();
 			let renderingFull = fullLongLinesRef.current;
 			const view = api.editor.create(host, {
 				...monacoEditorOptions(!!initial.readOnly, !!initial.lineWrapping, false),
@@ -260,7 +268,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				}
 				if (lastTheme !== darkRef.current) {
 					lastTheme = darkRef.current;
-					updateTheme(api, host, lastTheme);
+					updateTheme();
 				}
 				if (readOnly !== !!next.readOnly) {
 					readOnly = !!next.readOnly;
@@ -414,12 +422,17 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					attributes: true,
 					attributeFilter: ["style", "class", "hidden"],
 				});
+			// An embedding host can restyle its palette without a light/dark flip (a theme
+			// attribute on <html>); re-resolve the colours, redefining only when they changed.
+			const themeObserver = new MutationObserver(updateTheme);
+			themeObserver.observe(host.ownerDocument.documentElement, { attributes: true });
 			dispose = () => {
 				if (frame) cancelAnimationFrame(frame);
 				win?.removeEventListener("mouseup", endPointerSelection, true);
 				win?.removeEventListener("pointercancel", endPointerSelection, true);
 				observer.disconnect();
 				visibilityObserver.disconnect();
+				themeObserver.disconnect();
 				removeBoundary();
 				for (const subscription of subscriptions) subscription.dispose();
 				blurSubscription?.dispose();

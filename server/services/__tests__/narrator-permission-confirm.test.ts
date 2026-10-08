@@ -219,6 +219,15 @@ function makeRemoteRuntimeBackend(
 	} as unknown as ExecutionBackend;
 }
 
+function makeSyntheticPosixHostBackend(defaultCwd = "/local/work"): ExecutionBackend {
+	return {
+		...makeRemoteRuntimeBackend({ deviceId: "local", defaultCwd }),
+		kind: "local",
+	} as unknown as ExecutionBackend;
+}
+
+const syntheticPosixHostBackend = makeSyntheticPosixHostBackend();
+
 function makeRemotePlanBackend(planPath: string, content: string) {
 	const calls = {
 		stat: [] as string[],
@@ -300,7 +309,7 @@ function frozenTarget(
 function staticExecutionContext(deviceId: string): ExecutionTargetContext {
 	const backend =
 		deviceId === "local"
-			? localBackend
+			? syntheticPosixHostBackend
 			: makeRemoteRuntimeBackend({ deviceId, defaultCwd: "/workspace" });
 	return {
 		backend,
@@ -862,7 +871,7 @@ describe("pending permission execution identity", () => {
 		const toolCall = "local-reprocess-tool-call";
 		const toolUse = "local-reprocess-tool-use";
 		const controller = new AbortController();
-		const localTarget = frozenTarget(localBackend, { cwd: "/local/work" });
+		const localTarget = frozenTarget(syntheticPosixHostBackend, { cwd: "/local/work" });
 		try {
 			await seedPermissionRequest({
 				narratorId: id,
@@ -881,7 +890,7 @@ describe("pending permission execution identity", () => {
 				"/local/work",
 				"en",
 				undefined,
-				{ executionBackend: localBackend, executionTarget: localTarget },
+				{ executionBackend: syntheticPosixHostBackend, executionTarget: localTarget },
 			);
 			await waitFor(() => pendingPermissions.has(toolCall));
 			await db
@@ -1728,8 +1737,8 @@ describe("OAuth remote runtime permission constraints", () => {
 				label: "local-write",
 				toolName: "Write",
 				toolInput: { file_path: "/local/work/config.json", content: "{}" },
-				backend: localBackend,
-				target: frozenTarget(localBackend, {
+				backend: syntheticPosixHostBackend,
+				target: frozenTarget(syntheticPosixHostBackend, {
 					cwd: "/local/work",
 					path: "/local/work/config.json",
 				}),
@@ -1748,7 +1757,7 @@ describe("OAuth remote runtime permission constraints", () => {
 				label: "spec-write",
 				toolName: "Edit",
 				toolInput: { file_path: "spec://tasks.json", old_string: "a", new_string: "b" },
-				backend: localBackend,
+				backend: syntheticPosixHostBackend,
 				target: {
 					deviceId: "local",
 					backendKind: "local",
@@ -1757,7 +1766,7 @@ describe("OAuth remote runtime permission constraints", () => {
 					lexicalPath: "spec://tasks.json",
 					canonicalPath: "spec://tasks.json",
 					resolvedFilePath: "spec://tasks.json",
-					runtimeGeneration: localBackend.runtimeGeneration ?? 0,
+					runtimeGeneration: syntheticPosixHostBackend.runtimeGeneration ?? 0,
 					selectionSource: "local_default",
 				},
 				constraint: {
@@ -2145,8 +2154,8 @@ describe("subagent permission routing identity", () => {
 			"en",
 			parentNarratorId,
 			{
-				executionBackend: localBackend,
-				executionTarget: frozenTarget(localBackend, {
+				executionBackend: syntheticPosixHostBackend,
+				executionTarget: frozenTarget(syntheticPosixHostBackend, {
 					cwd: "/workspace",
 					path: "/outside/file.ts",
 				}),

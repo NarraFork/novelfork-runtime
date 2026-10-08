@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { resolve as hostResolve, posix as posixPath } from "node:path";
 import type { DangerInfo } from "../../../lib/agent";
 import {
 	classifyDanger,
@@ -9,18 +9,65 @@ import {
 	shouldTriggerDangerReflection,
 } from "../../../services/narrator-permission";
 import {
-	analyzeBashCommand,
+	analyzeBashCommand as analyzeBashCommandImpl,
 	analyzePowerShellCommand,
 	type BashAnalysis,
 	isReviewReadOnlyBashAnalysis,
 } from "../bash-analyze";
+import type { ExecutionBackend } from "../execution/backend";
 import {
 	posixPathSemantics,
 	specPathSemantics,
 	windowsPathSemantics,
 } from "../execution/path-semantics";
+import type { ExecutionTargetContext } from "../../../services/execution-policy/types";
 
 const CWD = "/home/user/project";
+
+/**
+ * 本文件的 fixture 全部使用 POSIX 绝对路径。默认的 localPathSemantics 会在
+ * Windows 宿主上把 "/tmp/foo" 规范化成 "\tmp\foo"，让针对合成 POSIX 目标的断言
+ * 失败。显式声明 POSIX 语义，与真实冻结执行目标携带的信息一致。
+ */
+async function analyzeBashCommand(
+	command: string,
+	cwd: string,
+	isChapterOrSemantics: Parameters<typeof analyzeBashCommandImpl>[2] = false,
+	pathSemantics = posixPathSemantics,
+): Promise<BashAnalysis> {
+	return analyzeBashCommandImpl(command, cwd, isChapterOrSemantics, pathSemantics);
+}
+
+const resolve = posixPath.resolve;
+
+/**
+ * 决策层同样需要 POSIX 目标上下文，否则会把宿主语义混进合成的 POSIX 目标，
+ * 使外部路径与黑名单目录判定落到错误的路径风格上。
+ */
+function makePosixExecutionContext(cwd: string): ExecutionTargetContext {
+	const paths = posixPathSemantics;
+	const backend = {
+		kind: "local" as const,
+		deviceId: "local",
+		defaultCwd: cwd,
+		paths,
+		pathFlavor: "posix" as const,
+		runtimeGeneration: 1,
+	} as unknown as ExecutionBackend;
+	return {
+		backend,
+		target: {
+			deviceId: "local",
+			backendKind: "local",
+			cwd,
+			pathFlavor: "posix",
+			runtimeGeneration: 1,
+			selectionSource: "local_default",
+		},
+		paths,
+		deviceClass: null,
+	} as unknown as ExecutionTargetContext;
+}
 
 /** 断言命令会被拦截（allWhitelisted === false） */
 async function expectBlocked(cmd: string) {
@@ -1051,10 +1098,11 @@ describe("allReadOnly detection", () => {
 	});
 
 	test("PowerShell git -C paths feed the path scope check", () => {
+		// PowerShell analysis resolves with the host's path semantics, not the POSIX fixture shim.
 		const analysis = analyzePowerShellCommand("git -C ../outside status", CWD);
-		expect(analysis.filePaths).toContain(resolve(CWD, "../outside"));
+		expect(analysis.filePaths).toContain(hostResolve(CWD, "../outside"));
 		expect(analyzePowerShellCommand("git -C sub status", CWD).filePaths).toContain(
-			resolve(CWD, "sub"),
+			hostResolve(CWD, "sub"),
 		);
 	});
 
@@ -1461,6 +1509,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				bashAnalysis: withExternalPath,
 				commandWhitelist: [{ pattern: "cat /etc/passwd", enabled: true }],
 				blacklistDirs: [{ path: "/etc", denyLevel: "denyAll", enabled: true }],
+				executionContext: makePosixExecutionContext(cwd),
 			}),
 		).toBe("deny");
 	});
@@ -1626,9 +1675,17 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			filePaths: ["/mnt/shared/info.txt"],
 		};
 		expect(
-			classifyDanger("Bash", { command: "cat /mnt/shared/info.txt" }, cwd, analysis, [
-				{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true },
-			]),
+			classifyDanger(
+				"Bash",
+				{ command: "cat /mnt/shared/info.txt" },
+				cwd,
+				analysis,
+				[{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true }],
+				[],
+				false,
+				undefined,
+				makePosixExecutionContext(cwd),
+			),
 		).toBeNull();
 	});
 
@@ -1646,9 +1703,17 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			hasWriteOperation: true,
 		};
 		expect(
-			classifyDanger("Bash", { command: "touch /mnt/shared/out.txt" }, cwd, analysis, [
-				{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true },
-			]),
+			classifyDanger(
+				"Bash",
+				{ command: "touch /mnt/shared/out.txt" },
+				cwd,
+				analysis,
+				[{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+				[],
+				false,
+				undefined,
+				makePosixExecutionContext(cwd),
+			),
 		).toBeNull();
 	});
 
@@ -1673,14 +1738,30 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 
 	test("Danger classifier ignores direct tool access in whitelisted external dir", () => {
 		expect(
-			classifyDanger("Read", { file_path: "/mnt/shared/info.txt" }, cwd, undefined, [
-				{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true },
-			]),
+			classifyDanger(
+				"Read",
+				{ file_path: "/mnt/shared/info.txt" },
+				cwd,
+				undefined,
+				[{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true }],
+				[],
+				false,
+				undefined,
+				makePosixExecutionContext(cwd),
+			),
 		).toBeNull();
 		expect(
-			classifyDanger("Write", { file_path: "/mnt/shared/new.txt", content: "ok" }, cwd, undefined, [
-				{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true },
-			]),
+			classifyDanger(
+				"Write",
+				{ file_path: "/mnt/shared/new.txt", content: "ok" },
+				cwd,
+				undefined,
+				[{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+				[],
+				false,
+				undefined,
+				makePosixExecutionContext(cwd),
+			),
 		).toBeNull();
 	});
 
@@ -1692,6 +1773,10 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				cwd,
 				undefined,
 				[{ path: "/mnt/shared", accessLevel: "full", enabled: true }],
+				[],
+				false,
+				undefined,
+				makePosixExecutionContext(cwd),
 			),
 		).toBeNull();
 	});

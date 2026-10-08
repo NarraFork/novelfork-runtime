@@ -140,13 +140,12 @@ describe("PluginUiAssetService", () => {
 		await expect(service.readAsset(pluginId, version, hash, "ui/index.js")).rejects.toMatchObject({
 			code: "PLUGIN_UI_ASSET_TOO_LARGE",
 		});
-		try {
+		// Creating a symlink needs a privilege non-admin Windows lacks (symlink() throws EPERM),
+		// so exercise the symlink-rejection case only where it is expressible. The traversal,
+		// non-declared-file, and oversized-asset assertions above still run on every platform.
+		if (process.platform !== "win32") {
 			await symlink(join(packagePath, "ui/index.js"), join(packagePath, "ui/link.js"));
 			await expect(service.readAsset(pluginId, version, hash, "ui/link.js")).rejects.toThrow();
-		} catch (error) {
-			if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") {
-				throw error;
-			}
 		}
 	});
 

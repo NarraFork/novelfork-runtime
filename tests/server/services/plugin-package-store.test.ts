@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { crc32 } from "node:zlib";
 import { PluginPackageStore } from "@server/services/plugin-package-store";
 
 const fixturePackage = fileURLToPath(
@@ -43,22 +44,76 @@ async function mutateManifest(
 }
 
 async function makeZipSlipArchive(root: string): Promise<string> {
-	const sourceRoot = join(root, "zip-source");
-	const evilRoot = join(sourceRoot, "evil");
-	await mkdir(evilRoot, { recursive: true });
-	await writeFile(join(evilRoot, "escape.txt"), "escape");
+	// Build the zip-slip archive in-process instead of shelling out to the `zip` CLI, which is
+	// not installed on Windows. The single stored entry keeps a leading `..` path so the store
+	// must reject it as escaping its root before extraction. The store lists names with
+	// `unzip -Z1` (present on Windows), which prints the crafted name verbatim, so the traversal
+	// assertion is preserved on every platform without depending on a POSIX archiver.
 	const archive = join(root, "escape.nfplugin");
-	const process = Bun.spawn(["zip", "-q", archive, "../zip-source/evil/escape.txt"], {
-		cwd: sourceRoot,
-		stdout: "ignore",
-		stderr: "pipe",
-	});
-	const exitCode = await process.exited;
-	if (exitCode !== 0)
-		throw new Error(
-			`zip failed: ${new TextDecoder().decode(await new Response(process.stderr).arrayBuffer())}`,
-		);
+	await writeFile(archive, buildStoredZip("../zip-source/evil/escape.txt", "escape"));
 	return archive;
+}
+
+/** A minimal single-entry, stored (uncompressed) ZIP with an arbitrary, unsanitized name. */
+function buildStoredZip(entryName: string, content: string): Uint8Array {
+	const name = new TextEncoder().encode(entryName);
+	const data = new TextEncoder().encode(content);
+	const crc = crc32(data) >>> 0;
+	const dosTime = 0;
+	const dosDate = 0x21; // 1980-01-01; any valid DOS date satisfies zipinfo.
+
+	const local = new Uint8Array(30 + name.byteLength + data.byteLength);
+	const lv = new DataView(local.buffer);
+	lv.setUint32(0, 0x04034b50, true); // local file header signature
+	lv.setUint16(4, 20, true); // version needed to extract
+	lv.setUint16(6, 0, true); // general purpose flags
+	lv.setUint16(8, 0, true); // compression method: stored
+	lv.setUint16(10, dosTime, true);
+	lv.setUint16(12, dosDate, true);
+	lv.setUint32(14, crc, true);
+	lv.setUint32(18, data.byteLength, true); // compressed size
+	lv.setUint32(22, data.byteLength, true); // uncompressed size
+	lv.setUint16(26, name.byteLength, true);
+	lv.setUint16(28, 0, true); // extra field length
+	local.set(name, 30);
+	local.set(data, 30 + name.byteLength);
+	const central = new Uint8Array(46 + name.byteLength);
+	const cv = new DataView(central.buffer);
+	cv.setUint32(0, 0x02014b50, true); // central directory header signature
+	cv.setUint16(4, 20, true); // version made by
+	cv.setUint16(6, 20, true); // version needed to extract
+	cv.setUint16(8, 0, true); // general purpose flags
+	cv.setUint16(10, 0, true); // compression method: stored
+	cv.setUint16(12, dosTime, true);
+	cv.setUint16(14, dosDate, true);
+	cv.setUint32(16, crc, true);
+	cv.setUint32(20, data.byteLength, true); // compressed size
+	cv.setUint32(24, data.byteLength, true); // uncompressed size
+	cv.setUint16(28, name.byteLength, true);
+	cv.setUint16(30, 0, true); // extra field length
+	cv.setUint16(32, 0, true); // comment length
+	cv.setUint16(34, 0, true); // disk number start
+	cv.setUint16(36, 0, true); // internal attributes
+	cv.setUint32(38, 0, true); // external attributes
+	cv.setUint32(42, 0, true); // relative offset of local header
+	central.set(name, 46);
+
+	const eocd = new Uint8Array(22);
+	const ev = new DataView(eocd.buffer);
+	ev.setUint32(0, 0x06054b50, true); // end of central directory signature
+	ev.setUint16(4, 0, true); // number of this disk
+	ev.setUint16(6, 0, true); // disk with the start of the central directory
+	ev.setUint16(8, 1, true); // entries on this disk
+	ev.setUint16(10, 1, true); // total entries
+	ev.setUint32(12, central.byteLength, true); // central directory size
+	ev.setUint32(16, local.byteLength, true); // central directory offset
+	ev.setUint16(20, 0, true); // comment length
+
+	const out = new Uint8Array(local.byteLength + central.byteLength + eocd.byteLength);
+	out.set(local, 0);
+	out.set(central, local.byteLength);
+	out.set(eocd, local.byteLength + central.byteLength);
+	return out;
 }
 
 afterEach(async () => {

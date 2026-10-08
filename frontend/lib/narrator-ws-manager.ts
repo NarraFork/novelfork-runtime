@@ -390,6 +390,7 @@ export class NarratorWSManager {
 	private foregroundRecovery: NarratorForegroundRecoveryCoalescer;
 	private syncProbeTimeoutMs: number;
 	private cancelled = false;
+	private connectionLeaseCount = 0;
 
 	/**
 	 * Timings are injectable so tests can drive the recovery sequences without
@@ -468,6 +469,23 @@ export class NarratorWSManager {
 	// -----------------------------------------------------------------------
 	// Lifecycle
 	// -----------------------------------------------------------------------
+
+	/**
+	 * Retain the shared narrator transport until the returned release callback
+	 * is invoked. This lets the standalone Runtime shell and embedded product
+	 * surfaces coexist without either unmount disconnecting the other.
+	 */
+	acquireConnection(): () => void {
+		this.connectionLeaseCount += 1;
+		if (this.connectionLeaseCount === 1) this.connect();
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.connectionLeaseCount = Math.max(0, this.connectionLeaseCount - 1);
+			if (this.connectionLeaseCount === 0) this.disconnect();
+		};
+	}
 
 	connect(): void {
 		if (this.ws) return; // already connected / connecting

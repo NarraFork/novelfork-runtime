@@ -4,7 +4,7 @@
  * When a routine is enabled:
  *   - command → written into user_preferences.commands (global) or project chapterSettings.commands (project)
  *   - skill   → written as SKILL.md into $NARRAFORK_HOME/skills/ (global, default
- *               ~/.narrafork/skills/) or <project>/.narrafork/skills/ (project)
+ *               ~/.narrafork/skills/) or <project>/.novelfork/skills/ (project)
  *
  * When disabled, the corresponding file/command entry is removed.
  */
@@ -618,7 +618,7 @@ async function addProjectSkill(routine: BuiltinRoutine, gitPath: string): Promis
 	const skill = routine.skill;
 	if (!skill) return;
 	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(gitPath, ".narrafork", "skills", dirName);
+	const skillDir = join(gitPath, ".novelfork", "skills", dirName);
 	const skillFile = join(skillDir, "SKILL.md");
 
 	await mkdir(skillDir, { recursive: true });
@@ -627,7 +627,7 @@ async function addProjectSkill(routine: BuiltinRoutine, gitPath: string): Promis
 
 async function removeProjectSkill(routine: BuiltinRoutine, gitPath: string): Promise<void> {
 	const dirName = routineSkillDirName(routine.id);
-	const skillDir = join(gitPath, ".narrafork", "skills", dirName);
+	const skillDir = join(gitPath, ".novelfork", "skills", dirName);
 	try {
 		await access(skillDir);
 		await rm(skillDir, { recursive: true, force: true });

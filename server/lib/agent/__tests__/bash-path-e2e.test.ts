@@ -1,9 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { posix as posixPath } from "node:path";
 import { resolvePermissionDecision } from "../../../services/narrator-session";
-import { analyzeBashCommand } from "../bash-analyze";
+import { analyzeBashCommand as analyzeBashCommandImpl } from "../bash-analyze";
+import { posixPathSemantics } from "../execution/path-semantics";
 
 const CWD = "/home/user/project";
+
+/**
+ * 本文件的 fixture 全部使用 POSIX 绝对路径。默认的 localPathSemantics 会在
+ * Windows 宿主上把 "/etc/passwd" 规范化成 "\etc\passwd"，让针对合成 POSIX 目标的
+ * 断言失败。显式声明 POSIX 语义，与真实冻结执行目标携带的信息一致。
+ */
+async function analyzeBashCommand(command: string, cwd: string) {
+	return analyzeBashCommandImpl(command, cwd, false, posixPathSemantics);
+}
+
+const resolve = posixPath.resolve;
 
 /**
  * 端到端验证：analyzeBashCommand → resolvePermissionDecision

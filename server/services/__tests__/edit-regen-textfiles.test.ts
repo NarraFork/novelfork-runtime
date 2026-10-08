@@ -17,7 +17,9 @@ import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 
 // In-memory DB from real migrations (mirrors tests/setup.ts).
-const DRIZZLE_DIR = join(import.meta.dir, "..", "..", "..", "drizzle");
+const DRIZZLE_DIR =
+	process.env.NARRAFORK_MIGRATIONS_DIR?.trim() ||
+	join(import.meta.dir, "..", "..", "..", "drizzle");
 const sqlite = new Database(":memory:");
 sqlite.run("PRAGMA foreign_keys = OFF");
 for (const file of readdirSync(DRIZZLE_DIR)
@@ -201,7 +203,7 @@ describe("editAndRegenerate text_file management", () => {
 		const files = blocks.filter((b) => b.type === "text_file");
 		expect(files).toHaveLength(1);
 		expect(files[0].filename).toBe("fresh.md");
-		expect(String(files[0].filePath)).toContain(".narrafork/attached");
+		expect(String(files[0].filePath).replaceAll("\\", "/")).toContain(".narrafork/attached");
 		expect(readFileSync(String(files[0].filePath), "utf-8")).toBe("hello world");
 	});
 

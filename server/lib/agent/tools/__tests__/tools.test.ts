@@ -921,7 +921,7 @@ describe("Bash", () => {
 	});
 
 	test("uses cwd", async () => {
-		const result = await bashTool.execute({ command: "pwd" }, makeCtx());
+		const result = await bashTool.execute({ command: 'bun -e "console.log(process.cwd())"' }, makeCtx());
 		expect(result.output.trim()).toBe(TEST_DIR);
 	});
 
@@ -1022,13 +1022,13 @@ describe("Bash", () => {
 	});
 
 	test("workdir changes the working directory", async () => {
-		const result = await bashTool.execute({ command: "pwd", workdir: NESTED_DIR }, makeCtx());
+		const result = await bashTool.execute({ command: 'bun -e "console.log(process.cwd())"', workdir: NESTED_DIR }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output.trim()).toBe(NESTED_DIR);
 	});
 
 	test("workdir resolves relative paths against cwd", async () => {
-		const result = await bashTool.execute({ command: "pwd", workdir: "sub/dir" }, makeCtx());
+		const result = await bashTool.execute({ command: 'bun -e "console.log(process.cwd())"', workdir: "sub/dir" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output.trim()).toBe(NESTED_DIR);
 	});
@@ -1055,14 +1055,15 @@ describe("Bash", () => {
 	test("a bad workdir argument is retryable, not a fatal session stop", async () => {
 		// The session cwd is fine, so only this call is wrong. Killing the narrator here
 		// would throw away a whole conversation over a model-supplied path typo.
+		const missingWorkdir = join(TEST_DIR, "missing-workdir");
 		const result = await bashTool.execute(
-			{ command: "pwd", workdir: "/no/such/directory" },
+			{ command: 'bun -e "console.log(process.cwd())"', workdir: missingWorkdir },
 			makeCtx(),
 		);
 		expect(result.isError).toBe(true);
 		expect(result.fatal).toBeFalsy();
 		expect(result.metadata?.cwdRecovery).toBeUndefined();
-		expect(result.output).toContain("/no/such/directory");
+		expect(result.output).toContain(missingWorkdir);
 		expect(result.output).toContain("workdir");
 		expect(result.output).toContain(TEST_DIR);
 	});
@@ -1100,7 +1101,7 @@ describe("Bash", () => {
 
 	test("workdir allows path traversal but resolves against cwd", async () => {
 		// ../  from TEST_DIR should resolve to its parent
-		const result = await bashTool.execute({ command: "pwd", workdir: ".." }, makeCtx());
+		const result = await bashTool.execute({ command: 'bun -e "console.log(process.cwd())"', workdir: ".." }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		const { dirname } = await import("node:path");
 		expect(result.output.trim()).toBe(dirname(TEST_DIR));

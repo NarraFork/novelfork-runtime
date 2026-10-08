@@ -36,6 +36,7 @@ import {
 
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];
+const posixTest = test.skipIf(process.platform === "win32");
 
 /** Create a real git repository, since snapshots mirror its ignore rules. */
 async function createRepo(prefix: string): Promise<string> {
@@ -564,7 +565,7 @@ describe("linked worktrees", () => {
  * that returned one.
  */
 describe("restore failure compensation", () => {
-	test("a failure in the delete loop restores the pre-rollback state", async () => {
+	posixTest("a failure in the delete loop restores the pre-rollback state", async () => {
 		const repo = await createRepo("nf-tree-restore-halfway-");
 		writeFileSync(join(repo, "keep.txt"), "keep\n");
 		const boundary = await worktreeTreeSnapshot.capture(repo);
@@ -604,7 +605,7 @@ describe("restore failure compensation", () => {
 		expect(await worktreeTreeSnapshot.capture(repo)).toBe(beforeRollback);
 	});
 
-	test("a scoped rollback reports the failure and registers its compensation", async () => {
+	posixTest("a scoped rollback reports the failure and registers its compensation", async () => {
 		// The reversal path (not the raw restore) has to carry the same guarantee: it is
 		// the one whose catch used to return `TREE_RESTORE_FAILED` without ever calling
 		// `registerTreeCompensation`, so all three capture-then-compensate exits had no
@@ -1099,7 +1100,7 @@ describe("path-restricted reversal", () => {
 		expect(readFileSync(join(repo, "theirs.txt"), "utf8")).toBe("theirs-v2\n");
 	});
 
-	test("preserves the executable bit when adopting a path", async () => {
+	posixTest("preserves the executable bit when adopting a path", async () => {
 		const repo = await createRepo("nf-tree-owned-mode-exec-");
 		mkdirSync(join(repo, "bin"), { recursive: true });
 		writeFileSync(join(repo, "bin/run.sh"), "#!/bin/sh\necho v1\n", { mode: 0o755 });
@@ -1117,7 +1118,7 @@ describe("path-restricted reversal", () => {
 		expect(statSync(join(repo, "bin/run.sh")).mode & 0o111).not.toBe(0);
 	});
 
-	test("restores a symlink as a link rather than a regular file", async () => {
+	posixTest("restores a symlink as a link rather than a regular file", async () => {
 		const repo = await createRepo("nf-tree-owned-mode-link-");
 		writeFileSync(join(repo, "target.txt"), "v1\n");
 		await safeSpawn({ cmd: ["ln", "-s", "target.txt", "link"], cwd: repo, timeout: 15_000 });

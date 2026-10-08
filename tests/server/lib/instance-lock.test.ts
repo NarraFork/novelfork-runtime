@@ -26,6 +26,15 @@ const IS_LINUX = process.platform === "linux";
 const tempDirs: string[] = [];
 const spawnedPids: number[] = [];
 
+function differentBootMarker(): string {
+	const current = __testing.currentBootId();
+	if (current?.startsWith(__testing.DERIVED_BOOT_PREFIX)) {
+		const seconds = Number(current.slice(__testing.DERIVED_BOOT_PREFIX.length));
+		return `${__testing.DERIVED_BOOT_PREFIX}${seconds + __testing.DERIVED_BOOT_TOLERANCE_S + 60}`;
+	}
+	return "00000000-0000-0000-0000-000000000000";
+}
+
 function createTempDbPath(): string {
 	const dir = mkdtempSync(join(tmpdir(), "narrafork-instance-lock-"));
 	tempDirs.push(dir);
@@ -224,7 +233,7 @@ describe("instance lock", () => {
 			dbPath,
 			startedAt: new Date().toISOString(),
 			argv: ["narrafork"],
-			bootId: "00000000-0000-0000-0000-000000000000",
+			bootId: differentBootMarker(),
 			// Matching start ticks: only the boot id proves this lock predates the current boot.
 			procStartTicks: IS_LINUX ? realStartTicks(helper.pid) : 1,
 			execPath: process.execPath,

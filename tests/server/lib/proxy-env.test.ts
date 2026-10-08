@@ -19,12 +19,15 @@ const ENV_KEYS = [
 	"no_proxy",
 ] as const;
 
+const ACTIVE_ENV_KEYS =
+	process.platform === "win32" ? ENV_KEYS.filter((key) => key === key.toUpperCase()) : ENV_KEYS;
+
 describe("net/proxy-env ambient neutralization", () => {
 	let saved: Record<string, string | undefined>;
 
 	beforeEach(() => {
 		saved = {};
-		for (const k of ENV_KEYS) {
+		for (const k of ACTIVE_ENV_KEYS) {
 			saved[k] = process.env[k];
 			delete process.env[k];
 		}
@@ -32,7 +35,7 @@ describe("net/proxy-env ambient neutralization", () => {
 	});
 
 	afterEach(() => {
-		for (const k of ENV_KEYS) {
+		for (const k of ACTIVE_ENV_KEYS) {
 			if (saved[k] === undefined) delete process.env[k];
 			else process.env[k] = saved[k];
 		}
@@ -137,7 +140,7 @@ describe("net/proxy-env ambient neutralization", () => {
 
 		// Simulate the child: fresh module state, environment taken from childEnv.
 		resetProxyEnvStateForTest();
-		for (const k of ENV_KEYS) {
+		for (const k of ACTIVE_ENV_KEYS) {
 			const value = childEnv[k];
 			if (value === undefined) delete process.env[k];
 			else process.env[k] = value;
@@ -155,7 +158,7 @@ describe("net/proxy-env ambient neutralization", () => {
 		const naiveChildEnv = { ...process.env };
 
 		resetProxyEnvStateForTest();
-		for (const k of ENV_KEYS) {
+		for (const k of ACTIVE_ENV_KEYS) {
 			const value = naiveChildEnv[k];
 			if (value === undefined) delete process.env[k];
 			else process.env[k] = value;

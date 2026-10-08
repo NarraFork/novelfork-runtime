@@ -34,7 +34,7 @@ afterEach(() => {
 });
 
 describe("bounded directory measurement", () => {
-	test("a self-referential directory symlink does not recurse forever", async () => {
+	test.skipIf(process.platform === "win32")("a self-referential directory symlink does not recurse forever", async () => {
 		const uploadsDir = makeUploadsDir();
 		const narratorDir = resolve(uploadsDir, "narrator-a");
 		mkdirSync(narratorDir, { recursive: true });
@@ -51,7 +51,7 @@ describe("bounded directory measurement", () => {
 		expect(result.truncated).toBeUndefined();
 	});
 
-	test("mutually referential directory symlinks do not recurse forever", async () => {
+	test.skipIf(process.platform === "win32")("mutually referential directory symlinks do not recurse forever", async () => {
 		const uploadsDir = makeUploadsDir();
 		const first = resolve(uploadsDir, "narrator-a");
 		const second = resolve(uploadsDir, "narrator-b");
@@ -67,7 +67,7 @@ describe("bounded directory measurement", () => {
 		expect(result.sizeBytes).toBe(30);
 	});
 
-	test("does not count a symlinked file, whose bytes belong to its target", async () => {
+	test.skipIf(process.platform === "win32")("does not count a symlinked file, whose bytes belong to its target", async () => {
 		const uploadsDir = makeUploadsDir();
 		const narratorDir = resolve(uploadsDir, "narrator-a");
 		mkdirSync(narratorDir, { recursive: true });
@@ -82,12 +82,20 @@ describe("bounded directory measurement", () => {
 	test("reports truncated when the depth limit stops the walk", async () => {
 		const uploadsDir = makeUploadsDir();
 		// DIR_SCAN_MAX_DEPTH is 64; nest past it so the limit is provably reached.
-		const segments = Array.from({ length: 70 }, (_, index) => `level-${index}`);
-		const deepest = resolve(uploadsDir, "narrator-a", ...segments);
+		// Single-character segments keep the deepest fixture path within the
+		// Windows MAX_PATH (260) limit, so the walk reaches the depth cap and
+		// reports `truncated` instead of failing to create/read an over-long path.
+		const segments = Array.from({ length: 70 }, () => "d");
+		const deepest = resolve(uploadsDir, "a", ...segments);
 		mkdirSync(deepest, { recursive: true });
 		await writeFileOfSize(resolve(deepest, "buried.bin"), 999);
-		// A shallow file proves the walk still reports what it did measure.
-		await writeFileOfSize(resolve(uploadsDir, "narrator-a", "shallow.bin"), 7);
+		// A shallow file in a separate narrator dir proves the walk still reports
+		// what it measured. Keeping it out of the truncated dir makes the counted
+		// total independent of readdir enumeration order: once the depth cap trips
+		// deep under "a", the walk abandons "a"'s remaining siblings, so a shallow
+		// file placed there would be dropped on filesystems that enumerate the deep
+		// child first (e.g. NTFS sorts before "s.bin").
+		await writeFileOfSize(resolve(uploadsDir, "b", "s.bin"), 7);
 
 		const result = await scanUploads();
 

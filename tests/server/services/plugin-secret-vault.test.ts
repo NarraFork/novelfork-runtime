@@ -32,7 +32,7 @@ describe("plugin secret vault", () => {
 		});
 	});
 
-	test("creates the vault file with owner-only permissions", async () => {
+	test.skipIf(process.platform === "win32")("creates the vault file with owner-only permissions", async () => {
 		await withVault(async (vault) => {
 			await vault.setSecret({ pluginId, key: "k", value: "v" });
 			const info = await stat(vault.path);

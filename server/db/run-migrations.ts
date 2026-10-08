@@ -9,11 +9,24 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
 
-const FILESYSTEM_MIGRATIONS_FOLDER = "./drizzle";
+const FILESYSTEM_MIGRATIONS_FOLDER = resolve(import.meta.dir, "../../drizzle");
+
+/**
+ * A host may keep immutable migration assets outside the replaceable Runtime tree.
+ * Resolving an absolute folder keeps migrations working regardless of the process
+ * working directory, which a compiled single-file binary does not control.
+ */
+function resolveFilesystemMigrationsFolder(): string {
+	const configured = process.env.NARRAFORK_MIGRATIONS_DIR?.trim();
+	if (configured) return resolve(configured);
+	const hostAssets = resolve(import.meta.dir, "../../runtime-migrations");
+	if (existsSync(join(hostAssets, "meta", "_journal.json"))) return hostAssets;
+	return FILESYSTEM_MIGRATIONS_FOLDER;
+}
 
 type EmbeddedMigrationDataModule = {
 	embeddedMigrationJournalJson: string;
@@ -50,14 +63,15 @@ function materializeEmbeddedMigrations(data: EmbeddedMigrationDataModule): {
 
 export async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolder> {
 	// Prefer filesystem migrations in source/dev mode so the latest SQL is always used.
-	if (existsSync(FILESYSTEM_MIGRATIONS_FOLDER)) {
-		return { folder: FILESYSTEM_MIGRATIONS_FOLDER, source: "filesystem" };
+	const filesystemMigrationsFolder = resolveFilesystemMigrationsFolder();
+	if (existsSync(join(filesystemMigrationsFolder, "meta", "_journal.json"))) {
+		return { folder: filesystemMigrationsFolder, source: "filesystem" };
 	}
 
-	// Fallback for compiled single-binary mode where ./drizzle doesn't exist on disk.
+	// Compiled single-binary mode: only a static alias import lets Bun embed the
+	// generated migration data. A runtime-computed module path is never bundled.
 	try {
-		const generatedMigrationsDataModulePath = "../generated/embedded-migrations-data";
-		const generatedModule = (await import(generatedMigrationsDataModulePath)) as
+		const generatedModule = (await import("@server/generated/embedded-migrations-data")) as
 			| EmbeddedMigrationDataModule
 			| undefined;
 		if (
@@ -75,7 +89,7 @@ export async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolde
 		// No embedded migration data module available.
 	}
 
-	return { folder: FILESYSTEM_MIGRATIONS_FOLDER, source: "filesystem" };
+	return { folder: filesystemMigrationsFolder, source: "filesystem" };
 }
 
 // Explicit migration-only driver selection. This is not a business-runtime configuration.
@@ -567,6 +581,108 @@ function migrationDropsRealTables(statements: readonly string[]): string[] {
 	return dropped;
 }
 
+/** Remove SQL string literals and comments before looking for table-reference keywords. */
+function maskSqlLiteralsAndComments(sql: string): string {
+	let masked = "";
+	for (let i = 0; i < sql.length; i++) {
+		const char = sql[i];
+		const next = sql[i + 1];
+		if (char === "-" && next === "-") {
+			masked += "  ";
+			i += 2;
+			while (i < sql.length && sql[i] !== "\n") {
+				masked += " ";
+				i++;
+			}
+			if (i < sql.length) masked += "\n";
+			continue;
+		}
+		if (char === "/" && next === "*") {
+			masked += "  ";
+			i += 2;
+			while (i < sql.length) {
+				if (sql[i] === "*" && sql[i + 1] === "/") {
+					masked += "  ";
+					i++;
+					break;
+				}
+				masked += sql[i] === "\n" ? "\n" : " ";
+				i++;
+			}
+			continue;
+		}
+		if (char === "'") {
+			masked += " ";
+			for (i++; i < sql.length; i++) {
+				if (sql[i] === "'" && sql[i + 1] === "'") {
+					masked += "  ";
+					i++;
+					continue;
+				}
+				if (sql[i] === "'") {
+					masked += " ";
+					break;
+				}
+				masked += sql[i] === "\n" ? "\n" : " ";
+			}
+			continue;
+		}
+		masked += char;
+	}
+	return masked;
+}
+
+/** Extract table names from the SQL clauses used by Drizzle's SQLite DDL/rebuild statements. */
+function tableReferencesOfStatement(stmt: string): string[] {
+	const masked = maskSqlLiteralsAndComments(stmt);
+	const references: string[] = [];
+	const referencePattern = new RegExp(
+		String.raw`\b(?:CREATE\s+(?:UNIQUE\s+)?INDEX(?:\s+IF\s+NOT\s+EXISTS)?|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+INTO|FROM|JOIN|UPDATE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|ALTER\s+TABLE|RENAME\s+TO|ON)\s+(${SQLITE_TABLE_REF})`,
+		"gi",
+	);
+	for (const match of masked.matchAll(referencePattern)) {
+		references.push(normalizeObjectName(match[1]));
+	}
+	return references;
+}
+
+/** Whether a statement is one standalone DDL form allowed to become obsolete after a later DROP. */
+function isSingleObsoleteDdlStatement(stmt: string): boolean {
+	const trimmed = maskSqlLiteralsAndComments(stmt).trim();
+	const withoutFinalSemicolon = trimmed.endsWith(";") ? trimmed.slice(0, -1).trimEnd() : trimmed;
+	if (withoutFinalSemicolon.includes(";")) return false;
+	const createIndex = new RegExp(
+		String.raw`^CREATE\s+(?:UNIQUE\s+)?INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+${SQLITE_IDENTIFIER}\s+ON\s+${SQLITE_TABLE_REF}\b[\s\S]*?;?$`,
+		"i",
+	);
+	const alterTable = new RegExp(
+		String.raw`^ALTER\s+TABLE\s+${SQLITE_TABLE_REF}\s+(?:ADD(?:\s+COLUMN)?|DROP(?:\s+COLUMN)?|RENAME\s+TO)\b[\s\S]*?;?$`,
+		"i",
+	);
+	return (
+		createIndex.test(trimmed) ||
+		alterTable.test(trimmed) ||
+		droppedTableOfStatement(trimmed) !== null
+	);
+}
+
+/**
+ * A historical-hole DDL may be obsolete when its missing table was explicitly removed by a later
+ * migration. This deliberately excludes CREATE TABLE, INSERT/SELECT, and table rebuild steps.
+ */
+function isObsoletedTableError(
+	err: unknown,
+	stmt: string,
+	obsoletedTables: ReadonlySet<string>,
+): boolean {
+	const missingTable = missingTableFromError(err);
+	if (missingTable === null) return false;
+	if (![...obsoletedTables].some((table) => sameObjectName(table, missingTable))) return false;
+	if (!isSingleObsoleteDdlStatement(stmt)) return false;
+	const references = tableReferencesOfStatement(stmt);
+	return references.some((reference) => sameObjectName(reference, missingTable));
+}
+
 /**
  * Whether a failed statement is exactly the harmless case of dropping a table this database
  * never had: the statement itself is a `DROP TABLE`, and the table SQLite reported missing is
@@ -719,6 +835,19 @@ function isRetiredIndexCreateError(
  * Exported for tests so the statement-level error tolerance can be exercised against purpose-
  * built migration folders instead of only the committed journal.
  */
+function statementReferencesDroppedTable(
+	statement: string,
+	droppedTables: readonly string[],
+): boolean {
+	const references = tableReferencesOfStatement(statement);
+	return droppedTables.some((table) =>
+		references.some(
+			(reference) =>
+				sameObjectName(reference, table) || sameObjectName(reference, `__new_${table}`),
+		),
+	);
+}
+
 export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder: string): void {
 	const journalPath = join(migrationsFolder, "meta", "_journal.json");
 	if (!existsSync(journalPath)) {
@@ -758,6 +887,18 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 		.filter(({ migration }) => !appliedHashes.has(migration.hash));
 	if (pending.length === 0) return;
 
+	const obsoletedTablesByIndex = new Map<number, Set<string>>();
+	for (const { index } of pending) {
+		const obsoleted = new Set<string>();
+		for (let j = index + 1; j < migrations.length; j++) {
+			const stmts = migrations[j].sql.map((s) => s.trim()).filter(Boolean);
+			for (const table of migrationDropsRealTables(stmts)) {
+				obsoleted.add(table.toLowerCase());
+			}
+		}
+		obsoletedTablesByIndex.set(index, obsoleted);
+	}
+
 	const foreignKeyState = sqlite.prepare("PRAGMA foreign_keys").get() as {
 		foreign_keys: number | bigint;
 	} | null;
@@ -784,46 +925,56 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					droppedTables.every((table) => tableExists(sqlite, table));
 
 				if (alreadyEffective) {
-					// The rebuild already happened on a prior run; the hash just never got stamped.
-					// Re-running the DROP/rebuild would risk live data, so only record the hash.
+					// The destructive rebuild already happened on a prior run; the hash just never
+					// got stamped. Skip only statements that reference the rebuilt table so missing
+					// additive objects from the same migration can still be recreated.
 					stampedWithoutRun++;
-					logger.warn("Stamping already-effective destructive migration without re-running", {
+					logger.warn("Skipping already-effective destructive rebuild statements", {
 						folderMillis: migration.folderMillis,
 						droppedTables,
 					});
-				} else {
-					for (const rawStmt of statements) {
-						const stmt = rewriteQualifiedNewTableChecks(rawStmt);
-						// Validate before SQLite can accept missing DQS names as literals. Neither
-						// compatibility failures nor repaired-copy failures are tolerable DDL errors.
-						const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
-						if (copyStatement !== stmt) {
-							if (copyStatement !== null) sqlite.run(copyStatement);
+				}
+
+				for (const rawStmt of statements) {
+					if (alreadyEffective && statementReferencesDroppedTable(rawStmt, droppedTables)) {
+						continue;
+					}
+					const stmt = rewriteQualifiedNewTableChecks(rawStmt);
+					// Validate before SQLite can accept missing DQS names as literals. Neither
+					// compatibility failures nor repaired-copy failures are tolerable DDL errors.
+					const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
+					if (copyStatement !== stmt) {
+						if (copyStatement !== null) sqlite.run(copyStatement);
+						continue;
+					}
+					try {
+						sqlite.run(stmt);
+					} catch (err) {
+						if (isAlreadyExistsError(err)) continue;
+						// An index/column drop whose target is already gone: the statement's
+						// own goal is satisfied, verified against the live catalog.
+						if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
+						if (isRetiredIndexCreateError(sqlite, err, stmt, migrations.slice(index + 1))) {
+							logger.info("Skipped retired historical index DDL", {
+								folderMillis: migration.folderMillis,
+							});
 							continue;
 						}
-						try {
-							sqlite.run(stmt);
-						} catch (err) {
-							if (isAlreadyExistsError(err)) continue;
-							// An index/column drop whose target is already gone: the statement's
-							// own goal is satisfied, verified against the live catalog.
-							if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
-							if (isRetiredIndexCreateError(sqlite, err, stmt, migrations.slice(index + 1))) {
-								logger.info("Skipped retired historical index DDL", {
-									folderMillis: migration.folderMillis,
-								});
-								continue;
-							}
-							// Scoped to the failing statement, not the whole migration: only a
-							// `DROP TABLE` whose own target is the table SQLite reports missing is
-							// harmless. Anything else failing with "no such table" means the
-							// migration's assumptions are broken, and continuing through the rest of
-							// a rebuild sequence would drop live rows into an empty replacement.
-							if (isDestructive && isMissingDropTargetError(err, stmt, droppedTables)) {
-								continue;
-							}
-							throw err;
+						// Scoped to the failing statement, not the whole migration: only a
+						// `DROP TABLE` whose own target is the table SQLite reports missing is
+						// harmless. Anything else failing with "no such table" means the
+						// migration's assumptions are broken, and continuing through the rest of
+						// a rebuild sequence would drop live rows into an empty replacement.
+						if (isDestructive && isMissingDropTargetError(err, stmt, droppedTables)) {
+							continue;
 						}
+						if (
+							isUnstampedHole &&
+							isObsoletedTableError(err, stmt, obsoletedTablesByIndex.get(index) ?? new Set())
+						) {
+							continue;
+						}
+						throw err;
 					}
 				}
 

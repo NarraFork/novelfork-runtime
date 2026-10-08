@@ -1122,6 +1122,45 @@ describe("adaptSegment — assistant message", () => {
 		expect((expanded[0]!.opts as { expanded: boolean }).expanded).toBe(true);
 	});
 
+	it("keeps reasoning body text when an empty thinking field is also projected", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "a4-body",
+				role: "assistant",
+				contentJson: [{ type: "reasoning", text: "Visible reasoning body", thinking: "" }],
+			},
+		};
+		const spec = adaptSegment(seg, { lod: 5, isExpanded: () => true })[0]!;
+		expect(spec.kind).toBe("reasoning");
+		expect((spec.data as { text: string }).text).toBe("Visible reasoning body");
+	});
+
+	it("renders an encrypted-only reasoning projection as a visible placeholder", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "a4-encrypted",
+				role: "assistant",
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "",
+						providerMetadata: { hasEncryptedReasoning: true },
+					},
+				],
+			},
+		};
+		const localized = adaptSegment(seg, {
+			lod: 5,
+			labels: { reasoningEncryptedPlaceholder: "推理内容已加密" },
+		})[0]!;
+		expect((localized.data as { text: string }).text).toBe("推理内容已加密");
+		expect((adaptSegment(seg, CTX)[0]!.data as { text: string }).text).toBe(
+			"Reasoning content is encrypted",
+		);
+	});
+
 	it("passes the reasoning show-original choice via opts (height-affecting)", () => {
 		// The flip changes which language is measured, so it has to be resolved
 		// during adaptation — not applied at paint time over a stale height.

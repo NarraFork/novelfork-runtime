@@ -21,9 +21,10 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { fileURLToPath } from "node:url";
 
 const CSS = await Bun.file(
-	new URL("./MarkdownContent.module.css", import.meta.url).pathname,
+	fileURLToPath(new URL("./MarkdownContent.module.css", import.meta.url)),
 ).text();
 
 /** The declaration block of the first rule whose selector matches `pattern`. */

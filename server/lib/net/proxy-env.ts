@@ -47,6 +47,15 @@ const PROXY_ENV_KEYS = [
 
 type ProxyEnvSnapshot = Partial<Record<(typeof PROXY_ENV_KEYS)[number], string>>;
 
+// Windows environment keys are case-insensitive. Reading both canonical casings there captures
+// one native variable twice and later emits duplicate subprocess entries. Keep uppercase names
+// as the stable Windows projection while preserving both casings on POSIX, where they are
+// genuinely distinct variables.
+const ACTIVE_PROXY_ENV_KEYS =
+	process.platform === "win32"
+		? PROXY_ENV_KEYS.filter((key) => key === key.toUpperCase())
+		: PROXY_ENV_KEYS;
+
 /**
  * The ambient values as they were before neutralization. Populated by
  * {@link neutralizeAmbientProxyEnv}; empty until then, which makes "system" mode
@@ -67,13 +76,13 @@ export function neutralizeAmbientProxyEnv(): void {
 	neutralized = true;
 
 	const captured: ProxyEnvSnapshot = {};
-	for (const key of PROXY_ENV_KEYS) {
+	for (const key of ACTIVE_PROXY_ENV_KEYS) {
 		const value = process.env[key];
 		if (value !== undefined && value !== "") captured[key] = value;
 	}
 	snapshot = captured;
 
-	for (const key of PROXY_ENV_KEYS) {
+	for (const key of ACTIVE_PROXY_ENV_KEYS) {
 		// Assignment rather than `delete`: only assignment reaches the native
 		// environment Bun's fetch reads. An empty value is honoured as "no proxy".
 		if (process.env[key] !== undefined) process.env[key] = "";

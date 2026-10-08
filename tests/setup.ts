@@ -13,13 +13,17 @@
 
 import { Database } from "bun:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { ensureColumns } from "../server/db/ensure-columns";
 import * as relations from "../server/db/relations";
 import * as schema from "../server/db/schema";
 
-const DRIZZLE_DIR = join(import.meta.dir, "..", "drizzle");
+// Runtime migrations are host-provided immutable assets in production and in the
+// workspace test runner. Keep the local drizzle fallback for standalone upstream tests.
+const DRIZZLE_DIR = resolve(
+	process.env.NARRAFORK_MIGRATIONS_DIR?.trim() || join(import.meta.dir, "..", "drizzle"),
+);
 
 /** Read and sort all migration SQL files from drizzle/ directory. */
 function getMigrationFiles(): string[] {

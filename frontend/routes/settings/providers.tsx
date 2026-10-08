@@ -122,7 +122,7 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 	};
 }
 
-function SettingsProvidersPage() {
+export function SettingsProvidersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");

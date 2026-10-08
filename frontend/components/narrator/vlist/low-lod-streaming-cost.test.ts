@@ -224,35 +224,49 @@ describe("low-LOD live turn: per-frame cost stays flat as the reply grows", () =
 		// design still rebuilt a string the size of the whole reply per delta (97.8% of
 		// a 0.489ms frame at 400k chars, by inline attribution). Emitting only the
 		// first body LINE — all a folded row can show — makes it O(1).
+		//
+		// This is asserted as a DETERMINISTIC OUTPUT INVARIANT, not a wall-clock ratio.
+		// The per-delta work is O(1) only because the emitted body is CAPPED to the
+		// first displayable line, so the emitted size stays constant however long the
+		// reply grows. A micro-benchmark on this path measures scheduler noise, not the
+		// algorithm: the O(n) frames are a per-turn minority that hide in the tail while
+		// the median sits at the sub-microsecond timer-resolution floor (early median
+		// ~0.002ms, late ~0.005ms), so a 3× ratio there flakes under CPU contention
+		// without any real regression. The structural invariant catches the exact
+		// regression with zero timing dependence: if the parser reverts to emitting the
+		// whole body, the emitted length scales with the reply (the full-body variant
+		// measured 5,016 → 400,008 chars across this same window) and `late === early`
+		// fails hard.
 		const { parseStreamingReasoningTitles, resetStreamingReasoningCache } = await import(
 			"@shared/pretext-layout/reasoning-segments-cache"
 		);
 
-		const cost = (chars: number) => {
+		// The largest body emitted across a growing single-title stream. Deltas are
+		// appended exactly as the live accumulator does (append-only → cache hits), so
+		// this exercises the incremental reuse path, not a one-shot cold parse.
+		const emittedBodyLength = (segments: { body: string }[]) =>
+			segments.reduce((total, segment) => total + segment.body.length, 0);
+		const maxEmittedBody = (chars: number) => {
 			const key = `single-${chars}`;
 			resetStreamingReasoningCache(key);
 			let text = `**分析步骤**\n\n${GROWTH.repeat(Math.ceil(chars / GROWTH.length))}`;
-			text.charCodeAt(0);
-			parseStreamingReasoningTitles(key, text);
-			const samples: number[] = [];
+			let peak = emittedBodyLength(parseStreamingReasoningTitles(key, text));
 			for (let i = 0; i < 40; i++) {
 				// Blank line every 4th append, like real reasoning prose.
 				text += i % 4 === 3 ? `${GROWTH}\n\n` : GROWTH;
-				text.charCodeAt(0);
-				const started = performance.now();
-				parseStreamingReasoningTitles(key, text);
-				samples.push(performance.now() - started);
+				peak = Math.max(peak, emittedBodyLength(parseStreamingReasoningTitles(key, text)));
 			}
-			samples.sort((left, right) => left - right);
-			return samples[Math.floor(samples.length / 2)] ?? 0;
+			return peak;
 		};
 
-		cost(2_000); // warm
-		const early = cost(5_000);
-		const late = cost(400_000);
-		// Measured 0.0071ms → 0.0031ms across this range (it gets CHEAPER, since the
-		// first line settles early and later paragraphs are skipped outright).
-		expect(late).toBeLessThan(Math.max(early, 0.005) * 3);
+		const early = maxEmittedBody(5_000);
+		const late = maxEmittedBody(400_000);
+		// 80× the accumulated reply, byte-for-byte the same emitted body: O(1) output.
+		expect(late).toBe(early);
+		// And that body is bounded to the first displayable line (TITLE_BODY_CAP = 512),
+		// never a slice proportional to the reply.
+		expect(late).toBeGreaterThan(0);
+		expect(late).toBeLessThanOrEqual(512);
 	});
 
 	it("keeps the measurement cache bounded across a long turn", async () => {

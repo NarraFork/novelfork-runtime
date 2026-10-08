@@ -37,6 +37,10 @@ async function fileFromPath(path: string, name: string): Promise<File> {
 }
 
 /** tar a map of relative path → contents into <workRoot>/<name>.tar.gz, return its path. */
+function tarPath(value: string): string {
+	return value.replaceAll("\\", "/");
+}
+
 function buildTarGz(name: string, files: Record<string, string>): string {
 	const srcDir = mkdtempSync(resolve(workRoot, "src-"));
 	for (const [rel, content] of Object.entries(files)) {
@@ -45,7 +49,7 @@ function buildTarGz(name: string, files: Record<string, string>): string {
 		writeFileSync(full, content);
 	}
 	const archivePath = resolve(workRoot, `${name}.tar.gz`);
-	const res = Bun.spawnSync(["tar", "-czf", archivePath, "-C", srcDir, "."]);
+	const res = Bun.spawnSync(["tar", "--force-local", "-czf", tarPath(archivePath), "-C", tarPath(srcDir), "."]);
 	if (res.exitCode !== 0) {
 		throw new Error(`tar failed: ${new TextDecoder().decode(res.stderr)}`);
 	}
@@ -61,10 +65,11 @@ async function makeZipSlipArchive(name: string): Promise<File> {
 	// a file under a transformed name via --transform, producing a ../ member path.
 	const res = Bun.spawnSync([
 		"tar",
+		"--force-local",
 		"-czf",
-		archivePath,
+		tarPath(archivePath),
 		"-C",
-		srcDir,
+		tarPath(srcDir),
 		"--transform",
 		"s,^ok.txt,../escape.txt,",
 		"ok.txt",

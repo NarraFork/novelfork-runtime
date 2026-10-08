@@ -96,7 +96,8 @@ describe("openDatabase guard without an isolating preload", () => {
 				// No `[test].preload`: reproduces a stale worktree's bunfig.
 				writeFileSync(resolve(dir, "bunfig.toml"), "[test]\n");
 				// Point NARRAFORK_HOME at the real directory the way an unisolated run would.
-				const realHome = resolve(homedir(), ".narrafork");
+				const realHome = resolve(process.env.NARRAFORK_TEST_REAL_HOME ?? homedir());
+				const narraforkHome = resolve(realHome, ".narrafork");
 				const testFile = resolve(dir, "probe.test.ts");
 				writeFileSync(
 					testFile,
@@ -111,7 +112,12 @@ describe("openDatabase guard without an isolating preload", () => {
 
 				proc = Bun.spawn(["bun", "test", "--config", resolve(dir, "bunfig.toml"), testFile], {
 					cwd: dir,
-					env: { ...process.env, NARRAFORK_HOME: realHome, HOME: homedir() },
+					env: {
+						...process.env,
+						NARRAFORK_HOME: narraforkHome,
+						HOME: realHome,
+						USERPROFILE: realHome,
+					},
 					stdout: "pipe",
 					stderr: "pipe",
 					timeout: CHILD_TIMEOUT_MS,

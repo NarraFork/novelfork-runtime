@@ -426,13 +426,22 @@ describe("worker pool", () => {
 	}, 60_000);
 
 	test("times out a task and stays usable afterwards", async () => {
+		// A 1ms budget is not a timeout on a fast host: the scan can finish first, so the
+		// assertion becomes a race. Pin the worker so the task can never complete, then let
+		// the real timeout fire and prove the pool still serves the next task.
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "timeout-worker.ts", HANGING_WORKER_BODY),
+		]);
 		await expect(
 			runReadTask(
 				dbPath,
 				{ kind: "storageScanTables", tableNames: ["narrator_messages"] },
-				{ timeoutMs: 1 },
+				{ timeoutMs: 50 },
 			),
 		).rejects.toThrow(/timed out/);
+		// The timed-out worker is retired, so restoring production resolution must be enough
+		// for the next task; no pool reset is allowed to hide poisoning here.
+		setDbWorkerSpecifiersForTest(null);
 		const ok = await runReadTask<StorageScanContextResult>(dbPath, {
 			kind: "storageScanContext",
 		});
@@ -579,18 +588,21 @@ describe("worker pool", () => {
 		const queued = runReadTask(
 			dbPath,
 			{ kind: "storageScanTables", tableNames: ["narrators"] },
-			{ timeoutMs: 500 },
+			{ timeoutMs: 50 },
 		);
 		await expect(queued).rejects.toThrow(/timed out/);
 		const elapsed = Date.now() - startedAt;
-		expect(elapsed).toBeGreaterThanOrEqual(400);
-		expect(elapsed).toBeLessThan(4_000);
+		expect(elapsed).toBeGreaterThanOrEqual(40);
+		expect(elapsed).toBeLessThan(1_000);
 		// The timed-out waiter must remove ITS OWN queue entry, or a later drain releases a dead slot.
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 
 		blocker.catch(() => {});
 		shutdownDbWorkerPool();
 		await expect(blocker).rejects.toThrow();
+		resetDbWorkerPoolForTest();
+		const recovered = await runReadTask<StorageScanContextResult>(dbPath, { kind: "storageScanContext" });
+		expect(recovered.pageSize).toBeGreaterThan(0);
 	}, 40_000);
 
 	/** An abort must also cancel a task that has not been given a worker yet. */

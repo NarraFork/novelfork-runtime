@@ -120,6 +120,23 @@ export interface ToolContext {
 	pipelineUnusedToolCallThreshold?: number;
 	/** Locale for i18n of tool outputs */
 	locale: string;
+	/**
+	 * Host-owned text generation capability backed by the current session
+	 * model. Product tools such as NovelFork pipeline.write/scene.spec use this
+	 * when they need non-interactive generation outside the agent loop.
+	 */
+	generateText?: (request: {
+		messages: ReadonlyArray<{ role: "system" | "user" | "assistant"; content: string }>;
+		temperature?: number;
+		maxTokens?: number;
+	}) => Promise<{
+		text: string;
+		usage?: {
+			promptTokens?: number;
+			completionTokens?: number;
+			totalTokens?: number;
+		};
+	}>;
 	/** Chapter ID the narrator belongs to (cached to avoid repeated DB lookups) */
 	chapterId?: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
@@ -339,6 +356,17 @@ export interface ToolResult {
 	images?: Array<{ format: string; base64: string }>;
 }
 
+export type ContributedToolRisk = "read" | "draft-write" | "confirmed-write" | "destructive";
+export type ContributedSessionPermissionMode = "ask" | "edit" | "allow" | "read" | "plan";
+export type ContributedToolVisibility = "author" | "advanced";
+
+export interface ContributedToolPermissionPolicy {
+	readonly risk: ContributedToolRisk;
+	readonly enabledForModes: readonly ContributedSessionPermissionMode[];
+	readonly visibility: ContributedToolVisibility;
+	readonly resolveRisk?: (input?: Record<string, unknown>) => ContributedToolRisk;
+}
+
 export interface ToolDefinition {
 	name: string;
 	description: string | ((config: AgentConfig) => string);
@@ -365,6 +393,8 @@ export interface ToolDefinition {
 		mcpToolName?: string;
 		/** Explicitly declares that executing this tool cannot mutate runtime or project state. */
 		readOnly?: boolean;
+		/** Product-neutral permission and visibility policy for contributed tools. */
+		contributedPermission?: ContributedToolPermissionPolicy;
 	};
 }
 

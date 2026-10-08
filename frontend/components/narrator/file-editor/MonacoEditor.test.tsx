@@ -325,6 +325,41 @@ test.each([
 	}
 });
 
+test("follows a host palette change on <html> without a light/dark flip", async () => {
+	const names = ["--mantine-color-body", "--mantine-color-text", "--mantine-color-dimmed"];
+	themeColors = Object.fromEntries(names.map((name, index) => [name, ["#f6f7f3", "#1d2420", "#5e6b63"][index]]));
+	const theme = spyOn(api.editor, "defineTheme");
+	const root = document.documentElement;
+	try {
+		await render({}, "light");
+		const model = handle?.getModel();
+		const calls = theme.mock.calls.length;
+
+		// Same colours: an unrelated attribute change does not redefine the theme.
+		await act(async () => {
+			root.setAttribute("data-unrelated", "1");
+			await Promise.resolve();
+		});
+		expect(theme.mock.calls.length).toBe(calls);
+
+		themeColors = Object.fromEntries(names.map((name, index) => [name, ["#eef1f6", "#1b2233", "#5a6478"][index]]));
+		await act(async () => {
+			root.setAttribute("data-nf-style", "shuhan");
+			await Promise.resolve();
+		});
+		expect(theme.mock.calls.length).toBe(calls + 1);
+		expect(theme.mock.calls.at(-1)?.[1]).toMatchObject({
+			base: "vs",
+			colors: { "editor.background": "#eef1f6", "editor.foreground": "#1b2233" },
+		});
+		expect(handle?.getModel()).toBe(model);
+	} finally {
+		root.removeAttribute("data-unrelated");
+		root.removeAttribute("data-nf-style");
+		theme.mockRestore();
+	}
+});
+
 test("long-line display protection toggles without replacing text, cursor or history", async () => {
 	const text = `${"x".repeat(20_000)}😀END`;
 	await render({ initialValue: text });

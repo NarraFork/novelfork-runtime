@@ -11,9 +11,11 @@ describe("narrators API", () => {
 	const g = globalThis as typeof globalThis & {
 		localStorage?: Storage;
 		fetch: typeof fetch;
+		XMLHttpRequest?: typeof XMLHttpRequest;
 	};
 	const originalFetch = g.fetch;
 	const originalLocalStorage = g.localStorage;
+	const originalXMLHttpRequest = g.XMLHttpRequest;
 
 	afterEach(() => {
 		Object.defineProperty(g, "fetch", { value: originalFetch, configurable: true });
@@ -21,6 +23,14 @@ describe("narrators API", () => {
 			Reflect.deleteProperty(g, "localStorage");
 		} else {
 			Object.defineProperty(g, "localStorage", { value: originalLocalStorage, configurable: true });
+		}
+		if (originalXMLHttpRequest === undefined) {
+			Reflect.deleteProperty(g, "XMLHttpRequest");
+		} else {
+			Object.defineProperty(g, "XMLHttpRequest", {
+				value: originalXMLHttpRequest,
+				configurable: true,
+			});
 		}
 	});
 

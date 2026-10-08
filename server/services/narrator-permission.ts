@@ -334,7 +334,7 @@ function getShellScopePaths(
 ): string[] {
 	const paths = new Set<string>();
 	if (typeof input.workdir === "string" && input.workdir) {
-		paths.add(context?.target.cwd ?? resolveDecisionPath(cwd, input.workdir, context));
+		paths.add(resolveDecisionPath(cwd, input.workdir, context));
 	}
 	// analyzeShellCommand already resolves these with the target's path semantics. Never
 	// feed them through the NarraFork host cwd a second time.
@@ -488,6 +488,45 @@ function compiledPolicyForDecision(opts: PermissionDecisionOpts): CompiledExecut
 		"narrator",
 	);
 	return compileExecutionPolicy(legacy, opts.executionContext);
+}
+
+function resolveContributedToolPermission(
+	toolName: string,
+	input: Record<string, unknown>,
+	effectiveMode: string | undefined,
+	planMode: boolean,
+): "allow" | "deny" | "ask" | null {
+	const policy = toolRegistry.get(toolName)?.metadata?.contributedPermission;
+	if (!policy) return null;
+
+	const sessionMode = planMode
+		? "plan"
+		: effectiveMode === "bypassPermissions"
+			? "allow"
+			: effectiveMode === "acceptEdits"
+				? "edit"
+				: effectiveMode === "readOnly"
+					? "read"
+					: "ask";
+	if (!policy.enabledForModes.includes(sessionMode)) return "deny";
+
+	let risk = policy.risk;
+	try {
+		risk = policy.resolveRisk?.(input) ?? risk;
+	} catch {
+		// A broken dynamic resolver must never downgrade permission requirements.
+		risk = "confirmed-write";
+	}
+
+	if (sessionMode === "allow") return "allow";
+	if (effectiveMode === "dontAsk") return risk === "read" ? "allow" : "deny";
+	if (sessionMode === "read" || sessionMode === "plan") {
+		return risk === "read" ? "allow" : "deny";
+	}
+	if (sessionMode === "edit") {
+		return risk === "read" || risk === "draft-write" ? "allow" : "ask";
+	}
+	return risk === "read" ? "allow" : "ask";
 }
 
 /**
@@ -974,6 +1013,14 @@ export function resolvePermissionDecision(
 	// MCP tool permission: check server-level defaultBehavior and per-tool overrides
 	const mcpDecision = resolveMcpToolPermission(toolName, effectiveMode);
 	if (mcpDecision) return mcpDecision;
+
+	const contributedDecision = resolveContributedToolPermission(
+		toolName,
+		input,
+		effectiveMode,
+		planMode,
+	);
+	if (contributedDecision) return contributedDecision;
 
 	// Command whitelist
 	let effectiveBashAnalysis = bashAnalysis;

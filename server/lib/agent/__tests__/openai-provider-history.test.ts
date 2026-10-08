@@ -928,9 +928,12 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		];
 
 		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const developerMessage = result.history.find(
+			(item) => (item as { role?: string }).role === "developer",
+		) as { content?: unknown } | undefined;
+		expect(developerMessage).toBeDefined();
+		expect(String(developerMessage?.content)).toContain(savedPath);
 		const historyJson = JSON.stringify(result.history);
-		expect(historyJson).toContain('"role":"developer"');
-		expect(historyJson).toContain(savedPath);
 		expect(historyJson).toContain('"type":"image_generation_call"');
 		expect(historyJson).toContain('"id":"ig_saved"');
 		expect(historyJson).toContain('"revised_prompt":"a saved blue square"');

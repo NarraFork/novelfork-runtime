@@ -174,6 +174,11 @@ export function resolveRenderExtra(spec: {
 		case "plan-card":
 			if (typeof data.label === "string") extra.label = data.label;
 			break;
+		case "tool-call":
+			if (typeof data.runtimeRenderer === "string") extra.runtimeRenderer = data.runtimeRenderer;
+			if ("runtimeRendererResult" in data) extra.runtimeRendererResult = data.runtimeRendererResult;
+			if (typeof data.toolName === "string") extra.toolName = data.toolName;
+			break;
 		case "tool-run-count":
 		case "reasoning-count":
 			// Count lines carry their localized header text as data (the adapter
@@ -460,6 +465,8 @@ export function renderElement(
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}
 					permissionSlot={extra.permissionSlot as React.ReactNode}
+					detailSlot={extra.detailSlot as React.ReactNode}
+					runtimeRenderer={extra.runtimeRenderer as string | undefined}
 					onPermissionFormHeight={
 						extra.onPermissionFormHeight as ((height: number) => void) | undefined
 					}

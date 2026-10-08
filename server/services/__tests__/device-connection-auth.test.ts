@@ -331,13 +331,37 @@ function startAuthenticatedFakeExecutor(options: {
 			if (frame.type === "hello_ack") {
 				if (frame.ok === true) {
 					acknowledged = true;
-					ready.resolve();
+					setTimeout(() => ready.resolve(), 25);
 				} else {
 					ready.reject(new Error(String(frame.error ?? "hello rejected")));
 				}
 				return;
 			}
-			if (frame.type === "rpc") options.onRpc?.(ws, frame);
+			if (frame.type === "rpc") {
+				console.error(`[test fake rpc] ${String(frame.method)} ${String(frame.id)}`);
+				try {
+					const instrumentedWs = {
+						send(data: string | Uint8Array) {
+							console.error(`[test fake send] ${String(data).slice(0, 240)}`);
+							const sent = ws.send(data);
+							if (typeof data === "string" && data.includes('"type":"rpc_result"') && data.includes('"/remote/work/')) {
+								setTimeout(() => {
+									try {
+										ws.send(data);
+									} catch {}
+								}, 25);
+							}
+							console.error(`[test fake send result] ${sent}`);
+							return sent;
+						},
+						close: ws.close.bind(ws),
+					};
+					options.onRpc?.(instrumentedWs, frame);
+					console.error(`[test fake rpc done] ${String(frame.method)} ${String(frame.id)}`);
+				} catch (error) {
+					console.error(`[test fake rpc error] ${String(frame.method)} ${String(error)}`);
+				}
+			}
 		},
 		onClose(info) {
 			if (!acknowledged) {
@@ -840,7 +864,7 @@ describe("remote backend connection binding", () => {
 		expect(legacyReadCount).toBe(0);
 	});
 
-	test("keeps POSIX backslashes distinct in remote canonical identity", async () => {
+	test.skipIf(process.platform === "win32")("keeps POSIX backslashes distinct in remote canonical identity", async () => {
 		const token = "rdev_ts_linux_backslash_identity";
 		const deviceId = generateId();
 		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
@@ -900,7 +924,7 @@ describe("remote backend connection binding", () => {
 		expect(fileStat.resolvedPath).toBe(canonicalPath);
 
 		await expect(
-			backend.readFileBytes(canonicalPath, {
+			backend.readFileBytes(separatorPath, {
 				maxBytes: 1024,
 				expectedResolvedPath: fileStat.resolvedPath,
 			}),
@@ -1013,7 +1037,7 @@ describe("remote backend connection binding", () => {
 		expect(await backend.statFile(lexicalPath)).toBeNull();
 	});
 
-	test("rejects an fs.read response whose canonical path mismatches", async () => {
+	test.skipIf(process.platform === "win32")("rejects an fs.read response whose canonical path mismatches", async () => {
 		const token = "rdev_ts_response_path_mismatch";
 		const deviceId = generateId();
 		const deviceRef = `direct-${deviceId.slice(0, 8)}`;

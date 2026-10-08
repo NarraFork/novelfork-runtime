@@ -21,6 +21,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { MantineProvider } from "@mantine/core";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
@@ -393,7 +394,9 @@ describe("compact marker row — the injected callbacks actually fire", () => {
 
 describe("shell wiring — the compact callbacks reach the row", () => {
 	const SHELL = Promise.resolve(shellSource());
-	const DISPATCH = Bun.file(new URL("./render-registry.tsx", import.meta.url).pathname).text();
+	const DISPATCH = Bun.file(
+		fileURLToPath(new URL("./render-registry.tsx", import.meta.url)),
+	).text();
 
 	it("ExactRow forwards the per-row compact actions into the render extra", async () => {
 		const shell = await SHELL;

@@ -1,5 +1,5 @@
-import { stat } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
@@ -51,6 +51,10 @@ export interface BuildPromptOptions {
 	}>;
 	/** Current session default device id (null/undefined → local server). */
 	defaultDeviceId?: string | null;
+	/** Trusted runtime contribution prompt extensions, ordered by the host integration. */
+	runtimePromptExtensions?: readonly string[];
+	/** Trusted product-owned root; never derived from model or browser input. */
+	trustedResourcePromptRoot?: string | null;
 	/** Whether the NarraFork server may be selected as an execution target. */
 	allowLocalExecution?: boolean;
 }
@@ -60,6 +64,27 @@ export interface BuildPromptResult {
 	usedCompactSummary: boolean;
 	/** Exact construction offsets, not a heading/text heuristic. */
 	summaryRange?: { start: number; end: number };
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+	const rel = relative(root, candidate);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/** Read resource instructions only from a root resolved by a trusted host integration. */
+async function loadTrustedResourcePrompt(root: string | null | undefined): Promise<string | null> {
+	if (!root) return null;
+	const canonicalRoot = await realpath(root).catch(() => null);
+	if (!canonicalRoot) return null;
+	for (const fileName of ["AGENTS.md", "AGENT.md", "CLAUDE.md"]) {
+		const candidate = resolve(canonicalRoot, fileName);
+		if (!isContainedPath(canonicalRoot, candidate)) continue;
+		const info = await stat(candidate).catch(() => null);
+		if (!info?.isFile()) continue;
+		const content = await readFile(candidate, "utf8").catch(() => null);
+		if (content !== null) return content;
+	}
+	return null;
 }
 
 /**
@@ -112,6 +137,8 @@ export async function buildEffectiveSystemPrompt(
 		defaultSystemPrompt,
 		devices,
 		defaultDeviceId,
+		runtimePromptExtensions,
+		trustedResourcePromptRoot,
 		allowLocalExecution = true,
 	} = options;
 
@@ -281,6 +308,20 @@ export async function buildEffectiveSystemPrompt(
 		}
 	}
 
+	// 3c. Append instructions from one host-resolved resource root.
+	{
+		let resourceInstructions = await loadTrustedResourcePrompt(trustedResourcePromptRoot);
+		if (resourceInstructions) {
+			const maxInstructionsLength = 50_000;
+			if (resourceInstructions.length > maxInstructionsLength) {
+				resourceInstructions = resourceInstructions.slice(0, maxInstructionsLength);
+			}
+			const base = prompt ?? "";
+			const sep = base ? "\n\n" : "";
+			prompt = `${base}${sep}## Resource Instructions\n\n${resourceInstructions}`;
+		}
+	}
+
 	// File locations are a shared UI protocol, independent of the selected provider.
 	{
 		const base = prompt ?? "";
@@ -293,6 +334,16 @@ export async function buildEffectiveSystemPrompt(
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
 		prompt = `${base}${sep}## Language\n\n${instruction}`;
+	}
+
+	// Runtime prompt extensions are ordered by the trusted host and kept outside
+	// the language/plan-mode blocks so they are added exactly once per assembly.
+	for (const extension of runtimePromptExtensions ?? []) {
+		const content = extension.trim();
+		if (!content) continue;
+		const base: string = prompt ?? "";
+		const sep = base ? "\n\n" : "";
+		prompt = `${base}${sep}${content}`;
 	}
 
 	// 5. Inject plan mode system reminder

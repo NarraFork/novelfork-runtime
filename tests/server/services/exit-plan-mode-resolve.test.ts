@@ -1052,7 +1052,7 @@ describe("resolveExitPlanModeInput — backend binding", async () => {
 		expect(calls.read).toEqual([]);
 	});
 
-	it("rejects a symlink whose canonical target escapes into a blacklist", async () => {
+	it.skipIf(process.platform === "win32")("rejects a symlink whose canonical target escapes into a blacklist", async () => {
 		const outside = mkdtempSync(join(tmpdir(), "narrafork-exit-plan-outside-"));
 		try {
 			const secretDir = join(outside, "secret");

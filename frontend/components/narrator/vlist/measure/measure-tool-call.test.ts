@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { BARE_ROW_CHEVRON, BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
 import { resetTypographyForTest, setTypography } from "@shared/pretext-layout/typography";
 import { installCanvasStub } from "./test-canvas-stub";
@@ -127,7 +128,7 @@ describe("measure-tool-call — fixed chrome (CONTRACT §4 ToolCallCard)", () =>
 		// the invariant is unchanged: it must take the px line box from THIS module, so
 		// measure and render cannot disagree. A ratio would reintroduce the drift.
 		const source = await Bun.file(
-			new URL("../render/RenderToolCall.tsx", import.meta.url).pathname,
+			fileURLToPath(new URL("../render/RenderToolCall.tsx", import.meta.url)),
 		).text();
 		expect(source).not.toMatch(/lineHeight:\s*1\.4\b/);
 		expect(source).toContain("lineHeight: `${detailContentLineHeight()}px`");

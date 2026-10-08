@@ -3,6 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
 import type { BashAnalysis } from "../../../server/lib/agent/bash-analyze";
+import type { ExecutionBackend } from "../../../server/lib/agent/execution/backend";
+import { targetPathSemantics } from "../../../server/lib/agent/execution/path-semantics";
+import type { ExecutionTargetContext } from "../../../server/services/execution-policy/types";
 import { toolRegistry } from "../../../server/lib/agent/tool-registry";
 import { getDefaults, migrateLegacyMcpBehaviors, settings } from "../../../server/lib/settings";
 import {
@@ -15,6 +18,31 @@ import {
 } from "../../../server/services/narrator-session";
 
 const TRUNCATE_DIR = join(tmpdir(), "narrafork-tool-output");
+
+function makePosixExecutionContext(cwd: string): ExecutionTargetContext {
+	const paths = targetPathSemantics("posix");
+	const backend = {
+		kind: "local" as const,
+		deviceId: "local",
+		defaultCwd: cwd,
+		paths,
+		pathFlavor: "posix" as const,
+		runtimeGeneration: 1,
+	} as unknown as ExecutionBackend;
+	return {
+		backend,
+		target: {
+			deviceId: "local",
+			backendKind: "local",
+			cwd,
+			pathFlavor: "posix",
+			runtimeGeneration: 1,
+			selectionSource: "local_default",
+		},
+		paths,
+		deviceClass: null,
+	};
+}
 
 type PermissionDecision = ReturnType<typeof resolvePermissionDecision>;
 
@@ -583,6 +611,7 @@ describe("resolvePermissionDecision", () => {
 				cwd: CWD,
 				bashAnalysis: makeBashAnalysis({ hasWriteOperation: true, filePaths: [] }),
 				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+				executionContext: makePosixExecutionContext(CWD),
 			}),
 		).toBe("allow");
 	});
@@ -595,6 +624,7 @@ describe("resolvePermissionDecision", () => {
 				permMode: "default",
 				cwd: CWD,
 				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "full", enabled: true }],
+				executionContext: makePosixExecutionContext(CWD),
 			}),
 		).toBe("allow");
 	});
@@ -607,6 +637,7 @@ describe("resolvePermissionDecision", () => {
 				permMode: "default",
 				cwd: CWD,
 				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+				executionContext: makePosixExecutionContext(CWD),
 			}),
 		).toBe("ask");
 	});
@@ -654,6 +685,7 @@ describe("resolvePermissionDecision", () => {
 				permMode: "default",
 				cwd: CWD,
 				whitelistDirs: [{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+				executionContext: makePosixExecutionContext(CWD),
 			}),
 		).toBe("allow");
 	});

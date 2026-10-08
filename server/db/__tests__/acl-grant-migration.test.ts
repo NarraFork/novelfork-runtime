@@ -20,10 +20,55 @@
  */
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runMigrations } from "../run-migrations";
 
-/** folderMillis of 0127_thick_satana, which introduces acl_grants. */
-const UNIFIED_ACL_WHEN = 1786800022207;
+type RuntimeMigrationJournal = {
+	version: string;
+	dialect: string;
+	entries: Array<{
+		idx: number;
+		version: string;
+		when: number;
+		tag: string;
+		breakpoints: boolean;
+	}>;
+};
+
+function runtimeMigrationFixture(lastIndex = Number.POSITIVE_INFINITY): {
+	folder: string;
+	cleanup: () => void;
+} {
+	const sourceRoot = join(import.meta.dir, "../../../runtime-migrations");
+	const temporaryRoot = mkdtempSync(join(tmpdir(), "narrafork-acl-migrations-"));
+	const folder = join(temporaryRoot, "drizzle");
+	cpSync(sourceRoot, folder, { recursive: true });
+	const journalPath = join(folder, "meta", "_journal.json");
+	const journal = JSON.parse(readFileSync(journalPath, "utf8")) as RuntimeMigrationJournal;
+	const originalEntries = journal.entries;
+	journal.entries = originalEntries.filter((entry) => entry.idx <= lastIndex);
+	for (const entry of originalEntries) {
+		if (entry.idx > lastIndex) rmSync(join(folder, `${entry.tag}.sql`), { force: true });
+	}
+	writeFileSync(journalPath, `${JSON.stringify(journal, null, 2)}\n`);
+	return {
+		folder,
+		cleanup: () => rmSync(temporaryRoot, { recursive: true, force: true }),
+	};
+}
+
+async function withMigrationsFolder<T>(folder: string, action: () => Promise<T>): Promise<T> {
+	const previous = process.env.NARRAFORK_MIGRATIONS_DIR;
+	process.env.NARRAFORK_MIGRATIONS_DIR = folder;
+	try {
+		return await action();
+	} finally {
+		if (previous === undefined) delete process.env.NARRAFORK_MIGRATIONS_DIR;
+		else process.env.NARRAFORK_MIGRATIONS_DIR = previous;
+	}
+}
 
 let sqlite: Database | undefined;
 
@@ -53,23 +98,30 @@ function aclRows(db: Database, principalId: string): AclRow[] {
 }
 
 /**
- * A database migrated to just before 0127: the unified tables and the new columns
+ * A database migrated through 0000-0009: the unified tables and the new columns
  * absent, and legacy grant rows present exactly as a live instance would hold them.
  */
 async function databaseBeforeUnification(): Promise<Database> {
 	const db = new Database(":memory:");
-	await runMigrations(db);
-
-	// Rewind the schema to the pre-0127 state.
-	db.run("DROP TABLE IF EXISTS acl_grants");
-	db.run("DROP TABLE IF EXISTS acl_events");
-	db.run("DROP INDEX IF EXISTS idx_projects_owner");
-	db.run("ALTER TABLE projects DROP COLUMN visibility");
-	db.run("ALTER TABLE projects DROP COLUMN owner_user_id");
-	db.run("ALTER TABLE knowledge_collections DROP COLUMN inherit_project_gate");
-	db.run("DELETE FROM __drizzle_migrations WHERE created_at = ?", [UNIFIED_ACL_WHEN]);
+	const fixture = runtimeMigrationFixture(9);
+	try {
+		await withMigrationsFolder(fixture.folder, () => runMigrations(db));
+	} finally {
+		fixture.cleanup();
+	}
 
 	const now = "2026-07-19T00:00:00.000Z";
+	db.run(`
+		CREATE TABLE narrator_grants (
+			id text PRIMARY KEY NOT NULL,
+			narrator_id text NOT NULL,
+			principal_type text NOT NULL,
+			principal_id text NOT NULL,
+			access text DEFAULT 'read' NOT NULL,
+			granted_by text,
+			created_at text NOT NULL
+		)
+	`);
 	db.run("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?,?,?,?,?)", [
 		"u-analyst",
 		"analyst",

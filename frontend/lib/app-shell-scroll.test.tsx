@@ -119,15 +119,18 @@ describe("authenticated AppShell scroll contract", () => {
 		//    test-relative resolve finds a hoisted 1.171.13. Two of the five source-text
 		//    assertions this replaced only matched the hoisted copy — they were green
 		//    while describing code the app never executes.
-		const routerCoreEntry = import.meta.resolve(
-			"@tanstack/router-core",
-			Bun.pathToFileURL(Bun.resolveSync("@tanstack/react-router", import.meta.dir)).href,
-		);
-		// `App.tsx`, not `main.tsx`: the router is constructed there (the tree was moved out
-		// of the entry so Fast Refresh has a valid boundary — see App.tsx's header). Reading
-		// the entry instead would make both `not.toContain` assertions pass on a file that
-		// no longer mentions the router at all, so the `createRouter(` check below keeps this
+		// NovelFork keeps the two-step Windows-safe resolve (`Bun.pathToFileURL` on a
+		// local absolute path; `import.meta.resolve` returned a file:// URL Bun could
+		// not resolve on win32), and reads `App.tsx` — the file where the router is
+		// constructed upstream (the tree was moved out of the entry so Fast Refresh
+		// has a valid boundary — see App.tsx's header). Reading the entry instead
+		// would make both `not.toContain` assertions pass on a file that no longer
+		// mentions the router at all, so the `createRouter(` check below keeps this
 		// honest rather than vacuously green.
+		const reactRouterEntry = Bun.resolveSync("@tanstack/react-router", import.meta.dir);
+		const routerCoreEntry = Bun.pathToFileURL(
+			Bun.resolveSync("@tanstack/router-core", reactRouterEntry),
+		).href;
 		const [appSource, restorationBundle] = await Promise.all([
 			Bun.file(new URL("../App.tsx", import.meta.url)).text(),
 			Bun.file(new URL("./scroll-restoration.js", routerCoreEntry)).text(),

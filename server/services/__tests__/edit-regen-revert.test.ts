@@ -21,7 +21,9 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 
-const DRIZZLE_DIR = join(import.meta.dir, "..", "..", "..", "drizzle");
+const DRIZZLE_DIR =
+	process.env.NARRAFORK_MIGRATIONS_DIR?.trim() ??
+	join(import.meta.dir, "..", "..", "..", "drizzle");
 const sqlite = new Database(":memory:");
 sqlite.run("PRAGMA foreign_keys = OFF");
 for (const file of readdirSync(DRIZZLE_DIR)

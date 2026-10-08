@@ -744,7 +744,11 @@ export function resetDbWorkerPoolForTest(): void {
  * Pass `null` to restore normal resolution.
  */
 export function setDbWorkerSpecifiersForTest(specifiers: string[] | null): void {
-	state().testSpecifiers = specifiers;
+	const s = state();
+	s.testSpecifiers = specifiers;
+	// A successful fixture spawn caches its entry point. Clear that cache when the
+	// test override changes so restoring `null` genuinely returns to production paths.
+	s.resolvedWorkerSpecifier = null;
 }
 
 /**

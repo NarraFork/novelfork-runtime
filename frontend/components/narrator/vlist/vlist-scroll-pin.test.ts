@@ -17,6 +17,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { resolveOlderHistoryAutoLoad } from "../history/older-history-auto-load";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { sliceBracketedRegion } from "./source-slice";
@@ -322,7 +323,7 @@ describe("the scroll container disables the browser's own anchoring", () => {
 		// the browser adjusting scrollTop for the same size changes would fight it —
 		// most visibly while the streaming row grows each frame.
 		const source = await Bun.file(
-			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+			fileURLToPath(new URL("./PretextExactMessageList.tsx", import.meta.url)),
 		).text();
 		expect(source).toContain('overflowAnchor: "none"');
 	});

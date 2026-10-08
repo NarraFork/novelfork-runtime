@@ -277,8 +277,9 @@ async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): P
 
 /**
  * Scan directories for SKILL.md files (recursively).
- * Searches every directory {@link getSkillSearchDirs} lists for `basePath`, walking
- * sub-directories up to {@link MAX_WALK_DEPTH} levels deep.
+ * Searches the product project canonical `.novelfork/skills/` plus the
+ * supported `.claude/skills/`, `.agents/skills/` and Codex locations under basePath.
+ * Walks sub-directories up to {@link MAX_WALK_DEPTH} levels deep.
  */
 async function scanSkillDirs(basePath: string): Promise<SkillInfo[]> {
 	const skills: SkillInfo[] = [];
@@ -314,10 +315,32 @@ function getHomeDir(): string {
 	return cachedHomeDir;
 }
 
+/**
+ * The NovelFork product data directory, present only when the product hosts this Runtime:
+ * the product entry sets `NOVELFORK_HOME` (default `~/.novelfork`) before the Runtime loads.
+ */
+function getNovelForkHome(): string | null {
+	const configured = process.env.NOVELFORK_HOME?.trim();
+	return configured ? resolve(configured) : null;
+}
+
 function getSkillSearchDirs(basePath: string): string[] {
+	const isHome = resolve(basePath) === getHomeDir();
+	const isHomeRoot = isHome || canonical(basePath) === getHomeDir();
+	// Inside the product, the home root's Skill directory is the product's global one, which
+	// NOVELFORK_HOME may relocate off the user profile. `~/.narrafork` then belongs to a
+	// standalone NarraFork install on the same machine, so its skills must not leak in.
+	const novelForkHome = isHomeRoot ? getNovelForkHome() : null;
 	const dirs = [
-		join(basePath, ".narrafork", "skills"),
-		join(basePath, ".narrafork", "skill"),
+		// NovelFork product projects use this path as the only canonical project Skill root.
+		novelForkHome ? join(novelForkHome, "skills") : join(basePath, ".novelfork", "skills"),
+		...(isHome && !novelForkHome
+			? [
+				// Keep Runtime's legacy global locations readable when no product hosts the Runtime.
+				join(basePath, ".narrafork", "skills"),
+				join(basePath, ".narrafork", "skill"),
+			]
+			: []),
 		join(basePath, ".claude", "skills"),
 		join(basePath, ".agents", "skills"),
 		// Codex-compatible locations: `.codex/skills` (repo-level) and, for the home
@@ -328,7 +351,7 @@ function getSkillSearchDirs(basePath: string): string[] {
 	// User-level roots that are NOT derived from `basePath`. Only meaningful when this
 	// call is scanning the home directory: for a project or workspace root, appending
 	// them would scan the same user-level directories once per project.
-	if (canonical(basePath) === getHomeDir()) {
+	if (isHomeRoot) {
 		// `$NARRAFORK_HOME/skills`. This is where `createGlobalSkill` and routine
 		// materialization WRITE, so leaving it out of the read path meant a custom
 		// NARRAFORK_HOME made every global skill invisible the moment it was created —
@@ -1017,8 +1040,8 @@ export async function loadProjectSkillByName(
 }
 
 /**
- * Load global (user-level) skills: the home-rooted directories plus the
- * `basePath`-independent ones (`$NARRAFORK_HOME/skills`, `$CODEX_HOME/skills`).
+ * Load global (user-level) skills: the home-rooted directories (including product `~/.novelfork/skills/`)
+ * plus the `basePath`-independent ones (`$NARRAFORK_HOME/skills`, `$CODEX_HOME/skills`).
  * See {@link getSkillSearchDirs}.
  */
 export async function loadGlobalSkills(): Promise<SkillInfo[]> {
@@ -1032,9 +1055,11 @@ export async function loadGlobalSkills(): Promise<SkillInfo[]> {
  * Load all skills (global + project-level). Project-level overrides global on name collision.
  *
  * Priority chain (low → high):
- *   ~/.narrafork/skills < ~/.narrafork/skill < ~/.claude/skills < ~/.agents/skills
+ *   ~/.novelfork/skills < ~/.narrafork/skills < ~/.narrafork/skill < ~/.claude/skills < ~/.agents/skills
  *   < ~/.codex/skills < $NARRAFORK_HOME/skills < $CODEX_HOME/skills
- *   < <project>/.narrafork/skills < ... < <project>/.codex/skills
+ *   < <project>/.novelfork/skills < <project>/.narrafork/skills < ... < <project>/.codex/skills
+ * Inside the NovelFork product, `$NOVELFORK_HOME/skills` replaces `~/.novelfork/skills`
+ * and the two `~/.narrafork` entries are skipped (see {@link getSkillSearchDirs}).
  */
 export async function loadAllSkills(projectGitPath: string | null): Promise<SkillInfo[]> {
 	const skillMap = new Map<string, SkillInfo>();
@@ -1153,7 +1178,8 @@ function getGlobalSkillsDir(): string {
 	return join(getNarraforkHome(), "skills");
 }
 
-const projectSkillsRelativeDir = join(".narrafork", "skills");
+const globalSkillsDir = join(getNarraforkHome(), "skills");
+const projectSkillsRelativeDir = join(".novelfork", "skills");
 
 async function assertPathInsideProject(projectGitPath: string, targetPath: string): Promise<void> {
 	const projectRoot = resolve(projectGitPath);
@@ -1314,7 +1340,7 @@ export async function toggleGlobalSkill(name: string, enabled: boolean): Promise
 	return existing;
 }
 
-// === Project skill CRUD (writes to <project>/.narrafork/skills/) ===
+// === Project skill CRUD (writes to <project>/.novelfork/skills/) ===
 
 export async function createProjectSkill(
 	projectGitPath: string,

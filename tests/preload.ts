@@ -8,8 +8,26 @@
  * Loaded via `bunfig.toml` → `[test].preload` before test modules are imported.
  */
 
-import { afterAll, afterEach, beforeEach } from "bun:test";
+import { afterAll, afterEach, beforeEach, mock } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+
+if (process.platform === "win32" && process.env.NARRAFORK_DEFER_WINDOWS_TEMP_CLEANUP === "1") {
+	const originalRmSync = fs.rmSync;
+	mock.module("node:fs", () => ({
+		...fs,
+		default: fs,
+		rmSync(path: fs.PathLike, options?: fs.RmDirOptions) {
+			try {
+				return originalRmSync(path, options);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EBUSY") return;
+				throw error;
+			}
+		},
+	}));
+}
+
 import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -26,7 +44,9 @@ function canonicalPath(path: string): string {
 	}
 }
 
-const originalHome = homedir();
+const originalHome = process.env.NARRAFORK_TEST_REAL_HOME?.trim() || homedir();
+process.env.NARRAFORK_TEST_REAL_HOME = originalHome;
+
 const realNarraforkHome = canonicalPath(resolve(originalHome, ".narrafork"));
 const requestedNarraforkHome = process.env.NARRAFORK_HOME?.trim();
 const allowExplicitTestHome = process.env.NARRAFORK_ALLOW_MULTIPLE === "1";
@@ -62,6 +82,9 @@ process.env.NARRAFORK_ORIGINAL_HOME = originalHome;
 process.env.HOME = isolatedHome;
 process.env.USERPROFILE = isolatedHome;
 process.env.NARRAFORK_HOME = isolatedNarraforkHome;
+// A developer running NovelFork has NOVELFORK_HOME pointing at real product data, and its
+// presence switches skill scanning into product mode. Tests opt into it explicitly.
+delete process.env.NOVELFORK_HOME;
 process.env.NARRAFORK_TEST = "1";
 
 export const testEnvironment = Object.freeze({
@@ -108,6 +131,9 @@ afterAll(() => {
 	try {
 		rmSync(isolatedHome, { recursive: true, force: true, maxRetries: 2 });
 	} catch (error) {
+		if (process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EBUSY") {
+			return;
+		}
 		console.warn(`Failed to clean isolated test home: ${String(error)}`);
 	}
 });

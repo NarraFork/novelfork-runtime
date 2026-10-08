@@ -4,6 +4,12 @@ import {
 	normalizeLocale,
 	pickLocalizedValue,
 } from "./i18n-locales";
+import type {
+	RuntimeLearningActionContribution,
+	RuntimeLearningCategoryContribution,
+	RuntimeLearningContribution,
+	RuntimeLearningDocumentContribution,
+} from "./learning-contract";
 
 export type LearningLocale = Locale;
 export type LocalizedText = LocalizedValue<string>;
@@ -61,6 +67,12 @@ export interface LearningCategory {
 	label: string;
 	description: string;
 }
+
+type LearningDocInput = LearningDocSource | RuntimeLearningDocumentContribution;
+type LearningCategoryInput =
+	| { id: string; label: LocalizedText; description: LocalizedText }
+	| RuntimeLearningCategoryContribution;
+type LearningActionInput = LearningAction | RuntimeLearningActionContribution;
 
 const categories: Record<string, LocalizedText & { description: LocalizedText }> = {
 	start: {
@@ -1199,7 +1211,7 @@ function pick(text: LocalizedText, locale: LearningLocale): string {
 }
 
 function localizeAction(
-	action: LearningAction,
+	action: LearningActionInput,
 	locale: LearningLocale,
 ): LearningDoc["actions"][number] {
 	return {
@@ -1209,11 +1221,11 @@ function localizeAction(
 	};
 }
 
-function localizeDoc(doc: LearningDocSource, locale: LearningLocale): LearningDoc {
+function localizeDoc(doc: LearningDocInput, locale: LearningLocale): LearningDoc {
 	return {
 		id: doc.id,
 		category: doc.category,
-		tags: doc.tags,
+		tags: [...doc.tags],
 		title: pick(doc.title, locale),
 		summary: pick(doc.summary, locale),
 		sections: doc.sections.map((section) => ({
@@ -1228,18 +1240,18 @@ function localizeDoc(doc: LearningDocSource, locale: LearningLocale): LearningDo
 	};
 }
 
-function summarizeDoc(doc: LearningDocSource, locale: LearningLocale): LearningDocSummary {
+function summarizeDoc(doc: LearningDocInput, locale: LearningLocale): LearningDocSummary {
 	return {
 		id: doc.id,
 		category: doc.category,
-		tags: doc.tags,
+		tags: [...doc.tags],
 		title: pick(doc.title, locale),
 		summary: pick(doc.summary, locale),
 		actions: doc.actions.map((action) => localizeAction(action, locale)),
 	};
 }
 
-function searchableText(doc: LearningDocSource, locale: LearningLocale): string {
+function searchableText(doc: LearningDocInput, locale: LearningLocale): string {
 	return [
 		doc.id,
 		doc.category,
@@ -1256,34 +1268,78 @@ function searchableText(doc: LearningDocSource, locale: LearningLocale): string 
 		.toLowerCase();
 }
 
-export function getLearningCategories(localeInput?: string | null): LearningCategory[] {
-	const locale = normalizeLocale(localeInput);
-	return Object.entries(categories).map(([id, category]) => ({
+function contributedCategories(contributions: readonly RuntimeLearningContribution[]): readonly LearningCategoryInput[] {
+	const result: LearningCategoryInput[] = Object.entries(categories).map(([id, category]) => ({
 		id,
-		label: pick(category, locale),
+		label: category,
+		description: category.description,
+	}));
+	const seen = new Set(result.map((category) => category.id));
+	for (const contribution of contributions) {
+		for (const category of contribution.categories) {
+			if (seen.has(category.id)) continue;
+			seen.add(category.id);
+			result.push(category);
+		}
+	}
+	return result;
+}
+
+function contributedDocs(contributions: readonly RuntimeLearningContribution[]): readonly LearningDocInput[] {
+	const result: LearningDocInput[] = [...docs];
+	const seen = new Set(result.map((doc) => doc.id));
+	for (const contribution of contributions) {
+		for (const doc of contribution.docs) {
+			if (seen.has(doc.id)) continue;
+			seen.add(doc.id);
+			result.push(doc);
+		}
+	}
+	return result;
+}
+
+export function getLearningCategories(
+	localeInput?: string | null,
+	contributions: readonly RuntimeLearningContribution[] = [],
+): LearningCategory[] {
+	const locale = normalizeLocale(localeInput);
+	return contributedCategories(contributions).map((category) => ({
+		id: category.id,
+		label: pick(category.label, locale),
 		description: pick(category.description, locale),
 	}));
 }
 
-export function getLearningDocSummaries(localeInput?: string | null): LearningDocSummary[] {
+export function getLearningDocSummaries(
+	localeInput?: string | null,
+	contributions: readonly RuntimeLearningContribution[] = [],
+): LearningDocSummary[] {
 	const locale = normalizeLocale(localeInput);
-	return docs.map((doc) => summarizeDoc(doc, locale));
+	return contributedDocs(contributions).map((doc) => summarizeDoc(doc, locale));
 }
 
-export function getLearningDocs(localeInput?: string | null): LearningDoc[] {
+export function getLearningDocs(
+	localeInput?: string | null,
+	contributions: readonly RuntimeLearningContribution[] = [],
+): LearningDoc[] {
 	const locale = normalizeLocale(localeInput);
-	return docs.map((doc) => localizeDoc(doc, locale));
+	return contributedDocs(contributions).map((doc) => localizeDoc(doc, locale));
 }
 
-export function getLearningDoc(id: string, localeInput?: string | null): LearningDoc | undefined {
+export function getLearningDoc(
+	id: string,
+	localeInput?: string | null,
+	contributions: readonly RuntimeLearningContribution[] = [],
+): LearningDoc | undefined {
 	const locale = normalizeLocale(localeInput);
-	const doc = docs.find((item) => item.id === id);
+	const doc = contributedDocs(contributions).find((item) => item.id === id);
 	return doc ? localizeDoc(doc, locale) : undefined;
 }
 
 export function searchLearningDocs(
 	query: string,
 	localeInput?: string | null,
+	contributions: readonly RuntimeLearningContribution[] = [],
 ): LearningDocSummary[] {
 	const locale = normalizeLocale(localeInput);
 	const terms = query
@@ -1291,9 +1347,9 @@ export function searchLearningDocs(
 		.split(/\s+/)
 		.map((term) => term.trim())
 		.filter(Boolean);
-	if (terms.length === 0) return getLearningDocSummaries(locale);
+	if (terms.length === 0) return getLearningDocSummaries(locale, contributions);
 
-	return docs
+	return contributedDocs(contributions)
 		.map((doc) => {
 			const text = searchableText(doc, locale);
 			const title = pick(doc.title, locale).toLowerCase();
@@ -1308,6 +1364,9 @@ export function searchLearningDocs(
 		.map((item) => summarizeDoc(item.doc, locale));
 }
 
-export function learningDocExists(id: string): boolean {
-	return docs.some((doc) => doc.id === id);
+export function learningDocExists(
+	id: string,
+	contributions: readonly RuntimeLearningContribution[] = [],
+): boolean {
+	return contributedDocs(contributions).some((doc) => doc.id === id);
 }

@@ -170,8 +170,8 @@ export function hasStructuredReasoning(segments: ReasoningSegment[]): boolean {
 /** Minimal shape of a content block needed for grouping. */
 export interface ContentBlockLike {
 	type?: string;
-	text?: string;
-	thinking?: string;
+	text?: string | null;
+	thinking?: string | null;
 	providerMetadata?: unknown;
 }
 

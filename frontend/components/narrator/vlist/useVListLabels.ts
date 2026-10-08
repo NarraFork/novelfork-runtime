@@ -418,6 +418,7 @@ export function useVListLabels(): VListLabels {
 			}),
 			// ── trace headers + count lines (CollapsibleTrace parity) ───────────────
 			reasoning: t("reasoning"),
+			reasoningEncryptedPlaceholder: t("reasoningEncryptedPlaceholder"),
 			reasoningSteps: t("reasoningSteps", { count: COUNT_PLACEHOLDER }),
 			reasoningCount: t("reasoningCount", { count: COUNT_PLACEHOLDER }),
 			toolCalls: t("toolCalls"),

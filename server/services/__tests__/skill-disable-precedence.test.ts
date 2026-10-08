@@ -138,9 +138,13 @@ describe("skill name collisions resolve by search-dir precedence", () => {
  * "the disable did not take" once in a while, with nothing to reproduce.
  */
 describe("skill name collisions inside ONE search directory", () => {
-	/** Write the skill nested one level deeper: `<root>/.narrafork/skills/<sub>/<NAME>`. */
+	/**
+	 * Write the skill nested one level deeper: `<root>/.novelfork/skills/<sub>/<NAME>`.
+	 * Fork layer: a product project's only canonical Skill root is `.novelfork/skills`
+	 * (see getSkillSearchDirs); upstream's project `.narrafork/skills` is not scanned.
+	 */
 	async function writeNested(root: string, sub: string, disabled = false): Promise<string> {
-		return writeSkill(root, [".narrafork", "skills", sub], disabled);
+		return writeSkill(root, [".novelfork", "skills", sub], disabled);
 	}
 
 	it("resolves to the same copy on every run (name order, not readdir order)", async () => {

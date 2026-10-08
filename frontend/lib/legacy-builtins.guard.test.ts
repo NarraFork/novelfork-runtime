@@ -477,7 +477,9 @@ describe("legacy built-ins guard (Safari 14 build target)", () => {
 		// which in turn imports `@server/lib/id` — the second hop is the one a single-level
 		// walk would miss, and it is exactly where a `toSorted()` would hide.
 		const bundled = collectBundledServerFiles([join(SERVER_ROOT, "routes", "usage-history.ts")]);
-		const relatives = bundled.map((file) => relative(REPO_ROOT, file));
+		const relatives = bundled.map((file) =>
+			relative(REPO_ROOT, file).split(sep).join("/"),
+		);
 		expect(relatives).toContain("server/services/credential-usage-totals.ts");
 		expect(relatives).toContain("server/lib/id.ts");
 	});

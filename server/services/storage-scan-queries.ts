@@ -498,12 +498,14 @@ export function measureTable(
 	// dbstat already gives exact page-level object sizes, so skip the extra SUM(length(...))
 	// full-table scan in that mode. Virtual tables are measured through their shadow tables.
 	const skipContentScan = dbstat.supported || table.kind === "virtual";
-	const measured = skipContentScan
-		? ({ ok: true, value: 0 } as const)
-		: readWithBusyRetry(
-				() => sumTableApproxBytes(sqlite, table.name, "t", `FROM ${quoteIdentifier(table.name)} t`),
-				budget,
-			);
+	const measured = !counted.ok && isSqliteBusyError(counted.error)
+		? ({ ok: false, error: counted.error } as const)
+		: skipContentScan
+			? ({ ok: true, value: 0 } as const)
+			: readWithBusyRetry(
+					() => sumTableApproxBytes(sqlite, table.name, "t", `FROM ${quoteIdentifier(table.name)} t`),
+					budget,
+				);
 
 	const readFailed = !counted.ok || !measured.ok;
 	const rowCount = counted.ok ? counted.value : null;

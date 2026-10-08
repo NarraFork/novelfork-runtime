@@ -7,7 +7,12 @@ import { Notifications } from "@mantine/notifications";
 /** True on devices whose primary pointer can hover and position a caret precisely. */
 const FINE_POINTER_MEDIA_QUERY = "(hover: hover) and (pointer: fine)";
 
-export function AppNotifications() {
+interface AppNotificationsProps {
+	/** Allows DOM-oriented tests to disable Mantine transition timers. */
+	transitionDuration?: number;
+}
+
+export function AppNotifications({ transitionDuration }: AppNotificationsProps = {}) {
 	// Mantine v9 enables swipe-to-dismiss by default. Its useDrag takes over after
 	// 5px of pointer movement and sets document.body.style.userSelect = "none",
 	// which makes it impossible to select toast text with a mouse — the drag runs
@@ -20,6 +25,7 @@ export function AppNotifications() {
 
 	return (
 		<Notifications
+			transitionDuration={transitionDuration}
 			position="top-right"
 			zIndex={Z.toast}
 			pauseResetOnHover="notification"
