@@ -347,10 +347,7 @@ export function AuthenticatedLayout() {
 	}, []);
 
 	// --- Global narrator WebSocket connection ---
-	useEffect(() => {
-		narratorWSManager.connect();
-		return () => narratorWSManager.disconnect();
-	}, []);
+	useEffect(() => narratorWSManager.acquireConnection(), []);
 
 	// --- Setup wizard ---
 	const [wizardOpen, setWizardOpen] = useState(false);
