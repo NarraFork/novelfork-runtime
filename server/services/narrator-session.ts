@@ -142,7 +142,6 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
@@ -356,6 +355,15 @@ import {
 	recoverStaleCompactingMessages,
 } from "./narrator-persistence";
 import { ensureNarratorPlanFileId } from "./narrator-plan-mode";
+import {
+	canManageProductRuntimeTool,
+	hasProductNarratorProfile,
+	isProductRuntimeToolVisible,
+	refreshProductRuntimeToolVisibility,
+	resolveProductNarratorCwd,
+	runtimeProductIntegration,
+	syncProductRuntimeToolVisibility,
+} from "./product-narrator-tools";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete.
 // Defined next to the snapshot hooks so both loops agree on the set.
@@ -1055,6 +1063,7 @@ async function ensureNarratorUnlocked(
  * Reads AGENTS.md (fallback AGENT.md, CLAUDE.md) from disk each time so changes are picked up mid-conversation.
  */
 export async function buildSystemPrompt(
+	narratorId: string,
 	narrator: { systemPrompt: string | null; contextSummary: string | null },
 	cwd: string,
 	locale: Locale,
@@ -1068,8 +1077,15 @@ export async function buildSystemPrompt(
 		allowLocalExecution?: boolean;
 	},
 	planFilePath?: string,
-): Promise<import("./narrator-prompt").BuildPromptResult> {
-	return buildEffectiveSystemPrompt({
+): Promise<import("./narrator-prompt").BuildPromptResult & { runtimeToolNames: readonly string[] }> {
+	const productNarrator = runtimeProductIntegration.narrator;
+	const [runtimeContribution, trustedResourcePromptRoot] = productNarrator
+		? await Promise.all([
+				productNarrator.resolveContribution(narratorId),
+				productNarrator.resolveTrustedPromptRoot(narratorId),
+			])
+		: [null, null];
+	const effectivePrompt = await buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
 		cwd,
 		locale,
@@ -1082,8 +1098,15 @@ export async function buildSystemPrompt(
 		defaultSystemPrompt,
 		devices: deviceContext?.devices,
 		defaultDeviceId: deviceContext?.defaultDeviceId,
+		runtimePromptExtensions:
+			runtimeContribution?.promptExtensions.map((extension) => extension.content) ?? [],
+		trustedResourcePromptRoot,
 		allowLocalExecution: deviceContext?.allowLocalExecution,
 	});
+	return {
+		...effectivePrompt,
+		runtimeToolNames: runtimeContribution?.tools.map((tool) => tool.definition.name) ?? [],
+	};
 }
 
 async function createNarrator(
@@ -1135,19 +1158,26 @@ async function createNarrator(
 			// A saved narrator cwd is an explicit user override (for example, after
 			// recovering from a missing workdir). Keep the chapter worktree as the
 			// default only when no override has been chosen.
-			narratorCwd = resolveNarratorSessionCwd(
-				narrator.cwd,
-				ch.worktreePath,
+			narratorCwd = resolveProductNarratorCwd({
+				traits: narrator.traits,
+				narratorCwd: narrator.cwd,
+				worktreePath: ch.worktreePath,
 				projectGitPath,
-				getHome(),
-			);
+				fallbackCwd: getHome(),
+			});
 			narratorChapterId = ch.id;
 			narratorChapterRole = ch.role;
 			narratorWorktreePath = ch.worktreePath;
 			narratorBaseBranch = ch.baseBranch;
 		} else {
 			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project?.gitPath, getHome());
+			narratorCwd = resolveProductNarratorCwd({
+				traits: narrator.traits,
+				narratorCwd: narrator.cwd,
+				worktreePath: null,
+				projectGitPath: project?.gitPath,
+				fallbackCwd: getHome(),
+			});
 			logger.info("Chapter dormant, using fallback CWD", {
 				chapterId: narrator.chapterId,
 				narratorCwd,
@@ -1161,9 +1191,21 @@ async function createNarrator(
 		narratorProjectId = project.id;
 		projectGitPath = project.gitPath;
 		projectRoutineConfig = parseProjectRoutineConfig(project.chapterSettings);
-		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project.gitPath, getHome());
+		narratorCwd = resolveProductNarratorCwd({
+			traits: narrator.traits,
+			narratorCwd: narrator.cwd,
+			worktreePath: null,
+			projectGitPath: project.gitPath,
+			fallbackCwd: getHome(),
+		});
 	} else {
-		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
+		narratorCwd = resolveProductNarratorCwd({
+			traits: narrator.traits,
+			narratorCwd: narrator.cwd,
+			worktreePath: null,
+			projectGitPath: null,
+			fallbackCwd: getHome(),
+		});
 	}
 
 	// Restore or create the persistent plan file ID if the narrator is already in plan mode
@@ -1199,7 +1241,12 @@ async function createNarrator(
 		creationTraits.deviceInjection,
 	);
 
-	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
+	const {
+		prompt: effectiveSystemPrompt,
+		usedCompactSummary,
+		runtimeToolNames,
+	} = await buildSystemPrompt(
+		narratorId,
 		{
 			systemPrompt: initialOAuthRuntime
 				? (initialOAuthRuntime.systemPrompt ?? null)
@@ -1338,6 +1385,8 @@ async function createNarrator(
 			}
 		}
 	}
+	// Trusted host resolution, not persisted /load state, is authoritative for contributed tools.
+	syncProductRuntimeToolVisibility(active._enabledOptionalTools, runtimeToolNames);
 
 	activeNarrators.set(narratorId, active);
 
@@ -5006,6 +5055,10 @@ async function retryLastMessageUnlocked(
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	const currentNarrator = await narratorService.getById(narratorId);
+	if (hasProductNarratorProfile(currentNarrator.traits)) {
+		await refreshProductRuntimeToolVisibility(narratorId, active._enabledOptionalTools);
+	}
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
@@ -5485,6 +5538,10 @@ async function reExecuteDeniedToolCallUnlocked(
 					toolCall.id,
 				);
 				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+				const isProductNarrator = hasProductNarratorProfile(narrator.traits);
+				if (isProductNarrator) {
+					await refreshProductRuntimeToolVisibility(narratorId, active._enabledOptionalTools);
+				}
 				// Restore the triggering user so knowledge-base ACL works after a rebuild.
 				// The active may have been freshly recreated (interrupt destroyed the old one),
 				// in which case _currentUserId would otherwise be undefined → null.
@@ -5564,6 +5621,25 @@ async function reExecuteDeniedToolCallUnlocked(
 						all: active._blockedSkills.all,
 						names: [...active._blockedSkills.names],
 					},
+					toolFilter: isProductNarrator
+						? (tool) => {
+								if (active._disabledTools.has(tool.name)) return false;
+								if (
+									!isProductRuntimeToolVisible(
+										tool.name,
+										active._enabledOptionalTools,
+										narrator.permissionMode,
+										isPlanModeTrait(narrator.traits),
+									)
+								) {
+									return false;
+								}
+								if (OPTIONAL_TOOLS.has(tool.name)) {
+									return active._enabledOptionalTools.has(tool.name);
+								}
+								return true;
+							}
+						: undefined,
 					...buildTreeSnapshotExecutionHooks({
 						session: active,
 						narratorId,
@@ -8320,9 +8396,10 @@ export async function loadOptionalTool(
 	// Read current enabled tools from DB
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
+		columns: { enabledTools: true, traits: true },
 	});
-	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
+	if (!narrator || !canManageProductRuntimeTool(toolName, narrator.traits)) return "unknown_tool";
+	const current: string[] = (narrator.enabledTools as string[] | null) ?? [];
 	if (current.includes(toolName)) return "already_loaded";
 
 	// Persist
@@ -8353,9 +8430,10 @@ export async function unloadOptionalTool(
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
+		columns: { enabledTools: true, traits: true },
 	});
-	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
+	if (!narrator || !canManageProductRuntimeTool(toolName, narrator.traits)) return "unknown_tool";
+	const current: string[] = (narrator.enabledTools as string[] | null) ?? [];
 	const next = current.filter((name) => name !== toolName);
 	const wasPersisted = next.length !== current.length;
 
