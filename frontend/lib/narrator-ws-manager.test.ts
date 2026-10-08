@@ -48,6 +48,39 @@ describe("complete input document lane ordering", () => {
 	});
 });
 
+class LeaseTestManager extends NarratorWSManager {
+	connectCalls = 0;
+	disconnectCalls = 0;
+
+	override connect(): void {
+		this.connectCalls += 1;
+	}
+
+	override disconnect(): void {
+		this.disconnectCalls += 1;
+	}
+}
+
+describe("connection leases", () => {
+	test("keeps the shared transport open until every owner releases it", () => {
+		const manager = new LeaseTestManager();
+		const releaseFirst = manager.acquireConnection();
+		const releaseSecond = manager.acquireConnection();
+
+		expect(manager.connectCalls).toBe(1);
+		expect(manager.disconnectCalls).toBe(0);
+
+		releaseFirst();
+		expect(manager.disconnectCalls).toBe(0);
+
+		releaseSecond();
+		expect(manager.disconnectCalls).toBe(1);
+
+		releaseSecond();
+		expect(manager.disconnectCalls).toBe(1);
+	});
+});
+
 describe("COW replacement aliases", () => {
 	test("forwards every old/new identity alias from WS frames", () => {
 		expect(
