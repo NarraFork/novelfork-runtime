@@ -2,14 +2,17 @@
 // Discovers Chrome via env var → Puppeteer cache → system paths.
 
 import { existsSync, readdirSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Browser, BrowserContext, Page } from "puppeteer-core";
 import { logger } from "../logger";
+import { getNarraforkPath } from "../narrafork-home";
 import { getBrowserProxy, getWebFetchProxy } from "../web-fetch/proxy";
 
 /** Browser instances keyed by mode. */
 const browsers: Map<boolean, Browser> = new Map();
+const browserProfiles: Map<boolean, string> = new Map();
 const launching: Map<boolean, Promise<Browser>> = new Map();
 
 /**
@@ -36,6 +39,40 @@ const LAUNCH_ARGS = [
 	"--disable-dev-shm-usage",
 	"--disable-extensions",
 ];
+
+/**
+ * Chrome must never inherit the user's default profile. Keep one owned, deterministic
+ * profile per display mode so a planned-update handoff can reconnect to the same process.
+ */
+function getBrowserProfilePath(headless: boolean): string {
+	return getNarraforkPath("chrome", headless ? "headless" : "headed");
+}
+
+/** Remove a profile only after its owned Chrome process has exited. */
+async function removeBrowserProfile(headless: boolean, userDataDir: string): Promise<void> {
+	const attempts = process.platform === "win32" ? 6 : 1;
+	let lastError: unknown;
+
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		try {
+			await rm(userDataDir, { recursive: true, force: true });
+			logger.info("Puppeteer browser profile removed", { headless, userDataDir });
+			return;
+		} catch (err) {
+			lastError = err;
+			// Chrome can retain profile files briefly after its process exits on Windows.
+			if (attempt < attempts - 1) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+			}
+		}
+	}
+
+	logger.warn("Failed to remove Puppeteer browser profile", {
+		headless,
+		userDataDir,
+		error: lastError instanceof Error ? lastError.message : String(lastError),
+	});
+}
 
 function buildLaunchArgs(headless: boolean): string[] {
 	const args = [...LAUNCH_ARGS, "--no-proxy-server"];
@@ -72,11 +109,12 @@ function findChromePath(): string | undefined {
 		}
 	}
 
-	// 2. Scan Puppeteer cache
-	const puppeteerCacheDir =
-		process.env.PUPPETEER_CACHE_DIR ?? join(homedir(), ".cache", "puppeteer");
-	const puppeteerPath = scanPuppeteerCache(puppeteerCacheDir);
-	if (puppeteerPath) return puppeteerPath;
+	// 2. Scan Puppeteer caches. Tests intentionally isolate HOME/USERPROFILE, but
+	// Windows keeps its executable cache under the account backing LOCALAPPDATA.
+	for (const puppeteerCacheDir of getPuppeteerCacheDirs()) {
+		const puppeteerPath = scanPuppeteerCache(puppeteerCacheDir);
+		if (puppeteerPath) return puppeteerPath;
+	}
 
 	// 3. System Chrome on common paths
 	const systemPaths = getSystemChromePaths();
@@ -96,6 +134,19 @@ function findChromePath(): string | undefined {
 	return undefined;
 }
 
+/** Return Puppeteer cache roots without letting an isolated HOME hide Windows' real cache. */
+function getPuppeteerCacheDirs(): string[] {
+	const candidates = [
+		process.env.PUPPETEER_CACHE_DIR,
+		join(homedir(), ".cache", "puppeteer"),
+	];
+	if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+		const accountHome = dirname(dirname(process.env.LOCALAPPDATA));
+		candidates.push(join(accountHome, ".cache", "puppeteer"));
+	}
+	return [...new Set(candidates.filter((candidate): candidate is string => Boolean(candidate)))];
+}
+
 /** Scan Puppeteer's cache directory for a Chrome executable. */
 function scanPuppeteerCache(cacheDir: string): string | undefined {
 	const chromeDir = join(cacheDir, "chrome");
@@ -107,22 +158,32 @@ function scanPuppeteerCache(cacheDir: string): string | undefined {
 			try {
 				const entries = readdirSync(platformDir);
 				for (const entry of entries) {
+					const installDir = join(platformDir, entry);
 					const candidates = [
-						join(platformDir, entry, "chrome.exe"),
-						join(platformDir, entry, "chrome"),
+						join(installDir, "chrome.exe"),
+						join(installDir, "chrome"),
 						join(
-							platformDir,
-							entry,
+							installDir,
 							"Google Chrome for Testing.app",
 							"Contents",
 							"MacOS",
 							"Google Chrome for Testing",
 						),
 					];
-					for (const c of candidates) {
-						if (existsSync(c)) {
-							logger.info("Found Chrome in Puppeteer cache", { path: c });
-							return c;
+					// Chrome for Testing packages the executable in a platform-specific
+					// subdirectory, e.g. chrome-win64/chrome.exe on Windows.
+					try {
+						for (const bundle of readdirSync(installDir)) {
+							candidates.push(join(installDir, bundle, "chrome.exe"));
+							candidates.push(join(installDir, bundle, "chrome"));
+						}
+					} catch {
+						// An incomplete cache entry is ignored in favor of other candidates.
+					}
+					for (const candidate of candidates) {
+						if (existsSync(candidate)) {
+							logger.info("Found Chrome in Puppeteer cache", { path: candidate });
+							return candidate;
 						}
 					}
 				}
@@ -218,12 +279,18 @@ async function launchBrowser(headless: boolean): Promise<Browser> {
 
 	const executablePath = findChromePath();
 	const launchArgs = buildLaunchArgs(headless);
+	const userDataDir = getBrowserProfilePath(headless);
+	// A pre-existing deterministic profile can belong to Chrome preserved by a process
+	// replacement. Only a profile first created by this launch attempt is safe to remove
+	// if Puppeteer reports a launch failure.
+	const profileExistedBeforeLaunch = existsSync(userDataDir);
 
 	if (executablePath) {
 		try {
 			const b = await puppeteer.default.launch({
 				headless,
 				executablePath,
+				userDataDir,
 				args: launchArgs,
 				timeout: LAUNCH_TIMEOUT_MS,
 				// Take full control of Chrome's lifecycle. Puppeteer's default signal/exit
@@ -239,14 +306,20 @@ async function launchBrowser(headless: boolean): Promise<Browser> {
 				pid: b.process()?.pid,
 				chromePath: executablePath,
 				headless,
+				userDataDir,
 			});
 			return b;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			logger.warn("Chrome found but launch failed", {
 				chromePath: executablePath,
+				headless,
+				userDataDir,
 				error: msg.slice(0, 500),
 			});
+			if (!profileExistedBeforeLaunch && !browsers.has(headless)) {
+				await removeBrowserProfile(headless, userDataDir);
+			}
 
 			// Flatpak Chrome can't be launched directly — give a specific hint
 			if (executablePath.includes("/flatpak/")) {
@@ -277,6 +350,10 @@ async function launchBrowser(headless: boolean): Promise<Browser> {
  * @param headless - true for headless mode (default), false for headed (GUI) mode.
  */
 export async function getBrowser(headless = true): Promise<Browser> {
+	// Do not reuse a deterministic profile until a preceding normal close has released
+	// Chrome and removed it; otherwise a new launch can race the cleanup on Windows.
+	if (closingPromise) await closingPromise;
+
 	const existing = browsers.get(headless);
 	if (existing?.connected) return existing;
 
@@ -287,6 +364,7 @@ export async function getBrowser(headless = true): Promise<Browser> {
 	const promise = launchBrowser(headless)
 		.then((b) => {
 			browsers.set(headless, b);
+			browserProfiles.set(headless, getBrowserProfilePath(headless));
 			launching.delete(headless);
 			return b;
 		})
@@ -404,13 +482,22 @@ export async function connectBrowser(
 	headless: boolean,
 	browserWSEndpoint: string,
 ): Promise<Browser> {
+	if (closingPromise) await closingPromise;
+
 	const puppeteer = await import("puppeteer-core");
 	const b = await puppeteer.default.connect({
 		browserWSEndpoint,
 		defaultViewport: DEFAULT_VIEWPORT,
 	});
 	browsers.set(headless, b);
-	logger.info("Reconnected to preserved Chrome instance", { headless, browserWSEndpoint });
+	// The original launcher and the replacement process agree on this deterministic
+	// directory, so the replacement owns final cleanup after the handoff.
+	browserProfiles.set(headless, getBrowserProfilePath(headless));
+	logger.info("Reconnected to preserved Chrome instance", {
+		headless,
+		browserWSEndpoint,
+		userDataDir: getBrowserProfilePath(headless),
+	});
 	return b;
 }
 
@@ -441,13 +528,18 @@ export function closeBrowser(): Promise<void> {
 		const preserve = preserveOnClose;
 		const promises: Promise<void>[] = [];
 		for (const [headless, b] of browsers) {
+			const userDataDir = browserProfiles.get(headless);
 			if (preserve) {
 				try {
 					b.disconnect();
-					logger.info("Puppeteer browser disconnected for update handoff", { headless });
+					logger.info("Puppeteer browser disconnected for update handoff", {
+						headless,
+						userDataDir,
+					});
 				} catch (err) {
 					logger.warn("Failed to disconnect browser for update handoff", {
 						headless,
+						userDataDir,
 						error: err instanceof Error ? err.message : String(err),
 					});
 				}
@@ -455,12 +547,16 @@ export function closeBrowser(): Promise<void> {
 				promises.push(
 					b
 						.close()
-						.then(() => logger.info("Puppeteer browser closed", { headless }))
+						.then(async () => {
+							logger.info("Puppeteer browser closed", { headless, userDataDir });
+							if (userDataDir) await removeBrowserProfile(headless, userDataDir);
+						})
 						.catch(() => {}),
 				);
 			}
 		}
 		browsers.clear();
+		browserProfiles.clear();
 		launching.clear();
 		await Promise.all(promises);
 	})();
