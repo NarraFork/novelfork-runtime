@@ -85,6 +85,13 @@
       "when": 1790589848358,
       "tag": "0011_tense_shadow_king",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1791425949697,
+      "tag": "0012_wealthy_red_hulk",
+      "breakpoints": true
     }
   ]
 }
