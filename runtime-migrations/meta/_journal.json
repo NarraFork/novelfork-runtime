@@ -1,0 +1,90 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1783817494558,
+      "tag": "0000_fantastic_orphan",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1783849970314,
+      "tag": "0001_light_bromley",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784108826477,
+      "tag": "0002_small_young_avengers",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1784163847381,
+      "tag": "0003_colossal_molten_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1784562442841,
+      "tag": "0004_lumpy_echo",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1785577123506,
+      "tag": "0005_friendly_captain_midlands",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1785722772071,
+      "tag": "0006_runtime_schema_delta",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1785722772072,
+      "tag": "0007_blacklist_partial_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1785722772073,
+      "tag": "0008_fast_mode_override",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1786223945846,
+      "tag": "0009_classy_luminals",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1787298871715,
+      "tag": "0010_messy_forgotten_one",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1790589848358,
+      "tag": "0011_tense_shadow_king",
+      "breakpoints": true
+    }
+  ]
+}
