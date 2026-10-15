@@ -150,13 +150,3 @@ export function getProductToolRoutines(
 	cache = { integration, routines };
 	return routines;
 }
-
-/** The product routine that controls a contributed tool, if any. */
-export function findProductToolRoutineForTool(
-	toolName: string,
-	reservedIds: ReadonlySet<string>,
-): BuiltinRoutine | undefined {
-	return getProductToolRoutines(reservedIds).find((routine) =>
-		routine.tool?.toolNames?.includes(toolName),
-	);
-}
