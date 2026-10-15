@@ -9,7 +9,9 @@
  * tool set; this module is the only place its routines enter the Runtime.
  */
 
-import { normalizeToolRoutineMode } from "@shared/routine-modes";
+// Relative, not `@shared/*`: product code loads this module (via builtin-routines)
+// from outside the Runtime tree, where the Runtime path aliases do not resolve.
+import { normalizeToolRoutineMode } from "../../../shared/routine-modes";
 import type { BuiltinRoutine } from "../builtin-routines";
 import { logger } from "../logger";
 import type { RuntimeProductIntegration, RuntimeProductToolRoutineContribution } from "./contracts";

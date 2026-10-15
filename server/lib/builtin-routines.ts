@@ -9,7 +9,7 @@
  * project overrides, `/load`, session preloading) treats them like built-ins.
  */
 
-import type { ToolRoutineMode } from "@shared/routine-modes";
+import type { ToolRoutineMode } from "../../shared/routine-modes";
 import { getProductToolRoutines } from "./product-host/tool-routines";
 
 export interface BuiltinCommandDef {
