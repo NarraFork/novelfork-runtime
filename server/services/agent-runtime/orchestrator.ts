@@ -195,11 +195,7 @@ import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
-import {
-	hasProductNarratorProfile,
-	isProductRuntimeToolVisible,
-	syncProductRuntimeToolVisibility,
-} from "../product-narrator-tools";
+import { isProductRuntimeToolVisible } from "../product-narrator-tools";
 import { reviewService } from "../review-service";
 import {
 	consumeNextBufferedSubagentMessage,
@@ -785,7 +781,9 @@ export async function runAgentLoopUnlocked(
 			let runtimeSummaryChars = (active.systemPrompt?.length ?? 0) - initialSystemChars;
 			await storeRuntimeCharacters({ systemChars: initialSystemChars });
 			active._usedCompactSummary = usedCompactSummary;
-			syncProductRuntimeToolVisibility(active._enabledOptionalTools, freshRuntimeToolNames);
+			// Product exposure for this turn (binding, workflow step). Visibility only; the
+			// enabled set stays what routines and /load made it.
+			active._productRuntimeToolNames = new Set(freshRuntimeToolNames);
 
 			const eventContext: EventHandlerContext = createRuntimeEventContext({
 				getFileReferenceContext: () => getAgentFileReferenceContext(config),
@@ -905,7 +903,7 @@ export async function runAgentLoopUnlocked(
 					);
 					runtimeSummaryChars = (finalPrompt?.length ?? 0) - systemChars;
 					await storeRuntimeCharacters({ systemChars });
-					syncProductRuntimeToolVisibility(active._enabledOptionalTools, runtimeToolNames);
+					active._productRuntimeToolNames = new Set(runtimeToolNames);
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
 					// Setting active.systemPrompt would create a second source of truth.
@@ -1246,7 +1244,6 @@ export async function runAgentLoopUnlocked(
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
 			await ensureSkillCacheFreshForActiveNarrator(active);
-			const isProductNarrator = hasProductNarratorProfile(freshNarrator.traits);
 			const availableDevices = turnSessionDevices;
 
 			let toolCallLimitExceeded = false;
@@ -1422,11 +1419,13 @@ export async function runAgentLoopUnlocked(
 					if (!profileToolFilter(tool)) return false;
 					if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
 					if (active._disabledTools.has(tool.name)) return false;
+					// Contributed product tools: visible only while the product exposes them to
+					// this narrator (trusted binding, workflow step) and their policy allows the
+					// session mode. Whether they are enabled is the optional-tool gate below.
 					if (
-						isProductNarrator &&
 						!isProductRuntimeToolVisible(
 							tool.name,
-							active._enabledOptionalTools,
+							active,
 							config.permissionMode,
 							config.planMode ?? false,
 						)

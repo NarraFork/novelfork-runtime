@@ -107,6 +107,7 @@ import {
 	secretEntriesToRecord,
 } from "../../lib/mcp-secrets";
 import type { ProxyOverride } from "../../lib/proxy";
+import { routineDisplayName } from "../../lib/routine-display";
 import { normalizeUrlProtocol } from "../../lib/url";
 
 export const Route = createFileRoute("/routines/")({
@@ -260,11 +261,16 @@ function OptionalToolsTab() {
 							<div style={{ flex: 1, minWidth: 0 }}>
 								<Group gap="xs">
 									<Text size="sm" fw={600}>
-										{routine.name}
+										{routineDisplayName(routine, locale)}
 									</Text>
 									<Badge size="xs" variant="light" color="yellow">
 										/load {routine.id}
 									</Badge>
+									{(routine.toolNames?.length ?? 0) > 1 && (
+										<Badge size="xs" variant="outline" color="gray">
+											{t("toolCount", { count: routine.toolNames?.length ?? 0 })}
+										</Badge>
+									)}
 								</Group>
 								<Text size="xs" c="dimmed">
 									{formatRoutineTextPreview(

@@ -200,3 +200,49 @@ describe("clearToolRoutineMode", () => {
 		expect(resolveProjectToolRoutineModeOverride(optIn, next)).toBe("global");
 	});
 });
+
+describe("routine default mode", () => {
+	// Product-contributed routines declare their own starting position. It applies
+	// only while neither layer has an opinion, exactly like `defaultEnabled` does.
+	const residentByDefault = { id: "vendor.writing", defaultMode: "resident" as const };
+	const autoByDefault = { id: "vendor.search", defaultMode: "auto" as const };
+
+	test("an unconfigured routine starts at its declared default mode", () => {
+		expect(resolveToolRoutineMode(residentByDefault, undefined)).toBe("resident");
+		expect(resolveToolRoutineMode(residentByDefault, {})).toBe("resident");
+		expect(resolveToolRoutineMode(autoByDefault, {})).toBe("auto");
+	});
+
+	test("the global layer still overrides the default mode, legacy lists included", () => {
+		expect(
+			resolveToolRoutineMode(residentByDefault, { toolModes: { "vendor.writing": "manual" } }),
+		).toBe("manual");
+		expect(
+			resolveToolRoutineMode(residentByDefault, { disabledRoutines: ["vendor.writing"] }),
+		).toBe("manual");
+		expect(resolveToolRoutineMode(autoByDefault, { enabledRoutines: ["vendor.search"] })).toBe(
+			"resident",
+		);
+	});
+
+	test("effective mode falls back to the default only when both layers are silent", () => {
+		expect(resolveEffectiveToolRoutineMode(residentByDefault, {}, {})).toEqual({
+			mode: "resident",
+			source: "global",
+		});
+		expect(
+			resolveEffectiveToolRoutineMode(
+				residentByDefault,
+				{},
+				{ toolModes: { "vendor.writing": "manual" } },
+			),
+		).toEqual({ mode: "manual", source: "project" });
+		// The default is a property of the routine, never a project opinion.
+		expect(resolveProjectToolRoutineModeOverride(residentByDefault, {})).toBe("global");
+	});
+
+	test("an invalid declared default falls back to the defaultEnabled projection", () => {
+		const bogus = { id: "vendor.bogus", defaultMode: "always" as unknown as "manual" };
+		expect(resolveToolRoutineMode(bogus, {})).toBe("manual");
+	});
+});

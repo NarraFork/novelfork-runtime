@@ -13,6 +13,7 @@ import {
 	useSetProjectRoutineMode,
 	useToggleProjectRoutine,
 } from "../../hooks/useRoutines";
+import { routineDisplayName } from "../../lib/routine-display";
 
 function routineOverrideToAction(value: string): "enable" | "disable" | "reset" | null {
 	switch (value) {
@@ -109,7 +110,9 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 												{ts(`routineType.${routine.type}`)}
 											</Badge>
 											<Text size="sm" fw={500} truncate>
-												{routine.type === "command" ? `/${routine.name}` : routine.name}
+												{routine.type === "command"
+													? `/${routine.name}`
+													: routineDisplayName(routine, locale)}
 											</Text>
 											{isTool && modeOverride === "global" ? (
 												<Badge size="xs" variant="outline" color="gray">

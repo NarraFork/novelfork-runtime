@@ -135,6 +135,7 @@
 	"tabOptionalTools": "Optional Tools",
 	"optionalToolsDesc": "Optional agent tools, each with a three-position switch. Manual: loadable in a session via /load only. Auto: reserved for the upcoming toolsearch mechanism. Resident: present in every new session.",
 	"noOptionalTools": "No optional tools available.",
+	"toolCount": "{{count}} tools",
 	"toolMode.manual": "Manual",
 	"toolMode.auto": "Auto",
 	"toolMode.resident": "Resident",

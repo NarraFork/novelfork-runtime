@@ -61,6 +61,13 @@ export type ResolvedRoutineModeConfig<T extends RoutineModeConfig> = Omit<
 export interface ToolRoutineModeSubject {
 	id: string;
 	defaultEnabled?: boolean;
+	/**
+	 * The position a routine starts at while neither the global nor the project
+	 * layer has an opinion. Takes precedence over `defaultEnabled`; product
+	 * contributed routines use it because they may start at any of the three
+	 * positions, not only on/off.
+	 */
+	defaultMode?: ToolRoutineMode;
 }
 
 /** Parse an untrusted value into a mode, or null when it is not one. */
@@ -101,17 +108,29 @@ export function resolveToolRoutineModeInLayer(
 }
 
 /**
+ * The position a routine takes when nobody has configured it: its declared
+ * `defaultMode`, else `resident` for a `defaultEnabled` routine, else `manual`.
+ */
+export function resolveDefaultToolRoutineMode(routine: ToolRoutineModeSubject): ToolRoutineMode {
+	return (
+		normalizeToolRoutineMode(routine.defaultMode) ??
+		(routine.defaultEnabled ? "resident" : "manual")
+	);
+}
+
+/**
  * The global mode for a routine. Unlike a project layer this never returns null:
- * a routine nobody has configured is `manual` unless it is `defaultEnabled`.
+ * a routine nobody has configured starts at its default position.
  */
 export function resolveToolRoutineMode(
 	routine: ToolRoutineModeSubject,
 	config: RoutineModeConfig | undefined,
 ): ToolRoutineMode {
-	return (
-		resolveToolRoutineModeInLayer(routine, config) ??
-		(routine.defaultEnabled ? "resident" : "manual")
-	);
+	// The layer's own fields first; the routine's default only when the layer is
+	// silent. `resolveToolRoutineModeInLayer` reads `defaultEnabled` as a layer
+	// opinion, which would let it shadow a declared `defaultMode`.
+	const layer = config ? resolveToolRoutineModeInLayer({ id: routine.id }, config) : null;
+	return layer ?? resolveDefaultToolRoutineMode(routine);
 }
 
 /** What a project layer explicitly says, or "global" when it says nothing. */

@@ -10,6 +10,7 @@ import {
 	type TextDocumentRange,
 	type TextDocumentRef,
 } from "@shared/pretext-layout/text-document";
+import type { ToolRoutineMode } from "@shared/routine-modes";
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
@@ -2008,6 +2009,24 @@ export const narratorsApi = {
 		}),
 
 	// Optional tools (Browser, Terminal, ...) — `toolId` is the routine id, e.g. "browser"
+	/** Optional tools actually loaded for the session, grouped by routine. */
+	listSessionOptionalTools: (narratorId: string) =>
+		request<{
+			active: boolean;
+			routines: Array<{
+				id: string;
+				toolName: string;
+				nameEn?: string;
+				nameZh?: string;
+				providerId?: string;
+				mode: ToolRoutineMode;
+				/** `resident`: preloaded by the routine mode; `session`: loaded in this session. */
+				source: "resident" | "session";
+				toolNames: string[];
+				loadedToolNames: string[];
+			}>;
+			otherToolNames: string[];
+		}>(`/narrators/${narratorId}/optional-tools`),
 	getOptionalToolState: (narratorId: string, toolId: string) =>
 		request<{
 			toolId: string;

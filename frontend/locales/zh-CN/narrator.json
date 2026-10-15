@@ -1513,6 +1513,8 @@
 	"details.backgroundStatus_cancelled": "已取消",
 	"details.pendingModelRestore": "待恢复模型",
 	"details.enabledTools": "启用工具",
+	"details.toolSourceResident": "常驻",
+	"details.toolSourceSession": "本会话加载",
 	"details.chapter": "所属章节",
 	"details.parentNarrator": "父叙述者",
 	"details.inheritMode": "继承模式",

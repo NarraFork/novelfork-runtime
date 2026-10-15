@@ -69,10 +69,49 @@ export type RuntimeProductAccessDeniedEvent = Readonly<{
 	narratorId?: string;
 }>;
 
+/** The three "可选工具" switch positions a contributed tool routine may start at. */
+export type RuntimeProductToolRoutineMode = "manual" | "auto" | "resident";
+
+/**
+ * A product-contributed optional tool routine.
+ *
+ * It joins the built-in tool routines, so the Runtime's own machinery manages it
+ * end to end: the global "可选工具" switch, project overrides, `/load <id>`,
+ * session preloading and the session details view. The product never edits a
+ * session's enabled-tool set itself.
+ */
+export interface RuntimeProductToolRoutineContribution {
+	/**
+	 * Stable, namespaced, lowercase id (`<product>.<group>`, e.g. `novelfork.writing`).
+	 * It is also the `/load` argument, and must not collide with a built-in routine.
+	 */
+	readonly id: string;
+	readonly nameEn: string;
+	readonly nameZh: string;
+	readonly descriptionEn: string;
+	readonly descriptionZh: string;
+	/**
+	 * Registry names (as returned by `toolDefinitions()`) controlled by this routine.
+	 * Names the product did not register are ignored, so a routine can never claim
+	 * a built-in tool. Each contributed tool belongs to at most one routine.
+	 */
+	readonly toolNames: readonly string[];
+	/** Position used while neither the global nor the project layer has an opinion. Defaults to `manual`. */
+	readonly defaultMode?: RuntimeProductToolRoutineMode;
+}
+
 /**
  * Product-owned adapter for a narrator's trusted domain contributions. The
  * Runtime only consumes these generic operations; the product owns bindings,
  * tool implementations, prompts, and allowlist policy.
+ *
+ * Enabling and visibility are separate concerns:
+ *   - which contributed tools are *enabled* for a session is decided by the
+ *     Runtime alone, from tool routine modes, `/load` and persisted loads;
+ *   - which enabled tools are *visible* on a turn is narrowed by the product:
+ *     `resolveContribution` / `resolveToolNames` return only the tools the trusted
+ *     binding (and any product step gate) exposes this turn, and `isToolAllowed`
+ *     may hide more. Neither can add a tool the session has not enabled.
  */
 export interface RuntimeProductNarratorAdapter {
 	resolve(narratorId: string): Promise<RuntimeResolveContext | null>;
@@ -80,17 +119,15 @@ export interface RuntimeProductNarratorAdapter {
 	resolveToolNames(narratorId: string): Promise<readonly string[]>;
 	resolveTrustedPromptRoot(narratorId: string): Promise<string | null>;
 	toolDefinitions(): ToolDefinition[];
+	/** Visibility-only veto for a contributed tool; it is never consulted to enable one. */
 	isToolAllowed(
 		toolName: string,
 		enabledOptionalToolNames: ReadonlySet<string>,
-		context?: Readonly<{ permissionMode?: SessionPermissionMode | string; isAdvancedEnabled?: boolean }>,
+		context?: Readonly<{ permissionMode?: SessionPermissionMode | string }>,
 	): boolean;
 	getToolPermissionPolicy?(toolName: string): ContributedToolPermissionPolicy | null;
-	syncToolVisibility(
-		enabledToolNames: Set<string>,
-		resolvedToolNames: readonly string[],
-		context?: Readonly<{ isAdvancedEnabled?: boolean; permissionMode?: SessionPermissionMode | string }>,
-	): void;
+	/** Optional tool routines grouping the contributed tools (see `RuntimeProductToolRoutineContribution`). */
+	toolRoutines?(): readonly RuntimeProductToolRoutineContribution[];
 }
 
 /**

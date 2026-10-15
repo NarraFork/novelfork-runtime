@@ -498,10 +498,30 @@ export async function handleLoadToolCommand(
 	for (const toolName of toolNames) {
 		results.push(await loadOptionalTool(narratorId, toolName));
 	}
-	const alreadyLoaded = results.every((result) => result === "already_loaded");
+	// `unknown_tool` here means the tool exists but this narrator cannot use it
+	// (e.g. a product-contributed tool without a trusted product binding). Say so
+	// instead of claiming it was loaded.
+	const unavailableCount = results.filter((result) => result === "unknown_tool").length;
+	if (unavailableCount === results.length) {
+		const infoText =
+			locale === "zh-CN"
+				? `⚠️ 无法加载：${displayToolName}（此叙述者不能使用这些工具）`
+				: `⚠️ Cannot load ${displayToolName}: not available to this narrator`;
+		await narratorService.persistDisplayMessage(narratorId, infoText);
+		return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
+	}
+	const alreadyLoaded = results.every(
+		(result) => result === "already_loaded" || result === "unknown_tool",
+	);
+	const skippedNote =
+		unavailableCount === 0
+			? ""
+			: locale === "zh-CN"
+				? `（其中 ${unavailableCount} 个工具此叙述者不能使用，未加载）`
+				: ` (${unavailableCount} not available to this narrator, skipped)`;
 	const infoText = alreadyLoaded
-		? `🔧 Tool already loaded: ${displayToolName}`
-		: `🔧 Tool loaded: ${displayToolName}`;
+		? `🔧 Tool already loaded: ${displayToolName}${skippedNote}`
+		: `🔧 Tool loaded: ${displayToolName}${skippedNote}`;
 	await narratorService.persistDisplayMessage(narratorId, infoText);
 
 	// Persist a user-role message so the model is aware the tool was just loaded

@@ -135,6 +135,7 @@
 	"tabOptionalTools": "可选工具",
 	"optionalToolsDesc": "可选的 Agent 工具，每项都有三段式开关。手动：仅能在会话中通过 /load 加载；自动：预留给即将到来的 toolsearch 机制；常驻：每个新会话默认加载。",
 	"noOptionalTools": "暂无可选工具。",
+	"toolCount": "{{count}} 个工具",
 	"toolMode.manual": "手动",
 	"toolMode.auto": "自动",
 	"toolMode.resident": "常驻",

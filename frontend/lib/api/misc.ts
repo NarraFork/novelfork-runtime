@@ -1068,6 +1068,13 @@ export const miscApi = {
 				enabled: boolean;
 				/** Three-position mode. Only present for tool routines. */
 				mode?: ToolRoutineMode;
+				/** Localized display name (product routines declare one); falls back to `name`. */
+				nameEn?: string;
+				nameZh?: string;
+				/** Product integration that contributed the routine; absent for built-ins. */
+				providerId?: string;
+				/** Tool routines only: every registry tool the routine controls. */
+				toolNames?: string[];
 			}>;
 		}>("/routines"),
 	toggleRoutine: (id: string, enabled: boolean) =>
@@ -1098,6 +1105,10 @@ export const miscApi = {
 				modeOverride?: ToolRoutineModeOverride;
 				/** The global mode this routine would follow. Tool routines only. */
 				globalMode?: ToolRoutineMode;
+				nameEn?: string;
+				nameZh?: string;
+				providerId?: string;
+				toolNames?: string[];
 			}>;
 		}>(`/routines/project/${projectId}`),
 	toggleProjectRoutine: (projectId: string, id: string, action: "enable" | "disable" | "reset") =>

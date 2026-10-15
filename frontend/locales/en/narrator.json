@@ -1515,6 +1515,8 @@
 	"details.backgroundStatus_cancelled": "Cancelled",
 	"details.pendingModelRestore": "Pending model restore",
 	"details.enabledTools": "Enabled tools",
+	"details.toolSourceResident": "resident",
+	"details.toolSourceSession": "loaded this session",
 	"details.chapter": "Chapter",
 	"details.parentNarrator": "Parent narrator",
 	"details.inheritMode": "Inherit mode",

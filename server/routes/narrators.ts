@@ -362,6 +362,7 @@ import {
 	isCompactInProgress,
 	isLoopRunning,
 	isNarratorActive,
+	listSessionOptionalTools,
 	normalizeRollbackBlockIndexForMessage,
 	persistGoalAddedNotice,
 	reconcileRunningStatus,
@@ -7115,6 +7116,17 @@ narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 });
 
 // ── Optional tools ───────────────────────────────────────────────────────────
+
+/**
+ * Optional tools actually loaded for this narrator, grouped by routine, each
+ * marked `resident` (preloaded by its routine mode) or `session` (loaded into
+ * this session). Backs the session details view.
+ */
+narratorRoutes.get("/:id/optional-tools", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id); // 404 if missing
+	return c.json(await listSessionOptionalTools(id, c.get("user").sub));
+});
 
 /**
  * Whether one optional tool is currently visible to the model for this narrator.

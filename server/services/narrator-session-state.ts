@@ -157,6 +157,13 @@ export interface ActiveNarrator {
 	_skillScopeKey?: string | null;
 	/** Optional tools enabled for this session (tool names, e.g. "Terminal") */
 	_enabledOptionalTools: Set<string>;
+	/**
+	 * Product-contributed tools the product exposed to this narrator on the latest
+	 * resolution (trusted binding plus any product step gate). A visibility set only:
+	 * it narrows `_enabledOptionalTools`, it never enables a tool. Undefined until
+	 * the first resolution, which hides every contributed tool.
+	 */
+	_productRuntimeToolNames?: ReadonlySet<string>;
 	/** Tools disabled by narrator custom traits. */
 	_disabledTools: Set<string>;
 	/** Skills blocked by narrator custom traits (`all` hides the Skill tool). */

@@ -359,10 +359,10 @@ import {
 	canManageProductRuntimeTool,
 	hasProductNarratorProfile,
 	isProductRuntimeToolVisible,
-	refreshProductRuntimeToolVisibility,
+	isRegisteredProductRuntimeTool,
 	resolveProductNarratorCwd,
+	resolveProductRuntimeToolNames,
 	runtimeProductIntegration,
-	syncProductRuntimeToolVisibility,
 } from "./product-narrator-tools";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete.
@@ -1362,31 +1362,17 @@ async function createNarrator(
 			active._enabledOptionalTools.add("KnowledgeEdit");
 		}
 	} else {
-		// Preload optional tools whose routine mode is `resident` (project override
-		// first, then global). `manual` and `auto` are not preloaded — `auto` is the
-		// toolsearch placeholder and behaves like `manual` until that lands.
-		for (const routine of getBuiltinToolRoutines()) {
-			if (!routine.tool) continue;
-			const { mode } = resolveEffectiveToolRoutineMode(
-				routine,
-				settings.routines,
-				projectRoutineConfig,
-			);
-			if (isPreloadedMode(mode)) {
-				for (const toolName of getBuiltinToolNames(routine.tool)) {
-					active._enabledOptionalTools.add(toolName);
-				}
-			}
-		}
-		// Merge tools explicitly enabled on this narrator (via /load).
-		if (Array.isArray(narrator.enabledTools)) {
-			for (const toolName of narrator.enabledTools) {
-				if (OPTIONAL_TOOLS.has(toolName)) active._enabledOptionalTools.add(toolName);
-			}
+		// Resident routines (product-contributed ones included) plus persisted /load.
+		for (const toolName of collectSessionOptionalTools(
+			projectRoutineConfig,
+			narrator.enabledTools,
+		)) {
+			active._enabledOptionalTools.add(toolName);
 		}
 	}
-	// Trusted host resolution, not persisted /load state, is authoritative for contributed tools.
-	syncProductRuntimeToolVisibility(active._enabledOptionalTools, runtimeToolNames);
+	// Which contributed tools the product exposes to this narrator now. Visibility
+	// only: the enabled set above is never rewritten from it.
+	active._productRuntimeToolNames = new Set(runtimeToolNames);
 
 	activeNarrators.set(narratorId, active);
 
@@ -5055,10 +5041,8 @@ async function retryLastMessageUnlocked(
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	const currentNarrator = await narratorService.getById(narratorId);
-	if (hasProductNarratorProfile(currentNarrator.traits)) {
-		await refreshProductRuntimeToolVisibility(narratorId, active._enabledOptionalTools);
-	}
+	// Product exposure may have moved on (binding, workflow step) since the session was built.
+	active._productRuntimeToolNames = await resolveProductRuntimeToolNames(narratorId);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
@@ -5539,9 +5523,8 @@ async function reExecuteDeniedToolCallUnlocked(
 				);
 				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 				const isProductNarrator = hasProductNarratorProfile(narrator.traits);
-				if (isProductNarrator) {
-					await refreshProductRuntimeToolVisibility(narratorId, active._enabledOptionalTools);
-				}
+				// Product exposure may have moved on (binding, workflow step) since the session was built.
+				active._productRuntimeToolNames = await resolveProductRuntimeToolNames(narratorId);
 				// Restore the triggering user so knowledge-base ACL works after a rebuild.
 				// The active may have been freshly recreated (interrupt destroyed the old one),
 				// in which case _currentUserId would otherwise be undefined → null.
@@ -5627,7 +5610,7 @@ async function reExecuteDeniedToolCallUnlocked(
 								if (
 									!isProductRuntimeToolVisible(
 										tool.name,
-										active._enabledOptionalTools,
+										active,
 										narrator.permissionMode,
 										isPlanModeTrait(narrator.traits),
 									)
@@ -8288,6 +8271,68 @@ function parseProjectRoutineConfig(raw: unknown): RoutineModeConfig | undefined 
 }
 
 /**
+ * The optional tools a new session starts with: every tool of a routine whose
+ * effective mode is `resident` (project override first, then global; product
+ * contributed routines included), plus the narrator's persisted `/load`s.
+ * `manual` and `auto` are not preloaded — `auto` is the toolsearch placeholder
+ * and behaves like `manual` until that lands.
+ *
+ * This is the whole "enabled" decision. Product exposure (binding, workflow
+ * step) is applied later as a visibility filter and never edits this set.
+ */
+export function collectSessionOptionalTools(
+	projectRoutineConfig: RoutineModeConfig | undefined,
+	persistedEnabledTools: unknown,
+): Set<string> {
+	const enabled = new Set<string>();
+	for (const routine of getBuiltinToolRoutines()) {
+		if (!routine.tool) continue;
+		const { mode } = resolveEffectiveToolRoutineMode(
+			routine,
+			settings.routines,
+			projectRoutineConfig,
+		);
+		if (!isPreloadedMode(mode)) continue;
+		for (const toolName of getBuiltinToolNames(routine.tool)) enabled.add(toolName);
+	}
+	if (Array.isArray(persistedEnabledTools)) {
+		for (const toolName of persistedEnabledTools) {
+			if (typeof toolName === "string" && OPTIONAL_TOOLS.has(toolName)) enabled.add(toolName);
+		}
+	}
+	return enabled;
+}
+
+/** The narrator row, its project and that project's routine layer, as the session build reads them. */
+async function loadNarratorRoutineContext(narratorId: string) {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: {
+			enabledTools: true,
+			traits: true,
+			chapterId: true,
+			contextProjectId: true,
+		},
+	});
+	if (!narrator) throw new NotFoundError("Narrator", narratorId);
+
+	const { resolveNarratorProjectId } = await import("./trait-layer-service");
+	const narratorProjectId = await resolveNarratorProjectId(narrator);
+
+	// Same project layer the session build uses, so callers never report a state the
+	// next turn would contradict.
+	let projectRoutineConfig: RoutineModeConfig | undefined;
+	if (narratorProjectId) {
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, narratorProjectId),
+			columns: { chapterSettings: true },
+		});
+		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
+	}
+	return { narrator, narratorProjectId, projectRoutineConfig };
+}
+
+/**
  * Whether an optional tool would be visible to the model on the next turn.
  *
  * Mirrors the resolution order used when building a session (`ensureActive`) and
@@ -8322,34 +8367,17 @@ export async function resolveOptionalToolState(
 		return { state: "unknown_tool", globallyEnabled: false };
 	}
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			enabledTools: true,
-			traits: true,
-			chapterId: true,
-			contextProjectId: true,
-		},
-	});
-	if (!narrator) throw new NotFoundError("Narrator", narratorId);
+	const { narrator, narratorProjectId, projectRoutineConfig } =
+		await loadNarratorRoutineContext(narratorId);
+	// A contributed tool the product never exposes to this narrator (no trusted
+	// binding) does not exist for it, whatever its routine mode says.
+	if (!(await canManageProductRuntimeTool(toolName, narratorId))) {
+		return { state: "unknown_tool", globallyEnabled: false };
+	}
 
 	// Layered, so the UI reports a project/user-level deny as disabled_by_trait
 	// instead of claiming the tool is merely not loaded.
-	const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
-		"./trait-layer-service"
-	);
-	const narratorProjectId = await resolveNarratorProjectId(narrator);
-
-	// Same project layer the session build uses, so this never reports a state the
-	// next turn would contradict.
-	let projectRoutineConfig: RoutineModeConfig | undefined;
-	if (narratorProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narratorProjectId),
-			columns: { chapterSettings: true },
-		});
-		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
-	}
+	const { resolveEffectiveTraits } = await import("./trait-layer-service");
 
 	let mode: ToolRoutineMode | undefined;
 	for (const routine of getBuiltinToolRoutines()) {
@@ -8396,9 +8424,10 @@ export async function loadOptionalTool(
 	// Read current enabled tools from DB
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true, traits: true },
+		columns: { enabledTools: true },
 	});
-	if (!narrator || !canManageProductRuntimeTool(toolName, narrator.traits)) return "unknown_tool";
+	if (!narrator || !(await canManageProductRuntimeTool(toolName, narratorId)))
+		return "unknown_tool";
 	const current: string[] = (narrator.enabledTools as string[] | null) ?? [];
 	if (current.includes(toolName)) return "already_loaded";
 
@@ -8430,9 +8459,10 @@ export async function unloadOptionalTool(
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true, traits: true },
+		columns: { enabledTools: true },
 	});
-	if (!narrator || !canManageProductRuntimeTool(toolName, narrator.traits)) return "unknown_tool";
+	if (!narrator || !(await canManageProductRuntimeTool(toolName, narratorId)))
+		return "unknown_tool";
 	const current: string[] = (narrator.enabledTools as string[] | null) ?? [];
 	const next = current.filter((name) => name !== toolName);
 	const wasPersisted = next.length !== current.length;
@@ -8458,6 +8488,105 @@ export async function unloadOptionalTool(
 export function getEnabledOptionalTools(narratorId: string): Set<string> {
 	const active = activeNarrators.get(narratorId);
 	return active?._enabledOptionalTools ?? new Set();
+}
+
+/** One tool routine with at least one tool loaded in a session. */
+export interface SessionOptionalToolRoutine {
+	id: string;
+	/** Primary registry tool name; the display fallback when no localized name exists. */
+	toolName: string;
+	nameEn?: string;
+	nameZh?: string;
+	/** Product integration that contributed the routine; absent for built-ins. */
+	providerId?: string;
+	/** Effective routine mode for this narrator (project override first). */
+	mode: ToolRoutineMode;
+	/**
+	 * Why the tools are loaded: `resident` — preloaded by the routine mode into every
+	 * new session; `session` — loaded into this session (`/load` or a panel button).
+	 */
+	source: "resident" | "session";
+	toolNames: string[];
+	loadedToolNames: string[];
+}
+
+/**
+ * The optional tools actually loaded for a narrator, grouped by routine, for the
+ * session details view. The active session's set is authoritative; a dormant
+ * narrator reports what its next session would start with. Tools hidden by a
+ * custom trait deny-list are left out, as are contributed tools the product does
+ * not expose to this narrator at all (no trusted binding).
+ */
+export async function listSessionOptionalTools(
+	narratorId: string,
+	actingUserId?: string | null,
+): Promise<{
+	active: boolean;
+	routines: SessionOptionalToolRoutine[];
+	/** Loaded tools no routine controls (e.g. granted by an OAuth runtime policy). */
+	otherToolNames: string[];
+}> {
+	const { narrator, narratorProjectId, projectRoutineConfig } =
+		await loadNarratorRoutineContext(narratorId);
+	const { resolveEffectiveTraits } = await import("./trait-layer-service");
+	const traits = await resolveEffectiveTraits({
+		narratorTraits: narrator.traits,
+		projectId: narratorProjectId,
+		actingUserId: actingUserId ?? null,
+	});
+	const disabled = getDisabledToolSet(traits.traits);
+
+	const active = activeNarrators.get(narratorId);
+	const enabled: ReadonlySet<string> =
+		active?._enabledOptionalTools ??
+		collectSessionOptionalTools(projectRoutineConfig, narrator.enabledTools);
+
+	let productApplies: boolean | undefined;
+	const productToolsApply = async (): Promise<boolean> => {
+		if (productApplies === undefined) {
+			const productNarrator = runtimeProductIntegration.narrator;
+			productApplies = productNarrator
+				? (await productNarrator.resolve(narratorId).catch(() => null)) !== null
+				: false;
+		}
+		return productApplies;
+	};
+
+	const covered = new Set<string>();
+	const routines: SessionOptionalToolRoutine[] = [];
+	for (const routine of getBuiltinToolRoutines()) {
+		if (!routine.tool) continue;
+		const toolNames = getBuiltinToolNames(routine.tool);
+		for (const toolName of toolNames) covered.add(toolName);
+		if (routine.providerId && !(await productToolsApply())) continue;
+		const loadedToolNames = toolNames.filter((name) => enabled.has(name) && !disabled.has(name));
+		if (loadedToolNames.length === 0) continue;
+		const { mode } = resolveEffectiveToolRoutineMode(
+			routine,
+			settings.routines,
+			projectRoutineConfig,
+		);
+		routines.push({
+			id: routine.id,
+			toolName: routine.tool.toolName,
+			...(routine.nameEn ? { nameEn: routine.nameEn } : {}),
+			...(routine.nameZh ? { nameZh: routine.nameZh } : {}),
+			...(routine.providerId ? { providerId: routine.providerId } : {}),
+			mode,
+			source: isPreloadedMode(mode) ? "resident" : "session",
+			toolNames,
+			loadedToolNames,
+		});
+	}
+
+	const otherToolNames: string[] = [];
+	for (const toolName of enabled) {
+		if (covered.has(toolName) || disabled.has(toolName)) continue;
+		if (isRegisteredProductRuntimeTool(toolName) && !(await productToolsApply())) continue;
+		otherToolNames.push(toolName);
+	}
+
+	return { active: Boolean(active), routines, otherToolNames };
 }
 
 export function updateActiveDisabledTools(narratorId: string, tools: Iterable<string>): void {

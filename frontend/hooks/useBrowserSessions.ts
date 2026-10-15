@@ -18,6 +18,20 @@ export function useOptionalToolState(narratorId: string, toolId: string, enabled
 	});
 }
 
+/**
+ * Optional tools actually loaded for this narrator's session, grouped by routine
+ * and marked resident / loaded-in-session. Shown in the session details panel.
+ */
+export function useSessionOptionalTools(narratorId: string, enabled = true) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "optional-tools"],
+		queryFn: () => api.listSessionOptionalTools(narratorId),
+		enabled: !!narratorId && enabled,
+		staleTime: 10_000,
+		gcTime: OPTIONAL_TOOL_STATE_GC_TIME_MS,
+	});
+}
+
 export function useLoadOptionalTool() {
 	const qc = useQueryClient();
 	return useMutation({

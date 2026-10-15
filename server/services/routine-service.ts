@@ -16,6 +16,7 @@ import {
 	clearToolRoutineMode,
 	isPreloadedMode,
 	type RoutineModeConfig,
+	resolveDefaultToolRoutineMode,
 	resolveEffectiveToolRoutineMode,
 	resolveProjectToolRoutineModeOverride,
 	resolveToolRoutineMode,
@@ -29,6 +30,7 @@ import {
 	type BuiltinRoutine,
 	getAllBuiltinRoutines,
 	getBuiltinRoutine,
+	getBuiltinToolNames,
 } from "../lib/builtin-routines";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
@@ -93,6 +95,15 @@ export interface RoutineStatus {
 	 * (and older clients) keep working.
 	 */
 	mode?: ToolRoutineMode;
+	/** Localized display name, when the routine declares one (product routines do). */
+	nameEn?: string;
+	nameZh?: string;
+	/** Id of the product integration that contributed the routine; absent for built-ins. */
+	providerId?: string;
+	/** Tool routines only: every registry tool the routine controls. */
+	toolNames?: string[];
+	/** Tool routines only: the position used while no layer has an opinion. */
+	defaultMode?: ToolRoutineMode;
 }
 
 /** The global settings layer, in the shape the mode resolver expects. */
@@ -124,6 +135,12 @@ function routineToStatus(
 		descriptionZh: def.descriptionZh,
 		enabled,
 		...(r.type === "tool" && mode ? { mode } : {}),
+		...(r.nameEn ? { nameEn: r.nameEn } : {}),
+		...(r.nameZh ? { nameZh: r.nameZh } : {}),
+		...(r.providerId ? { providerId: r.providerId } : {}),
+		...(r.type === "tool" && r.tool
+			? { toolNames: getBuiltinToolNames(r.tool), defaultMode: resolveDefaultToolRoutineMode(r) }
+			: {}),
 	};
 }
 

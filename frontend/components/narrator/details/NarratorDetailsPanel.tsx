@@ -27,6 +27,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { pickLocalizedValue } from "@shared/i18n-locales";
 import { isSubagentModelInheritance } from "@shared/model-inheritance";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import {
@@ -44,7 +45,7 @@ import { useNavigate } from "@tanstack/react-router";
 import React, { createContext, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
-import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
+import { useBrowserSessions, useSessionOptionalTools } from "../../../hooks/useBrowserSessions";
 import { useChapter } from "../../../hooks/useChapters";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import {
@@ -455,6 +456,43 @@ function NarratorDetailsContent({
 	const enabledTools = Array.isArray(narrator?.enabledTools)
 		? (narrator.enabledTools as string[])
 		: [];
+	// What the session actually has loaded (resident routines included), grouped by
+	// routine. `enabledTools` above only holds persisted /load state and is the
+	// fallback while this is loading or unavailable.
+	const { data: sessionOptionalTools } = useSessionOptionalTools(narratorId, opened);
+	const toolLocale = i18n.resolvedLanguage ?? i18n.language;
+	const loadedToolBadges = sessionOptionalTools
+		? [
+				...sessionOptionalTools.routines.map((routine) => ({
+					key: `routine:${routine.id}`,
+					label: routine.nameEn
+						? pickLocalizedValue(
+								{ en: routine.nameEn, "zh-CN": routine.nameZh ?? routine.nameEn },
+								toolLocale,
+							)
+						: routine.toolName,
+					source: routine.source,
+					title: routine.loadedToolNames.join(", "),
+					count:
+						routine.toolNames.length > 1
+							? `${routine.loadedToolNames.length}/${routine.toolNames.length}`
+							: null,
+				})),
+				...sessionOptionalTools.otherToolNames.map((toolName) => ({
+					key: `tool:${toolName}`,
+					label: toolName,
+					source: "session" as const,
+					title: toolName,
+					count: null,
+				})),
+			]
+		: enabledTools.map((toolName) => ({
+				key: `tool:${toolName}`,
+				label: toolName,
+				source: "session" as const,
+				title: toolName,
+				count: null,
+			}));
 	const planMode = !!(
 		narrator?.planMode ||
 		(Array.isArray(narrator?.traits) && (narrator.traits as string[]).includes("plan"))
@@ -947,11 +985,21 @@ function NarratorDetailsContent({
 			<DetailRow
 				label={t("details.enabledTools")}
 				value={
-					enabledTools.length ? (
+					loadedToolBadges.length ? (
 						<Group justify="flex-end" gap={4}>
-							{enabledTools.map((tool) => (
-								<Badge key={tool} variant="outline" size="sm">
-									{tool}
+							{loadedToolBadges.map((badge) => (
+								<Badge
+									key={badge.key}
+									variant={badge.source === "resident" ? "light" : "outline"}
+									size="sm"
+									title={badge.title}
+								>
+									{badge.label}
+									{badge.count ? ` ${badge.count}` : ""}
+									{" · "}
+									{badge.source === "resident"
+										? t("details.toolSourceResident")
+										: t("details.toolSourceSession")}
 								</Badge>
 							))}
 						</Group>

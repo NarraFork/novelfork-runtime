@@ -16,6 +16,8 @@ export type {
 	RuntimeProductTextGenerationUnavailableCode,
 	RuntimeProductTextMessage,
 	RuntimeProductTextModelRole,
+	RuntimeProductToolRoutineContribution,
+	RuntimeProductToolRoutineMode,
 	RuntimeResolveContext,
 	RuntimeResolvedPromptExtension,
 	RuntimeResolvedToolContribution,

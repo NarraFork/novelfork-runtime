@@ -3,7 +3,14 @@
  *
  * Houses optional agent tools plus command and skill routines. Skill routines
  * materialize a `SKILL.md` when enabled (see `routine-service`).
+ *
+ * A registered product integration may contribute further *tool* routines; the
+ * lookup helpers below merge them in, so every consumer (the "可选工具" page,
+ * project overrides, `/load`, session preloading) treats them like built-ins.
  */
+
+import type { ToolRoutineMode } from "@shared/routine-modes";
+import { getProductToolRoutines } from "./product-host/tool-routines";
 
 export interface BuiltinCommandDef {
 	name: string;
@@ -49,6 +56,16 @@ export interface BuiltinRoutine {
 	 * Defaults to `false` when omitted — requires explicit toggle or `/load`.
 	 */
 	defaultEnabled?: boolean;
+	/**
+	 * Tool routines only: the starting position while neither the global nor the
+	 * project layer has an opinion. Takes precedence over `defaultEnabled`.
+	 */
+	defaultMode?: ToolRoutineMode;
+	/** Localized display name; when absent the tool / command / skill name is shown. */
+	nameEn?: string;
+	nameZh?: string;
+	/** Id of the product integration that contributed this routine; absent for built-ins. */
+	providerId?: string;
 	command?: BuiltinCommandDef;
 	skill?: BuiltinSkillDef;
 	tool?: BuiltinToolDef;
@@ -395,12 +412,21 @@ When testing is warranted, verify observable behavior rather than wording. Prefe
 // Helpers
 // ---------------------------------------------------------------------------
 
+const BUILTIN_ROUTINE_IDS: ReadonlySet<string> = new Set(BUILTIN_ROUTINES.map((r) => r.id));
+
+/** Tool routines contributed by the registered product integration (empty when standalone). */
+function productToolRoutines(): readonly BuiltinRoutine[] {
+	return getProductToolRoutines(BUILTIN_ROUTINE_IDS);
+}
+
 export function getBuiltinRoutine(id: string): BuiltinRoutine | undefined {
-	return BUILTIN_ROUTINES.find((r) => r.id === id);
+	return (
+		BUILTIN_ROUTINES.find((r) => r.id === id) ?? productToolRoutines().find((r) => r.id === id)
+	);
 }
 
 export function getAllBuiltinRoutines(): BuiltinRoutine[] {
-	return BUILTIN_ROUTINES;
+	return [...BUILTIN_ROUTINES, ...productToolRoutines()];
 }
 
 export function getBuiltinCommandRoutines(): BuiltinRoutine[] {
@@ -412,7 +438,7 @@ export function getBuiltinSkillRoutines(): BuiltinRoutine[] {
 }
 
 export function getBuiltinToolRoutines(): BuiltinRoutine[] {
-	return BUILTIN_ROUTINES.filter((r) => r.type === "tool");
+	return getAllBuiltinRoutines().filter((r) => r.type === "tool");
 }
 
 /** Return every registry tool controlled by one built-in tool routine. */
@@ -422,5 +448,5 @@ export function getBuiltinToolNames(tool: BuiltinToolDef): string[] {
 
 /** Get all unique categories. */
 export function getBuiltinCategories(): string[] {
-	return [...new Set(BUILTIN_ROUTINES.map((r) => r.category))];
+	return [...new Set(getAllBuiltinRoutines().map((r) => r.category))];
 }
