@@ -88,6 +88,26 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "bash",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "Bash",
+			descriptionEn: "Shell commands — run a command in the workspace",
+			descriptionZh: "Shell 命令 — 在工作区内执行命令",
+		},
+	},
+	{
+		id: "write",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "Write",
+			descriptionEn: "Create or overwrite a file in the workspace",
+			descriptionZh: "新建或覆盖工作区内的文件",
+		},
+	},
+	{
 		id: "pipeline",
 		type: "tool",
 		category: "tools",

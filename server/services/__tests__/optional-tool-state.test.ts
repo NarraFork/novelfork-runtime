@@ -103,6 +103,26 @@ describe("resolveOptionalToolState", () => {
 		expect(result.state).toBe("not_loaded");
 	});
 
+	test("a fresh narrator loads none of Bash, Write, Terminal or Browser by default", async () => {
+		// Pin the global layer to the code defaults so this result does not depend on the
+		// machine's own settings file, then restore the whole layer exactly.
+		const saved = settings.routines;
+		settings.routines = { disabledRoutines: [], enabledRoutines: [], toolModes: {} };
+		try {
+			const narrator = await createStandaloneNarrator();
+			for (const toolName of ["Bash", "Write", "Terminal", "Browser"]) {
+				const result = await resolveOptionalToolState(narrator.id, toolName);
+				expect({ tool: toolName, state: result.state }).toEqual({
+					tool: toolName,
+					state: "not_loaded",
+				});
+				expect(result.globallyEnabled).toBe(false);
+			}
+		} finally {
+			settings.routines = saved;
+		}
+	});
+
 	test("persisted enabledTools makes it loaded without an active session", async () => {
 		const narrator = await createStandaloneNarrator();
 		await db

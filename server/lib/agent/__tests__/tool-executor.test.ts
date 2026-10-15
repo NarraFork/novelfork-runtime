@@ -2192,3 +2192,36 @@ describe("ExitPlanMode custom plan file resolution", () => {
 		}
 	});
 });
+
+describe("default-off tools at execution time", () => {
+	test("a default-off tool the model names without it being loaded does not run", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		const execute = mock(async () => ({ output: "executed" }));
+		toolRegistry.register({ name: "Bash", description: "test double", parameters: z.object({}), execute });
+		try {
+			const config = { ...makeConfig(async () => ({ behavior: "allow" })), toolFilter: () => false };
+			const result = await executeTool({ toolUseId: "default-off-unloaded", name: "Bash", input: {} }, config);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("not loaded");
+			expect(execute).not.toHaveBeenCalled();
+		} finally {
+			toolRegistry.unregister("Bash");
+		}
+	});
+
+	test("the same call runs once the routine is loaded", async () => {
+		const continuationRecords: Array<Record<string, unknown>> = [];
+		stubAdmissionPersistence(continuationRecords);
+		const execute = mock(async () => ({ output: "executed" }));
+		toolRegistry.register({ name: "Bash", description: "test double", parameters: z.object({}), execute });
+		try {
+			const config = { ...makeConfig(async () => ({ behavior: "allow" })), toolFilter: () => true };
+			const result = await executeTool({ toolUseId: "default-off-loaded", name: "Bash", input: {} }, config);
+			expect(result.output).toBe("executed");
+			expect(execute).toHaveBeenCalledTimes(1);
+		} finally {
+			toolRegistry.unregister("Bash");
+		}
+	});
+});

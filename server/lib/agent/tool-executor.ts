@@ -31,6 +31,7 @@ import {
 import { getProvider } from "./provider";
 import { isBashToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
+import { DEFAULT_OFF_TOOL_NAMES } from "./tools/default-off-tools";
 import { truncateOutput } from "./truncate";
 import type {
 	AgentConfig,
@@ -841,6 +842,16 @@ export async function executeTool(
 		if (!tool) {
 			return {
 				output: `Unknown tool: ${tu.name}`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
+		// A default-off tool stays out of the model's list (toolFilter); a name the model
+		// guesses must not run it either.
+		if (DEFAULT_OFF_TOOL_NAMES.has(tu.name) && config.toolFilter && !config.toolFilter(tool)) {
+			return {
+				output: `${tu.name} is not loaded for this narrator. Load its routine first.`,
 				isError: true,
 				durationMs: 0,
 			};

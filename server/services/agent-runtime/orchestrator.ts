@@ -21,9 +21,10 @@ import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
+import { subagentMayUseDefaultOffTool } from "../../lib/agent/tools/default-off-tools";
 import {
 	KNOWLEDGE_KIND_DENY_CORE,
-	OPTIONAL_TOOLS,
+	isOptionalTool,
 	REVIEW_TOOLS,
 } from "../../lib/agent/tools/index";
 import { buildAttachedFilesHint } from "../../lib/attached-files";
@@ -1436,8 +1437,15 @@ export async function runAgentLoopUnlocked(
 					if (tool.name === "Skill" && active._blockedSkills.all) return false;
 					// Child custom allowlists are already narrowed by the shared policy.
 					// Primary session optional-tool loading is not another child deny list.
-					if (profile.kind === "subagent") return true;
-					if (OPTIONAL_TOOLS.has(tool.name)) {
+					if (profile.kind === "subagent") {
+						// Default-off tools need the parent to have them loaded; other tools keep
+						// the shared-policy rule. A review child's Bash is already held to a
+						// read-only ceiling by the permission gate, so it is not starved here.
+						if (profile.subagentType === "review" && tool.name === "Bash") return true;
+						const parentLoaded = activeNarrators.get(profile.parentNarratorId)?._enabledOptionalTools;
+						return subagentMayUseDefaultOffTool(tool.name, parentLoaded ?? new Set<string>());
+					}
+					if (isOptionalTool(tool.name)) {
 						return active._enabledOptionalTools.has(tool.name);
 					}
 					// Review tools: only available for review chapter narrators

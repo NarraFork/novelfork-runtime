@@ -8,6 +8,7 @@ import { browserTool } from "./browser";
 import { concludeReviewTool } from "./conclude-review";
 import { contextAskTool } from "./context-ask";
 import { dangerCancelTool, dangerConfirmTool } from "./danger-reflection";
+import { DEFAULT_OFF_TOOL_NAMES } from "./default-off-tools";
 import { editTool } from "./edit";
 import { evalTool } from "./eval";
 import {
@@ -88,6 +89,15 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["StartPipeline", startPipelineTool],
 	["ExtractPipeline", extractPipelineTool],
 ]);
+
+/**
+ * A tool is optional when it is in OPTIONAL_TOOLS or default-off; either way a narrator
+ * sees it only after its routine is loaded. Bash and Write stay in the core provider
+ * (materialized lazily) and are gated by name, so they never sit in this eager map.
+ */
+export function isOptionalTool(toolName: string): boolean {
+	return OPTIONAL_TOOLS.has(toolName) || DEFAULT_OFF_TOOL_NAMES.has(toolName);
+}
 
 /**
  * Knowledge Steward preload tool names live in a dependency-free leaf module so

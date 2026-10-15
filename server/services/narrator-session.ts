@@ -36,7 +36,8 @@ import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
 } from "../lib/agent/tools/behavior-fence-grant";
-import { OPTIONAL_TOOLS } from "../lib/agent/tools/index";
+import { subagentMayUseDefaultOffTool } from "../lib/agent/tools/default-off-tools";
+import { isOptionalTool } from "../lib/agent/tools/index";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type BooleanOverride,
@@ -5604,25 +5605,36 @@ async function reExecuteDeniedToolCallUnlocked(
 						all: active._blockedSkills.all,
 						names: [...active._blockedSkills.names],
 					},
-					toolFilter: isProductNarrator
-						? (tool) => {
-								if (active._disabledTools.has(tool.name)) return false;
-								if (
-									!isProductRuntimeToolVisible(
-										tool.name,
-										active,
-										narrator.permissionMode,
-										isPlanModeTrait(narrator.traits),
-									)
-								) {
-									return false;
-								}
-								if (OPTIONAL_TOOLS.has(tool.name)) {
-									return active._enabledOptionalTools.has(tool.name);
-								}
-								return true;
+					toolFilter: (tool) => {
+						if (isProductNarrator) {
+							if (active._disabledTools.has(tool.name)) return false;
+							if (
+								!isProductRuntimeToolVisible(
+									tool.name,
+									active,
+									narrator.permissionMode,
+									isPlanModeTrait(narrator.traits),
+								)
+							) {
+								return false;
 							}
-						: undefined,
+						}
+						// Same rule as the live loop: a default-off tool runs only when its
+						// routine is loaded for this narrator (or, for a child, its parent's).
+						if (isSubagent) {
+							// A review child's Bash stays under the read-only ceiling in the permission
+							// gate; the default-off gate does not also starve it (see the live loop).
+							if (narrator.subagentType === "review" && tool.name === "Bash") return true;
+							const parentLoaded = parentNarratorId
+								? activeNarrators.get(parentNarratorId)?._enabledOptionalTools
+								: undefined;
+							return subagentMayUseDefaultOffTool(tool.name, parentLoaded ?? new Set<string>());
+						}
+						if (isOptionalTool(tool.name)) {
+							return active._enabledOptionalTools.has(tool.name);
+						}
+						return true;
+					},
 					...buildTreeSnapshotExecutionHooks({
 						session: active,
 						narratorId,
@@ -8297,7 +8309,7 @@ export function collectSessionOptionalTools(
 	}
 	if (Array.isArray(persistedEnabledTools)) {
 		for (const toolName of persistedEnabledTools) {
-			if (typeof toolName === "string" && OPTIONAL_TOOLS.has(toolName)) enabled.add(toolName);
+			if (typeof toolName === "string" && isOptionalTool(toolName)) enabled.add(toolName);
 		}
 	}
 	return enabled;
@@ -8343,7 +8355,7 @@ async function loadNarratorRoutineContext(narratorId: string) {
  *   3. otherwise: a `resident` routine mode (project override before global), or
  *      persisted `enabledTools`
  *
- * Returns `unknown_tool` for names outside OPTIONAL_TOOLS.
+ * Returns `unknown_tool` for names outside the optional set.
  */
 export async function resolveOptionalToolState(
 	narratorId: string,
@@ -8363,7 +8375,7 @@ export async function resolveOptionalToolState(
 	/** The effective routine mode, when the tool belongs to a tool routine. */
 	mode?: ToolRoutineMode;
 }> {
-	if (!OPTIONAL_TOOLS.has(toolName)) {
+	if (!isOptionalTool(toolName)) {
 		return { state: "unknown_tool", globallyEnabled: false };
 	}
 
@@ -8419,7 +8431,7 @@ export async function loadOptionalTool(
 	narratorId: string,
 	toolName: string,
 ): Promise<"loaded" | "already_loaded" | "unknown_tool"> {
-	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
+	if (!isOptionalTool(toolName)) return "unknown_tool";
 
 	// Read current enabled tools from DB
 	const narrator = await db.query.narrators.findFirst({
@@ -8455,7 +8467,7 @@ export async function unloadOptionalTool(
 	narratorId: string,
 	toolName: string,
 ): Promise<"unloaded" | "not_loaded" | "unknown_tool"> {
-	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
+	if (!isOptionalTool(toolName)) return "unknown_tool";
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),

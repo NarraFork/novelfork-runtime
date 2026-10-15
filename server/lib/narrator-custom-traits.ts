@@ -7,7 +7,7 @@ import {
 	type SubagentPoolType,
 } from "@shared/subagent-model-policy";
 import { toolRegistry } from "./agent/tool-registry";
-import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "./agent/tools/index";
+import { isOptionalTool, REVIEW_TOOLS } from "./agent/tools/index";
 import type { ToolDefinition } from "./agent/types";
 import { parseTraits } from "./narrator-utils";
 import { getSubagentVisibleModels, resolveAllowedModelCandidateMatch, settings } from "./settings";
@@ -255,7 +255,7 @@ export function getConfigurableTools(): ToolMenuItem[] {
 
 function getToolCategory(tool: ToolDefinition): ToolMenuItem["category"] {
 	if (tool.name.startsWith("mcp__")) return "mcp";
-	if (OPTIONAL_TOOLS.has(tool.name)) return "optional";
+	if (isOptionalTool(tool.name)) return "optional";
 	if (REVIEW_TOOLS.has(tool.name)) return "review";
 	return "core";
 }

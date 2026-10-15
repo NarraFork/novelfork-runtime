@@ -788,6 +788,53 @@ describe("real shared orchestrator profile contract", () => {
 		expect(h.calls[0].config.toolFilter?.(write)).toBe(false);
 	});
 
+	test("a primary narrator's model is offered none of Bash, Write, Terminal or Browser until loaded", async () => {
+		// The real primary pass: nothing loaded, so the four default-off tools are filtered out
+		// of the list the model is offered, while an ordinary tool still passes.
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const h = fixture({ kind: "primary" }, [finished]);
+		expect((await h.run()).hasError).toBe(false);
+		const filter = h.calls[0].config.toolFilter;
+		const read = toolRegistry.get("Read");
+		if (!read || !filter) throw new Error("Read tool and a primary toolFilter are required");
+		expect(filter(read)).toBe(true);
+		for (const toolName of ["Bash", "Write", "Terminal", "Browser"]) {
+			const tool = toolRegistry.get(toolName);
+			if (!tool) throw new Error(`${toolName} must be registered for the check`);
+			expect({ tool: toolName, offered: filter(tool) }).toEqual({ tool: toolName, offered: false });
+		}
+	});
+
+	test("a review subagent keeps Bash for its read-only review even when its parent has not loaded it", async () => {
+		// The review follow-up is read-only by policy (narrator-permission enforces it), so its
+		// Bash must stay offered; the default-off gate must not starve the review of its tool.
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const base = profiles[1];
+		if (base.kind !== "subagent") throw new Error("Missing child profile");
+		const h = fixture({ ...base, subagentType: "review" }, [finished]);
+		expect((await h.run()).hasError).toBe(false);
+		const bash = toolRegistry.get("Bash");
+		const filter = h.calls[0].config.toolFilter;
+		if (!bash || !filter) throw new Error("Bash tool and a child toolFilter are required");
+		expect(filter(bash)).toBe(true);
+	});
+
+	test("a review subagent is still refused Write, Terminal and Browser when its parent has not loaded them", async () => {
+		// The exemption is Bash only: its read-only ceiling does not cover the other three tools.
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const base = profiles[1];
+		if (base.kind !== "subagent") throw new Error("Missing child profile");
+		const h = fixture({ ...base, subagentType: "review" }, [finished]);
+		expect((await h.run()).hasError).toBe(false);
+		const filter = h.calls[0].config.toolFilter;
+		if (!filter) throw new Error("A child toolFilter is required");
+		for (const toolName of ["Write", "Terminal", "Browser"]) {
+			const tool = toolRegistry.get(toolName);
+			if (!tool) throw new Error(`${toolName} must be registered for the check`);
+			expect({ tool: toolName, offered: filter(tool) }).toEqual({ tool: toolName, offered: false });
+		}
+	});
+
 	test("child stream reaches both audiences through the real event handler with different origin projection", async () => {
 		const ws = await import("../../websocket/narrator-ws");
 		const { processEvent } = await import("../narrator-event-handler");
