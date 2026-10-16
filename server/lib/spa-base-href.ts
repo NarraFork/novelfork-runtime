@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * spa-base-href.ts — Make the SPA's own asset references work at ANY mount prefix.
  *
@@ -161,6 +163,86 @@ function matchOutsideComments(html: string, pattern: RegExp): RegExpExecArray | 
  * re-derive it. Sharing the injector is what keeps the comment-awareness and the
  * replace-don't-append rule from existing in two versions.
  */
+/**
+ * Content-Security-Policy for the SPA document itself (T-11 / 安全 V15).
+ *
+ * Every directive below is pinned to something this app actually does, because a policy
+ * that is stricter than the app is a blank page and a policy that is looser than the app
+ * buys nothing:
+ *
+ * - `script-src 'self' 'wasm-unsafe-eval' blob:` — the own scripts are same-origin build
+ *   chunks; Shiki compiles an Emscripten module from an inlined base64 payload
+ *   (`WebAssembly.instantiate`; the bundle contains no `eval`), which Chromium refuses
+ *   without `'wasm-unsafe-eval'`; Monaco builds its worker bootstrap as a `blob:` URL.
+ * - the `sha256-…` entries — the served `index.html` boots the colour scheme and the
+ *   cached instance brand from inline scripts BEFORE any bundle loads. They are hashed
+ *   per response (see `inlineScriptHashes`) rather than pinned as a constant, because the
+ *   build minifies the shell: a hard-coded digest would silently stop matching the file it
+ *   is served from and take the theme with it.
+ * - `worker-src 'self' blob:` — Monaco's and the text-document workers, as above.
+ * - `style-src 'self' 'unsafe-inline'` — React `style=` attributes, the ghost-text
+ *   extension's injected `<style>`, and Mantine's runtime CSS variables.
+ * - `img-src` / `media-src` `data:` `blob:` — the noise texture inlined in the stylesheet,
+ *   pasted clipboard images, notification sounds decoded from a Blob URL, and `https:` for
+ *   images referenced from author/agent content.
+ * - `connect-src 'self' ws: wss:` — every API call plus same-origin SSE and the
+ *   `/ws/narrator` + `/ws/terminal` WebSockets.
+ * - `frame-src 'self' http: https:` — the browser/webview panel is an iframe pointed at a
+ *   URL the author types, so no fixed allow-list can describe it. Nothing else is relaxed:
+ *   `object-src`, `base-uri`, `form-action` and `frame-ancestors` stay locked down.
+ *
+ * Deliberately NOT set: `require-trusted-types-for 'script'` — it would break Monaco's
+ * policy-based worker bootstrap, and the win is marginal for a local single-user tool.
+ */
+export const SPA_CSP_DIRECTIVES = [
+	"default-src 'self'",
+	"script-src 'self' 'wasm-unsafe-eval' blob:",
+	"worker-src 'self' blob:",
+	"style-src 'self' 'unsafe-inline'",
+	"img-src 'self' data: blob: https:",
+	"font-src 'self' data:",
+	"media-src 'self' data: blob:",
+	"connect-src 'self' ws: wss:",
+	"frame-src 'self' http: https:",
+	"object-src 'none'",
+	"base-uri 'self'",
+	"form-action 'self'",
+	"frame-ancestors 'self'",
+] as const;
+
+/** The `script-src` token list without any inline-script hash. */
+export const SPA_SCRIPT_SRC = SPA_CSP_DIRECTIVES[1];
+
+/**
+ * The `sha256-…` hashes of every INLINE `<script>` in `html`.
+ *
+ * Inline scripts are otherwise blocked by `script-src 'self'`; hashing exactly the ones the
+ * document carries lets them run without opening the door to any other inline script. It is
+ * computed from the document actually being served, so it cannot drift from a build step
+ * that rewrites (minifies) the shell.
+ */
+export function inlineScriptHashes(html: string): string[] {
+	const hashes: string[] = [];
+	// `(?![^>]*\bsrc=)` keeps external <script src> out: they are covered by 'self'.
+	const pattern = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+	for (let match = pattern.exec(html); match; match = pattern.exec(html)) {
+		const body = match[1] ?? "";
+		if (!body.trim()) continue;
+		const digest = createHash("sha256").update(Buffer.from(body, "utf8")).digest("base64");
+		hashes.push(`'sha256-${digest}'`);
+	}
+	return hashes;
+}
+
+/** The full policy for a document, with the hashes of that document's inline scripts. */
+export function spaContentSecurityPolicy(inlineHashes: readonly string[] = []): string {
+	return SPA_CSP_DIRECTIVES
+		.map((directive) => (directive === SPA_SCRIPT_SRC && inlineHashes.length > 0
+			? `${directive} ${inlineHashes.join(" ")}`
+			: directive))
+		.join("; ");
+}
+
 export function setBaseHref(html: string, href: string): string {
 	const tag = `<base href="${href}">`;
 
@@ -185,12 +267,13 @@ export function injectSpaBaseHref(html: string, requestPath: string): string {
 }
 
 /** Both filesystem and embedded SPA responses use the same public-share privacy policy. */
-export function spaIndexHeaders(requestPath: string): Record<string, string> {
+export function spaIndexHeaders(requestPath: string, inlineHashes: readonly string[] = []): Record<string, string> {
 	const publicShare =
 		requestPath === "/shared/narrators" || requestPath.startsWith("/shared/narrators/");
 	return {
 		"Content-Type": "text/html; charset=utf-8",
 		"Cache-Control": publicShare ? "no-store" : "no-cache",
+		"Content-Security-Policy": spaContentSecurityPolicy(inlineHashes),
 		...(publicShare
 			? {
 					"Referrer-Policy": "no-referrer",

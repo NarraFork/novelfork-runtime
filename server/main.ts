@@ -52,7 +52,7 @@ import {
 } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
-import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
+import { injectSpaBaseHref, inlineScriptHashes, spaIndexHeaders } from "./lib/spa-base-href";
 import {
 	buildHealthPayload,
 	createStartupReadinessGate,
@@ -368,7 +368,9 @@ function getFrontendCacheControl(path: string): string {
 async function serveSpaIndex(indexFile: Bun.BunFile, requestPath: string): Promise<Response> {
 	const html = injectSpaBaseHref(await indexFile.text(), requestPath);
 	return new Response(html, {
-		headers: spaIndexHeaders(requestPath),
+		// Hashes are computed from the body actually being served: the build rewrites this
+		// file, so a pinned digest would stop matching the script it is meant to allow.
+		headers: spaIndexHeaders(requestPath, inlineScriptHashes(html)),
 	});
 }
 
