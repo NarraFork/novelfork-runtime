@@ -37,7 +37,13 @@ interface ProjectRoutinesModalProps {
 	onClose: () => void;
 }
 
-export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRoutinesModalProps) {
+interface ProjectRoutinesPanelProps {
+	projectId: string;
+	/** False keeps the panel mounted but silent, the same way a closed modal behaves. */
+	enabled: boolean;
+}
+
+export function ProjectRoutinesPanel({ projectId, enabled }: ProjectRoutinesPanelProps) {
 	const { t } = useTranslation("projects");
 	const { t: ts } = useTranslation("settings");
 	const { i18n } = useTranslation();
@@ -49,7 +55,7 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 		: (routinesCapability.reason ?? t("routinesUnsupportedDesc"));
 
 	const { data } = useProjectRoutines(
-		opened && routinesCapability.supported ? projectId : undefined,
+		enabled && routinesCapability.supported ? projectId : undefined,
 	);
 	const toggle = useToggleProjectRoutine(projectId);
 	const setToolMode = useSetProjectRoutineMode(projectId);
@@ -68,120 +74,132 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 	}, [data?.routines]);
 
 	return (
-		<Modal opened={opened} onClose={onClose} title={t("routinesTitle")} size="lg">
-			<Stack gap="md">
-				<Text size="sm" c="dimmed">
-					{t("routinesDesc")}
-				</Text>
+		<Stack gap="md">
+			<Text size="sm" c="dimmed">
+				{t("routinesDesc")}
+			</Text>
 
-				{routinesUnsupportedReason && (
-					<Alert color="yellow" variant="light" title={t("routinesUnsupportedTitle")}>
-						{routinesUnsupportedReason}
-					</Alert>
-				)}
+			{routinesUnsupportedReason && (
+				<Alert color="yellow" variant="light" title={t("routinesUnsupportedTitle")}>
+					{routinesUnsupportedReason}
+				</Alert>
+			)}
 
-				{routineGroups.map(({ category, routines }) => (
-					<Stack key={category} gap="xs">
-						<Text size="sm" fw={600} c="dimmed" tt="uppercase">
-							{ts(`routineCategory.${category}`, category)}
-						</Text>
-						{routines.map((routine) => {
-							// Tool routines get the three-position mode plus "follow global"; command
-							// and skill routines keep the original tri-state on/off.
-							const isTool = routine.type === "tool";
-							const modeOverride =
-								routine.modeOverride ??
-								(routine.override === "global"
-									? "global"
-									: routine.override === "enabled"
-										? "resident"
-										: "manual");
-							const globalMode: ToolRoutineMode =
-								routine.globalMode ?? (routine.globalEnabled ? "resident" : "manual");
-							return (
-								<Group key={routine.id} justify="space-between" wrap="nowrap" gap="sm">
-									<Stack gap={2} style={{ minWidth: 0, flex: 1 }}>
-										<Group gap="xs" wrap="nowrap">
-											<Badge
-												size="xs"
-												variant="light"
-												color={routine.type === "command" ? "indigo" : "teal"}
-											>
-												{ts(`routineType.${routine.type}`)}
-											</Badge>
-											<Text size="sm" fw={500} truncate>
-												{routine.type === "command"
-													? `/${routine.name}`
-													: routineDisplayName(routine, locale)}
-											</Text>
-											{isTool && modeOverride === "global" ? (
-												<Badge size="xs" variant="outline" color="gray">
-													{ts("routineGlobalMode", {
-														mode: ts(`toolMode.${globalMode}`),
-													})}
-												</Badge>
-											) : (
-												!routine.globalEnabled &&
-												routine.override === "global" && (
-													<Badge size="xs" variant="outline" color="gray">
-														{ts("routineGlobalOff")}
-													</Badge>
-												)
-											)}
-										</Group>
-										<Text size="xs" c="dimmed" truncate>
-											{pickLocalizedValue(
-												{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
-												locale,
-											)}
+			{routineGroups.map(({ category, routines }) => (
+				<Stack key={category} gap="xs">
+					<Text size="sm" fw={600} c="dimmed" tt="uppercase">
+						{ts(`routineCategory.${category}`, category)}
+					</Text>
+					{routines.map((routine) => {
+						// Tool routines get the three-position mode plus "follow global"; command
+						// and skill routines keep the original tri-state on/off.
+						const isTool = routine.type === "tool";
+						const modeOverride =
+							routine.modeOverride ??
+							(routine.override === "global"
+								? "global"
+								: routine.override === "enabled"
+									? "resident"
+									: "manual");
+						const globalMode: ToolRoutineMode =
+							routine.globalMode ?? (routine.globalEnabled ? "resident" : "manual");
+						return (
+							<Group key={routine.id} justify="space-between" wrap="nowrap" gap="sm">
+								<Stack gap={2} style={{ minWidth: 0, flex: 1 }}>
+									<Group gap="xs" wrap="nowrap">
+										<Badge
+											size="xs"
+											variant="light"
+											color={routine.type === "command" ? "indigo" : "teal"}
+										>
+											{ts(`routineType.${routine.type}`)}
+										</Badge>
+										<Text size="sm" fw={500} truncate>
+											{routine.type === "command"
+												? `/${routine.name}`
+												: routineDisplayName(routine, locale)}
 										</Text>
-										{isTool && routine.mode === "auto" && (
-											<Text size="xs" c="yellow.6">
-												{ts("toolModeAutoPending")}
-											</Text>
+										{isTool && modeOverride === "global" ? (
+											<Badge size="xs" variant="outline" color="gray">
+												{ts("routineGlobalMode", {
+													mode: ts(`toolMode.${globalMode}`),
+												})}
+											</Badge>
+										) : (
+											!routine.globalEnabled &&
+											routine.override === "global" && (
+												<Badge size="xs" variant="outline" color="gray">
+													{ts("routineGlobalOff")}
+												</Badge>
+											)
 										)}
-									</Stack>
-									{isTool ? (
-										<SegmentedControl
-											size="xs"
-											value={modeOverride}
-											disabled={!routinesCapability.supported}
-											onChange={(val) => {
-												if (!routinesCapability.supported) return;
-												const next = normalizeToolRoutineModeOverride(val);
-												if (!next || next === modeOverride) return;
-												setToolMode.mutate({ id: routine.id, mode: next });
-											}}
-											data={PROJECT_TOOL_MODE_VALUES.map((value) => ({
-												value,
-												label:
-													value === "global" ? t("routineFollowGlobal") : ts(`toolMode.${value}`),
-											}))}
-										/>
-									) : (
-										<SegmentedControl
-											size="xs"
-											value={routine.override}
-											disabled={!routinesCapability.supported}
-											onChange={(val) => {
-												if (!routinesCapability.supported) return;
-												const action = routineOverrideToAction(val);
-												if (!action) return;
-												toggle.mutate({ id: routine.id, action });
-											}}
-											data={[
-												{ label: t("routineFollowGlobal"), value: "global" },
-												{ label: ts("routineEnabled"), value: "enabled" },
-												{ label: ts("routineDisabled"), value: "disabled" },
-											]}
-										/>
+									</Group>
+									<Text size="xs" c="dimmed" truncate>
+										{pickLocalizedValue(
+											{ en: routine.descriptionEn, "zh-CN": routine.descriptionZh },
+											locale,
+										)}
+									</Text>
+									{isTool && routine.mode === "auto" && (
+										<Text size="xs" c="yellow.6">
+											{ts("toolModeAutoPending")}
+										</Text>
 									)}
-								</Group>
-							);
-						})}
-					</Stack>
-				))}
-			</Stack>
+								</Stack>
+								{isTool ? (
+									<SegmentedControl
+										size="xs"
+										value={modeOverride}
+										disabled={!routinesCapability.supported}
+										onChange={(val) => {
+											if (!routinesCapability.supported) return;
+											const next = normalizeToolRoutineModeOverride(val);
+											if (!next || next === modeOverride) return;
+											setToolMode.mutate({ id: routine.id, mode: next });
+										}}
+										data={PROJECT_TOOL_MODE_VALUES.map((value) => ({
+											value,
+											label:
+												value === "global" ? t("routineFollowGlobal") : ts(`toolMode.${value}`),
+										}))}
+									/>
+								) : (
+									<SegmentedControl
+										size="xs"
+										value={routine.override}
+										disabled={!routinesCapability.supported}
+										onChange={(val) => {
+											if (!routinesCapability.supported) return;
+											const action = routineOverrideToAction(val);
+											if (!action) return;
+											toggle.mutate({ id: routine.id, action });
+										}}
+										data={[
+											{ label: t("routineFollowGlobal"), value: "global" },
+											{ label: ts("routineEnabled"), value: "enabled" },
+											{ label: ts("routineDisabled"), value: "disabled" },
+										]}
+									/>
+								)}
+							</Group>
+						);
+					})}
+				</Stack>
+			))}
+		</Stack>
+	);
+}
+
+/**
+ * The project page keeps its modal; the embedding host renders the same panel inline,
+ * so the project-level routine surface has exactly one implementation.
+ */
+export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRoutinesModalProps) {
+	const { t } = useTranslation("projects");
+
+	return (
+		<Modal opened={opened} onClose={onClose} title={t("routinesTitle")} size="lg">
+			<ProjectRoutinesPanel projectId={projectId} enabled={opened} />
 		</Modal>
 	);
 }

@@ -93,6 +93,7 @@ import {
 } from "../../hooks/useSkills";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { useSettingsHostExtension } from "../../lib/settings-host-extension";
 import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
 import {
 	MCP_SECRET_KEEP_PLACEHOLDER,
@@ -1481,7 +1482,7 @@ const TOOL_ACCESS_OPTIONS = [
 	{ value: "custom", label: "Custom tool list" },
 ];
 
-const AVAILABLE_TOOLS = [
+const BUILTIN_SUBAGENT_TOOLS = [
 	"Read",
 	"Glob",
 	"Grep",
@@ -1516,6 +1517,11 @@ const emptyDraft: SubagentDraft = {
 };
 
 function CustomSubagentsTab() {
+	const hostSubagentTools = useSettingsHostExtension()?.subagentTools ?? [];
+	const availableSubagentTools = [
+		...BUILTIN_SUBAGENT_TOOLS,
+		...hostSubagentTools.filter((tool) => !BUILTIN_SUBAGENT_TOOLS.includes(tool)),
+	];
 	const { t } = useTranslation("routines");
 	const { data: subagents, isLoading } = useCustomSubagents();
 	const createMutation = useCreateCustomSubagent();
@@ -1689,7 +1695,7 @@ function CustomSubagentsTab() {
 								{t("subagentCustomTools")}
 							</Text>
 							<Group gap="xs">
-								{AVAILABLE_TOOLS.map((tool) => (
+								{availableSubagentTools.map((tool) => (
 									<Badge
 										key={tool}
 										size="sm"

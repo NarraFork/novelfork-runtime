@@ -2,7 +2,7 @@ import { normalizeLocale } from "@shared/i18n-locales";
 import { count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { narrators, userPreferences, users } from "../db/schema";
+import { narratorMessages, narrators, userPluginThemes, userPreferences, users } from "../db/schema";
 import { revokeUserSessions } from "../lib/auth";
 import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
 import { randomAvatarColor } from "../lib/avatar-colors";
@@ -244,6 +244,10 @@ adminRoutes.delete("/users/:id", async (c) => {
 	}
 
 	await prepareOAuthUserHardDeletion(id);
+	// 两处外键没有 ON DELETE：消息保留（属于叙述者），只去掉作者标记；插件主题启用记录随用户删除。
+	await db.update(narratorMessages).set({ createdBy: null }).where(eq(narratorMessages.createdBy, id));
+	await db.update(narratorMessages).set({ editedBy: null }).where(eq(narratorMessages.editedBy, id));
+	await db.delete(userPluginThemes).where(eq(userPluginThemes.userId, id));
 	const [deleted] = await db.delete(users).where(eq(users.id, id)).returning();
 	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
 	// Drop the existence cache immediately; otherwise the deleted user's token

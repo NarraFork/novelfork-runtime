@@ -22,6 +22,8 @@ type AnyPrefs = any;
 type AnyMutation = UseMutationResult<any, any, any, any>;
 
 export interface AppearanceSectionProps {
+	/** 嵌入它的产品自己管配色（如 NovelFork 书房主题）时为真：不再提供插件主题下拉框。 */
+	hidePluginThemes?: boolean;
 	userPrefs: AnyPrefs;
 	updateUserPref: AnyMutation;
 	oledMode: boolean;
@@ -108,6 +110,7 @@ function TypographyKnob({
 }
 
 export function AppearanceSection({
+	hidePluginThemes = false,
 	userPrefs,
 	updateUserPref,
 	oledMode,
@@ -147,7 +150,7 @@ export function AppearanceSection({
 				checked={oledMode}
 				onChange={(e) => setOledMode(e.currentTarget.checked)}
 			/>
-			{availableThemes.length > 0 && (
+			{!hidePluginThemes && availableThemes.length > 0 && (
 				<Select
 					label={t("pluginTheme")}
 					description={t("pluginThemeDesc")}

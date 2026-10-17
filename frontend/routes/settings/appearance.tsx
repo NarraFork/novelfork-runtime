@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { AppearanceSection } from "../../components/settings/AppearanceSection";
 import { useLocalNumberPref, useLocalPref } from "../../hooks/useLocalPref";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import { useSettingsHostExtension } from "../../lib/settings-host-extension";
 
 export const Route = createFileRoute("/settings/appearance")({
 	component: SettingsAppearancePage,
@@ -12,6 +13,8 @@ export const Route = createFileRoute("/settings/appearance")({
 
 function SettingsAppearancePage() {
 	const { t } = useTranslation("settings");
+	const hostExtension = useSettingsHostExtension();
+	const HostAppearanceSection = hostExtension?.AppearanceSection;
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPref = useUpdateUserPreferences();
 	const [oledMode, setOledMode] = useLocalPref("narrafork_oled");
@@ -37,7 +40,9 @@ function SettingsAppearancePage() {
 	return (
 		<Stack>
 			<Title order={3}>{t("appearanceSection")}</Title>
+			{HostAppearanceSection && <HostAppearanceSection />}
 			<AppearanceSection
+				hidePluginThemes={hostExtension?.hidePluginThemes === true}
 				userPrefs={userPrefs}
 				updateUserPref={updateUserPref}
 				oledMode={oledMode}

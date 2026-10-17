@@ -1,4 +1,10 @@
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import {
+	type SettingsHostPage,
+	settingsHostPagePath,
+	useSettingsHostExtension,
+	visibleSettingsHostGroups,
+} from "@frontend/lib/settings-host-extension";
 import { getSettingsNavGroups, type SettingsNavItem } from "@frontend/lib/settings-nav";
 import { Alert, Box, NavLink, Text } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
@@ -35,6 +41,7 @@ function MobileSettingsNav() {
 	// a second hand-maintained copy and silently dropped gateway / devices /
 	// execution-log; both surfaces must render from `settings-nav`.
 	const { personal, enhancements, instance } = getSettingsNavGroups();
+	const hostGroups = visibleSettingsHostGroups(useSettingsHostExtension(), isAdmin);
 
 	const renderNavItem = (item: SettingsNavItem) => (
 		<NavLink
@@ -43,6 +50,18 @@ function MobileSettingsNav() {
 			to={item.to}
 			label={t(item.labelKey)}
 			leftSection={<item.Icon size={20} />}
+			rightSection={<IconChevronRight size={16} stroke={1.5} />}
+			variant="subtle"
+		/>
+	);
+
+	const renderHostNavItem = (page: SettingsHostPage) => (
+		<NavLink
+			key={page.id}
+			component={Link}
+			to={settingsHostPagePath(page.id)}
+			label={page.label}
+			leftSection={<page.Icon size={20} />}
 			rightSection={<IconChevronRight size={16} stroke={1.5} />}
 			variant="subtle"
 		/>
@@ -59,6 +78,15 @@ function MobileSettingsNav() {
 				{t("enhancementsGroup")}
 			</Text>
 			{enhancements.map(renderNavItem)}
+
+			{hostGroups.map((group) => (
+				<Box key={group.id}>
+					<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+						{group.label}
+					</Text>
+					{group.pages.map(renderHostNavItem)}
+				</Box>
+			))}
 
 			{isAdmin && (
 				<>

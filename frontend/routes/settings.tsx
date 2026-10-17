@@ -10,10 +10,13 @@ import {
 	Transition,
 } from "@mantine/core";
 import { IconArrowLeft, IconShieldLock, IconWand } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
 import { InstanceSettingsProvider, useInstanceSettings } from "../hooks/useInstanceSettings";
+import { useUserPreferences } from "../hooks/useUserPreferences";
+import { SetupWizard } from "../components/settings/SetupWizard";
 import {
 	useSettingsFeatureCapability,
 	useSettingsValidationCapability,
@@ -25,6 +28,13 @@ import {
 	isAdminPath,
 	type SettingsNavItem,
 } from "../lib/settings-nav";
+import {
+	SETTINGS_HOST_PAGE_PREFIX,
+	type SettingsHostPage,
+	settingsHostPagePath,
+	useSettingsHostExtension,
+	visibleSettingsHostGroups,
+} from "../lib/settings-host-extension";
 
 export const Route = createFileRoute("/settings")({
 	component: SettingsLayout,
@@ -42,6 +52,11 @@ function SettingsLayout() {
 	const settingsValidation = useSettingsValidationCapability();
 	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const isAdmin = user?.role === "admin";
+	const queryClient = useQueryClient();
+	const { data: prefs } = useUserPreferences();
+	// 嵌入的设置页没有应用外壳，外壳里的向导守卫不会生效：这里对管理员直接换成向导，
+	// 与外壳的守卫同口径（只对管理员、未完成时拦截）。
+	const wizardPending = isAdmin && prefs?.setupWizardCompleted === false;
 	const openSetupWizard = () => {
 		window.dispatchEvent(new CustomEvent("narrafork:open-wizard"));
 	};
@@ -50,9 +65,17 @@ function SettingsLayout() {
 	// cannot appear on one surface and silently miss the other.
 	const { personal, enhancements, instance } = getSettingsNavGroups();
 	const allVisibleItems = getVisibleSettingsNavItems(isAdmin);
+	// Product-host groups (fork layer): rendered in the same sidebar, see settings-host-extension.
+	const hostGroups = visibleSettingsHostGroups(useSettingsHostExtension(), isAdmin);
 
 	// Find current page label for mobile back header
 	const currentItem = allVisibleItems.find((item) => pathname === item.to);
+	const currentHostPage = pathname.startsWith(SETTINGS_HOST_PAGE_PREFIX)
+		? hostGroups
+				.flatMap((group) => group.pages)
+				.find((page) => pathname === settingsHostPagePath(page.id))
+		: undefined;
+	const currentLabel = currentItem ? t(currentItem.labelKey) : currentHostPage?.label;
 
 	// Redirect non-admin users away from admin-only settings pages
 	if (user && !isAdmin && isAdminPath(pathname)) {
@@ -70,6 +93,31 @@ function SettingsLayout() {
 			variant="light"
 		/>
 	);
+
+	const renderHostNavItem = (page: SettingsHostPage) => {
+		const to = settingsHostPagePath(page.id);
+		return (
+			<NavLink
+				key={to}
+				component={Link}
+				to={to}
+				label={page.label}
+				leftSection={<page.Icon size={18} />}
+				active={pathname === to}
+				variant="light"
+			/>
+		);
+	};
+
+	if (wizardPending) {
+		return (
+			<SetupWizard
+				onClose={() => {
+					void queryClient.invalidateQueries({ queryKey: ["user-preferences"] });
+				}}
+			/>
+		);
+	}
 
 	return (
 		<InstanceSettingsProvider value={instanceSettings}>
@@ -106,6 +154,15 @@ function SettingsLayout() {
 							{t("enhancementsGroup")}
 						</Text>
 						{enhancements.map(renderNavItem)}
+
+						{hostGroups.map((group) => (
+							<Box key={group.id} data-settings-host-group={group.id}>
+								<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+									{group.label}
+								</Text>
+								{group.pages.map(renderHostNavItem)}
+							</Box>
+						))}
 
 						{isAdmin && (
 							<>
@@ -145,7 +202,7 @@ function SettingsLayout() {
 				{/* Main content column */}
 				<Box style={{ flex: 1, minWidth: 0 }}>
 					{/* Mobile: back button header (only on sub-pages, not on index) */}
-					{currentItem && (
+					{currentLabel && (
 						<Box
 							hiddenFrom="sm"
 							px="xs"
@@ -166,7 +223,7 @@ function SettingsLayout() {
 							>
 								<IconArrowLeft size={18} />
 								<Text size="sm" fw={500}>
-									{t(currentItem.labelKey)}
+									{currentLabel}
 								</Text>
 							</Link>
 						</Box>
