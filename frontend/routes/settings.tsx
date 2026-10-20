@@ -12,6 +12,7 @@ import {
 import { IconArrowLeft, IconShieldLock, IconWand } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { SetupWizard } from "../components/settings/SetupWizard";
 import { useCurrentUser } from "../hooks/useAuth";
@@ -58,13 +59,30 @@ function SettingsLayout() {
 	// 嵌入的设置页没有应用外壳，外壳里的向导守卫不会生效：这里只给嵌入模式挂向导。
 	// 独立版由 AuthenticatedAppLayout 放在导航栏里，在这里再挂一份会同时出现两个。
 	// 正文必须保留，否则「前往供应商设置」会被向导整页顶掉，供应商永远配不上。
+	const [wizardDismissed, setWizardDismissed] = useState(false);
+	const [wizardReopened, setWizardReopened] = useState(false);
 	const wizardPending =
-		settingsHostExtension !== null && isAdmin && prefs?.setupWizardCompleted === false;
+		settingsHostExtension !== null &&
+		isAdmin &&
+		(wizardReopened || (prefs?.setupWizardCompleted === false && !wizardDismissed));
+	// 嵌入版没有 AuthenticatedAppLayout 的监听器，侧栏和移动端「重新打开设置向导」
+	// 发出的 open-wizard 事件得在这里接住；独立版仍由导航栏那份处理。
+	useEffect(() => {
+		if (settingsHostExtension === null) return;
+		const handleOpenWizard = () => {
+			setWizardDismissed(false);
+			setWizardReopened(true);
+		};
+		window.addEventListener("narrafork:open-wizard", handleOpenWizard);
+		return () => window.removeEventListener("narrafork:open-wizard", handleOpenWizard);
+	}, [settingsHostExtension]);
 	// 移动端没有侧栏可放向导，仍在供应商页放行正文，让向导能走完这一步。
 	const mobileWizardPending = wizardPending && pathname !== "/settings/providers";
 	const renderSetupWizard = () => (
 		<SetupWizard
 			onClose={() => {
+				setWizardReopened(false);
+				setWizardDismissed(true);
 				void queryClient.invalidateQueries({ queryKey: ["user-preferences"] });
 			}}
 		/>
