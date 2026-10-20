@@ -54,11 +54,12 @@ function SettingsLayout() {
 	const isAdmin = user?.role === "admin";
 	const queryClient = useQueryClient();
 	const { data: prefs } = useUserPreferences();
-	// 嵌入的设置页没有应用外壳，外壳里的向导守卫不会生效：这里对管理员挂出向导，
-	// 与外壳的守卫同口径（只对管理员、未完成时拦截）。独立版把向导放在导航栏里，
-	// 正文仍可打开供应商页；这里也必须保留正文，否则「前往供应商设置」会被向导
-	// 整页顶掉，供应商永远配不上、向导也永远走不完。
-	const wizardPending = isAdmin && prefs?.setupWizardCompleted === false;
+	const settingsHostExtension = useSettingsHostExtension();
+	// 嵌入的设置页没有应用外壳，外壳里的向导守卫不会生效：这里只给嵌入模式挂向导。
+	// 独立版由 AuthenticatedAppLayout 放在导航栏里，在这里再挂一份会同时出现两个。
+	// 正文必须保留，否则「前往供应商设置」会被向导整页顶掉，供应商永远配不上。
+	const wizardPending =
+		settingsHostExtension !== null && isAdmin && prefs?.setupWizardCompleted === false;
 	// 移动端没有侧栏可放向导，仍在供应商页放行正文，让向导能走完这一步。
 	const mobileWizardPending = wizardPending && pathname !== "/settings/providers";
 	const renderSetupWizard = () => (
@@ -77,7 +78,7 @@ function SettingsLayout() {
 	const { personal, enhancements, instance } = getSettingsNavGroups();
 	const allVisibleItems = getVisibleSettingsNavItems(isAdmin);
 	// Product-host groups (fork layer): rendered in the same sidebar, see settings-host-extension.
-	const hostGroups = visibleSettingsHostGroups(useSettingsHostExtension(), isAdmin);
+	const hostGroups = visibleSettingsHostGroups(settingsHostExtension, isAdmin);
 
 	// Find current page label for mobile back header
 	const currentItem = allVisibleItems.find((item) => pathname === item.to);
