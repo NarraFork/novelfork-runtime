@@ -13,21 +13,15 @@ import { IconArrowLeft, IconShieldLock, IconWand } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
+import { SetupWizard } from "../components/settings/SetupWizard";
 import { useCurrentUser } from "../hooks/useAuth";
 import { InstanceSettingsProvider, useInstanceSettings } from "../hooks/useInstanceSettings";
-import { useUserPreferences } from "../hooks/useUserPreferences";
-import { SetupWizard } from "../components/settings/SetupWizard";
 import {
 	useSettingsFeatureCapability,
 	useSettingsValidationCapability,
 } from "../hooks/usePlatform";
+import { useUserPreferences } from "../hooks/useUserPreferences";
 import { APP_VIEWPORT_BOTTOM, SAFE_AREA_INSET_BOTTOM } from "../lib/safe-area";
-import {
-	getSettingsNavGroups,
-	getVisibleSettingsNavItems,
-	isAdminPath,
-	type SettingsNavItem,
-} from "../lib/settings-nav";
 import {
 	SETTINGS_HOST_PAGE_PREFIX,
 	type SettingsHostPage,
@@ -35,6 +29,12 @@ import {
 	useSettingsHostExtension,
 	visibleSettingsHostGroups,
 } from "../lib/settings-host-extension";
+import {
+	getSettingsNavGroups,
+	getVisibleSettingsNavItems,
+	isAdminPath,
+	type SettingsNavItem,
+} from "../lib/settings-nav";
 
 export const Route = createFileRoute("/settings")({
 	component: SettingsLayout,
@@ -54,9 +54,20 @@ function SettingsLayout() {
 	const isAdmin = user?.role === "admin";
 	const queryClient = useQueryClient();
 	const { data: prefs } = useUserPreferences();
-	// 嵌入的设置页没有应用外壳，外壳里的向导守卫不会生效：这里对管理员直接换成向导，
-	// 与外壳的守卫同口径（只对管理员、未完成时拦截）。
+	// 嵌入的设置页没有应用外壳，外壳里的向导守卫不会生效：这里对管理员挂出向导，
+	// 与外壳的守卫同口径（只对管理员、未完成时拦截）。独立版把向导放在导航栏里，
+	// 正文仍可打开供应商页；这里也必须保留正文，否则「前往供应商设置」会被向导
+	// 整页顶掉，供应商永远配不上、向导也永远走不完。
 	const wizardPending = isAdmin && prefs?.setupWizardCompleted === false;
+	// 移动端没有侧栏可放向导，仍在供应商页放行正文，让向导能走完这一步。
+	const mobileWizardPending = wizardPending && pathname !== "/settings/providers";
+	const renderSetupWizard = () => (
+		<SetupWizard
+			onClose={() => {
+				void queryClient.invalidateQueries({ queryKey: ["user-preferences"] });
+			}}
+		/>
+	);
 	const openSetupWizard = () => {
 		window.dispatchEvent(new CustomEvent("narrafork:open-wizard"));
 	};
@@ -109,16 +120,6 @@ function SettingsLayout() {
 		);
 	};
 
-	if (wizardPending) {
-		return (
-			<SetupWizard
-				onClose={() => {
-					void queryClient.invalidateQueries({ queryKey: ["user-preferences"] });
-				}}
-			/>
-		);
-	}
-
 	return (
 		<InstanceSettingsProvider value={instanceSettings}>
 			<Group
@@ -131,8 +132,8 @@ function SettingsLayout() {
 				<Box
 					component="nav"
 					data-settings-desktop-sidebar
-					w={220}
-					miw={220}
+					w={wizardPending ? 420 : 220}
+					miw={wizardPending ? 420 : 220}
 					style={{
 						borderRight: "1px solid var(--mantine-color-default-border)",
 						position: "sticky",
@@ -144,63 +145,74 @@ function SettingsLayout() {
 					}}
 					visibleFrom="sm"
 				>
-					<ScrollArea h={SETTINGS_SIDEBAR_HEIGHT} pr="xs">
-						<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="sm" pb={4}>
-							{t("personalGroup")}
-						</Text>
-						{personal.map(renderNavItem)}
+					{wizardPending ? (
+						<Box h={SETTINGS_SIDEBAR_HEIGHT}>{renderSetupWizard()}</Box>
+					) : (
+						<ScrollArea h={SETTINGS_SIDEBAR_HEIGHT} pr="xs">
+							<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="sm" pb={4}>
+								{t("personalGroup")}
+							</Text>
+							{personal.map(renderNavItem)}
 
-						<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
-							{t("enhancementsGroup")}
-						</Text>
-						{enhancements.map(renderNavItem)}
+							<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+								{t("enhancementsGroup")}
+							</Text>
+							{enhancements.map(renderNavItem)}
 
-						{hostGroups.map((group) => (
-							<Box key={group.id} data-settings-host-group={group.id}>
-								<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
-									{group.label}
-								</Text>
-								{group.pages.map(renderHostNavItem)}
-							</Box>
-						))}
+							{hostGroups.map((group) => (
+								<Box key={group.id} data-settings-host-group={group.id}>
+									<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+										{group.label}
+									</Text>
+									{group.pages.map(renderHostNavItem)}
+								</Box>
+							))}
 
-						{isAdmin && (
-							<>
-								<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
-									{t("instanceGroup")}
-								</Text>
-								{instance.map(renderNavItem)}
-								<NavLink
-									label={t("wizardReopen")}
-									leftSection={<IconWand size={18} />}
-									onClick={openSetupWizard}
-									variant="subtle"
-									mt="md"
-								/>
-							</>
-						)}
-						{!isAdmin && (
-							<>
-								<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
-									{t("instanceGroup")}
-								</Text>
-								<Alert
-									color="gray"
-									variant="light"
-									icon={<IconShieldLock size={18} />}
-									title={t("instanceAdminOnlyTitle")}
-									mx="sm"
-									mt={4}
-								>
-									<Text size="xs">{t("instanceAdminOnlyHint")}</Text>
-								</Alert>
-							</>
-						)}
-					</ScrollArea>
+							{isAdmin && (
+								<>
+									<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+										{t("instanceGroup")}
+									</Text>
+									{instance.map(renderNavItem)}
+									<NavLink
+										label={t("wizardReopen")}
+										leftSection={<IconWand size={18} />}
+										onClick={openSetupWizard}
+										variant="subtle"
+										mt="md"
+									/>
+								</>
+							)}
+							{!isAdmin && (
+								<>
+									<Text size="xs" fw={700} c="dimmed" tt="uppercase" px="sm" pt="md" pb={4}>
+										{t("instanceGroup")}
+									</Text>
+									<Alert
+										color="gray"
+										variant="light"
+										icon={<IconShieldLock size={18} />}
+										title={t("instanceAdminOnlyTitle")}
+										mx="sm"
+										mt={4}
+									>
+										<Text size="xs">{t("instanceAdminOnlyHint")}</Text>
+									</Alert>
+								</>
+							)}
+						</ScrollArea>
+					)}
 				</Box>
 
+				{/* Mobile: no sidebar to host the wizard, so it takes the content column. */}
+				{mobileWizardPending && (
+					<Box hiddenFrom="sm" h={SETTINGS_SIDEBAR_HEIGHT} style={{ flex: 1, minWidth: 0 }}>
+						{renderSetupWizard()}
+					</Box>
+				)}
+
 				{/* Main content column */}
-				<Box style={{ flex: 1, minWidth: 0 }}>
+				<Box visibleFrom={mobileWizardPending ? "sm" : undefined} style={{ flex: 1, minWidth: 0 }}>
 					{/* Mobile: back button header (only on sub-pages, not on index) */}
 					{currentLabel && (
 						<Box
