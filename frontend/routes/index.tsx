@@ -6,6 +6,7 @@ import { NeedsAttention } from "../components/dashboard/NeedsAttention";
 import { QuickActions } from "../components/dashboard/QuickActions";
 import { RecentNarrators } from "../components/dashboard/RecentNarrators";
 import { StatsRow } from "../components/dashboard/StatsRow";
+import { useBranding } from "../hooks/useBranding";
 
 export const Route = createFileRoute("/")({
 	component: DashboardPage,
@@ -13,11 +14,12 @@ export const Route = createFileRoute("/")({
 
 function DashboardPage() {
 	const { t } = useTranslation("dashboard");
+	const { name: brand } = useBranding();
 
 	return (
 		<Stack>
 			<div>
-				<Title>{t("welcome")}</Title>
+				<Title>{t("welcome", { brand })}</Title>
 				<Text c="dimmed">{t("subtitle")}</Text>
 			</div>
 

@@ -28,6 +28,7 @@ import {
 	useSsoExchange,
 	useSsoProviders,
 } from "../hooks/useAuth";
+import { useBranding } from "../hooks/useBranding";
 import { type ApiError, api, getToken } from "../lib/api";
 import {
 	isMfaChallenge,
@@ -137,6 +138,7 @@ function LoginPage() {
 	const ssoExchange = useSsoExchange();
 	const { data: ssoData } = useSsoProviders();
 	const { t, i18n } = useTranslation("common");
+	const { name: brand } = useBranding();
 
 	const passkeySupported = isPasskeySupported();
 	const ssoProviders = ssoData?.providers ?? [];
@@ -515,8 +517,8 @@ function LoginPage() {
 							</Stack>
 						) : needsSetup ? (
 							<>
-								<Alert color="blue" variant="light" title={t("firstUserSetupTitle")}>
-									<Text size="sm">{t("firstUserSetupDescription")}</Text>
+								<Alert color="blue" variant="light" title={t("firstUserSetupTitle", { brand })}>
+									<Text size="sm">{t("firstUserSetupDescription", { brand })}</Text>
 								</Alert>
 								{error && <Alert color="red">{error}</Alert>}
 								<TextInput

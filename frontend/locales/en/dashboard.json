@@ -1,5 +1,5 @@
 {
-	"welcome": "Welcome to NarraFork",
+	"welcome": "Welcome to {{brand}}",
 	"subtitle": "AI-powered collaborative programming platform.",
 	"viewProjects": "View Projects",
 	"activeProjects": "Active Projects",

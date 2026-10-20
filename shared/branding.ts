@@ -1,7 +1,7 @@
 /**
  * Per-instance branding: the instance name and icon accent colour.
  *
- * Exists because several NarraFork deployments are commonly open in one browser
+ * Exists because several NovelFork deployments are commonly open in one browser
  * (a work instance, a home instance, a test instance). When a window is not
  * focused — or the app is installed as a PWA — the tab title, the installed app
  * name and the icon are the ONLY things that distinguish them, and all three are
@@ -9,7 +9,7 @@
  *
  * Both fields are optional throughout. An unconfigured instance must keep working
  * exactly as before, so every entry point resolves absent/blank/invalid input to
- * the NarraFork defaults rather than erroring. That asymmetry is deliberate: the
+ * the NovelFork defaults rather than erroring. That asymmetry is deliberate: the
  * settings WRITE path validates strictly (an admin who typed a bad colour should
  * be told), while every READ path is forgiving (a bad stored value must never
  * cost the instance its icon).
@@ -20,9 +20,9 @@
  */
 
 /** Name used when no instance name is configured. */
-export const DEFAULT_BRAND_NAME = "NarraFork";
+export const DEFAULT_BRAND_NAME = "NovelFork";
 
-/** NarraFork indigo — the accent colour baked into the shipped icon assets. */
+/** The accent colour baked into the shipped icon assets. */
 export const DEFAULT_BRAND_ICON_COLOR = "#4c6ef5";
 
 /**
@@ -48,11 +48,11 @@ export interface ResolvedBranding {
 	/** Always a lowercase `#rrggbb` string. */
 	iconColor: string;
 	/**
-	 * True when either field differs from the NarraFork default.
+	 * True when either field differs from the NovelFork default.
 	 *
 	 * Drives two things: whether to request recoloured icons from the server
 	 * (skipping the request entirely for default installs), and whether to show
-	 * the "powered by NarraFork" line under a renamed header.
+	 * the "powered by NovelFork" line under a renamed header.
 	 */
 	customized: boolean;
 }

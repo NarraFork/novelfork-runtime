@@ -551,14 +551,14 @@ export interface NarraForkSettings {
 	 * title / app name / icon are the only distinguishing marks — and they are
 	 * identical across instances out of the box.
 	 *
-	 * Both fields are optional and blank means "use the NarraFork defaults"; see
+	 * Both fields are optional and blank means "use the NovelFork defaults"; see
 	 * `shared/branding.ts` for resolution and why every read path is forgiving.
 	 */
 	branding?: {
-		/** Instance display name. Blank/absent = "NarraFork". */
+		/** Instance display name. Blank/absent = "NovelFork". */
 		name?: string;
 		/**
-		 * Icon accent colour as `#rrggbb`. Absent = NarraFork indigo (#4c6ef5).
+		 * Icon accent colour as `#rrggbb`. Absent = the shipped indigo (#4c6ef5).
 		 * Drives the favicon, PWA icons and apple-touch-icon. Deliberately NOT the
 		 * manifest `theme_color`, which is the dark UI background rather than an
 		 * accent — see `server/routes/branding.ts`.

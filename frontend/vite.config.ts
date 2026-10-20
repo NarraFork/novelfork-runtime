@@ -484,8 +484,8 @@ function shikiRuntimeAssets(): Plugin {
 export default defineConfig(({ mode, command }) => {
 	const isDev = mode === "development";
 	const isServe = command === "serve";
-	const appName = isDev ? "NarraFork Dev" : "NarraFork";
-	const shortName = isDev ? "NarraFork Dev" : "NarraFork";
+	const appName = isDev ? "NovelFork Dev" : "NovelFork";
+	const shortName = isDev ? "NovelFork Dev" : "NovelFork";
 	let finalAppShellHtml: string | null = null;
 
 	return {

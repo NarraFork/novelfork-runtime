@@ -69,7 +69,7 @@ describe("parseHexColor", () => {
 });
 
 describe("resolveBranding", () => {
-	test("absent input resolves to the NarraFork defaults and is not customized", () => {
+	test("absent input resolves to the NovelFork defaults and is not customized", () => {
 		const resolved = resolveBranding(undefined);
 		expect(resolved).toEqual({
 			name: DEFAULT_BRAND_NAME,
@@ -79,10 +79,10 @@ describe("resolveBranding", () => {
 	});
 
 	test("a name equal to the default is not customized", () => {
-		// Storing "NarraFork" explicitly must not switch on the attribution line, which
-		// only exists to credit NarraFork when the name no longer says so.
-		expect(resolveBranding({ name: "NarraFork" }).customized).toBe(false);
-		expect(resolveBranding({ name: " NarraFork " }).customized).toBe(false);
+		// Storing the default name explicitly must not switch on the attribution line,
+		// which only exists to credit NovelFork when the name no longer says so.
+		expect(resolveBranding({ name: DEFAULT_BRAND_NAME }).customized).toBe(false);
+		expect(resolveBranding({ name: ` ${DEFAULT_BRAND_NAME} ` }).customized).toBe(false);
 	});
 
 	test("a colour equal to the default is not customized", () => {

@@ -25,6 +25,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBranding } from "../../hooks/useBranding";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
@@ -323,14 +324,15 @@ function StepIndicator({ current, total }: { current: number; total: number }) {
 
 function WelcomeStep() {
 	const { t } = useTranslation("settings");
+	const { name: brand } = useBranding();
 	return (
 		<Stack align="center" justify="center" gap="lg" py="xl">
 			<IconRocket size={48} color="var(--mantine-color-indigo-6)" />
 			<Title order={3} ta="center">
-				{t("wizardWelcomeTitle")}
+				{t("wizardWelcomeTitle", { brand })}
 			</Title>
 			<Text size="sm" c="dimmed" ta="center" maw={420}>
-				{t("wizardWelcomeDesc")}
+				{t("wizardWelcomeDesc", { brand })}
 			</Text>
 		</Stack>
 	);
@@ -343,10 +345,11 @@ function WelcomeStep() {
  */
 function DepsStep({ onDelegated }: { onDelegated: () => void }) {
 	const { t } = useTranslation("settings");
+	const { name: brand } = useBranding();
 	return (
 		<Stack gap="sm">
 			<Text size="sm" c="dimmed">
-				{t("wizardDepsDesc")}
+				{t("wizardDepsDesc", { brand })}
 			</Text>
 			<Text size="xs" c="dimmed">
 				{t("wizardDepsOptionalHint")}
@@ -358,6 +361,7 @@ function DepsStep({ onDelegated }: { onDelegated: () => void }) {
 
 function ProviderStep({ providerCount }: { providerCount: number }) {
 	const { t } = useTranslation("settings");
+	const { name: brand } = useBranding();
 	const navigate = useNavigate();
 
 	const handleGoToProviders = () => {
@@ -367,7 +371,7 @@ function ProviderStep({ providerCount }: { providerCount: number }) {
 	return (
 		<Stack gap="md">
 			<Text size="sm" c="dimmed">
-				{t("wizardProviderDesc")}
+				{t("wizardProviderDesc", { brand })}
 			</Text>
 			<Group>
 				{providerCount > 0 ? (
@@ -542,6 +546,7 @@ function NetworkStep({
 	onHostChange: (host: string) => void;
 }) {
 	const { t } = useTranslation("settings");
+	const { name: brand } = useBranding();
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -599,7 +604,7 @@ function NetworkStep({
 				<IconNetwork size={36} color="var(--mantine-color-indigo-6)" />
 			</Stack>
 			<Text size="sm" c="dimmed" ta="center">
-				{t("wizardNetworkDesc")}
+				{t("wizardNetworkDesc", { brand })}
 			</Text>
 			<SegmentedControl fullWidth value={mode} onChange={handleChange} data={segmentData} />
 			<Text size="xs" c="dimmed">

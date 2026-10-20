@@ -16,8 +16,8 @@ import type { NarraForkSettings } from "../../server/lib/settings/types";
 
 /** The manifest VitePWA generates, reduced to the fields under test. */
 const STATIC_MANIFEST = JSON.stringify({
-	name: "NarraFork",
-	short_name: "NarraFork",
+	name: "NovelFork",
+	short_name: "NovelFork",
 	description: "AI-powered collaborative programming with narrative forking",
 	start_url: "/",
 	display: "standalone",
@@ -59,7 +59,7 @@ describe("brandManifestJson", () => {
 		expect(manifest.short_name).toBe("Work Instance");
 	});
 
-	test("uses the NarraFork default when no name is configured", () => {
+	test("uses the default when no name is configured", () => {
 		const manifest = brand(undefined);
 		expect(manifest.name).toBe(DEFAULT_BRAND_NAME);
 		expect(manifest.short_name).toBe(DEFAULT_BRAND_NAME);

@@ -1,5 +1,5 @@
 /**
- * The instance name, with a "powered by NarraFork" attribution line when it has
+ * The instance name, with a "powered by NovelFork" attribution line when it has
  * been customized.
  *
  * Shared by the app header (desktop and mobile variants) and the login page so the
@@ -44,7 +44,7 @@ export const BrandTitle = forwardRef<HTMLDivElement, BrandTitleProps>(function B
 ) {
 	const branding = useBranding();
 	// Attribution is tied to the NAME, not to `customized`: renaming is what removes
-	// "NarraFork" from view, whereas a recoloured icon leaves the name intact and
+	// "NovelFork" from view, whereas a recoloured icon leaves the name intact and
 	// needs no attribution line.
 	const renamed = branding.name !== DEFAULT_BRAND_NAME;
 
@@ -66,7 +66,7 @@ export const BrandTitle = forwardRef<HTMLDivElement, BrandTitleProps>(function B
 					ta={centered ? "center" : undefined}
 					style={{ lineHeight: 1, userSelect: "none", whiteSpace: "nowrap" }}
 				>
-					powered by NarraFork
+					powered by NovelFork
 				</Text>
 			)}
 		</Stack>

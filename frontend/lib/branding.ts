@@ -9,7 +9,7 @@
  *     from event handlers rather than components.
  *
  * The localStorage mirror exists to kill the first-paint flash. `/api/branding` is
- * a network round trip, and until it resolves the tab would read "NarraFork" —
+ * a network round trip, and until it resolves the tab would read "NovelFork" —
  * which is precisely the ambiguity this feature removes. Last-known values are
  * applied synchronously on load and corrected when the response arrives. Same
  * pattern index.html already uses for the colour scheme.
@@ -75,7 +75,7 @@ function readStoredBranding(): ResolvedBranding {
 function writeStoredBranding(branding: ResolvedBranding): void {
 	try {
 		// The default name/colour are REMOVED rather than written, so clearing a
-		// custom brand actually clears the mirror; storing "NarraFork" would leave
+		// custom brand actually clears the mirror; storing "NovelFork" would leave
 		// index.html setting a title it did not need to set.
 		if (branding.name === DEFAULT_BRAND_NAME) {
 			localStorage.removeItem(BRAND_NAME_STORAGE_KEY);

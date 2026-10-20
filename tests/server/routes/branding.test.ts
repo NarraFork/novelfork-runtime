@@ -44,7 +44,7 @@ describe("GET /api/branding", () => {
 		expect(response.status).toBe(200);
 	});
 
-	test("returns the NarraFork defaults when nothing is configured", async () => {
+	test("returns the NovelFork defaults when nothing is configured", async () => {
 		setBranding(undefined);
 		const body = await (await app.request("/api/branding")).json();
 		expect(body).toEqual({
