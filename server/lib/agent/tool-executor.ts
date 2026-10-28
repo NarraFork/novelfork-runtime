@@ -29,6 +29,7 @@ import {
 	isPipelineControlTool,
 } from "./pipeline-state";
 import { getProvider } from "./provider";
+import { createToolGenerateText } from "./tool-generate-text";
 import { isBashToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
 import { DEFAULT_OFF_TOOL_NAMES } from "./tools/default-off-tools";
@@ -1227,75 +1228,11 @@ export async function executeTool(
 			model: config.model,
 			pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,
 			locale: config.locale ?? "en",
-			generateText: async (request) => {
-				const provider = getProvider(config.provider);
-				const systemParts: string[] = [];
-				const transcript: Array<{ role: "user" | "assistant"; content: string }> = [];
-				for (const message of request.messages) {
-					if (message.role === "system") {
-						systemParts.push(message.content);
-						continue;
-					}
-					transcript.push({ role: message.role, content: message.content });
-				}
-				const systemInstruction = systemParts.join("\n\n").trim();
-				const lastUserIndex = (() => {
-					for (let i = transcript.length - 1; i >= 0; i -= 1) {
-						if (transcript[i]?.role === "user") return i;
-					}
-					return -1;
-				})();
-				const userContent =
-					lastUserIndex >= 0
-						? transcript
-								.slice(lastUserIndex)
-								.filter((item) => item.role === "user")
-								.map((item) => item.content)
-								.join("\n\n")
-						: transcript.map((item) => item.content).join("\n\n");
-				const historyPrefix = transcript
-					.slice(0, Math.max(lastUserIndex, 0))
-					.map((item) => `${item.role === "assistant" ? "Assistant" : "User"}: ${item.content}`)
-					.join("\n\n");
-				const content = historyPrefix
-					? `${historyPrefix}\n\nUser: ${userContent}`
-					: userContent || transcript.map((item) => item.content).join("\n\n");
-				const generateOptions = {
-					signal: config.signal,
-					...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
-				};
-				if (provider.generateWithHistoryWithMeta) {
-					const result = await provider.generateWithHistoryWithMeta(
-						systemInstruction || "You are a helpful writing assistant.",
-						content || " ",
-						config.model,
-						config.locale,
-						generateOptions,
-					);
-					return {
-						text: result.text,
-						usage: result.usage
-							? {
-									promptTokens: result.usage.inputTokens,
-									completionTokens: result.usage.outputTokens,
-									totalTokens:
-										typeof result.usage.inputTokens === "number" &&
-										typeof result.usage.outputTokens === "number"
-											? result.usage.inputTokens + result.usage.outputTokens
-											: undefined,
-								}
-							: undefined,
-					};
-				}
-				const text = await provider.generateWithHistory(
-					systemInstruction || "You are a helpful writing assistant.",
-					content || " ",
-					config.model,
-					config.locale,
-					generateOptions,
-				);
-				return { text };
-			},
+			generateText: createToolGenerateText(() => getProvider(config.provider), {
+				model: config.model,
+				signal: config.signal,
+				reasoningEffort: config.reasoningEffort,
+			}),
 			chapterId: config.chapterId,
 			planFileId: config.planFileId,
 			planFilePath: config.getPlanFilePathForTool?.(tu.toolUseId) ?? config.planFilePath,

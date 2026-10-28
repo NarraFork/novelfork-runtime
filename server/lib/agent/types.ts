@@ -131,6 +131,8 @@ export interface ToolContext {
 		maxTokens?: number;
 	}) => Promise<{
 		text: string;
+		/** The provider stopped at the output-token ceiling; `text` is partial. */
+		outputTruncated?: boolean;
 		usage?: {
 			promptTokens?: number;
 			completionTokens?: number;
