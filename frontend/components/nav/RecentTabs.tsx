@@ -2,14 +2,10 @@ import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import {
 	directoryRowId,
 	groupRecentTabsByDirectory,
+	hasDirectorySubtitle,
 	type RecentTabRow,
 } from "@frontend/hooks/recent-tab-directory-groups";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
-import {
-	getEffectiveNarratorDisplay,
-	type StatusShape,
-	statusRegistry,
-} from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
 import {
 	ActionIcon,
@@ -33,24 +29,18 @@ import type { RecentTabsDelta as RecentTabsDeltaFrame } from "@shared/recent-tab
 import {
 	IconArchive,
 	IconArrowUp,
-	IconBox,
 	IconBrain,
-	IconCheck,
 	IconClock,
 	IconColumns,
 	IconCopy,
-	IconExclamationMark,
 	IconFolder,
 	IconFolderPlus,
-	IconGitBranch,
-	IconMessageCircle,
-	IconMessageCircleFilled,
 	IconPencil,
 	IconPin,
 	IconPinnedOff,
 	IconPlus,
 	IconRobot,
-	IconShield,
+	IconServer,
 	IconSubtask,
 	IconTerminal2,
 	IconWindowMaximize,
@@ -61,9 +51,11 @@ import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCollapsedTabDirectories } from "../../hooks/useCollapsedTabDirectories";
+import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
+import { useNarratorIsOptimizingPrompt } from "../../hooks/usePromptOptimizeTask";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
@@ -74,7 +66,6 @@ import {
 	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
 	collectRecentTabsDeltaFrame,
-	isRecentTabBackgroundActive,
 	normalizeRecentTabViewers,
 	pruneRecentTabsRuntimeVersions,
 	type RecentTab,
@@ -99,9 +90,16 @@ import {
 	triggerNotification,
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
+import { LeftTruncatedPathText } from "../common/TruncatedPath";
+import {
+	CreateNarratorLazyModal,
+	preloadCreateNarratorModal,
+} from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
+import { NarratorStatusIcon } from "./NarratorStatusIcon";
+import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import type { RecentTabDropTarget } from "./recent-tab-drop-target";
@@ -118,116 +116,13 @@ import type { RecentTabDropTarget } from "./recent-tab-drop-target";
 import {
 	clampSwipeTravel,
 	classifySwipeRelease,
+	isBackgroundWorkSilencedStatus,
 	isTabActive,
 	SWIPE_THRESHOLD,
 } from "./recent-tabs-logic";
+import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
-
-const CreateNarratorModal = React.lazy(() =>
-	import("../narrator/CreateNarratorModal").then((m) => ({
-		default: m.CreateNarratorModal,
-	})),
-);
-
-const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
-
-function getRecentTabDisplaySubstatus(tab: RecentTab): string[] | undefined {
-	// Reasoning has its own corner marker in RecentTabs; don't let it override
-	// higher-level session states such as planning for the base icon color.
-	return tab.substatus?.includes("reasoning")
-		? tab.substatus.filter((tag) => tag !== "reasoning")
-		: tab.substatus;
-}
-
-function getRecentTabIconColor(tab: RecentTab): string | undefined {
-	const substatus = getRecentTabDisplaySubstatus(tab);
-	if (!tab.status && !substatus?.length) return undefined;
-	return statusRegistry.accentVar(getEffectiveNarratorDisplay(tab.status ?? "idle", substatus), 6);
-}
-
-/**
- * The state shape for a tab, or undefined when it has none.
- *
- * Derived from the registry rather than re-enumerated here, so a state that gains a
- * shape tomorrow is picked up automatically — the same contract `isFilledRecentTabStatus`
- * follows for `solidAccent`.
- */
-function getRecentTabShape(tab: RecentTab): StatusShape | undefined {
-	return getEffectiveNarratorDisplay(tab.status ?? "idle", getRecentTabDisplaySubstatus(tab)).shape;
-}
-
-/**
- * Tabler glyph per shape, drawn OVER the centre of the tab's own icon.
- *
- * ⚠️ Not a corner badge. These started as 11px corner dots holding a 7px glyph — the
- * same treatment the draft / reasoning / scheduled markers use — and at that size a
- * shield and an exclamation mark were simply not legible. A shape that cannot be
- * recognised carries no information, so it defeats the whole reason shape was introduced
- * (the palette having no distinguishable hue left; see `StatusShape`).
- *
- * Overlaying the centre buys roughly 2× the glyph size. It works for every tab type,
- * which a composed icon would not: Tabler ships `IconMessageCircleCheck` and
- * `…Exclamation`, but nothing for a shield, and no composed variants at all for the
- * git-branch / robot / users icons the other tab types use.
- */
-const SHAPE_MARKERS: Record<StatusShape, { Icon: typeof IconCheck }> = {
-	check: { Icon: IconCheck },
-	shield: { Icon: IconShield },
-	alert: { Icon: IconExclamationMark },
-};
-
-/**
- * How much of the host icon the knocked-out glyph occupies.
- *
- * Sized by what the host can hold, not by taste. The tabs render at 14–16px, so a glyph
- * kept "inside" the icon at ~58% came out around 8px — no better than the 7px corner badge
- * it replaced, which was rejected for being unreadable. At 0.62 it lands at 9–10px and a
- * shield is distinguishable from an exclamation mark, while still leaving a rim of the
- * bubble's colour so the hue keeps doing its grouping job.
- */
-const SHAPE_GLYPH_RATIO = 0.62;
-
-/**
- * Nudge, as a fraction of icon size, from the icon's geometric centre to the visual centre
- * of the message bubble's round body.
- *
- * Tabler's message-circle is not a centred disc: its body occupies roughly x/y 2.3–20 of
- * the 24-unit viewBox and the remaining bottom strip is the tail. Centring the glyph on the
- * box therefore pushes it down-right and it reads as misaligned. ~4% of the size back along
- * both axes puts it on the body.
- */
-const SHAPE_INK_OFFSET = 0.04;
-
-function isFilledRecentTabStatus(tab: RecentTab): boolean {
-	const display = getEffectiveNarratorDisplay(
-		tab.status ?? "idle",
-		getRecentTabDisplaySubstatus(tab),
-	);
-	// Hollow vs filled is this surface's "idle vs occupied" signal, so a state
-	// that owns a solid accent (e.g. waiting for a model) must fill too —
-	// otherwise it stays a hollow dot next to idle's hollow dot regardless of hue.
-	if (display.solidAccent) return true;
-	// A state that draws a SHAPE must fill too, for a hard reason rather than a stylistic
-	// one: `ShapeOverlay` knocks its glyph out in white, expecting a solid bubble of the
-	// state's colour behind it. On a hollow outline that white glyph would sit on the page
-	// background and disappear entirely.
-	if (display.shape) return true;
-	return (
-		tab.status === "working" ||
-		!!tab.substatus?.includes("planning") ||
-		!!tab.substatus?.includes("error") ||
-		!!tab.substatus?.includes("unread")
-	);
-}
-
-const CONTAINER_STATUS_I18N: Record<string, string> = {
-	running: "containerRunning",
-	paused: "containerPaused",
-	stopped: "containerStopped",
-	created: "containerCreated",
-	removed: "containerRemoved",
-};
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 
@@ -235,7 +130,6 @@ const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId ?? null;
 	// group tabs have no single narrator (multi-party)
 	return null;
 }
@@ -414,8 +308,9 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				event.activeBackgroundTaskCount !== undefined
 			) {
 				patch.activeBackgroundTaskCount = event.activeBackgroundTaskCount;
-			} else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
-			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
+				patch.activeBackgroundWorkCount = event.activeBackgroundWorkCount;
+				patch.activeBackgroundServiceCount = event.activeBackgroundServiceCount;
+			} else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
 			else if (event.type === "awaitedQuestion") {
 				// The subscription reconciles caches for ALL changes before this callback.
 				// Attention is separate: no synthetic status patch or urgency-gated refetch.
@@ -460,7 +355,11 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 							? "waiting"
 							: "unread";
 					setFaviconAlert(narratorId, alertKind);
-					if (userPrefsRef.current) {
+					// Done while non-service background work is still running: keep the
+					// in-app unread + favicon state, but stay silent (no sound, no PWA
+					// browser notification). The wake-up turn after the last background
+					// task completes emits a fresh, unflagged done which notifies normally.
+					if (!isBackgroundWorkSilencedStatus(event) && userPrefsRef.current) {
 						const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
 						if (tab) {
 							triggerNotification(
@@ -574,7 +473,7 @@ interface RecentTabListProps {
 
 /**
  * Renders a filtered subset of recent tabs with DnD, clear button, etc.
- * `filter="project"` shows project tabs; `filter="narrator"` shows chapter+narrator tabs.
+ * `filter="project"` shows project tabs; `filter="narrator"` shows narrator tabs.
  */
 export function RecentTabList({
 	filter,
@@ -624,14 +523,6 @@ export function RecentTabList({
 					gcTime: PREFETCH_QUERY_GC_TIME_MS,
 				});
 			}
-
-			if (tab.type === "chapter" && !qc.getQueryData(["chapters", tab.id])) {
-				void qc.prefetchQuery({
-					queryKey: ["chapters", tab.id],
-					queryFn: () => api.getChapter(tab.id),
-					gcTime: PREFETCH_QUERY_GC_TIME_MS,
-				});
-			}
 		},
 		[qc],
 	);
@@ -651,8 +542,14 @@ export function RecentTabList({
 
 	// Workspace "add narrator" modal state
 	const [wsCreateTarget, setWsCreateTarget] = useState<string | null>(null);
-	// "New narrator in this directory" modal state (cwd pre-filled from a tab)
-	const [newNarratorCwd, setNewNarratorCwd] = useState<string | null>(null);
+	// Open the shell before resolving cwd; only a resolved target mounts the form body.
+	const [newNarratorTarget, setNewNarratorTarget] = useState<{
+		narratorId: string;
+		cwd?: string;
+	} | null>(null);
+	const newNarratorTargetRef = useRef(newNarratorTarget);
+	newNarratorTargetRef.current = newNarratorTarget;
+	const newNarratorRequestRef = useRef(0);
 
 	const listBoxRef = useRef<HTMLDivElement | null>(null);
 	// Collapse is a user/view preference, never a temporary drag state.
@@ -791,26 +688,38 @@ export function RecentTabList({
 	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
 
 	/**
-	 * Resolve the on-disk directory a tab points at: a chapter's worktree, or a
-	 * narrator/subagent's cwd. Returns null when the tab has no directory
-	 * (workspace, project) or the lookup fails.
+	 * Resolve the on-disk directory a tab points at: its narrator's cwd. Returns null
+	 * when the tab has no
+	 * directory (workspace, project) or the lookup fails.
 	 */
-	const resolveTabDirectory = useCallback(async (tab: RecentTab): Promise<string | null> => {
-		try {
-			if (tab.type === "chapter") {
-				const chapter = await api.getChapter(tab.id);
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				return ((chapter as any)?.worktreePath as string | undefined) ?? null;
-			}
-			if (tab.type === "narrator" || tab.type === "subagent") {
-				const narrator = await api.getNarrator(tab.id);
+	const resolveTabDirectory = useCallback(
+		async (tabOrNarratorId: RecentTab | string): Promise<string | null> => {
+			try {
+				const narratorId =
+					typeof tabOrNarratorId === "string"
+						? tabOrNarratorId
+						: getRecentTabNarratorId(tabOrNarratorId);
+				if (!narratorId) return null;
+				// Directory actions must see cwd changes made in other windows, even with cached data.
+				const narrator = await qc.fetchQuery({
+					queryKey: ["narrators", narratorId],
+					queryFn: () => api.getNarrator(narratorId),
+					staleTime: 0,
+					gcTime: PREFETCH_QUERY_GC_TIME_MS,
+				});
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				return ((narrator as any)?.cwd as string | undefined) ?? null;
+			} catch {
+				return null;
 			}
-		} catch {
-			return null;
-		}
-		return null;
+		},
+		[qc],
+	);
+
+	const closeNewNarratorHere = useCallback(() => {
+		newNarratorRequestRef.current += 1;
+		newNarratorTargetRef.current = null;
+		setNewNarratorTarget(null);
 	}, []);
 
 	const handleNewNarratorHere = useCallback(async () => {
@@ -818,17 +727,32 @@ export function RecentTabList({
 		const { tab } = ctxMenu;
 		setCtxMenu(null);
 		if (!requireSetup()) return;
-		const dir = await resolveTabDirectory(tab);
-		if (!dir) {
+		const narratorId = getRecentTabNarratorId(tab);
+		if (!narratorId) {
 			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
 			return;
 		}
-		setNewNarratorCwd(dir);
-	}, [ctxMenu, requireSetup, resolveTabDirectory, t]);
+		const request = ++newNarratorRequestRef.current;
+		const target = { narratorId };
+		newNarratorTargetRef.current = target;
+		setNewNarratorTarget(target);
+		const dir = await resolveTabDirectory(narratorId);
+		if (request !== newNarratorRequestRef.current || newNarratorTargetRef.current !== target) {
+			return;
+		}
+		if (!dir) {
+			closeNewNarratorHere();
+			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+			return;
+		}
+		const resolved = { narratorId, cwd: dir };
+		newNarratorTargetRef.current = resolved;
+		setNewNarratorTarget(resolved);
+	}, [ctxMenu, requireSetup, resolveTabDirectory, closeNewNarratorHere, t]);
 
 	const handleNewNarratorHereCreated = useCallback(
 		(data: CreateNarratorResult) => {
-			setNewNarratorCwd(null);
+			closeNewNarratorHere();
 			addRecentTab({
 				type: "narrator",
 				id: data.id,
@@ -839,7 +763,7 @@ export function RecentTabList({
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
-		[navigate, onNavigate],
+		[navigate, onNavigate, closeNewNarratorHere],
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
@@ -854,13 +778,9 @@ export function RecentTabList({
 		setCtxMenu(null);
 		if (!revealAvailable) return;
 		try {
-			if (tab.type === "chapter") {
-				const chapter = await api.getChapter(tab.id);
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const wt = (chapter as any)?.worktreePath;
-				if (wt) await api.fsReveal(wt);
-			} else if (tab.type === "narrator") {
-				const narrator = await api.getNarrator(tab.id);
+			const narratorId = tab.type === "subagent" ? null : getRecentTabNarratorId(tab);
+			if (narratorId) {
+				const narrator = await api.getNarrator(narratorId);
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const cwd = (narrator as any)?.cwd;
 				if (cwd) await api.fsReveal(cwd);
@@ -870,7 +790,7 @@ export function RecentTabList({
 		}
 	}, [ctxMenu, revealAvailable]);
 
-	/** 复制工作目录到剪贴板（chapter/narrator/subagent） */
+	/** 复制工作目录到剪贴板（narrator/subagent） */
 	const handleCopyCwd = useCallback(async () => {
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
@@ -1321,12 +1241,10 @@ export function RecentTabList({
 							canReveal={revealAvailable && ctxMenu.tab.type !== "project"}
 							onNewNarratorHere={handleNewNarratorHere}
 							canNewNarratorHere={
-								ctxMenu.tab.type === "chapter" ||
-								ctxMenu.tab.type === "narrator" ||
-								ctxMenu.tab.type === "subagent"
+								ctxMenu.tab.type === "narrator" || ctxMenu.tab.type === "subagent"
 							}
 							onCopyCwd={handleCopyCwd}
-							canCopyCwd={["chapter", "narrator", "subagent"].includes(ctxMenu.tab.type)}
+							canCopyCwd={["narrator", "subagent"].includes(ctxMenu.tab.type)}
 							onOpenInWindow={handleOpenInWindow}
 							canOpenInWindow={recentTabWindowHref(ctxMenu.tab) !== null}
 							onRename={handleRename}
@@ -1339,6 +1257,7 @@ export function RecentTabList({
 								) === 0
 							}
 							isWorkspace={ctxMenu.tab.type === "workspace"}
+							gitIdentityNarratorId={ctxMenu.tab.type === "narrator" ? ctxMenu.tab.id : null}
 							t={t}
 						/>
 					)}
@@ -1389,25 +1308,18 @@ export function RecentTabList({
 							</Button>
 						</Group>
 					</Modal>
-					{wsCreateTarget !== null && (
-						<React.Suspense fallback={null}>
-							<CreateNarratorModal
-								opened={wsCreateTarget !== null}
-								onClose={() => setWsCreateTarget(null)}
-								onCreated={handleWsNarratorCreated}
-							/>
-						</React.Suspense>
-					)}
-					{newNarratorCwd !== null && (
-						<React.Suspense fallback={null}>
-							<CreateNarratorModal
-								opened={newNarratorCwd !== null}
-								initialCwd={newNarratorCwd}
-								onClose={() => setNewNarratorCwd(null)}
-								onCreated={handleNewNarratorHereCreated}
-							/>
-						</React.Suspense>
-					)}
+					<CreateNarratorLazyModal
+						opened={wsCreateTarget !== null}
+						onClose={() => setWsCreateTarget(null)}
+						onCreated={handleWsNarratorCreated}
+					/>
+					<CreateNarratorLazyModal
+						opened={newNarratorTarget !== null}
+						busy={newNarratorTarget?.cwd == null}
+						initialCwd={newNarratorTarget?.cwd}
+						onClose={closeNewNarratorHere}
+						onCreated={handleNewNarratorHereCreated}
+					/>
 				</Box>
 				{/* Keep preview rows outside the measured source container. */}
 				<DragOverlay dropAnimation={null} style={{ pointerEvents: "none" }}>
@@ -1418,88 +1330,46 @@ export function RecentTabList({
 	);
 }
 
-/**
- * Diagonally half-filled narrator bubble: FOREGROUND idle + background tasks running.
- *
- * The outline keeps the tab's foreground state colour; the filled upper-left triangle
- * uses working blue, because that is what the filled half means — work is still in
- * flight, just not in the foreground. Two stacked Tabler icons with a CSS clip-path:
- * Tabler ships no diagonal half glyph, and a rotated `IconCircleHalf2` would lose the
- * message-bubble shape this surface's whole state language is built on.
- */
-function HalfFilledNarratorBubble({ size, color }: { size: number; color?: string }) {
-	const fillColor = statusRegistry.accentVar(getEffectiveNarratorDisplay("working"), 6);
-	return (
-		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
-			<IconMessageCircle size={size} color={color} />
-			<Box
-				component="span"
-				data-tab-background-active="true"
-				style={{
-					position: "absolute",
-					inset: 0,
-					clipPath: "polygon(0 0, 100% 0, 0 100%)",
-					pointerEvents: "none",
-				}}
-			>
-				<IconMessageCircleFilled size={size} color={fillColor} />
-			</Box>
-		</Box>
-	);
-}
-
 /** Shared icon component for recent tabs — avoids duplicating icon logic across 4 components. */
-function TabIcon({
-	tab,
-	size,
-	iconColor,
-	filledStatus,
-}: {
-	tab: RecentTab;
-	size: number;
-	iconColor?: string;
-	filledStatus: boolean;
-}) {
-	let icon: React.ReactNode;
-	if (tab.type === "project") icon = <IconFolder size={size} />;
-	else if (tab.type === "workspace") icon = <IconColumns size={size} />;
-	else if (tab.type === "chapter") {
-		icon = (
-			<IconGitBranch size={size} color={iconColor} fill={filledStatus ? "currentColor" : "none"} />
-		);
-	} else if (tab.type === "subagent") icon = <IconRobot size={size} color={iconColor} />;
-	else {
-		// Hollow = idle, filled = something happened. A narrator whose FOREGROUND is
-		// idle while background tasks still run gets a diagonally half-filled bubble:
-		// the outline keeps the foreground state, the filled half (working blue) says
-		// the work has not actually stopped.
-		const backgroundActive = isRecentTabBackgroundActive(tab, filledStatus);
-		icon = filledStatus ? (
-			<IconMessageCircleFilled size={size} color={iconColor} />
-		) : backgroundActive ? (
-			<HalfFilledNarratorBubble size={size} color={iconColor} />
-		) : (
-			<IconMessageCircle size={size} color={iconColor} />
+function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconColor?: string }) {
+	// Read from the optimize registry, not from tab props: the request outlives the
+	// composer that started it, so the sidebar has to learn about it from the same
+	// place the request lives. `TabIcon` is a component (not a render helper) so a
+	// hook is legal here even though it is called per row.
+	const narratorId = tab.type === "narrator" ? getRecentTabNarratorId(tab) : null;
+	const isOptimizingPrompt = useNarratorIsOptimizingPrompt(narratorId);
+
+	// The narrator bubble is shared verbatim with the narrator list page — see
+	// `NarratorStatusIcon`. It owns its corner markers and the centre shape overlay.
+	if (tab.type === "narrator") {
+		return (
+			<NarratorStatusIcon
+				size={size}
+				status={tab.status}
+				substatus={tab.substatus}
+				activeBackgroundWorkCount={tab.activeBackgroundWorkCount}
+				activeBackgroundTaskCount={tab.activeBackgroundTaskCount}
+				hasDraft={tab.hasDraft}
+				isScheduled={tab.isScheduled}
+				isOptimizingPrompt={isOptimizingPrompt}
+			/>
 		);
 	}
 
-	const canShowMarker =
-		tab.type === "chapter" || tab.type === "narrator" || tab.type === "subagent";
+	let icon: React.ReactNode;
+	if (tab.type === "project") icon = <IconFolder size={size} />;
+	else if (tab.type === "workspace") icon = <IconColumns size={size} />;
+	else icon = <IconRobot size={size} color={iconColor} />;
+
+	// Corner markers remain for subagent rows. The centre state SHAPE (tick / shield /
+	// alert) does not: it is knocked out in white and needs the narrator bubble's solid
+	// body behind it — the robot glyph is a Tabler OUTLINE icon (stroke only, no closed
+	// shape), so a white glyph there would land on the page background and disappear.
+	const canShowMarker = tab.type === "subagent";
 	const showDraft = !!tab.hasDraft && canShowMarker;
 	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
 	const showScheduled = !!tab.isScheduled && canShowMarker;
-	// The state SHAPE (tick / shield / alert), knocked out of the middle of the icon. The
-	// palette had no hue left to distinguish these states (see `StatusShape`), so shape
-	// carries the difference instead.
-	//
-	// Restricted to the narrator bubble, and only once it is filled, because the glyph is
-	// white and supplies no body of its own — it needs solid colour behind it. The chapter
-	// and subagent icons are Tabler OUTLINE glyphs (git-branch, robot: stroke only, no
-	// closed shape), so a white glyph there would land on the page background and disappear.
-	// `IconGitBranch`'s `fill` only tints its three small nodes, which is not a body either.
-	const canShowShape = tab.type === "narrator" && filledStatus;
-	const shape = canShowShape ? getRecentTabShape(tab) : undefined;
-	if (!showDraft && !showReasoning && !showScheduled && !shape) return icon;
+	if (!showDraft && !showReasoning && !showScheduled) return icon;
 
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
@@ -1570,63 +1440,6 @@ function TabIcon({
 					<IconPencil size={7} stroke={2.5} />
 				</Box>
 			)}
-			{/* State shape, centred OVER the tab icon rather than tucked into a corner —
-			    see SHAPE_MARKERS on why a corner badge was too small to read. The three
-			    corner markers stay where they are; this one owns the middle.
-
-			    `needsBacking` is false only for the narrator bubble, the one tab type whose
-			    icon is a genuinely FILLED shape the white glyph can be cut out of. */}
-			{shape && <ShapeOverlay shape={shape} size={size} />}
-		</Box>
-	);
-}
-
-/**
- * The state shape, knocked out in WHITE from the middle of the tab's filled bubble.
- *
- * ── WHY THERE IS NO BACKGROUND HERE ───────────────────────────────────────────
- * Two earlier attempts went wrong in opposite directions, and both are worth recording
- * because the pull toward each is still there:
- *
- *  1. A 7px badge in the corner. Too small to tell a shield from an exclamation mark.
- *  2. A filled disc the full size of the icon. This one looked worse: the bubble's ink only
- *     covers about three quarters of its box (the rest is the tail and padding), so a
- *     full-size disc buried the bubble AND spilled past its edge — a blob stuck onto the
- *     tab rather than a symbol inside it. It also appeared off-centre, because the box
- *     centre is not the bubble's centre.
- *
- * What works is to add no body at all. The bubble is already solid in the state's colour
- * (`isFilledRecentTabStatus` guarantees it for any state carrying a shape), so the glyph is
- * cut out of the colour that is already there. Nothing to align, nothing to cover.
- *
- * `pointerEvents: none` because the whole icon is one click target; the glyph must not
- * become a dead spot in the middle of it.
- */
-function ShapeOverlay({ shape, size }: { shape: StatusShape; size: number }) {
-	const { Icon } = SHAPE_MARKERS[shape];
-	return (
-		<Box
-			component="span"
-			data-tab-shape={shape}
-			style={{
-				position: "absolute",
-				// Centre on the bubble's INK, not on the icon's box. Tabler's message-circle
-				// draws its round body in the upper-left of the viewBox and spends the bottom
-				// strip on the tail, so box-centre sits low and right of where the eye reads
-				// the centre. `SHAPE_INK_OFFSET` walks it back onto the body.
-				left: `calc(50% - ${(size * SHAPE_INK_OFFSET).toFixed(2)}px)`,
-				top: `calc(50% - ${(size * SHAPE_INK_OFFSET).toFixed(2)}px)`,
-				transform: "translate(-50%, -50%)",
-				display: "inline-flex",
-				// No disc of its own. The host bubble is already filled with the state's
-				// colour, so the glyph is knocked out OF it. Painting another circle here
-				// covered the bubble entirely and spilled past its ink, which read as a blob
-				// stuck on the tab rather than as a symbol inside it.
-				color: "var(--mantine-color-white)",
-				pointerEvents: "none",
-			}}
-		>
-			<Icon size={Math.round(size * SHAPE_GLYPH_RATIO)} stroke={3} />
 		</Box>
 	);
 }
@@ -1644,20 +1457,14 @@ function WorkspaceChildTab({
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
 }) {
 	const navigate = useNavigate();
-	const to =
-		tab.type === "chapter" && tab.narratorId
-			? `/narrators/${tab.narratorId}`
-			: `/narrators/${tab.id}`;
-	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus = isFilledRecentTabStatus(tab);
+	const to = `/narrators/${tab.id}`;
+	const iconColor = getNarratorStatusIconColor(tab);
 
 	return (
 		<NavLink
 			active={active}
 			label={<Text size="xs">{tab.title}</Text>}
-			leftSection={
-				<TabIcon tab={tab} size={14} iconColor={iconColor} filledStatus={filledStatus} />
-			}
+			leftSection={<TabIcon tab={tab} size={14} iconColor={iconColor} />}
 			onClick={() => {
 				onNavigate?.();
 				navigate({ to });
@@ -1695,24 +1502,14 @@ const DraggableWorkspaceChildTab = React.memo(function DraggableWorkspaceChildTa
 		id: tabSortId(tab),
 		disabled: drag.pending,
 	});
-	const to =
-		tab.type === "chapter" && tab.narratorId
-			? `/narrators/${tab.narratorId}`
-			: `/narrators/${tab.id}`;
+	const to = `/narrators/${tab.id}`;
 	const prefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 	return (
 		<div ref={setNodeRef} {...attributes} {...listeners} data-tab-sort-id={tabSortId(tab)}>
 			<NavLink
 				active={active}
 				label={<Text size="xs">{tab.title}</Text>}
-				leftSection={
-					<TabIcon
-						tab={tab}
-						size={14}
-						iconColor={getRecentTabIconColor(tab)}
-						filledStatus={isFilledRecentTabStatus(tab)}
-					/>
-				}
+				leftSection={<TabIcon tab={tab} size={14} iconColor={getNarratorStatusIconColor(tab)} />}
 				onClick={() => {
 					if (drag.consumeClick()) return;
 					prefetch();
@@ -1787,8 +1584,7 @@ function DragOverlayWorkspaceItem({
 /** Rendered in DragOverlay while a non-workspace tab is being dragged. */
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const { t } = useTranslation("common");
-	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus = isFilledRecentTabStatus(tab);
+	const iconColor = getNarratorStatusIconColor(tab);
 
 	return (
 		<div style={{ overflow: "hidden" }}>
@@ -1804,25 +1600,21 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 				}
 				description={
 					<>
-						{tab.subtitle && (
-							<Text
-								size="xs"
-								c="dimmed"
-								truncate
-								style={{
-									direction: tab.type === "narrator" ? "rtl" : undefined,
-									textAlign: "left",
-								}}
-							>
-								{tab.subtitle}
-							</Text>
-						)}
+						{tab.subtitle &&
+							(hasDirectorySubtitle(tab) ? (
+								// cwd: left-ellipsis + LTR isolation so the leading "/" stays put.
+								<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+							) : (
+								<Text size="xs" c="dimmed" truncate>
+									{tab.subtitle}
+								</Text>
+							))}
 						{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
 					</>
 				}
 				leftSection={
 					<span>
-						<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
+						<TabIcon tab={tab} size={16} iconColor={iconColor} />
 					</span>
 				}
 				styles={{
@@ -1901,13 +1693,10 @@ function TabItemBody({
 	const to =
 		tab.type === "project"
 			? `/projects/${tab.id}`
-			: tab.type === "chapter" && tab.narratorId
-				? `/narrators/${tab.narratorId}`
-				: tab.type === "workspace"
-					? `/narrators/workspace/${tab.id}`
-					: `/narrators/${tab.id}`;
-	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus = isFilledRecentTabStatus(tab);
+			: tab.type === "workspace"
+				? `/narrators/workspace/${tab.id}`
+				: `/narrators/${tab.id}`;
+	const iconColor = getNarratorStatusIconColor(tab);
 
 	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 
@@ -2086,19 +1875,16 @@ function TabItemBody({
 					}
 					description={
 						<>
-							{tab.subtitle && !hideSubtitle && (
-								<Text
-									size="xs"
-									c="dimmed"
-									truncate
-									style={{
-										direction: tab.type === "narrator" ? "rtl" : undefined,
-										textAlign: "left",
-									}}
-								>
-									{tab.subtitle}
-								</Text>
-							)}
+							{tab.subtitle &&
+								!hideSubtitle &&
+								(hasDirectorySubtitle(tab) ? (
+									// cwd: left-ellipsis + LTR isolation so the leading "/" stays put.
+									<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
+								) : (
+									<Text size="xs" c="dimmed" truncate>
+										{tab.subtitle}
+									</Text>
+								))}
 							{tab.type !== "project" && <TabIndicators tab={tab} t={t} />}
 						</>
 					}
@@ -2112,7 +1898,7 @@ function TabItemBody({
 								touchAction: "pan-y",
 							}}
 						>
-							<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
+							<TabIcon tab={tab} size={16} iconColor={iconColor} />
 						</span>
 					}
 					rightSection={
@@ -2122,7 +1908,12 @@ function TabItemBody({
 									size="xs"
 									variant="subtle"
 									onClick={(e: React.MouseEvent) => onWsAddClick(e, tab.id)}
-									onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
+									onPointerEnter={preloadCreateNarratorModal}
+									onFocus={preloadCreateNarratorModal}
+									onPointerDown={(e: React.PointerEvent) => {
+										e.stopPropagation();
+										preloadCreateNarratorModal();
+									}}
 								>
 									<IconPlus size={14} />
 								</ActionIcon>
@@ -2232,11 +2023,12 @@ interface TabIndicatorsProps {
 function TabIndicators({ tab, t }: TabIndicatorsProps) {
 	const viewerCount = tab.viewerCount ?? tab.viewers?.length ?? 0;
 	const hasViewers = viewerCount >= 2;
-	const hasContainer = tab.type === "chapter" && tab.containerStatus;
 	const hasTerminals = (tab.activeTerminalCount ?? 0) > 0;
-	const hasBackgroundTasks = (tab.activeBackgroundTaskCount ?? 0) > 0;
+	const workCount = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
+	const serviceCount = tab.activeBackgroundServiceCount ?? 0;
+	const hasBackgroundTasks = workCount > 0;
 
-	if (!hasViewers && !hasContainer && !hasTerminals && !hasBackgroundTasks) return null;
+	if (!hasViewers && !hasTerminals && !hasBackgroundTasks && !serviceCount) return null;
 
 	return (
 		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
@@ -2246,18 +2038,6 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 					viewerCount={viewerCount}
 					t={t}
 				/>
-			)}
-			{hasContainer && (
-				<Tooltip
-					label={t(CONTAINER_STATUS_I18N[tab.containerStatus as string] ?? "containerStopped")}
-					withArrow
-					position="right"
-				>
-					<IconBox
-						size={12}
-						color={mantineVar(statusRegistry.containerStatus(tab.containerStatus as string).color)}
-					/>
-				</Tooltip>
 			)}
 			{hasTerminals && (
 				<Tooltip
@@ -2275,14 +2055,28 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 			)}
 			{hasBackgroundTasks && (
 				<Tooltip
-					label={t("activeBackgroundTasks", { count: tab.activeBackgroundTaskCount })}
+					label={t("activeBackgroundTasks", { count: workCount })}
 					withArrow
 					position="right"
 				>
 					<Group gap={1} wrap="nowrap">
 						<IconSubtask size={11} style={{ opacity: 0.6, transform: "translateY(-1px)" }} />
 						<Text size="xs" c="dimmed" lh={1}>
-							{tab.activeBackgroundTaskCount}
+							{workCount}
+						</Text>
+					</Group>
+				</Tooltip>
+			)}
+			{serviceCount > 0 && (
+				<Tooltip
+					label={t("activeBackgroundServices", { count: serviceCount })}
+					withArrow
+					position="right"
+				>
+					<Group gap={1} wrap="nowrap">
+						<IconServer size={11} style={{ opacity: 0.6 }} />
+						<Text size="xs" c="dimmed" lh={1}>
+							{serviceCount}
 						</Text>
 					</Group>
 				</Tooltip>
@@ -2371,6 +2165,8 @@ interface TabContextMenuProps {
 	canArchive: boolean;
 	isFirst: boolean;
 	isWorkspace: boolean;
+	/** The narrator this tab stands for, when the per-narrator git identity pick applies. */
+	gitIdentityNarratorId: string | null;
 	t: (key: string) => string;
 }
 
@@ -2396,8 +2192,10 @@ function TabContextMenu({
 	canArchive,
 	isFirst,
 	isWorkspace,
+	gitIdentityNarratorId,
 	t,
 }: TabContextMenuProps) {
+	const gitIdentityVisibility = useGitIdentityVisibility();
 	return (
 		<>
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
@@ -2476,6 +2274,9 @@ function TabContextMenu({
 							</Group>
 						</UnstyledButton>
 					)}
+					{gitIdentityNarratorId && gitIdentityVisibility.contextMenu && (
+						<TabGitIdentityMenu narratorId={gitIdentityNarratorId} onClose={onClose} />
+					)}
 					{canReveal && (
 						<UnstyledButton px="xs" py={4} onClick={onReveal} style={{ borderRadius: 4 }}>
 							<Group gap={8} wrap="nowrap">
@@ -2483,9 +2284,17 @@ function TabContextMenu({
 								<Text size="sm">{t("revealInExplorer")}</Text>
 							</Group>
 						</UnstyledButton>
-					)}
+					)}{" "}
 					{canNewNarratorHere && (
-						<UnstyledButton px="xs" py={4} onClick={onNewNarratorHere} style={{ borderRadius: 4 }}>
+						<UnstyledButton
+							px="xs"
+							py={4}
+							onPointerEnter={preloadCreateNarratorModal}
+							onFocus={preloadCreateNarratorModal}
+							onPointerDown={preloadCreateNarratorModal}
+							onClick={onNewNarratorHere}
+							style={{ borderRadius: 4 }}
+						>
 							<Group gap={8} wrap="nowrap">
 								<IconFolderPlus size={14} />
 								<Text size="sm">{t("newNarratorHere")}</Text>

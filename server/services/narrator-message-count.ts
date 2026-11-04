@@ -31,14 +31,39 @@
  */
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessageRefs, narratorMessages } from "../db/schema";
+import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+
+const exactRefCounts = new Map<string, { version: number; count: number }>();
+const EXACT_COUNT_CACHE_LIMIT = 256;
 
 /** Exact number of message refs owned by one narrator. */
-export async function countNarratorMessageRefs(narratorId: string): Promise<number> {
-	const [row] = await db
-		.select({ count: sql<number>`count(*)` })
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, narratorId));
+export async function countNarratorMessageRefs(
+	narratorId: string,
+	messageVersion?: number,
+): Promise<number> {
+	const cached = exactRefCounts.get(narratorId);
+	if (messageVersion !== undefined && cached?.version === messageVersion) {
+		exactRefCounts.delete(narratorId);
+		exactRefCounts.set(narratorId, cached);
+		return cached.count;
+	}
+	// Count and version are observed in one statement; never seed a cache under
+	// a pre-await version or use the insert-only messageCount high-water mark.
+	const row = await db
+		.select({
+			version: narrators.messageVersion,
+			count: sql<number>`(SELECT count(*) FROM narrator_message_refs exact_refs
+			WHERE exact_refs.narrator_id = ${narratorId})`,
+		})
+		.from(narrators)
+		.where(eq(narrators.id, narratorId))
+		.get();
+	if (row && messageVersion !== undefined && row.version === messageVersion) {
+		exactRefCounts.delete(narratorId);
+		exactRefCounts.set(narratorId, { version: row.version, count: row.count });
+		if (exactRefCounts.size > EXACT_COUNT_CACHE_LIMIT)
+			exactRefCounts.delete(exactRefCounts.keys().next().value as string);
+	}
 	return row?.count ?? 0;
 }
 
@@ -71,6 +96,13 @@ export async function countNarratorMessageRefsBatch(
  * false as soon as the first turn makes a tool call, so the question is asked
  * directly instead: exactly one user-role message exists.
  *
+ * Only messages authored by THIS session count. A fork inherits the parent's
+ * prefix as shared refs whose message rows still belong to the parent
+ * (`narrator_messages.narrator_id` stays the parent's id — forking copies refs,
+ * never message rows, and lazy backfill adds more of the same). Without the
+ * ownership filter a forked narrator never looks like it is on its first turn,
+ * so its first post-fork message would never trigger title generation.
+ *
  * Bounded by `LIMIT 2` — the answer only depends on whether a second user
  * message exists, and stopping there keeps a long conversation cheap (1ms rather
  * than 79ms on a 31k-ref narrator).
@@ -80,7 +112,13 @@ export async function isFirstUserTurn(narratorId: string): Promise<boolean> {
 		.select({ id: narratorMessageRefs.id })
 		.from(narratorMessageRefs)
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-		.where(and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessages.role, "user")))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessages.role, "user"),
+				eq(narratorMessages.narratorId, narratorId),
+			),
+		)
 		.limit(2);
 	return rows.length <= 1;
 }

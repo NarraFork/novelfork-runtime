@@ -29,6 +29,7 @@ import { RenderInjectionBubble } from "./render/RenderInjectionBubble";
 import { RenderMarkdown } from "./render/RenderMarkdown";
 import { RenderMedia } from "./render/RenderMedia";
 import { RenderMessageBubble } from "./render/RenderMessageBubble";
+import { RenderModelTraceResult } from "./render/RenderModelTraceResult";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
@@ -119,7 +120,7 @@ export function resolveRenderExtra(spec: {
 			// Height-neutral: the header row is a fixed single line either way.
 			if ("speakerId" in data) extra.speakerId = data.speakerId;
 			// Where the speaker row navigates to (a child session, a knowledge entry, a
-			// Dynamic Spec file, a chapter). ONE tagged value rather than a field per kind,
+			// Dynamic Spec file). ONE tagged value rather than a field per kind,
 			// so the destinations stay mutually exclusive — see `injection-target.ts`.
 			// Kept separate from `speakerId`, which is the identicon seed and is set even
 			// for speakers with nowhere to go. Height-neutral: the header row is one fixed
@@ -170,6 +171,7 @@ export function resolveRenderExtra(spec: {
 			// The measured block already carries the full payload; only the live
 			// callbacks come through opts (mutations live outside vlist/).
 			if (spec.opts?.onResume) extra.onResume = spec.opts.onResume;
+			if (spec.opts?.onDismiss) extra.onDismiss = spec.opts.onDismiss;
 			break;
 		case "plan-card":
 			if (typeof data.label === "string") extra.label = data.label;
@@ -210,6 +212,8 @@ export function resolveRenderExtra(spec: {
 			// The takeover badge is height-neutral but PAINTED, so it must reach the
 			// renderer explicitly — the measure layer keeps only the geometry it needs.
 			if ("isTakenOver" in data) extra.isTakenOver = data.isTakenOver;
+			// Same paint-only forwarding for the live output counter badge.
+			if ("liveOutputChars" in data) extra.liveOutputChars = data.liveOutputChars;
 			if ("resultPreview" in data) extra.resultPreview = data.resultPreview;
 			if ("resultText" in data) extra.resultText = data.resultText;
 			// RenderSubagent reads the prompt body via `promptText` (not `prompt`).
@@ -416,6 +420,8 @@ export function renderElement(
 		}
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
+		case "modeltrace-result":
+			return <RenderModelTraceResult measured={m} />;
 		case "plan-card":
 			return (
 				<RenderPlanCard
@@ -428,11 +434,10 @@ export function renderElement(
 			return (
 				<RenderReviewCard
 					measured={m as never}
-					// Header chrome (verdict badge / revision marker / action label) is
-					// height-neutral: the measure pass reserved a constant header row, so this
-					// only decides what is painted in it.
+					// Header chrome (verdict badge / revision marker) is height-neutral: the
+					// measure pass reserved a constant header row, so this only decides what
+					// is painted in it.
 					data={extra.data as never}
-					actions={extra.reviewFeedbackActions as never}
 					truncatedLabel={extra.truncatedLabel as string | undefined}
 				/>
 			);
@@ -444,6 +449,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					pending={extra.askInPassingPending as AskInPassingPendingInteraction | undefined}
 					onOpen={extra.onOpenAskInPassingTarget as (() => void) | undefined}
+					quote={(extra.data as { quoteText?: string } | undefined)?.quoteText}
 				/>
 			);
 		case "subagent-recovery":
@@ -452,6 +458,7 @@ export function renderElement(
 					measured={m}
 					onToggleRow={extra.onToggleRow as ((rowIndex: number) => void) | undefined}
 					onResume={extra.onResume as ((mode: "notify" | "await") => void) | undefined}
+					onDismiss={extra.onDismiss as (() => void) | undefined}
 				/>
 			);
 		case "tool-call":
@@ -550,6 +557,7 @@ export function renderElement(
 					agentType={extra.agentType as string | undefined}
 					isBackground={extra.isBackground as boolean | undefined}
 					isTakenOver={extra.isTakenOver as boolean | undefined}
+					liveOutputChars={extra.liveOutputChars as number | undefined}
 					model={extra.model as string | undefined}
 					modelInheritance={extra.modelInheritance as SubagentModelInheritance | undefined}
 					reasoningEffort={extra.reasoningEffort as string | undefined}

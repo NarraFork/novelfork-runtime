@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -11,7 +12,12 @@ import { createMailboxStore } from "../agent-runtime/mailbox";
 import type { MailboxClaim, MailboxRow } from "../agent-runtime/mailbox-types";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+}));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 const { narratorPersistence } = await import("../narrator-persistence");
@@ -196,7 +202,7 @@ function enqueue(user = false) {
 				},
 	);
 	if (result.status !== "accepted") throw new Error(result.status);
-	const owner = getExecutionOwner("recipient") ?? tryClaimExecution("recipient", "primary");
+	const owner = getExecutionOwner("recipient") ?? tryClaimExecution("recipient", "run");
 	if (!owner) throw new Error("Test execution owner unavailable");
 	const row = store.claimBatch("recipient", { token: key, epoch: owner.epoch })[0] as MailboxRow;
 	const claim: MailboxClaim = {
@@ -355,7 +361,7 @@ test.each([
 	"user_input",
 	"task_notice",
 ] as const)("generic %s adoption survives a cold history build, while prepare/abort does not acknowledge", async (kind) => {
-	const owner = tryClaimExecution("recipient", "primary");
+	const owner = tryClaimExecution("recipient", "run");
 	if (!owner) throw new Error("Missing test owner");
 	const input = { narratorId: "recipient", text: "durable input", projectedByteSize: 13 };
 	const accepted = store.enqueue(
@@ -399,24 +405,14 @@ test.each([
 		},
 	];
 	const abortedHistory: unknown[] = [];
-	trackAgentMessageHistory(
-		"recipient",
-		abortedHistory,
-		candidates,
-		kind === "task_notice" ? input.text : undefined,
-	);
+	trackAgentMessageHistory("recipient", abortedHistory, candidates);
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
-	consumeAgentMessageHistory(abortedHistory, "unrelated replacement input");
+	consumeAgentMessageHistory(abortedHistory);
 	await Promise.resolve();
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
 	const coldHistory: unknown[] = [];
-	trackAgentMessageHistory(
-		"recipient",
-		coldHistory,
-		candidates,
-		kind === "task_notice" ? input.text : undefined,
-	);
-	consumeAgentMessageHistory(coldHistory, input.text);
+	trackAgentMessageHistory("recipient", coldHistory, candidates);
+	consumeAgentMessageHistory(coldHistory);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeString();
 	await markMailboxDeliveryConsumed({
@@ -505,7 +501,7 @@ test.each([
 		contentText: "edited third",
 		contentJson: [{ type: "text", text: "edited third" }],
 	});
-	consumeAgentMessageHistory(history2, "edited second");
+	consumeAgentMessageHistory(history2);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		currentRevision: 3,
@@ -521,7 +517,7 @@ test.each([
 			contentJson: [{ type: "text", text: "edited third" }],
 		},
 	]);
-	consumeAgentMessageHistory(history3, "edited third");
+	consumeAgentMessageHistory(history3);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		contentRevision: 1,
@@ -560,7 +556,7 @@ test("edited revision cannot be adopted through a fork COW or after recipient de
 			contentJson: [{ type: "text", text: "edited" }],
 		},
 	]);
-	consumeAgentMessageHistory(forkHistory, "edited");
+	consumeAgentMessageHistory(forkHistory);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
 	const recipientHistory: unknown[] = [];
@@ -573,7 +569,7 @@ test("edited revision cannot be adopted through a fork COW or after recipient de
 		},
 	]);
 	await messageService.deleteMessage("recipient", message.id, { skipRevert: true });
-	consumeAgentMessageHistory(recipientHistory, "edited");
+	consumeAgentMessageHistory(recipientHistory);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		receiptDisposition: "recipient_deleted",
@@ -637,7 +633,7 @@ test("fault after mailbox materialization rolls message/ref/mailbox back togethe
 test("released owner cannot materialize even while its persistent claim token remains valid", async () => {
 	const { row, claim } = enqueue();
 	getExecutionOwner("recipient")?.release();
-	const successor = tryClaimExecution("recipient", "primary");
+	const successor = tryClaimExecution("recipient", "run");
 	expect(successor?.epoch).not.toBe(claim.epoch);
 	await expect(persist(row, claim)).rejects.toThrow("Stale mailbox claim execution owner");
 	expect(ref(row.recipientMessageId as string)).toBeUndefined();
@@ -714,7 +710,7 @@ test("fork COW cannot acknowledge another recipient even with the same envelope"
 	trackAgentMessageHistory("fork", history, [
 		{ id: current, narratorId: "fork", role: "user", contentJson: content?.contentJson },
 	]);
-	consumeAgentMessageHistory(history, "original");
+	consumeAgentMessageHistory(history);
 	await markAgentMessageConsumed({
 		...delivery(row),
 		recipientNarratorId: "fork",

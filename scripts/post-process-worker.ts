@@ -1,27 +1,25 @@
 /**
  * Worker thread for post-processing a single platform binary.
- * Runs signing, SHA-512, zstd patch generation in an isolated thread
+ * Runs signing and SHA-512/full metadata generation in an isolated thread
  * so multiple platforms can be processed in true parallelism.
  *
  * Communication: parentPort.postMessage({ type: "log" | "done", ... })
  */
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	readFileSync,
-	readdirSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
-import { workerData, parentPort } from "node:worker_threads";
-import { generateZstdPatch } from "../server/lib/zstd-patch";
+import { parentPort, workerData } from "node:worker_threads";
+import {
+	type HelperDistributionDependencies,
+	parseHelperDistributionDependencies,
+} from "../shared/helper-distribution";
 import {
 	type BinaryMetadata,
 	computeBinaryMetadata,
 	formatMetadataJson,
 } from "./lib/binary-metadata";
+import { computeCiBinaryMetadata, runCiBuildCommand, signCiBinary } from "./lib/ci-build-strict";
 
 interface WorkerInput {
 	platform: { target: string; platformId: string; name: string };
@@ -29,12 +27,28 @@ interface WorkerInput {
 	root: string;
 	version: string;
 	commit: string;
+	repository: string;
+	helperDistribution: HelperDistributionDependencies;
+	recoveryManifestVersions?: readonly number[];
+	releaseCi?: boolean;
 }
 
-const { platform, distDir, root, version, commit } = workerData as WorkerInput;
+const {
+	platform,
+	distDir,
+	root,
+	version,
+	commit,
+	repository,
+	helperDistribution,
+	recoveryManifestVersions,
+	releaseCi = false,
+} = workerData as WorkerInput;
 
+if (!parentPort) throw new Error("Post-processing must run inside a worker");
+const port = parentPort;
 function log(message: string) {
-	parentPort!.postMessage({ type: "log", message });
+	port.postMessage({ type: "log", message });
 }
 
 // ---------------------------------------------------------------------------
@@ -94,58 +108,6 @@ function adHocSign(filePath: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Find previous version binary
-// ---------------------------------------------------------------------------
-
-function findPreviousVersionBinary(
-	currentName: string,
-	currentVersion: string,
-): { path: string; version: string } | null {
-	const versionedPrefix = `narrafork-${currentVersion}-`;
-	if (!currentName.startsWith(versionedPrefix)) return null;
-	const platformSuffix = currentName.slice(versionedPrefix.length);
-
-	const candidates: { version: string; path: string }[] = [];
-	const pattern = new RegExp(
-		`^narrafork-(\\d+\\.\\d+\\.\\d+)-${platformSuffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-	);
-
-	for (const name of readdirSync(distDir)) {
-		const m = name.match(pattern);
-		if (m && m[1] !== currentVersion) {
-			candidates.push({ version: m[1], path: join(distDir, name) });
-		}
-	}
-
-	if (candidates.length === 0) return null;
-
-	candidates.sort((a, b) => {
-		const pa = a.version.split(".").map(Number);
-		const pb = b.version.split(".").map(Number);
-		for (let i = 0; i < 3; i++) {
-			if (pa[i] !== pb[i]) return pb[i] - pa[i];
-		}
-		return 0;
-	});
-
-	const currentParts = currentVersion.split(".").map(Number);
-	for (const c of candidates) {
-		const parts = c.version.split(".").map(Number);
-		let isLess = false;
-		for (let i = 0; i < 3; i++) {
-			if (parts[i] < currentParts[i]) {
-				isLess = true;
-				break;
-			}
-			if (parts[i] > currentParts[i]) break;
-		}
-		if (isLess) return c;
-	}
-
-	return null;
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -153,7 +115,9 @@ const outfile = join(distDir, platform.name);
 const buildDate = new Date().toISOString();
 
 // 1. macOS signing (must happen before hashing so digests match the final file)
-if (platform.target.includes("darwin")) {
+if (releaseCi) {
+	await signCiBinary(platform.target, process.platform, outfile, runCiBuildCommand);
+} else if (platform.target.includes("darwin")) {
 	if (!adHocSign(outfile)) {
 		log(
 			`⚠ Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(root, outfile)}`,
@@ -162,56 +126,39 @@ if (platform.target.includes("darwin")) {
 }
 
 // 2. SHA-512 (kept for latest*.yml) + verifiable sidecar metadata
-const fileSha512 = createHash("sha512").update(readFileSync(outfile)).digest("base64");
-const fileSize = statSync(outfile).size;
+const metadataInput = {
+	version,
+	platformId: platform.platformId,
+	target: platform.target,
+	commit,
+	repository,
+	helperDistribution: parseHelperDistributionDependencies(helperDistribution),
+	recoveryManifestVersions,
+	buildDate,
+};
+const strictMetadata = releaseCi
+	? await computeCiBinaryMetadata(outfile, metadataInput)
+	: undefined;
+const fileSha512 =
+	strictMetadata?.sha512 ?? createHash("sha512").update(readFileSync(outfile)).digest("base64");
+const fileSize = strictMetadata?.size ?? statSync(outfile).size;
 
 let metadata: BinaryMetadata | undefined;
 try {
-	metadata = computeBinaryMetadata(outfile, {
-		version,
-		platformId: platform.platformId,
-		target: platform.target,
-		commit,
-		buildDate,
-	});
+	metadata = strictMetadata ?? computeBinaryMetadata(outfile, metadataInput);
 	const metadataPath = `${outfile}.metadata.json`;
 	writeFileSync(metadataPath, formatMetadataJson(metadata));
 	log(`✓ Metadata: ${relative(root, metadataPath)} (sha256 ${metadata.sha256.slice(0, 12)}…)`);
 } catch (err) {
+	if (releaseCi) throw err;
 	const message = err instanceof Error ? err.message : String(err);
 	log(`⚠ Metadata generation failed for ${platform.platformId}: ${message}`);
 }
 
-// 3. Zstd patch
-const prevBinary = findPreviousVersionBinary(platform.name, version);
-if (prevBinary) {
-	log(`→ Generating zstd patch from ${relative(root, prevBinary.path)}...`);
-	try {
-		const oldBuf = readFileSync(prevBinary.path);
-		const newBuf = readFileSync(outfile);
-
-		const { patch, meta } = generateZstdPatch(oldBuf, newBuf, {
-			fromVersion: prevBinary.version,
-			toVersion: version,
-		});
-
-		const patchPath = `${outfile}.zstd-patch`;
-		const metaPath = `${outfile}.zstd-patch.meta.json`;
-		writeFileSync(patchPath, patch);
-		writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-
-		const savings = ((1 - patch.length / newBuf.length) * 100).toFixed(1);
-		log(
-			`✓ Zstd patch: ${relative(root, patchPath)} (${(patch.length / 1024).toFixed(0)}KB, ${savings}% savings)`,
-		);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		log(`⚠ Zstd patch generation failed for ${platform.platformId}: ${message}`);
-	}
-} else {
-	log("ℹ No previous version found for zstd patch generation");
-}
-
+// 3. Full-only local build. Release CI assembles patches separately, once,
+// using verified original binaries from public GitHub Releases. A dist filename
+// is never evidence of a published base, and mirrors never generate patches.
+log("Full-only post-processing; canonical patches are generated by GitHub Release CI");
 // 4. Done — send latestYml back
 function getLatestYmlName(target: string): string {
 	if (target.includes("darwin")) return "latest-mac.yml";
@@ -226,4 +173,4 @@ const latestYml = {
 	file: { url: platform.name, size: fileSize, sha512: fileSha512 },
 };
 
-parentPort!.postMessage({ type: "done", latestYml, metadata });
+port.postMessage({ type: "done", latestYml, metadata });

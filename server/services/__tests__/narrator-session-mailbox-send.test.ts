@@ -1,14 +1,14 @@
-import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { asc, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
+import { cleanDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
 import type { RuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
 
-const { db, sqlite } = getTestDb();
-// This integration suite owns an in-memory database; importing the production
-// singleton here would start migrations and background upkeep before the mock.
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
 
 for (const statement of [
@@ -32,21 +32,18 @@ const providerCalls: string[] = [];
 let beforeResponse: ((params: ChatParams) => Promise<void>) | undefined;
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: rowsAsHistory,
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		// Queue assertions address the task text, not the sender projection. Keep
 		// the real request signal/model while exposing the anonymous human body
 		// to fixture gates that otherwise never recognize their starting task.
-		const content = params.content.replace(/^<sender kind="human" \/>\n/, "");
+		const content = requestInput(params).replace(/^<sender kind="human" \/>\n/, "");
 		providerCalls.push(content);
 		params.onRequestStart?.();
 		await beforeResponse?.({ ...params, content });
 		yield { text: "mailbox send turn ran" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -67,6 +64,9 @@ const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { bindRuntimeQueue } = await import("../agent-runtime/runtime-queue-port");
 const {
 	acceptUserMessage,
+	acquireNarratorRevertAdmission,
+	startBackgroundCompletionContinuationIfPossible,
+	startParentInboundContinuationIfPossible,
 	closeNarrator,
 	clearBufferedMessageSoftStopIfIdle,
 	ensureNarrator,
@@ -78,7 +78,11 @@ const { enqueueBufferedMessage, removeBufferedMessage, updateBufferedMessageMode
 	"../narrator-buffer"
 );
 const { narratorService } = await import("../narrator-service");
+const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
+const { compactLocks, pendingPermissions } = await import("../narrator-session-state");
+const { createAgentMessageDelivery } = await import("../agent-message-delivery");
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 
 const now = new Date().toISOString();
 
@@ -90,6 +94,12 @@ function seedNarrator(narratorId: string) {
 			variant: "primary",
 			traits: ["standalone"],
 			model: "openai:test-model",
+			// These fixtures intentionally exercise anonymous system execution, not an
+			// unknown principal (which the runtime correctly refuses to invent).
+			runtimeRegistrationJson: {
+				version: 1,
+				run: { logicalRunId: `fixture-${narratorId}`, principal: { userId: null } },
+			},
 			permissionMode: "bypassPermissions",
 			autoContinuationOverride: "off",
 			status: "idle",
@@ -98,6 +108,8 @@ function seedNarrator(narratorId: string) {
 			updatedAt: now,
 		})
 		.run();
+	// Direct SQL fixtures must publish the same entity-specific maintenance as production writes.
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 }
 
 function enqueueCancelledNotice(narratorId: string, index: number) {
@@ -139,10 +151,56 @@ async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void>
 	throw new Error("Timed out waiting for narrator loop");
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	providerCalls.length = 0;
 	beforeResponse = undefined;
+});
+
+afterEach(async () => {
+	await backgroundOccupancyStore.flush();
+});
+
+test.each([
+	[false, false],
+	[true, false],
+	// A delegated session queues and consumes input exactly like any other session.
+	[true, true],
+])("composer document persists atomically with accepted input (queued=%s, delegated=%s)", async (queued, delegated) => {
+	const narratorId = `composer-send-${queued}-${delegated}`;
+	seedNarrator(narratorId);
+	if (delegated) {
+		seedNarrator(`${narratorId}-caller`);
+		db.update(narrators)
+			.set({
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: `${narratorId}-caller`,
+			})
+			.where(eq(narrators.id, narratorId))
+			.run();
+	}
+	if (queued) await enqueueBufferedMessage(narratorId, "earlier");
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "text" as const, text: "rich 😀" }] }],
+		assets: [],
+	};
+	const result = await acceptUserMessage(narratorId, "rich 😀", { composerDocument: document });
+	if (!result.buffered) expect(result.userMsg).toMatchObject({ hasComposerDocument: true });
+	await waitForIdle(narratorId, queued ? 2 : 1);
+	const row = db
+		.select()
+		.from(narratorMessages)
+		.where(eq(narratorMessages.contentText, "rich 😀"))
+		.get();
+	expect(row?.composerDocument).toEqual(document);
+	expect(row?.contentJson).toEqual([{ type: "text", text: "rich 😀" }]);
+	expect(providerCalls.at(-1)).toBe("rich 😀");
+	closeNarrator(narratorId);
 });
 
 test("consumes earlier cancelled task notices before sending a new idle user input", async () => {
@@ -431,6 +489,98 @@ test("a live queued Bash does not hold admission and interrupt terminates its pr
 	}
 }, 10_000);
 
+test("interrupt terminates a running loop's pre-command Bash and is adopted in the same run", async () => {
+	const narratorId = "mailbox-loop-pre-bash";
+	seedNarrator(narratorId);
+	db.insert(users)
+		.values({ id: "pre-user", username: "pre-user", passwordHash: "unused", createdAt: now })
+		.run();
+	const { bashTool } = await import("../../lib/agent/tools/bash");
+	const { interruptManualBash } = await import("../narrator-service");
+	const oldStarted = Promise.withResolvers<void>();
+	const releaseOld = Promise.withResolvers<void>();
+	const bashStarted = Promise.withResolvers<AbortSignal>();
+	const bashStopped = Promise.withResolvers<void>();
+	const original = bashTool.execute;
+	const execute = spyOn(bashTool, "execute").mockImplementation(async (input, context) => {
+		try {
+			return await original(input, {
+				...context,
+				emitOutput: (output) => {
+					context.emitOutput?.(output);
+					if (String(output).includes("pre-ready")) bashStarted.resolve(context.signal);
+				},
+			});
+		} finally {
+			bashStopped.resolve();
+		}
+	});
+	let ownerAtUrgent: unknown;
+	beforeResponse = async (params) => {
+		if (params.content === "old task") {
+			oldStarted.resolve();
+			await releaseOld.promise;
+		}
+		if (params.content === "urgent input") ownerAtUrgent = getExecutionOwner(narratorId);
+	};
+	async function within<T>(promise: Promise<T>): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				promise,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(new Error("Pre-command settlement timed out")), 2000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+	try {
+		await acceptUserMessage(narratorId, "old task");
+		await within(oldStarted.promise);
+		const owner = getExecutionOwner(narratorId);
+		// An ordinary next step with a pre-command: the live loop adopts it and runs the
+		// Bash as its current activity.
+		expect(
+			await acceptUserMessage(narratorId, "after pre", {
+				userId: "pre-user",
+				preBashCommand: "printf pre-ready; sleep 300",
+			}),
+		).toMatchObject({ buffered: true });
+		releaseOld.resolve();
+		const signal = await within(bashStarted.promise);
+		expect(signal.aborted).toBe(false);
+		expect(getExecutionOwner(narratorId)).toBe(owner);
+
+		expect(
+			await within(acceptUserMessage(narratorId, "urgent input", { interrupt: true })),
+		).toMatchObject({ buffered: true });
+		expect(signal.aborted).toBe(true);
+		await within(bashStopped.promise);
+
+		const deadline = Date.now() + 3_000;
+		while (!providerCalls.includes("urgent input") && Date.now() < deadline) await Bun.sleep(10);
+		expect(providerCalls[0]).toBe("old task");
+		expect(providerCalls).toContain("urgent input");
+		// Same run: the owner that ran the old task adopted the urgent input.
+		expect(ownerAtUrgent).toBe(owner);
+		expect(
+			db
+				.select({ reason: narrators.lastStopReason })
+				.from(narrators)
+				.where(eq(narrators.id, narratorId))
+				.get()?.reason,
+		).not.toBe("user_interrupt");
+	} finally {
+		releaseOld.resolve();
+		interruptManualBash(narratorId);
+		closeNarrator(narratorId);
+		await within(bashStopped.promise).catch(() => {});
+		execute.mockRestore();
+	}
+}, 10_000);
+
 test("control idle settlement excludes concurrent admission until its idle write commits", async () => {
 	const narratorId = "mailbox-control-settle-race";
 	seedNarrator(narratorId);
@@ -537,6 +687,7 @@ test("a stale control finalizer cannot settle or release a replacement epoch", a
 		replacement = tryClaimExecution(narratorId, "tool-replay");
 		expect(replacement).not.toBeNull();
 		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, narratorId));
+		backgroundOccupancyStore.refreshNarrator(narratorId);
 		finish.resolve();
 		await completion;
 		expect(getExecutionOwner(narratorId)).toBe(replacement ?? undefined);
@@ -666,6 +817,7 @@ test.each([
 			.set({ traits: ["standalone", "plan"] })
 			.where(eq(narrators.id, narratorId))
 			.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
 	for (let index = 0; index < 25; index++) enqueueCancelledNotice(narratorId, index);
 	const result = await acceptUserMessage(narratorId, "continue after the notice backlog");
 	expect(result).toMatchObject({ buffered: true });
@@ -680,6 +832,301 @@ test.each([
 	expect(rows.every((row) => row.state === "materialized")).toBe(true);
 	closeNarrator(narratorId);
 });
+function enqueueDelegatedReport(narratorId: string, kind: "agent" | "bash" | "send") {
+	const text = `delegated ${kind} research result`;
+	// Seed an already accepted delivery; producer receipt admission is covered by inbox tests.
+	db.insert(narrators)
+		.values({
+			id: "research-child",
+			type: "subagent",
+			variant: "subagent:plan",
+			parentNarratorId: narratorId,
+			createdAt: now,
+			updatedAt: now,
+		})
+		.onConflictDoNothing()
+		.run();
+	backgroundOccupancyStore.refreshNarrator("research-child");
+	const store = createMailboxStore(db);
+	const resultMessageId = `${narratorId}-result`;
+	if (kind === "agent")
+		db.insert(narratorMessages)
+			.values({
+				id: resultMessageId,
+				narratorId: "research-child",
+				role: "assistant",
+				contentJson: [{ type: "text", text }],
+				contentText: text,
+				createdAt: now,
+			})
+			.run();
+	const delivery = createAgentMessageDelivery(
+		narratorId,
+		{ id: "research-child", label: "research-child", type: "plan", isParent: false },
+		"research-send",
+		text,
+	);
+	const result = store.enqueue({
+		narratorId,
+		...(kind === "send"
+			? {
+					kind: "agent_message" as const,
+					recipientMessageId: delivery.recipientMessageId,
+					sourceNarratorId: "research-child",
+					sourceToolCallId: "research-send",
+					sourceAttempt: 1,
+				}
+			: { kind: "task_notice" as const, noticeKind: kind }),
+		sourceKey: `delegated-${kind}`,
+		text,
+		projectedByteSize: Buffer.byteLength(text),
+		metadata:
+			kind === "send"
+				? { delivery, channel: "parent" }
+				: {
+						producerKind: kind,
+						taskId: "research-child",
+						logicalRunId: "research-run",
+						eventKind: "completed",
+						...(kind === "agent" ? { resultRef: `message:${resultMessageId}` } : {}),
+					},
+	});
+	if (!("delivery" in result)) throw new Error("failed to enqueue delegated report");
+}
+
+for (const plan of [false, true]) {
+	for (const kind of ["agent", "bash", "send"] as const) {
+		test(`delegated ${kind} report wakes idle parent without changing plan mode (${plan})`, async () => {
+			const narratorId = `mailbox-report-${kind}-${plan}`;
+			seedNarrator(narratorId);
+			const traits = plan ? ["standalone", "plan"] : ["standalone"];
+			db.update(narrators).set({ traits }).where(eq(narrators.id, narratorId)).run();
+			backgroundOccupancyStore.refreshNarrator(narratorId);
+			enqueueDelegatedReport(narratorId, kind);
+			try {
+				expect(await wakeInboxIfEligible(narratorId)).toBe(true);
+				await waitForIdle(narratorId);
+				expect(providerCalls).toHaveLength(1);
+				const row = db.select().from(narrators).where(eq(narrators.id, narratorId)).get();
+				expect(row?.traits).toEqual(traits);
+				expect(row?.permissionMode).toBe("bypassPermissions");
+				const receipt = db
+					.select()
+					.from(narratorBufferedMessages)
+					.where(eq(narratorBufferedMessages.narratorId, narratorId))
+					.get();
+				expect(receipt?.state).toBe("materialized");
+				const message = db
+					.select()
+					.from(narratorMessages)
+					.where(eq(narratorMessages.id, receipt?.recipientMessageId ?? ""))
+					.get();
+				expect(message?.contentText).toContain(`delegated ${kind} research result`);
+				expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+			} finally {
+				closeNarrator(narratorId);
+			}
+		});
+	}
+}
+
+test("notification entries share admission and start only one plan-mode loop", async () => {
+	const narratorId = "mailbox-report-concurrent-plan";
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	enqueueDelegatedReport(narratorId, "agent");
+	try {
+		const results = await Promise.all([
+			startBackgroundCompletionContinuationIfPossible(narratorId),
+			startParentInboundContinuationIfPossible(narratorId),
+		]);
+		expect(results.filter((result) => result.started)).toHaveLength(1);
+		await waitForIdle(narratorId);
+		expect(providerCalls).toHaveLength(1);
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
+test("plan-mode parent wakes after a report arrives during idle finalization", async () => {
+	const narratorId = "mailbox-report-finalization-plan";
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	const original = narratorService.updateStatus.bind(narratorService);
+	let queued = false;
+	const update = spyOn(narratorService, "updateStatus").mockImplementation(async (...args) => {
+		const result = await original(...args);
+		if (args[0] === narratorId && args[1] === "idle" && providerCalls.length === 1 && !queued) {
+			queued = true;
+			enqueueDelegatedReport(narratorId, "agent");
+			// The old owner still holds execution; release must recheck the durable queue.
+			expect(getExecutionOwner(narratorId)).toBeDefined();
+			expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		}
+		return result;
+	});
+	try {
+		await acceptUserMessage(narratorId, "delegate research then stop");
+		await waitForIdle(narratorId, 2);
+		expect(queued).toBe(true);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.get()?.state,
+		).toBe("materialized");
+	} finally {
+		update.mockRestore();
+		closeNarrator(narratorId);
+	}
+});
+
+test("plan parent without queued work does not start a notification turn", async () => {
+	const narratorId = "mailbox-report-empty-plan";
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	try {
+		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		expect(await startBackgroundCompletionContinuationIfPossible(narratorId)).toEqual({
+			started: false,
+		});
+		expect(providerCalls).toHaveLength(0);
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
+test.each([
+	"owner",
+	"approval",
+	"compact",
+	"revert",
+	"working",
+	"waiting",
+	"archived",
+	"user_interrupt",
+	"error",
+] as const)("plan-mode notification respects %s barrier and leaves report queued", async (barrier) => {
+	const narratorId = `mailbox-report-barrier-${barrier}`;
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	enqueueDelegatedReport(narratorId, "agent");
+	let release: (() => void) | undefined;
+	if (barrier === "owner") {
+		const owner = tryClaimExecution(narratorId, "run");
+		if (!owner) throw new Error("failed to claim owner");
+		release = () => {
+			owner.release();
+		};
+	} else if (barrier === "approval") {
+		pendingPermissions.set(narratorId, {
+			narratorId,
+			toolName: "ExitPlanMode",
+			toolUseId: "exit-plan",
+			broadcastTargetId: narratorId,
+			cwd: process.cwd(),
+			locale: "en",
+			input: { mode: "inline", inline_plan: "pending plan" },
+			signal: new AbortController().signal,
+			resolve: () => {},
+			cleanup: () => {},
+		});
+		release = () => {
+			pendingPermissions.delete(narratorId);
+		};
+	} else if (barrier === "compact") {
+		compactLocks.set(narratorId, {
+			kind: "history",
+			promise: Promise.resolve({ kind: "history", compacted: false }),
+		});
+		release = () => {
+			compactLocks.delete(narratorId);
+		};
+	} else if (barrier === "revert") {
+		release = await acquireNarratorRevertAdmission(narratorId, {
+			signal: new AbortController().signal,
+			interrupt: false,
+		});
+	} else if (barrier === "user_interrupt" || barrier === "error") {
+		db.update(narrators).set({ lastStopReason: barrier }).where(eq(narrators.id, narratorId)).run();
+	} else {
+		db.update(narrators).set({ status: barrier }).where(eq(narrators.id, narratorId)).run();
+	}
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	try {
+		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		// The compatibility entry must apply the same gates inside start admission.
+		if (barrier !== "revert") {
+			expect(await startBackgroundCompletionContinuationIfPossible(narratorId)).toEqual({
+				started: false,
+			});
+			expect(await startParentInboundContinuationIfPossible(narratorId)).toEqual({
+				started: false,
+			});
+		}
+		expect(providerCalls).toHaveLength(0);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.get()?.state,
+		).toBe("queued");
+	} finally {
+		release?.();
+		closeNarrator(narratorId);
+	}
+});
+
+test.each([
+	["error", ["error"], true],
+	["error", [], false],
+	["user_interrupt", ["error"], false],
+	["user_interrupt", ["error", "user_interrupt"], true],
+] as const)("agent message on a %s-stopped session wakes only with explicit resume %j", async (reason, resumeStopped, expected) => {
+	const narratorId = `mailbox-resume-${reason}-${resumeStopped.length}`;
+	seedNarrator(narratorId);
+	db.update(narrators).set({ lastStopReason: reason }).where(eq(narrators.id, narratorId)).run();
+	enqueueDelegatedReport(narratorId, "send");
+	try {
+		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		expect(await wakeInboxIfEligible(narratorId, "en", { resumeStopped })).toBe(expected);
+		if (expected) {
+			await waitForIdle(narratorId);
+			expect(providerCalls).toHaveLength(1);
+			expect(db.select().from(narrators).where(eq(narrators.id, narratorId)).get()).toMatchObject({
+				lastStopReason: "normal",
+			});
+		}
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.get()?.state,
+		).toBe(expected ? "materialized" : "queued");
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
 test("gates the synchronous pending-work probe on PostgreSQL", () => {
 	bindRuntimeQueue({ backend: "postgres", queue: {} as RuntimeQueuePort });
 	try {
@@ -755,9 +1202,10 @@ test.each([
 		closeNarrator(narratorId);
 	}
 });
-afterAll(() => {
+afterAll(async () => {
+	backgroundOccupancyStore.resetForTests();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
 	mock.restore();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
-	sqlite.close();
 });

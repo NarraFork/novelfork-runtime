@@ -12,6 +12,7 @@ import {
 	PluginContributionOptions,
 	type PluginContributionPick,
 } from "../../plugins/PluginContributionPicker";
+import { usePluginUiSurface } from "../../plugins/PluginUiSurfaceContext";
 import type { NarratorDockContextValue } from "../dock/NarratorDockContext";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { NarratorLodOptions } from "../lod/NarratorLodMenu";
@@ -36,8 +37,7 @@ export interface UseHeaderToolbarOptions {
 	dock: NarratorDockContextValue | null;
 	/**
 	 * Whether the git panel can resolve a workspace for this narrator (ready
-	 * state + read capability). Replaces the old `!!chapterId` gate now that
-	 * standalone narrators can also have a Git workspace.
+	 * state + read capability).
 	 */
 	gitWorkspaceAvailable: boolean;
 	tasksSupported: boolean;
@@ -94,6 +94,7 @@ export interface UseHeaderToolbarResult {
  * Dialogs opened from menus live in `toolbarOverlays`, mounted outside those menus.
  */
 export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToolbarResult {
+	const hostSurface = usePluginUiSurface()?.hostContext.surface ?? "focus";
 	const {
 		narratorId,
 		headerHostCapabilities,
@@ -140,8 +141,8 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					// this hook does not depend on a value defined after the early return.
 					return terminalToolAvailable || !!onOpenTerminalPanel;
 				case "git":
-					// Chapter or standalone, the git panel is offered whenever a
-					// workspace resolves with read capability for this narrator.
+					// The git panel is offered whenever a workspace resolves with read
+					// capability for this narrator.
 					return gitWorkspaceAvailable;
 				case "browser":
 					return browserSessionsSupported !== false;
@@ -199,7 +200,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "spec":
 					return specToolOpened;
 				case "git":
-					return dock?.openToolTypes.has("git") ?? false;
+					return dock ? dock.openToolTypes.has("git") : mobileToolPanel === "git";
 				case "search":
 					return dock ? dock.openToolTypes.has("search") : mobileToolPanel === "search";
 				case "browser":
@@ -207,7 +208,9 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "userchat":
 					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
 				case "filetree":
-					return dock?.openToolTypes.has("filetree") ?? false;
+					return dock ? dock.openToolTypes.has("filetree") : mobileToolPanel === "filetree";
+				case "timeline":
+					return dock ? dock.openToolTypes.has("timeline") : mobileToolPanel === "timeline";
 				default:
 					return false;
 			}
@@ -245,14 +248,13 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "search":
 				case "browser":
 				case "userchat":
+				case "filetree":
+				case "timeline":
 					if (dock) dock.toggleToolPanel(id);
 					else {
 						const kind = id as MobileToolPanelKind;
 						setMobileToolPanel((current) => (current === kind ? null : kind));
 					}
-					return;
-				case "filetree":
-					dock?.toggleToolPanel("filetree");
 					return;
 				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
 				// transcript while a slider moves, so there is no drawer fallback to offer.
@@ -325,6 +327,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "plugins":
 					return (
 						<PluginContributionOptions
+							surface={hostSurface}
 							onPick={(pick) => {
 								close();
 								openPluginPanel(pick);
@@ -337,6 +340,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 		},
 		[
 			t,
+			hostSurface,
 			executionDevicesQuery.data,
 			updateExecutionDeviceMutation,
 			renderLod,

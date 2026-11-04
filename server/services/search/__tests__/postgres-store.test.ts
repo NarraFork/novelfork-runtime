@@ -43,13 +43,17 @@ import type {
 } from "../types";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../db", () => ({ db, sqlite }));
+mock.module("../../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 // FTS virtual tables + sync triggers are runtime DDL on the SQLite side.
 const { ensureFts } = await import("../../../db/fts");
 ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
 
-const { sqliteSearchStore } = await import("../sqlite-store");
+const { createSqliteSearchStore } = await import("../sqlite-store");
+// Use the seeded fixture, not the production worker's separately opened database.
+const sqliteSearchStore = createSqliteSearchStore(async (sql, params) =>
+	sqlite.prepare<Record<string, unknown>, typeof params>(sql).all(...params),
+);
 const { createPostgresSearchStore } = await import("../postgres-store");
 const { ensurePgFts } = await import("../../../db/pg-fts");
 const { createPostgresClient } = await import("../../../db/postgres-client");
@@ -64,6 +68,13 @@ const NOW = "2026-09-20T00:00:00.000Z";
 
 const USERS = ["u-owner", "u-stranger", "u-author"];
 const NOW_PARAMS = [NOW];
+/** id, project (`narrators.context_project_id`), title, visibility. */
+const NARRATORS: [string, string, string | null, string][] = [
+	["n1", "p1", "Auth discussion session", "private"],
+	["n2", "p2", "Public brainstorm auth", "public"],
+	["n3", "p2", null, "public"],
+	["n4", "p2", "child session", "public"],
+];
 
 function seedSqlite(): void {
 	const run = (sql: string, params: unknown[] = []) =>
@@ -85,29 +96,11 @@ function seedSqlite(): void {
 		 VALUES ('p2', 'Public project', 'public', 'u-owner', ?, ?)`,
 		NOW_PARAMS.concat(NOW),
 	);
-	const chapters: [string, string, string, string][] = [
-		["ch1", "p1", "Authentication middleware overhaul", "Rework the auth flow for token refresh"],
-		["ch2", "p2", "充电三阶段任务", "实现三阶段充电策略"],
-		["ch3", "p2", "Middleware logging", "Add request logging to middleware"],
-	];
-	for (const [id, project, title, description] of chapters) {
+	for (const [id, project, title, visibility] of NARRATORS) {
 		run(
-			`INSERT INTO chapters (id, project_id, title, description, branch, base_branch, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, 'main', ?, ?)`,
-			[id, project, title, description, `branch-${id}`, NOW, NOW],
-		);
-	}
-	const narrators: [string, string, string | null, string][] = [
-		["n1", "ch1", "Auth discussion session", "private"],
-		["n2", "ch2", "Public brainstorm auth", "public"],
-		["n3", "ch3", null, "public"],
-		["n4", "ch2", "child session", "public"],
-	];
-	for (const [id, chapter, title, visibility] of narrators) {
-		run(
-			`INSERT INTO narrators (id, chapter_id, title, visibility, owner_user_id, created_at, updated_at)
+			`INSERT INTO narrators (id, context_project_id, title, visibility, owner_user_id, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, 'u-owner', ?, ?)`,
-			[id, chapter, title, visibility, NOW, NOW],
+			[id, project, title, visibility, NOW, NOW],
 		);
 	}
 	const messages: [string, string, string, string][] = [
@@ -191,29 +184,11 @@ async function seedPostgres(pg: PgExecutor): Promise<void> {
 		        ('p2', 'Public project', 'public', 'u-owner', $1, $1)`,
 		[NOW],
 	);
-	const chapters: [string, string, string, string][] = [
-		["ch1", "p1", "Authentication middleware overhaul", "Rework the auth flow for token refresh"],
-		["ch2", "p2", "充电三阶段任务", "实现三阶段充电策略"],
-		["ch3", "p2", "Middleware logging", "Add request logging to middleware"],
-	];
-	for (const [id, project, title, description] of chapters) {
+	for (const [id, project, title, visibility] of NARRATORS) {
 		await pg.unsafe(
-			`INSERT INTO chapters (id, project_id, title, description, branch, base_branch, created_at, updated_at)
-			 VALUES ($1, $2, $3, $4, $5, 'main', $6, $6)`,
-			[id, project, title, description, `branch-${id}`, NOW],
-		);
-	}
-	const narrators: [string, string, string | null, string][] = [
-		["n1", "ch1", "Auth discussion session", "private"],
-		["n2", "ch2", "Public brainstorm auth", "public"],
-		["n3", "ch3", null, "public"],
-		["n4", "ch2", "child session", "public"],
-	];
-	for (const [id, chapter, title, visibility] of narrators) {
-		await pg.unsafe(
-			`INSERT INTO narrators (id, chapter_id, title, visibility, owner_user_id, created_at, updated_at)
+			`INSERT INTO narrators (id, context_project_id, title, visibility, owner_user_id, created_at, updated_at)
 			 VALUES ($1, $2, $3, $4, 'u-owner', $5, $5)`,
-			[id, chapter, title, visibility, NOW],
+			[id, project, title, visibility, NOW],
 		);
 	}
 	const messages: [string, string, string, string][] = [
@@ -335,6 +310,101 @@ function expectRankOrdered(rows: readonly { rank: number | null }[], label: stri
 	}
 }
 
+describe("PostgreSQL modeltrace exclusion SQL", () => {
+	for (const strategy of ["index", "substring"] as const) {
+		test(`${strategy} excludes traces in every search path before LIMIT`, async () => {
+			const statements: string[] = [];
+			let targetVisible = true;
+			const store = createPostgresSearchStore({
+				async unsafe(sql) {
+					statements.push(sql);
+					return sql.startsWith("SELECT n.id FROM narrators n") && targetVisible
+						? [{ id: "source" }]
+						: [];
+				},
+			});
+			const exclusion = `COALESCE(n.traits, '[]') NOT LIKE '%"modeltrace"%'`;
+			const q = {
+				text: "needle",
+				strategy,
+				limit: 2,
+				viewer: { userId: "u-owner", isAdmin: true },
+			};
+			await store.searchNarrators(q);
+			await store.searchMessages(q);
+			await store.searchSessionAggregates(q);
+			await store.searchSessionHits({ ...q, narratorIds: ["source"], perSession: 2 });
+			for (const narratorId of [null, "source"]) {
+				await store.searchRecallMessages({ ...q, narratorId, previewChars: 200 });
+			}
+			for (const sql of statements) {
+				expect(sql).toContain(exclusion);
+				if (sql.includes("LIMIT"))
+					expect(sql.indexOf(exclusion)).toBeLessThan(sql.lastIndexOf("LIMIT"));
+			}
+			statements.length = 0;
+			targetVisible = false;
+			expect(
+				await store.searchTimeline({
+					...q,
+					narratorId: "trace",
+					inheritedScopes: [{ narratorId: "source", upperBoundSeq: 3 }],
+				}),
+			).toEqual([]);
+			expect(statements).toHaveLength(1);
+			expect(statements[0]).toContain(exclusion);
+		});
+	}
+});
+
+describe("PostgreSQL standalone search SQL", () => {
+	for (const strategy of ["index", "substring"] as const) {
+		test(`${strategy} binds owner and target scope and preserves standalone identity`, async () => {
+			let statement = "";
+			let bound: unknown[] = [];
+			const store = createPostgresSearchStore({
+				async unsafe(sql, params) {
+					statement = sql;
+					bound = params ?? [];
+					return [
+						{
+							id: "personal",
+							personal_entry_id: "personal",
+							collection_id: null,
+							title: "needle",
+							status: "active",
+						},
+					];
+				},
+			});
+			const rows = await store.searchKnowledgeDrafts({
+				...draftQuery("needle", strategy),
+				includeStandalone: true,
+				projectId: "project",
+				collectionId: "collection",
+			});
+			expect(statement).toContain("LEFT JOIN knowledge_entries e ON e.id = d.entry_id");
+			expect(statement).toContain("AND d.author_user_id =");
+			expect(statement).toContain("AND d.status =");
+			expect(statement).toContain("d.entry_id IS NULL AND d.target_collection_id IS NULL");
+			expect(statement).toContain("COALESCE(e.collection_id, d.target_collection_id)");
+			if (strategy === "substring")
+				expect(statement).toContain("COALESCE(e.title, d.title, '') ILIKE");
+			expect(bound).toEqual(
+				expect.arrayContaining(["u-author", "active", "project", "collection"]),
+			);
+			expect(rows[0]).toMatchObject({
+				id: "personal",
+				personalEntryId: "personal",
+				collectionId: null,
+				fromDraft: true,
+			});
+			await store.searchKnowledgeDrafts(draftQuery("needle", strategy));
+			expect(statement).not.toContain("LEFT JOIN");
+		});
+	}
+});
+
 describe("PostgreSQL knowledge time ordering", () => {
 	for (const strategy of ["index", "substring"] as const) {
 		for (const draft of [false, true]) {
@@ -413,6 +483,48 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 					await seedPostgres(pg);
 					const lite: SearchStore = sqliteSearchStore;
 					const store: SearchStore = createPostgresSearchStore(pg);
+					// Standalone rows use the same draft index, but must remain owner-only.
+					for (const [id, owner, status, target] of [
+						["standalone", "u-author", "active", null],
+						["standalone-target", "u-author", "active", "kc1"],
+						["standalone-other", "u-stranger", "active", null],
+						["standalone-archived", "u-author", "archived", null],
+					] as const) {
+						const values = [id, owner, status, target, "standalonefind 电池", NOW];
+						const columns =
+							"id, author_user_id, status, target_collection_id, title, content, content_hash, created_at, updated_at";
+						sqlite
+							.prepare(
+								`INSERT INTO knowledge_drafts (${columns}) VALUES (?, ?, ?, ?, ?, '', 'hash', ?, ?)`,
+							)
+							.run(...[...values, NOW]);
+						await pg.unsafe(
+							`INSERT INTO knowledge_drafts (${columns}) VALUES ($1, $2, $3, $4, $5, '', 'hash', $6, $6)`,
+							values,
+						);
+					}
+					for (const strategy of ["index", "substring"] as const) {
+						const query = {
+							...draftQuery(strategy === "index" ? "standalonefind" : "电池", strategy),
+							includeStandalone: true,
+						};
+						for (const s of [lite, store]) {
+							expect(ids(await s.searchKnowledgeDrafts(query))).toEqual([
+								"standalone",
+								"standalone-target",
+							]);
+							expect(ids(await s.searchKnowledgeDrafts({ ...query, projectId: "p2" }))).toEqual([
+								"standalone",
+							]);
+							expect(ids(await s.searchKnowledgeDrafts({ ...query, collectionId: "kc1" }))).toEqual(
+								["standalone-target"],
+							);
+							expect(await s.searchKnowledgeDrafts({ ...query, includeStandalone: false })).toEqual(
+								[],
+							);
+						}
+					}
+
 					const failures: string[] = [];
 					const check = (label: string, actual: unknown, expected: unknown) => {
 						try {
@@ -421,35 +533,6 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 							failures.push(`${label}: ${JSON.stringify(actual)} != ${JSON.stringify(expected)}`);
 						}
 					};
-
-					// ── chapters: phrase recall + project ACL gate ────────────────────────
-					for (const [label, viewer, expected] of [
-						["owner", OWNER, ["ch1", "ch3"]],
-						["stranger (private project hidden)", STRANGER, ["ch3"]],
-						["admin", ADMIN, ["ch1", "ch3"]],
-					] as const) {
-						const [a, b] = await Promise.all([
-							lite.searchChapters(entity("middleware", "index", viewer)),
-							store.searchChapters(entity("middleware", "index", viewer)),
-						]);
-						check(`chapters index middleware ${label} (sqlite)`, ids(a), expected);
-						check(`chapters index middleware ${label} (postgres)`, ids(b), expected);
-						expectRankOrdered(a, `sqlite chapters ${label}`);
-						expectRankOrdered(b, `postgres chapters ${label}`);
-					}
-
-					// ── chapters: CJK index (3 chars) and substring (2 chars) ──────────────
-					for (const [label, query, expected] of [
-						["index 三阶段", entity("三阶段", "index"), ["ch2"]],
-						["substring 充电", entity("充电", "substring"), ["ch2"]],
-					] as const) {
-						const [a, b] = await Promise.all([
-							lite.searchChapters(query),
-							store.searchChapters(query),
-						]);
-						check(`chapters ${label} (sqlite)`, ids(a), expected);
-						check(`chapters ${label} (postgres)`, ids(b), expected);
-					}
 
 					// ── narrators: title recall + narrator ACL gate ───────────────────────
 					for (const [label, viewer, expected] of [
@@ -464,6 +547,24 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						check(`narrators index auth ${label} (postgres)`, ids(b), expected);
 						expectRankOrdered(a, `sqlite narrators ${label}`);
 						expectRankOrdered(b, `postgres narrators ${label}`);
+					}
+					// A hit names the narrator's own project, on both hit types and both engines.
+					for (const [backend, s] of [
+						["sqlite", lite],
+						["postgres", store],
+					] as const) {
+						const projectOf = (rows: readonly { id: string; projectName: string | null }[]) =>
+							Object.fromEntries(rows.map((r) => [r.id, r.projectName]));
+						check(
+							`narrator project names (${backend})`,
+							projectOf(await s.searchNarrators(entity("auth", "index"))),
+							{ n1: "Private project", n2: "Public project" },
+						);
+						check(
+							`message project names (${backend})`,
+							projectOf(await s.searchMessages(entity("auth", "index"))),
+							{ m1: "Private project", m2: "Public project" },
+						);
 					}
 
 					// ── messages: narrator ACL gate on transcript excerpts ────────────────
@@ -504,6 +605,94 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						check(`messages index tokens owner (${backend})`, ids(ownerRows), ["m1"]);
 					}
 
+					// ── sessions: hits rolled up per narrator, gated and filtered ─────────
+					const sessionIds = (rows: readonly { narratorId: string; hitCount: number }[]) =>
+						rows.map((r) => `${r.narratorId}:${r.hitCount}`).sort();
+					for (const [label, query, expected] of [
+						["index auth owner", entity("auth", "index", OWNER), ["n1:1", "n2:1"]],
+						["index auth stranger", entity("auth", "index", STRANGER), ["n2:1"]],
+						["substring 充电", entity("充电", "substring"), ["n2:1"]],
+						// Terms match on their own, in any order; a short term filters the indexed ones.
+						[
+							"index terms out of order",
+							entity("middleware auth", "index", OWNER),
+							["n1:1", "n2:1"],
+						],
+						["index terms, one absent", entity("middleware rotate", "index", OWNER), ["n1:1"]],
+						["index term with a short term", entity("三阶段 充电", "index"), ["n2:1"]],
+						["short terms only", entity("充电 你好", "substring"), ["n2:1"]],
+						[
+							"index auth in project p2",
+							{ ...entity("auth", "index", OWNER), filters: { projectId: "p2" } },
+							["n2:1"],
+						],
+						[
+							"index auth owned by a stranger",
+							{ ...entity("auth", "index", OWNER), filters: { ownerUserId: "u-stranger" } },
+							[],
+						],
+						[
+							"index auth after the fixture's time",
+							{ ...entity("auth", "index", OWNER), filters: { from: "2027-01-01T00:00:00.000Z" } },
+							[],
+						],
+					] as const) {
+						const [a, b] = await Promise.all([
+							lite.searchSessionAggregates(query),
+							store.searchSessionAggregates(query),
+						]);
+						check(`session aggregates ${label} (sqlite)`, sessionIds(a), expected);
+						check(`session aggregates ${label} (postgres)`, sessionIds(b), expected);
+					}
+					for (const [label, viewer, expected] of [
+						["owner", OWNER, ["m1", "m2"]],
+						["stranger", STRANGER, ["m2"]],
+					] as const) {
+						const query = {
+							...entity("auth", "index", viewer),
+							narratorIds: ["n1", "n2"],
+							perSession: 3,
+						};
+						const [a, b] = await Promise.all([
+							lite.searchSessionHits(query),
+							store.searchSessionHits(query),
+						]);
+						check(`session hits auth ${label} (sqlite)`, ids(a), expected);
+						check(`session hits auth ${label} (postgres)`, ids(b), expected);
+					}
+					// The same pass names each session's newest hits (ties by id), and a page reads
+					// them back by id, in the order asked, skipping ids that no longer exist.
+					{
+						const query = { ...entity("e", "substring", OWNER), latestHits: 2 };
+						const [a, b] = await Promise.all([
+							lite.searchSessionAggregates(query),
+							store.searchSessionAggregates(query),
+						]);
+						const latest = (rows: { narratorId: string; latestHits: { id: string }[] }[]) =>
+							rows
+								.map((row) => `${row.narratorId}:${row.latestHits.map((h) => h.id).join("+")}`)
+								.sort();
+						check("session latest hits (sqlite)", latest(a), ["n1:m1+m4", "n2:m2"]);
+						check("session latest hits (postgres)", latest(b), ["n1:m1+m4", "n2:m2"]);
+						const refs = ["m2", "missing", "m1"].map((id) => ({
+							id,
+							blockId: null,
+							createdAt: null,
+						}));
+						for (const [backend, s] of [
+							["sqlite", lite],
+							["postgres", store],
+						] as const) {
+							const rows = await s.searchSessionHitDetails({ text: "middleware", refs });
+							check(
+								`session hit details (${backend})`,
+								rows.map((row) => row.id),
+								["m2", "m1"],
+							);
+							expect(rows[0]?.snippet, `hit detail excerpt (${backend})`).toContain("middleware");
+							expect(rows[0]?.narratorId, `hit detail narrator (${backend})`).toBe("n2");
+						}
+					}
 					// ── timeline: own refs and an inherited fork scope ────────────────────
 					const timelineCases: [string, TimelineSearchQuery, string[]][] = [
 						[
@@ -522,6 +711,40 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 							{
 								narratorId: "n2",
 								text: "充电",
+								strategy: "substring",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							["m3"],
+						],
+						// A short term filters the indexed one; short terms match apart, in any order.
+						[
+							"index term with a short term",
+							{
+								narratorId: "n2",
+								text: "三阶段 充电",
+								strategy: "index",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							["m3"],
+						],
+						[
+							"index term with an absent short term",
+							{
+								narratorId: "n2",
+								text: "middleware 充电",
+								strategy: "index",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							[],
+						],
+						[
+							"short terms apart",
+							{
+								narratorId: "n2",
+								text: "充电 你好",
 								strategy: "substring",
 								limit: 20,
 								inheritedScopes: [],
@@ -578,6 +801,40 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 							"global substring 充电",
 							{
 								text: "充电",
+								strategy: "substring",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							["m3"],
+						],
+						// A short term filters the indexed one; short terms match apart.
+						[
+							"global index term with a short term",
+							{
+								text: "三阶段 充电",
+								strategy: "index",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							["m3"],
+						],
+						[
+							"global index term with an absent short term",
+							{
+								text: "middleware 充电",
+								strategy: "index",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							[],
+						],
+						[
+							"global short terms apart",
+							{
+								text: "充电 你好",
 								strategy: "substring",
 								limit: 20,
 								narratorId: null,
@@ -682,6 +939,9 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						throw new Error(`parity failures:\n${failures.join("\n")}`);
 					}
 					return "ok";
+				} catch (error) {
+					console.error("Search parity fixture failed", error);
+					throw error;
 				} finally {
 					await client.close();
 				}

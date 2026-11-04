@@ -11,6 +11,7 @@
  */
 
 import { beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -94,14 +95,15 @@ describe("mixed action-card append cache locality", () => {
 		const generation = { type: "image_generation", status: "completed", width: 320, height: 160 };
 		const tails = { tool: tool("tail"), search, generation, subagent: tool("tail-agent", "Agent") };
 		function msg(id: string, contentJson: Record<string, unknown>[]) {
-			return {
-				id,
-				role: "assistant",
+			return rowWithElements(
+				{
+					id,
+					role: "assistant",
+					toolCalls: [],
+					parentToolUseId: null,
+				},
 				contentJson,
-				toolCalls: [],
-				children: [],
-				parentToolUseId: null,
-			} as unknown as import("../narrator-panel-types").NarratorMsg;
+			) as unknown as import("../narrator-panel-types").NarratorMsg;
 		}
 		const messages = [
 			msg("stable", [tool("read"), search, generation, tool("agent", "Agent")]),
@@ -149,12 +151,14 @@ describe("chat grouped-header cached measurements", () => {
 			const spec = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: "stable-chat-message",
-						role: "user",
-						contentJson: [{ type: "text", text: "Unchanged body" }],
-						omitHeader,
-					},
+					msg: rowWithElements(
+						{
+							id: "stable-chat-message",
+							role: "user",
+							omitHeader,
+						},
+						[{ type: "text", text: "Unchanged body" }],
+					),
 				},
 				{ lod: 5 },
 			)[0];
@@ -210,11 +214,13 @@ describe("ask-in-passing cached measurements", () => {
 			const spec = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: "stable-aip-message",
-						role: "system",
-						contentJson: [{ type: "ask_in_passing", status, question }],
-					},
+					msg: rowWithElements(
+						{
+							id: "stable-aip-message",
+							role: "system",
+						},
+						[{ type: "ask_in_passing", status, question }],
+					),
 				},
 				{ lod: 5 },
 			)[0];
@@ -286,7 +292,7 @@ describe("trace inspector refs in cached measurements", () => {
 						kind: "tool",
 						blockIndex: 0,
 						isSubagent: false,
-						msg: { id: ref.messageId, role: "assistant", contentJson: [] },
+						msg: rowWithElements({ id: ref.messageId, role: "assistant" }, []),
 						tc: {
 							id: ref.toolCallId,
 							executionAttempt: ref.executionAttempt,
@@ -484,6 +490,25 @@ describe("canonical body revision", () => {
 		]) {
 			expect(revision(over)).not.toBe(revision());
 		}
+	});
+
+	it("re-keys when an Await meta-rows identity line appears mid-wait", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const detail = (rows: unknown[]) => ({
+			detail: {
+				kind: "sections",
+				sections: [{ key: "meta.await", body: { kind: "meta-rows", rows } }],
+			},
+		});
+		// The row APPEARING changes the card's height, so the key must move even
+		// though the call's status is still `running`.
+		expect(extractDataRevision(detail([]))).not.toBe(
+			extractDataRevision(detail([{ text: "", identity: "g2GQj-mTWJqSPaaAqG_Ud" }])),
+		);
+		// A same-length id swap repaints the cached payload, so it re-keys too.
+		expect(extractDataRevision(detail([{ text: "", identity: "g2GQj-mTWJqSPaaAqG_Ud" }]))).not.toBe(
+			extractDataRevision(detail([{ text: "", identity: "h3HRk-nUXKrTBpBhR_Ve" }])),
+		);
 	});
 
 	it("keys source focus, never a viewport projection or reading state", async () => {
@@ -1299,6 +1324,33 @@ describe("extractDataRevision", () => {
 			expect(extractDataRevision(rowWith(1_500))).not.toBe(exec);
 		});
 
+		it("keys terminal timing corrections on cards and rows even with unchanged displayed duration", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			const base = {
+				status: "success",
+				durationMs: 1000,
+				executionStartedAt: 0,
+				completedAt: 1000,
+			};
+			const changed = {
+				...base,
+				fileChangeTiming: { waitMs: 200, executionMs: 800, totalMs: 1000 },
+			};
+			expect(extractDataRevision(changed)).not.toBe(extractDataRevision(base));
+			expect(extractDataRevision({ ...changed, completedAt: 1100 })).not.toBe(
+				extractDataRevision(changed),
+			);
+			const trace = (timing: unknown) => ({
+				items: [{ key: "tool-tu-1", timing, displayDurationMs: 800 }],
+			});
+			expect(extractDataRevision(trace(changed))).not.toBe(extractDataRevision(trace(base)));
+			expect(
+				extractDataRevision(
+					trace({ ...changed, fileChangeTiming: { waitMs: 300, executionMs: 800, totalMs: 1100 } }),
+				),
+			).not.toBe(extractDataRevision(trace(changed)));
+		});
+
 		it("a collapsed fold pays nothing (no card → no card component)", async () => {
 			const { extractDataRevision } = await import("./measure-cache");
 			const rev = extractDataRevision(traceWith());
@@ -1399,6 +1451,17 @@ describe("extractDataRevision", () => {
 			);
 			expect(after).not.toBe(before);
 			expect(after).toContain("gn:2");
+		});
+
+		it("a subagent card's live output counter re-keys the fold", async () => {
+			const { extractDataRevision } = await import("./measure-cache");
+			// Height-neutral but PAINTED from the cached payload: the streaming channel
+			// advances the count alone, so without the key component the badge would
+			// freeze at whatever the first measure saw.
+			const before = extractDataRevision(traceWith(agentCard()));
+			const after = extractDataRevision(traceWith(agentCard({ liveOutputChars: 1240 })));
+			expect(after).not.toBe(before);
+			expect(after).toContain("gl:1240");
 		});
 
 		it("a subagent conclusion landing re-keys the fold (status stays success)", async () => {
@@ -1572,7 +1635,8 @@ describe("subagent file-change cache identity", () => {
 			const scope = { sourceToolUseId: "same-tool", startedAt: null, completedAt: null };
 			const scoped = measure(data({ scope }));
 			expect(scoped).not.toBe(baseline);
-			expect(scoped.height).toBeGreaterThan(baseline.height);
+			// The window lives in hover text: a new identity, but no extra row.
+			expect(scoped.height).toBe(baseline.height);
 			const updatedScope = measure(data({ scope: { ...scope, completedAt: "end" } }));
 			expect(updatedScope).not.toBe(scoped);
 			expect(updatedScope.height).toBe(scoped.height);
@@ -1778,11 +1842,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// Build 20 items
 		const segments = Array.from({ length: 20 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `msg-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Message ${i} with some content` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `msg-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Message ${i} with some content` }],
+			),
 		}));
 
 		// First build: all misses
@@ -1809,11 +1875,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// Initial window: 10 items
 		const existing = Array.from({ length: 10 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `existing-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Existing msg ${i}` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `existing-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Existing msg ${i}` }],
+			),
 		}));
 
 		computeVListLayout(existing, { contentWidth: 600, lod: 5 });
@@ -1821,11 +1889,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// After loadOlder: 5 new + 10 existing
 		const newer = Array.from({ length: 5 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `new-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `New msg ${i}` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `new-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `New msg ${i}` }],
+			),
 		}));
 		const combined = [...newer, ...existing];
 
@@ -1845,11 +1915,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		const N = 6500;
 		const segments = Array.from({ length: N }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `large-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Message ${i} content here` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `large-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Message ${i} content here` }],
+			),
 		}));
 
 		// First build: all misses (populates cache with N entries)
@@ -1868,11 +1940,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// Third build with 500 new items prepended: only new items miss
 		const prepended = Array.from({ length: 500 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `prepend-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Prepended msg ${i}` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `prepend-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Prepended msg ${i}` }],
+			),
 		}));
 		const combined = [...prepended, ...segments];
 

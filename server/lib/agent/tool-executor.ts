@@ -1,6 +1,12 @@
 import {
+	isAdminToolExecutionAllowed,
+	mcpServerMarker,
+	mcpToolMarker,
+} from "@server/services/tool-load-markers";
+import {
 	beginToolStartAdmission,
 	convertToolStartGrantToExecution,
+	getUpdateCoordinationStatus,
 	inertUpdateExecutionLease,
 	type UpdateCheckpointActivityLease,
 	type UpdateExecutionKind,
@@ -8,10 +14,23 @@ import {
 	type UpdateToolStartGrant,
 	waitUntilUpdateGateOpens,
 } from "@server/services/update-coordinator";
+import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import type { MediaContentBlock, NativeMediaInput } from "@shared/media-attachments";
 import { logger } from "../logger";
-import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import {
+	getOutlineSpecUnavailableHint,
+	getToolMessage,
+	getToolMessageWithParams,
+	type Locale,
+} from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
-import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
+import { settings } from "../settings";
+import {
+	assertSpecPath,
+	assertToolSpecPaths,
+	toolNamesSpecPath,
+	toolSpecPathError,
+} from "../spec-uri";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
@@ -71,6 +90,8 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	media?: NativeMediaInput[];
+	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
@@ -88,6 +109,8 @@ export interface ToolAdmissionState {
 		toolCallId: string;
 		updateEpoch: string;
 		payloadJson: Record<string, unknown>;
+		/** The existing recovery owner alone may finish this carried execution. */
+		carryover?: boolean;
 	};
 }
 
@@ -387,13 +410,14 @@ function describeExecutionTargetDrift(
 }
 
 export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKind {
+	// Cancellation is a bounded control operation, not a resumable child execution.
+	if (tu.name === "Stop") return "ordinary";
 	if (isBashToolName(tu.name) && tu.input.run_in_background === true) {
 		return "background_bash";
 	}
 	if (
 		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && tu.input.type === "agent") ||
-		(tu.name === "Send" && tu.input.await === true)
+		(tu.name === "Await" && tu.input.type === "agent")
 	) {
 		return "resumable";
 	}
@@ -441,6 +465,7 @@ async function upsertDeferredTool(
 			toolUseId: tu.toolUseId,
 			toolName: tu.name,
 			executionKind: kind,
+			executionAttempt: binding.attempt,
 			permissionGranted,
 			...(executionTarget ? { executionTarget } : {}),
 			...(tu.name === "Await" && typeof tu.input.type === "string"
@@ -452,16 +477,46 @@ async function upsertDeferredTool(
 					}
 				: {}),
 		};
+		const obsoleteGate = () => {
+			const current = getUpdateCoordinationStatus();
+			return (
+				current.cancelRequested || current.phase === "idle" || current.updateEpoch !== updateEpoch
+			);
+		};
 		const { toolContinuationService } = await import("@server/services/tool-continuation-service");
-		await toolContinuationService.upsert({
+		if (obsoleteGate()) return;
+		let continuation: Awaited<ReturnType<typeof toolContinuationService.checkpoint>>;
+		try {
+			continuation = await toolContinuationService.checkpoint({
+				toolCallId: toolCall.id,
+				narratorId: config.narratorId,
+				updateEpoch,
+				kind: "deferred_tool",
+				state: "paused",
+				payloadJson,
+			});
+		} catch (error) {
+			// Cancellation may release the ticket while checkpoint's bounded DB reads yield.
+			// Only an obsolete gate permits dropping this write; an active foreign owner is fatal.
+			if (obsoleteGate()) return;
+			throw error;
+		}
+		if (obsoleteGate()) {
+			// Close a late *new-root* write after the cancelling owner's cleanup already ran.
+			// This CAS never cancels carryover or a claimed/result-bearing execution.
+			if (continuation.updateEpoch === updateEpoch)
+				await toolContinuationService.cancelUnclaimedCheckpoint(toolCall.id, updateEpoch);
+			return;
+		}
+		state.deferred = {
 			toolCallId: toolCall.id,
-			narratorId: config.narratorId,
-			updateEpoch,
-			kind: "deferred_tool",
-			state: "paused",
-			payloadJson,
-		});
-		state.deferred = { toolCallId: toolCall.id, updateEpoch, payloadJson };
+			updateEpoch: continuation.updateEpoch,
+			payloadJson: continuation.payloadJson ?? payloadJson,
+			carryover:
+				continuation.updateEpoch !== updateEpoch ||
+				continuation.state === "resuming" ||
+				continuation.kind !== "deferred_tool",
+		};
 	} finally {
 		activity.release();
 	}
@@ -619,14 +674,15 @@ async function acquireFinalToolExecution(
 			const { toolContinuationService } = await import(
 				"@server/services/tool-continuation-service"
 			);
-			await toolContinuationService.upsert({
-				toolCallId: deferred.toolCallId,
-				narratorId: config.narratorId,
-				updateEpoch: deferred.updateEpoch,
-				kind: "deferred_tool",
-				state: "completed",
-				payloadJson: deferred.payloadJson,
-			});
+			if (!deferred.carryover)
+				await toolContinuationService.checkpoint({
+					toolCallId: deferred.toolCallId,
+					narratorId: config.narratorId,
+					updateEpoch: deferred.updateEpoch,
+					kind: "deferred_tool",
+					state: "completed",
+					payloadJson: deferred.payloadJson,
+				});
 			state.deferred = undefined;
 		}
 		return { lease, resumed };
@@ -698,6 +754,25 @@ export function getReflectionToolRejection(
 	};
 }
 
+/**
+ * A tool call that names a `spec://` path in a session whose tasks live in the outline: the
+ * outline session has no Dynamic Spec (plan §3), so instead of reading or writing one it can no
+ * longer see, the call is answered with where its tasks, notes and behavior boundary are. That
+ * includes `spec://behavior_fence`: the session's boundary is the behavior page of its session
+ * space (plan PR 4), which the system keeps in its context. Spec sessions pass.
+ */
+export function getOutlineSpecRejection(
+	tu: AgentToolUse,
+	config: Pick<AgentConfig, "taskBackend" | "locale">,
+): ToolExecResult | undefined {
+	if (config.taskBackend !== "outline" || !toolNamesSpecPath(tu.name, tu.input)) return undefined;
+	return {
+		output: getOutlineSpecUnavailableHint((config.locale as Locale) ?? "en"),
+		isError: true,
+		durationMs: 0,
+	};
+}
+
 export async function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
@@ -707,6 +782,11 @@ export async function executeTool(
 	if (reflectionRejection) {
 		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
 		return reflectionRejection;
+	}
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
+		return outlineSpecRejection;
 	}
 	const specError = toolSpecPathError(tu.name, tu.input);
 	if (specError) {
@@ -790,24 +870,30 @@ export async function executeTool(
 		)
 			return;
 		try {
-			if (preparedNoDispatch) {
-				await preparedNoDispatch(reason, claimed);
-			} else if (config.recordToolNoDispatch) {
-				await config.recordToolNoDispatch(proofContext(), fileToolName, reason, claimed);
-			} else {
-				const { getDefaultLocalFileChangeRuntime } = await import(
-					"@server/services/file-change-runtime"
-				);
-				await (await getDefaultLocalFileChangeRuntime()).recordHostNoDispatch(
-					proofContext(),
-					fileToolName,
-					reason,
-					claimed,
-				);
-			}
+			const { boundedFileHistory } = await import("@server/services/file-change-runtime");
+			await boundedFileHistory(async () => {
+				if (preparedNoDispatch) {
+					await preparedNoDispatch(reason, claimed);
+				} else if (config.recordToolNoDispatch) {
+					await config.recordToolNoDispatch(proofContext(), fileToolName, reason, claimed);
+				} else {
+					const { getDefaultLocalFileChangeRuntime } = await import(
+						"@server/services/file-change-runtime"
+					);
+					await (await getDefaultLocalFileChangeRuntime()).recordHostNoDispatch(
+						proofContext(),
+						fileToolName,
+						reason,
+						claimed,
+					);
+				}
+			});
 		} catch (error) {
 			evidenceFailure = error;
-			throw error;
+			logger.warn("Tool no-dispatch history unavailable", {
+				toolUseId: tu.toolUseId,
+				error: String(error),
+			});
 		}
 	};
 
@@ -853,6 +939,49 @@ export async function executeTool(
 		if (DEFAULT_OFF_TOOL_NAMES.has(tu.name) && config.toolFilter && !config.toolFilter(tool)) {
 			return {
 				output: `${tu.name} is not loaded for this narrator. Load its routine first.`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
+		// Keep existing declarations/cache intact, but a non-admin can neither execute
+		// nor approve an admin tool, even when it was loaded by another principal.
+		if (!(await isAdminToolExecutionAllowed(tool.name, config.userId))) {
+			return {
+				output: `Tool is restricted to administrators: ${tu.name}`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
+		if (tool.metadata?.mcpServerId) {
+			const server = settings.mcpServers?.find((item) => item.id === tool.metadata?.mcpServerId);
+			if (
+				!server ||
+				resolveMcpLoadingMode(server) === "disabled" ||
+				(config.toolFilter && !config.toolFilter(tool)) ||
+				(config.toolLoading?.managed.size !== 0 &&
+					resolveMcpLoadingMode(server) === "auto" &&
+					config.isToolLoaded?.(mcpServerMarker(server.id)) !== true &&
+					config.isToolLoaded?.(mcpToolMarker(server.id, tool.name)) !== true)
+			) {
+				return {
+					output: `MCP tool is disabled or not loaded: ${tu.name}`,
+					isError: true,
+					durationMs: 0,
+				};
+			}
+		}
+
+		// Within a context epoch an unloaded tool stays declared (see tool-loading.ts), so
+		// the declaration alone no longer means the tool may run.
+		if (
+			!tool.metadata?.mcpServerId &&
+			config.toolLoading?.managed.has(tu.name) &&
+			config.isToolLoaded?.(tu.name) === false
+		) {
+			return {
+				output: `Tool is not loaded in this session: ${tu.name}. Ask the user to /load it if it is needed.`,
 				isError: true,
 				durationMs: 0,
 			};
@@ -1193,7 +1322,9 @@ export async function executeTool(
 		const parsed = tool.parameters.safeParse(effectiveInput);
 		if (!parsed.success) {
 			return {
-				output: `Invalid parameters: ${parsed.error.message}`,
+				output: tool.formatValidationError
+					? tool.formatValidationError(parsed.error)
+					: `Invalid parameters: ${parsed.error.message}`,
 				isError: true,
 				durationMs: Date.now() - start,
 				permissionStartedAt,
@@ -1220,10 +1351,14 @@ export async function executeTool(
 		const pipelinePreviewChars = pipelineState?.maxPreviewChars ?? 100;
 
 		const ctx: ToolContext = {
-			recordFileNoDispatch: (reason) => persistNoDispatch(reason, true),
+			recordFileNoDispatch: async (reason) => {
+				await persistNoDispatch(reason, true);
+				if (evidenceFailure) throw evidenceFailure;
+			},
 			narratorId: config.narratorId,
 			cwd: config.cwd,
 			signal: config.signal,
+			guidanceSignal: config.guidanceSignal,
 			provider: config.provider,
 			model: config.model,
 			pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,
@@ -1233,16 +1368,15 @@ export async function executeTool(
 				signal: config.signal,
 				reasoningEffort: config.reasoningEffort,
 			}),
-			chapterId: config.chapterId,
 			planFileId: config.planFileId,
 			planFilePath: config.getPlanFilePathForTool?.(tu.toolUseId) ?? config.planFilePath,
 			skillRoot: config.skillRoot,
 			projectGitPath: config.projectGitPath,
-			worktreePath: config.worktreePath,
 			skillScopeKey: config.skillScopeKey,
 			blockedSkills: config.blockedSkills,
 			parentNarratorId: config.parentNarratorId,
 			runtimePolicy: config.runtimePolicy,
+			bot: config.bot,
 			userId: config.userId,
 			projectId: config.projectId,
 			requestPermission: (toolName, input, toolUseId) =>
@@ -1543,6 +1677,12 @@ export async function executeTool(
 					: undefined;
 				if (authorizeFinalStart && typeof finalTicket?.assertStillCurrent !== "function")
 					throw new Error("Final authorization did not return a synchronous policy fence");
+				ctx.assertFinalExecutionPermission = () => {
+					config.signal.throwIfAborted();
+					config.assertWorkspaceCurrent?.();
+					if (!finalTicket) throw new Error("A final execution permission fence is required");
+					finalTicket.assertStillCurrent();
+				};
 				config.signal.throwIfAborted();
 				config.assertWorkspaceCurrent?.();
 				// Only actual execution is painted as running; captures are preparation.
@@ -1631,6 +1771,8 @@ export async function executeTool(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						media: result.media,
+						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
 						pipelineExitConfirmation,
 						pipelineExitConfirmationStateId,
@@ -1650,6 +1792,8 @@ export async function executeTool(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					media: result.media,
+					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
 					pipelineExitConfirmation,
 					pipelineExitConfirmationStateId,
@@ -1666,6 +1810,8 @@ export async function executeTool(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				media: result.media,
+				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,
 				pipelineExitConfirmation,
 				pipelineExitConfirmationStateId,
@@ -1722,8 +1868,6 @@ export async function executeTool(
 					: permissionRuleTerminationReason,
 			});
 		}
-		// biome-ignore lint/correctness/noUnsafeFinally: evidence persistence failure must override any tool result.
-		if (evidenceFailure) throw evidenceFailure;
 		if (!bodyInvoked) {
 			await persistNoDispatch(
 				config.signal.aborted ? "cancelled_before_dispatch" : "invocation_rejected",

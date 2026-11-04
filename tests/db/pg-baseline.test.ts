@@ -62,6 +62,46 @@ const MIGRATIONS_FOLDER = "drizzle-postgres";
 /** One container, sequentially: image pull plus ~800 statements plus ~40 paged reads. */
 const RUN_TIMEOUT_MS = 420_000;
 
+/**
+ * Baseline constraints the narrative-line retirement (`0035_retire_narrative_line`) drops on
+ * purpose: the chapter tables' own constraints and every foreign key to `chapters`. Listed by
+ * name so the upgrade check below still fails on any other lost constraint.
+ */
+const RETIRED_CONSTRAINTS: [table: string, constraint: string][] = [
+	["chapter_commits", "chapter_commits_chapter_id_chapters_id_fk"],
+	["chapter_commits", "chapter_commits_narrator_id_narrators_id_fk"],
+	["chapter_commits", "chapter_commits_narrator_message_id_narrator_messages_id_fk"],
+	["chapter_commits", "chapter_commits_pkey"],
+	["chapter_edges", "chapter_edges_pkey"],
+	["chapter_edges", "chapter_edges_project_id_projects_id_fk"],
+	["chapter_edges", "chapter_edges_source_id_chapters_id_fk"],
+	["chapter_edges", "chapter_edges_target_id_chapters_id_fk"],
+	["chapters", "chapters_exploration_group_id_exploration_groups_id_fk"],
+	["chapters", "chapters_merged_into_chapter_id_chapters_id_fk"],
+	["chapters", "chapters_parent_chapter_id_chapters_id_fk"],
+	["chapters", "chapters_pkey"],
+	["chapters", "chapters_project_id_projects_id_fk"],
+	["chapters", "chapters_review_source_chapter_id_chapters_id_fk"],
+	["container_instances", "container_instances_chapter_id_chapters_id_fk"],
+	["exploration_groups", "exploration_groups_base_chapter_id_chapters_id_fk"],
+	["exploration_groups", "exploration_groups_decided_chapter_id_chapters_id_fk"],
+	["exploration_groups", "exploration_groups_pkey"],
+	["exploration_groups", "exploration_groups_project_id_projects_id_fk"],
+	["gateway_session_mappings", "gateway_session_mappings_chapter_id_chapters_id_fk"],
+	["merge_sessions", "merge_sessions_pkey"],
+	["merge_sessions", "merge_sessions_target_chapter_id_chapters_id_fk"],
+	["narrators", "narrators_chapter_id_chapters_id_fk"],
+	["port_allocations", "port_allocations_chapter_id_chapters_id_fk"],
+	["review_conclusions", "review_conclusions_pkey"],
+	["review_conclusions", "review_conclusions_review_chapter_id_chapters_id_fk"],
+	["review_conclusions", "review_conclusions_source_chapter_id_chapters_id_fk"],
+	["scheduled_tasks", "scheduled_tasks_chapter_id_chapters_id_fk"],
+	["terminal_view_state", "terminal_view_state_chapter_id_chapters_id_fk"],
+	["terminals", "terminals_chapter_id_chapters_id_fk"],
+	["volume_snapshot_applications", "volume_snapshot_applications_chapter_id_chapters_id_fk"],
+	["volume_snapshots", "volume_snapshots_source_chapter_id_chapters_id_fk"],
+];
+
 async function loadJournal(): Promise<{
 	entries: JournalEntry[];
 	hashes: string[];
@@ -137,13 +177,13 @@ type Outcome = {
 		foreignKeys: number;
 		indexes: number;
 		uniques: number;
+		primaryKeys: number;
 		checks: number;
 		generated: number;
 		canonicalExpressions: number;
 		migrationStatements: number;
 		ledgerRows: number;
 		replayQueries: number;
-		rawReplayFailed: boolean;
 		swappedOrdinalityDiffers: number;
 		unquotedAliasFolds: boolean;
 		tamperDetected: string[];
@@ -212,15 +252,6 @@ describe("PostgreSQL baseline", () => {
 				if (replayQueries !== 0) {
 					problems.push(`migrator re-ran ${replayQueries} statements over an applied journal`);
 				}
-				// The SQL itself must NOT be idempotent: if it were, applying it over an existing
-				// database would silently do nothing and the ledger would be the only guard.
-				const rawReplay = await exec(
-					await readFile(`${MIGRATIONS_FOLDER}/${entries.at(-1)?.tag}.sql`, "utf8"),
-				);
-				if (rawReplay.code === 0) {
-					problems.push("re-applying the migration SQL succeeded; it is not creating anything");
-				}
-
 				// --- catalog ------------------------------------------------------------------
 				const read = await readCatalog(exec);
 				problems.push(...read.problems);
@@ -281,10 +312,40 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 				const tamperDetected: string[] = [];
 				const tampers: Array<{ label: string; sql: string; facets: FacetName[]; match: RegExp }> = [
 					{
+						label: "renamed composite primary key",
+						sql: `ALTER TABLE "resource_protection_sources" RENAME CONSTRAINT "resource_protection_sources_source_source_id_pk" TO "tampered_sources_pk";`,
+						facets: ["primaryKeys"],
+						match:
+							/^primary key resource_protection_sources\.resource_protection_sources_source_source_id_pk: missing/,
+					},
+					{
+						label: "reordered composite primary key",
+						sql: `ALTER TABLE "resource_protection_paths" DROP CONSTRAINT "resource_protection_paths_source_source_id_slot_pk";
+ALTER TABLE "resource_protection_paths" ADD CONSTRAINT "resource_protection_paths_source_source_id_slot_pk" PRIMARY KEY ("source_id", "source", "slot");`,
+						facets: ["primaryKeys", "columns"],
+						match:
+							/^primary key resource_protection_paths\.resource_protection_paths_source_source_id_slot_pk: expected/,
+					},
+					{
+						label: "dropped composite primary key",
+						sql: `ALTER TABLE "resource_protection_paths" DROP CONSTRAINT "resource_protection_paths_source_source_id_slot_pk";`,
+						facets: ["primaryKeys", "columns"],
+						match:
+							/^primary key resource_protection_paths\.resource_protection_paths_source_source_id_slot_pk: missing/,
+					},
+					{
 						label: "dropped foreign key",
-						sql: `ALTER TABLE "chapters" DROP CONSTRAINT "chapters_project_id_projects_id_fk";`,
+						sql: `ALTER TABLE "narrators" DROP CONSTRAINT "narrators_context_project_id_projects_id_fk";`,
 						facets: ["foreignKeys"],
-						match: /^foreign key chapters_project_id_projects_id_fk: missing/,
+						match: /^foreign key narrators_context_project_id_projects_id_fk: missing/,
+					},
+					{
+						label: "changed partial index predicate",
+						sql: `DROP INDEX "idx_integration_authorities_source_grant";
+CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_authorities" ("source_grant_id") WHERE "source_grant_id" is null;`,
+						facets: ["indexes"],
+						match:
+							/^index integration_authorities\.idx_integration_authorities_source_grant: expected/,
 					},
 					{
 						label: "dropped index",
@@ -351,13 +412,13 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 						foreignKeys: read.catalog.foreignKeys.length,
 						indexes: read.catalog.indexes.length,
 						uniques: read.catalog.uniques.length,
+						primaryKeys: read.catalog.primaryKeys.length,
 						checks: read.catalog.checks.length,
 						generated: read.catalog.generated.length,
 						canonicalExpressions: canonical.canonical.size,
 						migrationStatements,
 						ledgerRows: ledger.length,
 						replayQueries,
-						rawReplayFailed: rawReplay.code !== 0,
 						swappedOrdinalityDiffers: Number(ordinality),
 						unquotedAliasFolds: !("foreignKeys" in alias) && "foreignkeys" in alias,
 						tamperDetected,
@@ -380,12 +441,12 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 			expect(observed.migrationStatements).toBe(statements);
 			expect(observed.ledgerRows).toBe(entries.length);
 			expect(observed.replayQueries).toBe(0);
-			expect(observed.rawReplayFailed).toBe(true);
 			expect({
 				tables: observed.tables,
 				columns: observed.columns,
 				foreignKeys: observed.foreignKeys,
 				uniques: observed.uniques,
+				primaryKeys: observed.primaryKeys,
 				checks: observed.checks,
 				generated: observed.generated,
 			}).toEqual({
@@ -393,6 +454,7 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 				columns: expected.counts.columns,
 				foreignKeys: expected.counts.foreignKeys,
 				uniques: expected.counts.uniqueConstraints,
+				primaryKeys: expected.counts.primaryKeys,
 				checks: expected.counts.checkConstraints,
 				generated: expected.counts.generatedColumns,
 			});
@@ -403,7 +465,11 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 			expect(observed.unquotedAliasFolds).toBe(true);
 			// And the gate can still fail on real damage.
 			expect(observed.tamperDetected).toEqual([
+				"renamed composite primary key",
+				"reordered composite primary key",
+				"dropped composite primary key",
 				"dropped foreign key",
+				"changed partial index predicate",
 				"dropped index",
 				"changed default",
 				"dropped unique constraint",
@@ -412,6 +478,83 @@ SELECT json_build_array((SELECT next_seq FROM narrators WHERE id='fresh-n'), (SE
 				"dropped generated column",
 			]);
 			expect(problems).toEqual([]);
+		},
+		RUN_TIMEOUT_MS,
+	);
+
+	it(
+		"checks raw replay at the 0046 and 0048 migration boundaries",
+		async () => {
+			const journal = JSON.parse(
+				await readFile(`${MIGRATIONS_FOLDER}/meta/_journal.json`, "utf8"),
+			) as {
+				entries: JournalEntry[];
+				[key: string]: unknown;
+			};
+			const index46 = journal.entries.findIndex(
+				(entry) => entry.tag === "0046_outline_task_claims",
+			);
+			const index47 = journal.entries.findIndex((entry) => entry.tag === "0048_native_media");
+			expect(index46).toBeGreaterThanOrEqual(0);
+			expect(journal.entries[index46 + 1]?.tag).toBe("0047_modeltrace_narrator");
+			expect(index47).toBe(index46 + 2);
+			const folder = await mkdtemp(join(tmpdir(), "nf-pg-replay-prefix-"));
+			try {
+				await mkdir(join(folder, "meta"));
+				for (const entry of journal.entries.slice(0, index47 + 1)) {
+					await copyFile(`${MIGRATIONS_FOLDER}/${entry.tag}.sql`, join(folder, `${entry.tag}.sql`));
+				}
+				const setPrefix = (end: number) =>
+					writeFile(
+						join(folder, "meta/_journal.json"),
+						JSON.stringify({
+							...journal,
+							entries: journal.entries.slice(0, end + 1),
+						}),
+					);
+				let callbackError: unknown;
+				const result = await withPostgres(async ({ exec }) => {
+					try {
+						const db = drizzleProxy(psqlProxyCallback(exec)) as unknown as PgRemoteDatabase;
+						const apply = async (end: number) => {
+							await setPrefix(end);
+							await migrate(
+								db,
+								async (queries) => {
+									const applied = await exec(migrationScript(queries));
+									if (applied.code !== 0)
+										throw new Error(`prefix migration failed: ${applied.stderr.slice(-600)}`);
+								},
+								{ migrationsFolder: folder },
+							);
+						};
+						await apply(index46);
+						const sql46 = await readFile(
+							`${MIGRATIONS_FOLDER}/0046_outline_task_claims.sql`,
+							"utf8",
+						);
+						const replay46 = await exec(`BEGIN;\n${sql46}\n;ROLLBACK;`);
+						expect(replay46.code).not.toBe(0);
+						expect(replay46.stderr).toMatch(/outline_task_claims.*already exists/i);
+
+						await apply(index47);
+						const sql47 = await readFile(`${MIGRATIONS_FOLDER}/0048_native_media.sql`, "utf8");
+						const replay47 = await exec(`BEGIN;\n${sql47}\n${sql47}\nROLLBACK;`);
+						if (replay47.code !== 0)
+							throw new Error(`0047 raw replay failed: ${replay47.stderr.slice(-600)}`);
+						return true;
+					} catch (error) {
+						callbackError = error;
+						throw error;
+					}
+				});
+				if (callbackError) throw callbackError;
+				if (typeof result !== "boolean") {
+					throw new Error(`PostgreSQL replay check did not complete: ${JSON.stringify(result)}`);
+				}
+			} finally {
+				await rm(folder, { recursive: true, force: true });
+			}
 		},
 		RUN_TIMEOUT_MS,
 	);
@@ -475,7 +618,10 @@ INSERT INTO background_tasks (id,parent_narrator_id,type,status,started_at,creat
 CREATE TABLE nf_upgrade_constraint_probe.before AS
 SELECT c.relname AS table_name, k.conname AS constraint_name, pg_get_constraintdef(k.oid) AS definition
 FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid
-WHERE k.connamespace='public'::regnamespace;`);
+WHERE k.connamespace='public'::regnamespace;
+DELETE FROM nf_upgrade_constraint_probe.before WHERE (table_name, constraint_name) IN (VALUES ${RETIRED_CONSTRAINTS.map(([table, name]) => `('${table}','${name}')`).join(",")});`);
+						// Every retired constraint must have been in the baseline, or the list is stale.
+						const prior = oldConstraints.count - RETIRED_CONSTRAINTS.length;
 						await apply(MIGRATIONS_FOLDER);
 						const preservationSql = `SELECT json_build_object(
 'prior', count(*),
@@ -487,7 +633,7 @@ LEFT JOIN pg_constraint k ON k.conrelid=c.oid AND k.conname=old.constraint_name;
 						const preservation = () =>
 							readJson(exec, preservationSql, "old constraint preservation");
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 0,
 							changed: 0,
 						});
@@ -495,7 +641,7 @@ LEFT JOIN pg_constraint k ON k.conrelid=c.oid AND k.conname=old.constraint_name;
 						await run(`UPDATE nf_upgrade_constraint_probe.before SET definition='__nf_changed__'||definition
 WHERE (table_name,constraint_name)=(SELECT table_name,constraint_name FROM nf_upgrade_constraint_probe.before ORDER BY table_name,constraint_name LIMIT 1);`);
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 0,
 							changed: 1,
 						});
@@ -504,14 +650,14 @@ WHERE left(definition,length('__nf_changed__'))='__nf_changed__';
 UPDATE nf_upgrade_constraint_probe.before SET table_name='__nf_missing__'||table_name
 WHERE (table_name,constraint_name)=(SELECT table_name,constraint_name FROM nf_upgrade_constraint_probe.before ORDER BY table_name,constraint_name LIMIT 1);`);
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 1,
 							changed: 0,
 						});
 						await run(`UPDATE nf_upgrade_constraint_probe.before SET table_name=substr(table_name,length('__nf_missing__')+1)
 WHERE left(table_name,length('__nf_missing__'))='__nf_missing__';`);
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 0,
 							changed: 0,
 						});

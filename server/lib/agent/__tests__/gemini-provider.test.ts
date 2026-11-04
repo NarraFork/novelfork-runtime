@@ -2,7 +2,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { RequestRecording } from "@shared/request-recording";
 import { z } from "zod/v4";
+import {
+	customApiProviderToGemini,
+	geminiProviderToCustomApi,
+} from "../../settings/custom-api-providers";
+import type { CustomApiProviderConfig } from "../../settings/types";
 import type { DbMessage, ParsedStreamEvent } from "../provider";
 import { ApiRequestDumpCollector } from "../request-dump";
 
@@ -11,40 +17,9 @@ interface TestGeminiProvider {
 	buildHistory(
 		messages: DbMessage[],
 		model: string,
-	): Promise<{
-		history: unknown[];
-		trailingToolResults: unknown[];
-	}>;
+		owner?: string,
+	): Promise<{ history: unknown[] }>;
 	chat(params: Record<string, unknown>): AsyncGenerator<ParsedStreamEvent>;
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown;
-	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void;
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: Array<{
-			toolUseId: string;
-			name: string;
-			input: Record<string, unknown>;
-			outputIndex?: number;
-			thoughtSignature?: string;
-			thoughtSignatureSource?: string;
-		}>,
-		reasoningBlocks?: Array<{
-			text: string;
-			outputIndex?: number;
-			providerMetadata?: Record<string, unknown>;
-		}>,
-		webSearches?: unknown[],
-		messageId?: string,
-		imageGenerations?: unknown[],
-		textOutputIndex?: number,
-	): void;
 	generateWithMeta(
 		text: string,
 		model: string,
@@ -82,14 +57,6 @@ let setOutboundFetchOverrideForTest: (
 ) => void;
 let maxSseEventBytes = 0;
 let maxStreamBytes = 0;
-/**
- * The provider's ceiling on a persisted dump, whatever `agent.requestDumpMaxSize` says.
- *
- * Read from the module rather than written literally: the configurable setting is
- * clamped to this value, so a test that hard-codes the setting's current default breaks
- * when that default changes even though the capping behaviour is unchanged.
- */
-let maxDumpBytes = 0;
 let testHome = "";
 let originalNarraforkHome: string | undefined;
 
@@ -112,7 +79,6 @@ beforeAll(async () => {
 		factoryModule.createGeminiProvider as unknown as typeof createGeminiProvider;
 	maxSseEventBytes = interactionsModule.GEMINI_MAX_SSE_EVENT_BYTES;
 	maxStreamBytes = interactionsModule.GEMINI_MAX_STREAM_BYTES;
-	maxDumpBytes = interactionsModule.GEMINI_MAX_REQUEST_DUMP_BYTES;
 	setOutboundFetchOverrideForTest = outboundFetchModule.setOutboundFetchOverrideForTest;
 });
 
@@ -184,6 +150,162 @@ async function collect(stream: AsyncGenerator<ParsedStreamEvent>): Promise<Parse
 	return events;
 }
 
+describe("Gemini parallel tool media attribution", () => {
+	test("preserves source IDs for live and replayed audio/video without changing images", async () => {
+		const audioBytes = Buffer.from(
+			"524946462400000057415645666d74201000000001000100401f0000803e0000020010006461746100000000",
+			"hex",
+		);
+		const videoBytes = Buffer.from("000000146674797069736f6d0000000069736f6d", "hex");
+		const audio = { type: "audio", mediaType: "audio/wav", base64: audioBytes.toString("base64") };
+		const video = { type: "video", mediaType: "video/mp4", base64: videoBytes.toString("base64") };
+		for (const [kind, provider] of [
+			["generate", makeGenerateContentProvider()],
+			["interactions", makeProvider()],
+		] as const) {
+			type Part = {
+				text?: string;
+				type?: string;
+				data?: string;
+				inlineData?: { mimeType: string; data: string };
+				functionResponse?: { name: string; response: Record<string, unknown> };
+			};
+			type Step = {
+				type?: string;
+				parts?: Part[];
+				content?: Part[];
+				call_id?: string;
+				name?: string;
+			};
+			const requests: Array<{ contents: Step[]; input: Step[] }> = [];
+			setOutboundFetchOverrideForTest(async (_input, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				return kind === "generate"
+					? sseResponse([
+							{
+								event: "message",
+								data: {
+									candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+								},
+							},
+						])
+					: sseResponse([
+							{
+								event: "interaction.completed",
+								data: { event_type: "interaction.completed", interaction: { status: "completed" } },
+							},
+						]);
+			});
+			const ids = ["read-audio", "read-video"];
+			const media = [audio, video];
+			const toolResults = ids.map((id, index) =>
+				kind === "generate"
+					? {
+							name: "Read",
+							toolUseId: id,
+							response: { output: "ok" },
+							mediaParts: [
+								{ inlineData: { mimeType: media[index].mediaType, data: media[index].base64 } },
+							],
+						}
+					: {
+							type: "function_result",
+							call_id: id,
+							name: "Read",
+							result: "ok",
+							_nativeMedia: [media[index]],
+						},
+			);
+			await collect(provider.chat(baseChatParams({ content: "", toolResults })));
+			const turns = [
+				{
+					kind: "tool_results",
+					envelopeId: "a",
+					results: ids.map((wireId, index) => ({
+						wireId,
+						name: "Read",
+						text: "ok",
+						isError: false,
+						images: [],
+						media: [media[index]],
+					})),
+				},
+			];
+			const projector = provider as unknown as {
+				geminiWireHistory(turns: unknown[]): unknown[];
+				interactionsWireHistory(turns: unknown[]): unknown[];
+			};
+			const history =
+				kind === "generate"
+					? projector.geminiWireHistory(turns)
+					: projector.interactionsWireHistory(turns);
+			await collect(provider.chat(baseChatParams({ content: "", history })));
+			for (const request of requests) {
+				const steps = kind === "generate" ? request.contents : request.input;
+				if (kind === "generate") {
+					const responses = steps.flatMap((step) =>
+						(step.parts ?? []).flatMap((part) =>
+							part.functionResponse ? [part.functionResponse] : [],
+						),
+					);
+					expect(responses).toEqual(
+						ids.map((toolCallId) => ({ name: "Read", response: { output: "ok", toolCallId } })),
+					);
+				} else {
+					expect(
+						steps
+							.filter((step) => step.type === "function_result")
+							.map(({ name, call_id }) => ({ name, call_id })),
+					).toEqual(ids.map((call_id) => ({ name: "Read", call_id })));
+				}
+				const mediaContainer =
+					kind === "generate"
+						? steps.find((step) =>
+								step.parts?.some((part) => part.inlineData?.mimeType?.startsWith("audio/")),
+							)?.parts
+						: steps.find(
+								(step) =>
+									step.type === "user_input" &&
+									Array.isArray(step.content) &&
+									step.content.some((part) => part.type === "audio"),
+							)?.content;
+				if (!mediaContainer) throw new Error("Missing media container");
+				for (const [index, item] of media.entries()) {
+					const position = mediaContainer.findIndex((part) =>
+						kind === "generate" ? part.inlineData?.data === item.base64 : part.data === item.base64,
+					);
+					expect(position).toBeGreaterThan(0);
+					expect(mediaContainer[position - 1].text).toBe(
+						`Tool result media source: ${JSON.stringify({ toolCallId: ids[index] })}`,
+					);
+				}
+			}
+			const imageResult =
+				kind === "generate"
+					? {
+							name: "Read",
+							toolUseId: "image",
+							response: { output: "ok" },
+							mediaParts: [{ inlineData: { mimeType: "image/png", data: "aW1hZ2U=" } }],
+						}
+					: {
+							type: "function_result",
+							call_id: "image",
+							name: "Read",
+							result: [{ type: "image", mime_type: "image/png", data: "aW1hZ2U=" }],
+						};
+			await collect(provider.chat(baseChatParams({ content: "", toolResults: [imageResult] })));
+			expect(JSON.stringify(requests[2])).not.toContain("Tool result media source:");
+			if (kind === "generate") {
+				const response = requests[2].contents
+					.flatMap((step) => step.parts ?? [])
+					.find((part) => part.functionResponse)?.functionResponse;
+				expect(response).toEqual({ name: "Read", response: { output: "ok" } });
+			}
+		}
+	});
+});
+
 describe("Gemini transport selection", () => {
 	test("factory defaults missing transport to generateContent and never calls /interactions", async () => {
 		const urls: string[] = [];
@@ -244,47 +366,59 @@ describe("Gemini transport selection", () => {
 		expect(url).toBe("https://gemini.example.test/v1beta/interactions");
 	});
 
-	test("does not replay opaque signatures across Gemini transports", () => {
-		const interactionsHistory: unknown[] = [];
-		makeProvider().pushAssistantTurn(interactionsHistory, "", [
+	test("does not replay opaque signatures across Gemini transports", async () => {
+		const call = (toolUseId: string, source: string): DbMessage[] => [
 			{
-				toolUseId: "cross-transport",
-				name: "Read",
-				input: { file_path: "/tmp/a" },
-				thoughtSignature: "opaque-signature",
-				thoughtSignatureSource: "gemini:gemini-test:generate-content",
-			},
-		]);
-		expect(interactionsHistory).toEqual([
-			{
-				type: "function_call",
-				id: "cross-transport",
-				name: "Read",
-				arguments: { file_path: "/tmp/a" },
-			},
-		]);
-
-		const generateHistory: unknown[] = [];
-		makeGenerateContentProvider().pushAssistantTurn(generateHistory, "", [
-			{
-				toolUseId: "same-transport",
-				name: "Read",
-				input: { file_path: "/tmp/a" },
-				thoughtSignature: "opaque-signature",
-				thoughtSignatureSource: "gemini:gemini-generate-test:generate-content",
-			},
-		]);
-		expect(generateHistory).toEqual([
-			{
-				role: "model",
-				parts: [
+				id: `assistant-${toolUseId}`,
+				role: "assistant",
+				contentJson: [
 					{
-						functionCall: { name: "Read", args: { file_path: "/tmp/a" } },
+						type: "tool_use",
+						id: toolUseId,
+						name: "Read",
+						input: { file_path: "/tmp/a" },
 						thoughtSignature: "opaque-signature",
+						thoughtSignatureSource: source,
+					},
+				],
+				contentText: null,
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [
+					{
+						toolUseId,
+						toolName: "Read",
+						inputJson: { file_path: "/tmp/a" },
+						outputJson: "contents",
+						status: "success",
 					},
 				],
 			},
-		]);
+		];
+		const interactions = await makeProvider().buildHistory(
+			call("cross-transport", "gemini:gemini-test:generate-content"),
+			"gemini-test:model",
+		);
+		expect(interactions.history[0]).toEqual({
+			type: "function_call",
+			id: "cross-transport",
+			name: "Read",
+			arguments: { file_path: "/tmp/a" },
+		});
+
+		const generate = await makeGenerateContentProvider().buildHistory(
+			call("same-transport", "gemini:gemini-generate-test:generate-content"),
+			"gemini-generate-test:model",
+		);
+		expect(generate.history[0]).toEqual({
+			role: "model",
+			parts: [
+				{
+					functionCall: { name: "Read", args: { file_path: "/tmp/a" } },
+					thoughtSignature: "opaque-signature",
+				},
+			],
+		});
 	});
 
 	test("generateContent lightweight generation streams deltas and usage", async () => {
@@ -321,7 +455,8 @@ describe("Gemini transport selection", () => {
 		expect(result).toEqual({
 			text: "generated",
 			usage: {
-				inputTokens: 7,
+				// promptTokenCount 7 含缓存 1，归一到「input 不含缓存」后为 6。
+				inputTokens: 6,
 				outputTokens: 2,
 				cachedInputTokens: 1,
 				cacheCreationInputTokens: 0,
@@ -335,6 +470,98 @@ describe("Gemini transport selection", () => {
 		expect(headers.get("Accept")).toBe("text/event-stream");
 		expect(signal).toBe(controller.signal);
 	});
+});
+
+describe("Gemini input token accounting", () => {
+	for (const api of ["generateContent", "interactions"] as const) {
+		const model =
+			api === "generateContent"
+				? "gemini-generate-test:gemini-2.5-flash"
+				: "gemini-test:gemini-3-flash-preview";
+		const make = () => (api === "generateContent" ? makeGenerateContentProvider() : makeProvider());
+		for (const prompt of [100, 0, undefined]) {
+			for (const cached of [0, 40, 100, 120]) {
+				test(`${api} total=${prompt} cached=${cached} normalizes JSON and SSE`, async () => {
+					const usage =
+						api === "generateContent"
+							? {
+									promptTokenCount: prompt,
+									cachedContentTokenCount: cached,
+									candidatesTokenCount: 7,
+									thoughtsTokenCount: 2,
+								}
+							: {
+									total_input_tokens: prompt,
+									total_cached_tokens: cached,
+									total_output_tokens: 7,
+									total_thought_tokens: 2,
+								};
+					const data =
+						api === "generateContent" ? { usageMetadata: usage } : { status: "completed", usage };
+					const frames = [
+						{
+							event: api === "generateContent" ? "message" : "interaction.completed",
+							data: api === "generateContent" ? data : { interaction: data },
+						},
+					];
+					const expected = Math.max((prompt ?? 0) - cached, 0);
+					for (const transport of ["JSON", "SSE"]) {
+						setOutboundFetchOverrideForTest(async () =>
+							transport === "SSE"
+								? sseResponse(frames)
+								: new Response(JSON.stringify(data), {
+										headers: { "content-type": "application/json" },
+									}),
+						);
+						const result = await make().generateWithMeta("hello", model);
+						expect(result.usage).toEqual({
+							inputTokens: expected,
+							outputTokens: 7,
+							cachedInputTokens: cached,
+							cacheCreationInputTokens: 0,
+							reasoningTokens: 2,
+						});
+					}
+					setOutboundFetchOverrideForTest(async () => sseResponse(frames));
+					const events = await collect(make().chat(baseChatParams({ model })));
+					expect(events.find((event) => event.usage)?.usage).toMatchObject({
+						promptTokens: prompt ?? 0,
+						inputTokens: expected,
+						completionTokens: 7,
+					});
+				});
+			}
+		}
+
+		for (const inputTokens of [undefined, 0, 17]) {
+			test(`${api} stream conversion preserves normalized input=${inputTokens}`, async () => {
+				const provider = make() as TestGeminiProvider & {
+					parseSSEStream: () => AsyncGenerator<ParsedStreamEvent>;
+				};
+				provider.parseSSEStream = async function* () {
+					yield {
+						usage: {
+							promptTokens: 100,
+							inputTokens,
+							cachedInputTokens: 40,
+							cacheCreationInputTokens: 20,
+							completionTokens: 7,
+							reasoningTokens: 2,
+						},
+					};
+				};
+				setOutboundFetchOverrideForTest(async () => sseResponse([]));
+				const result = await provider.generateWithMeta("hello", model);
+				expect(result.usage).toEqual({
+					inputTokens: inputTokens ?? 40,
+					outputTokens: 7,
+					cachedInputTokens: 40,
+					cacheCreationInputTokens: 20,
+					reasoningTokens: 2,
+				});
+			});
+		}
+	}
 });
 
 describe("Gemini lightweight partial output regression", () => {
@@ -438,7 +665,8 @@ describe("Gemini lightweight partial output regression", () => {
 						text: partialText,
 						outputTruncated: true,
 						usage: {
-							inputTokens: 11,
+							// promptTokenCount 11 含缓存 3，归一到「input 不含缓存」后为 8。
+							inputTokens: 8,
 							outputTokens: 7,
 							cachedInputTokens: 3,
 							cacheCreationInputTokens: 0,
@@ -466,6 +694,34 @@ describe("Gemini lightweight partial output regression", () => {
 			}
 		}
 	}
+});
+
+describe("Gemini HTTP error diagnostics", () => {
+	test("a non-2xx response carries status, envelope and retry-after in diagnostics", async () => {
+		setOutboundFetchOverrideForTest(async () =>
+			Response.json(
+				{
+					error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "5-hour usage limit reached" },
+				},
+				{ status: 429, headers: { "retry-after": "1800" } },
+			),
+		);
+		const error = await makeGenerateContentProvider()
+			.generateWithMeta("hello", "gemini-generate-test:gemini-2.5-flash")
+			.then(
+				() => undefined,
+				(caught: unknown) => caught,
+			);
+		expect(error).toMatchObject({
+			status: 429,
+			message: expect.stringContaining("Gemini API error 429:"),
+			diagnostics: {
+				statusCode: 429,
+				message: "5-hour usage limit reached",
+				responseHeaders: { "retry-after": "1800" },
+			},
+		});
+	});
 });
 
 describe("Gemini Interactions API provider", () => {
@@ -682,22 +938,48 @@ describe("Gemini Interactions API provider", () => {
 			]);
 		});
 		const provider = makeProvider();
-		const history: unknown[] = [];
 		await collect(provider.chat(baseChatParams() as never));
-		provider.pushUserTurn(history, "hello", "gemini-test:model", []);
-		provider.pushAssistantTurn(history, "", [
-			{ toolUseId: "call_upstream", name: "Read", input: { file_path: "/tmp/a" }, outputIndex: 0 },
-		]);
-		const result = provider.formatToolResult(
-			"call_upstream",
-			"file contents",
-			false,
-			undefined,
-			"Read",
+		// The second request is the projection of the conversation so far.
+		const { history } = await provider.buildHistory(
+			[
+				{
+					id: "user-1",
+					role: "user",
+					contentJson: [{ type: "text", text: "hello" }],
+					contentText: "hello",
+					parentToolUseId: null,
+					messageUuid: null,
+				},
+				{
+					id: "assistant-1",
+					role: "assistant",
+					contentJson: [
+						{
+							type: "tool_use",
+							id: "call_upstream",
+							name: "Read",
+							input: { file_path: "/tmp/a" },
+							outputIndex: 0,
+						},
+					],
+					contentText: null,
+					parentToolUseId: null,
+					messageUuid: null,
+					toolCalls: [
+						{
+							toolUseId: "call_upstream",
+							toolName: "Read",
+							inputJson: { file_path: "/tmp/a" },
+							outputJson: "file contents",
+							status: "success",
+						},
+					],
+				},
+			],
+			"gemini-test:model",
 		);
-		provider.pushUserTurn(history, "", "gemini-test:model", [result]);
 		await collect(
-			provider.chat(baseChatParams({ content: ".", history, toolResults: [] }) as never),
+			provider.chat(baseChatParams({ content: "", history, toolResults: [] }) as never),
 		);
 
 		expect(bodies[1].input).toEqual([
@@ -717,42 +999,8 @@ describe("Gemini Interactions API provider", () => {
 		]);
 	});
 
-	test("pushAssistantTurn and buildHistory round-trip ordering, indices, and thought signature", async () => {
+	test("buildHistory keeps ordering, indices, and thought signatures", async () => {
 		const provider = makeProvider();
-		const pushed: unknown[] = [];
-		provider.pushUserTurn(pushed, "question", "gemini-test:model", []);
-		provider.pushAssistantTurn(
-			pushed,
-			"answer prefix",
-			[
-				{
-					toolUseId: "call_roundtrip",
-					name: "Read",
-					input: { file_path: "/tmp/a" },
-					outputIndex: 2,
-					thoughtSignature: "sig_roundtrip",
-				},
-			],
-			[
-				{
-					text: "reasoning summary",
-					outputIndex: 0,
-					providerMetadata: {
-						gemini: {
-							stepId: "thought_roundtrip",
-							stepIndex: 0,
-							thoughtSignature: "sig_roundtrip",
-						},
-						signatureSource: "gemini:gemini-test:interactions",
-					},
-				},
-			],
-			undefined,
-			undefined,
-			undefined,
-			1,
-		);
-
 		const rebuilt = await provider.buildHistory(
 			[
 				{
@@ -807,8 +1055,23 @@ describe("Gemini Interactions API provider", () => {
 			"gemini-test:model",
 		);
 
-		expect(rebuilt.history).toEqual(pushed);
-		expect(rebuilt.trailingToolResults).toEqual([
+		// Encounter order; the thought keeps its same-source signature, the call (whose
+		// signature names no source) does not carry one.
+		expect(rebuilt.history).toEqual([
+			{ type: "user_input", content: "question" },
+			{
+				type: "thought",
+				id: "thought_roundtrip",
+				signature: "sig_roundtrip",
+				summary: [{ type: "text", text: "reasoning summary" }],
+			},
+			{ type: "model_output", content: "answer prefix" },
+			{
+				type: "function_call",
+				id: "call_roundtrip",
+				name: "Read",
+				arguments: { file_path: "/tmp/a" },
+			},
 			{
 				type: "function_result",
 				call_id: "call_roundtrip",
@@ -886,7 +1149,8 @@ describe("Gemini Interactions API provider", () => {
 		expect(result).toEqual({
 			text: "Hello world",
 			usage: {
-				inputTokens: 9,
+				// total_input_tokens 9 含缓存 2，归一到「input 不含缓存」后为 7。
+				inputTokens: 7,
 				outputTokens: 3,
 				cachedInputTokens: 2,
 				cacheCreationInputTokens: 0,
@@ -971,8 +1235,21 @@ describe("Gemini Interactions API provider", () => {
 		]);
 	});
 
-	test("enforces per-SSE-event hard limit without cloning the whole stream dump", async () => {
-		const dump = new ApiRequestDumpCollector();
+	test("enforces per-SSE-event hard limit and records the error on the recording", async () => {
+		const metas: Record<string, unknown>[] = [];
+		let chunkBytes = 0;
+		const recording: RequestRecording = {
+			requestId: "gemini-hard-limit",
+			pin: () => {},
+			request: () => {},
+			responseMeta: (meta) => metas.push(meta),
+			responseChunk: (chunk) => {
+				chunkBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+			},
+			frame: () => {},
+			finish: () => {},
+		};
+		const dump = new ApiRequestDumpCollector(recording);
 		const huge = "x".repeat(maxSseEventBytes + 1);
 		setOutboundFetchOverrideForTest(
 			async () =>
@@ -988,18 +1265,9 @@ describe("Gemini Interactions API provider", () => {
 			thrown = error as Error;
 		}
 		expect(thrown?.message).toContain("SSE event exceeded hard limit");
-		const snapshot = dump.snapshot();
-		// Bounded by the provider's OWN dump ceiling, not by a hard-coded 1MB: the
-		// configurable `agent.requestDumpMaxSize` feeds `resolveDumpLimit`, so writing the
-		// old default in here made this test fail the moment that default was raised —
-		// while the property under test (the dump is capped rather than cloning the whole
-		// stream) still held. `maxDumpBytes` is the effective cap for any configured value.
-		// The slack covers the appended truncation marker.
-		expect(snapshot.response?.bodyText?.length ?? 0).toBeLessThanOrEqual(maxDumpBytes + 200);
-		// The stream itself is larger than the cap, so a real truncation must have happened
-		// — otherwise this assertion would pass for an unbounded dump that simply fit.
-		expect(snapshot.response?.bodyText?.length ?? 0).toBeLessThan(huge.length);
-		expect(snapshot.response?.error).toContain("hard limit");
+		// The raw bytes reach the recorder (bounded by its ring window, not an in-memory copy).
+		expect(chunkBytes).toBeGreaterThan(0);
+		expect(metas.find((meta) => typeof meta.error === "string")?.error).toContain("hard limit");
 	});
 
 	test("accepts one chunk whose complete small frames exceed the per-event limit in aggregate", async () => {
@@ -1078,3 +1346,179 @@ describe("Gemini Interactions API provider", () => {
 		expect(thrown?.message).toContain("rate limited");
 	});
 });
+
+// Exercise both transports through the real outbound request path.
+for (const transport of ["generate-content", "interactions"] as const) {
+	describe(`Gemini ${transport} request compatibility`, () => {
+		function provider(config: Record<string, unknown> = {}): TestGeminiProvider {
+			const Constructor =
+				transport === "interactions" ? GeminiProvider : GeminiGenerateContentProvider;
+			const converted = customApiProviderToGemini({
+				id: "gem-headers",
+				name: "Gemini",
+				prefix: "gem-headers",
+				protocol: "gemini-compatible",
+				defaultModel: "gemini-2.5-flash",
+				geminiTransport: transport,
+				apiKey: "test-key",
+				baseUrl: "https://opencode.ai/inference/go/v1",
+				userAgentMode: "narrafork",
+				...config,
+			} as CustomApiProviderConfig);
+			if (!converted) throw new Error("Gemini conversion failed");
+			// Include legacy round-tripping so fingerprint settings cannot disappear in projections.
+			const roundTrip = customApiProviderToGemini(geminiProviderToCustomApi(converted));
+			return new Constructor(roundTrip as unknown as Record<string, unknown>);
+		}
+
+		function captureRequests(): Array<{ headers: Headers; body: Record<string, unknown> }> {
+			const requests: Array<{ headers: Headers; body: Record<string, unknown> }> = [];
+			setOutboundFetchOverrideForTest(async (_input, init) => {
+				requests.push({
+					headers: new Headers(init?.headers),
+					body: JSON.parse(String(init?.body)),
+				});
+				return transport === "interactions"
+					? sseResponse([
+							{
+								event: "interaction.completed",
+								data: {
+									event_type: "interaction.completed",
+									interaction: { status: "completed" },
+								},
+							},
+						])
+					: sseResponse([
+							{
+								event: "message",
+								data: {
+									candidates: [
+										{ content: { role: "model", parts: [{ text: "OK" }] }, finishReason: "STOP" },
+									],
+								},
+							},
+						]);
+			});
+			return requests;
+		}
+
+		test("sends stable per-conversation OpenCode identity and the configured fingerprint", async () => {
+			const requests = captureRequests();
+			const adapter = provider({
+				userAgentMode: "custom",
+				customUserAgent: "Gemini-Test/1",
+				extraHeaders: { "X-Test": "configured" },
+			});
+			for (const conversationId of ["conv-one", "conv-one", "conv-two"]) {
+				await collect(adapter.chat(baseChatParams({ conversationId })));
+			}
+			const first = requests[0].headers;
+			expect(first.get("user-agent")).toBe("Gemini-Test/1");
+			expect(first.get("x-test")).toBe("configured");
+			expect(first.get("x-goog-api-key")).toBe("test-key");
+			expect(first.get("x-opencode-session")).toBeTruthy();
+			expect(requests[1].headers.get("x-opencode-session")).toBe(first.get("x-opencode-session"));
+			expect(requests[2].headers.get("x-opencode-session")).not.toBe(
+				first.get("x-opencode-session"),
+			);
+		});
+
+		test("extra headers override defaults case-insensitively without duplicate values", async () => {
+			const requests = captureRequests();
+			await collect(
+				provider({
+					extraHeaders: {
+						"USER-AGENT": "Override/2",
+						"X-OpenCode-Session": "manual-session",
+						"X-Goog-Api-Key": "override-key",
+						"content-type": "application/json; charset=utf-8",
+					},
+				}).chat(baseChatParams()),
+			);
+			expect(requests[0].headers.get("user-agent")).toBe("Override/2");
+			expect(requests[0].headers.get("x-opencode-session")).toBe("manual-session");
+			expect(requests[0].headers.get("x-goog-api-key")).toBe("override-key");
+			expect(requests[0].headers.get("content-type")).toBe("application/json; charset=utf-8");
+		});
+
+		test("does not add OpenCode identity to other hosts", async () => {
+			const requests = captureRequests();
+			await collect(
+				provider({ baseUrl: "https://generativelanguage.googleapis.com/v1beta" }).chat(
+					baseChatParams(),
+				),
+			);
+			expect(requests[0].headers.has("x-opencode-session")).toBe(false);
+			expect(requests[0].headers.get("user-agent")).toMatch(/narrafork/i);
+		});
+
+		test("auxiliary generation also applies fingerprint and fallback session headers", async () => {
+			const requests = captureRequests();
+			const adapter = provider({ extraHeaders: { "user-agent": "Auxiliary/1", "X-Test": "aux" } });
+			await adapter.generateWithMeta("hello", "gemini-2.5-flash");
+			await adapter.generateWithMeta("hello again", "gemini-2.5-flash");
+			expect(requests[0].headers.get("user-agent")).toBe("Auxiliary/1");
+			expect(requests[0].headers.get("x-test")).toBe("aux");
+			expect(requests[0].headers.get("accept")).toBe("text/event-stream");
+			expect(requests[0].headers.get("x-opencode-session")).toBeTruthy();
+			expect(requests[1].headers.get("x-opencode-session")).toBe(
+				requests[0].headers.get("x-opencode-session"),
+			);
+		});
+
+		test("emits valid nested function schemas for literal and enum constraints", async () => {
+			const requests = captureRequests();
+			const adapter = provider();
+			const properties = {
+				confirm: { type: "boolean", const: true },
+				cancel: { type: "boolean", const: false },
+				count: { type: "integer", const: 1, minimum: 0 },
+				action: { type: "string", const: "approve" },
+				flag: { type: "boolean", enum: [true, false] },
+				numbers: { type: "array", items: { type: "number", enum: [1, 2] } },
+				mixed: {
+					anyOf: [
+						{ type: "boolean", const: true },
+						{ type: "string", enum: ["yes", "no"] },
+					],
+				},
+				// A property named const or enum must not itself be interpreted as a keyword.
+				const: { type: "boolean", const: true },
+				enum: { type: "string", const: "literal" },
+			};
+			const tools = adapter.formatTools([
+				{
+					name: "DangerConfirm",
+					description: "Confirm",
+					parameters: z.object({ confirm: z.literal(true) }),
+					rawJsonSchema: { type: "object", properties, required: ["confirm"] },
+				},
+			]);
+			await collect(adapter.chat(baseChatParams({ tools })));
+			const body = requests[0].body;
+			const declarations = body.tools as Array<{
+				parameters?: unknown;
+				functionDeclarations?: Array<{ parameters: unknown }>;
+			}>;
+			const parameters =
+				transport === "interactions"
+					? declarations[0].parameters
+					: declarations[0].functionDeclarations?.[0].parameters;
+			expect(parameters).toEqual({
+				type: "object",
+				required: ["confirm"],
+				properties: {
+					confirm: { type: "boolean" },
+					cancel: { type: "boolean" },
+					count: { type: "integer", minimum: 0 },
+					action: { type: "string", enum: ["approve"] },
+					flag: { type: "boolean" },
+					numbers: { type: "array", items: { type: "number" } },
+					mixed: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["yes", "no"] }] },
+					const: { type: "boolean" },
+					enum: { type: "string", enum: ["literal"] },
+				},
+			});
+		});
+	});
+}

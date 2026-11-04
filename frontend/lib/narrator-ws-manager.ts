@@ -10,6 +10,7 @@
  * dedicated connection via `useTerminalWS`.
  */
 
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import {
@@ -17,7 +18,9 @@ import {
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import { getToken } from "./api";
+import { decodeBlockFrame } from "./block-protocol";
 import { observePageLifecycle } from "./page-lifecycle";
+import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
 import { buildWsUrl, safeCloseWs } from "./ws";
 import { removeWSStatus, setWSStatus } from "./ws-status";
 
@@ -25,7 +28,12 @@ import { removeWSStatus, setWSStatus } from "./ws-status";
 // Types
 // ---------------------------------------------------------------------------
 
-export type NarratorSubscriptionKind = "list" | "panel" | "messages";
+/**
+ * `activity` is the lightest level: the server sends only status, title and a
+ * one-line projection of top-level tool calls (see `narrator-activity-projection`).
+ * A narrator stays at that level only while every handle on it is `activity`.
+ */
+export type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 
 /**
  * Max chat room ids per `chat_subscribe` frame. Matches the server-side Zod cap
@@ -87,12 +95,11 @@ interface ListenerEntry {
 
 type ConnectionChangeCallback = (connected: boolean, isReconnect: boolean) => void;
 
-type MinimalTreeMessage = {
+type MinimalTreeMessage = MessageBodySource & {
 	id?: unknown;
 	narratorId?: unknown;
 	parentToolUseId?: unknown;
 	toolCalls?: unknown;
-	contentJson?: unknown;
 };
 
 /**
@@ -163,12 +170,10 @@ function extractToolUseIds(message: MinimalTreeMessage): string[] {
 			}
 		}
 	}
-	if (Array.isArray(message.contentJson)) {
-		for (const block of message.contentJson) {
-			if (block && typeof block === "object") {
-				const record = block as { type?: unknown; id?: unknown };
-				if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
-			}
+	for (const block of messageBody(message)) {
+		if (block && typeof block === "object") {
+			const record = block as { type?: unknown; id?: unknown };
+			if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
 		}
 	}
 	return [...ids];
@@ -363,12 +368,12 @@ export function decideNarratorForegroundRecovery(opts: {
 // ── Share-auth mode ─────────────────────────────────────────────────────────
 // The anonymous public-share page rides THIS manager (same /ws/narrator channel,
 // same event fan-out) but authenticates with the share credential instead of the
-// session JWT. The mode is process-wide and deliberately trivial: the public
+// session token. The mode is process-wide and deliberately trivial: the public
 // route never mounts the authenticated shell, so the two modes never coexist.
 let shareAuth: { shareId: string; token: string } | null = null;
 
 /**
- * Switch the manager's credential to a public share (or back to the session JWT
+ * Switch the manager's credential to a public share (or back to the session token
  * with `null`). Reconnects so the socket re-opens under the new credential.
  */
 export function setNarratorWSShareAuth(auth: { shareId: string; token: string } | null): void {
@@ -449,6 +454,8 @@ export class NarratorWSManager {
 
 	// --- Connection change callbacks ---
 	private connectionChangeCallbacks = new Set<ConnectionChangeCallback>();
+	/** Receivers of binary frames (outline live sessions); text frames never reach them. */
+	private binaryListeners = new Set<(bytes: Uint8Array) => void>();
 
 	// --- Microtask dispatch batching ---
 	// Non-latency-sensitive messages are queued and flushed in a single
@@ -626,6 +633,34 @@ export class NarratorWSManager {
 				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds }));
 			}
 		}
+		if (handle._kind !== "activity") this._downgradeToActivity(handle._narratorIds);
+	}
+
+	/** Whether any non-`activity` handle still holds this narrator. */
+	private _hasFullSubscription(narratorId: string): boolean {
+		for (const handleId of this.narratorRefCounts.get(narratorId) ?? []) {
+			if (this.subscriptions.get(handleId)?.kind !== "activity") return true;
+		}
+		return false;
+	}
+
+	/**
+	 * After a full handle let go, narrators still held only by `activity` handles
+	 * fall back to the activity stream (the server keeps the last level it was told).
+	 */
+	private _downgradeToActivity(narratorIds: string[]): void {
+		for (const narratorId of narratorIds) {
+			const refs = this.narratorRefCounts.get(narratorId);
+			if (!refs?.size || this._hasFullSubscription(narratorId)) continue;
+			const holder = [...refs][0];
+			const record = holder == null ? undefined : this.subscriptions.get(holder);
+			if (!record) continue;
+			this._scheduleSubscribe(
+				{ _id: record.id, _narratorIds: record.narratorIds, _kind: record.kind },
+				[narratorId],
+				{ downgrade: true },
+			);
+		}
 	}
 
 	/**
@@ -692,6 +727,7 @@ export class NarratorWSManager {
 			}
 			if (accepted.length) this._scheduleSubscribe(handle, accepted);
 		}
+		if (handle._kind !== "activity") this._downgradeToActivity(toRemove);
 	}
 
 	// -----------------------------------------------------------------------
@@ -798,6 +834,19 @@ export class NarratorWSManager {
 		if (this.ws?.readyState !== WebSocket.OPEN) return false;
 		this.ws.send(JSON.stringify(message));
 		return true;
+	}
+
+	/** Send a binary frame (outline live sessions). False when the socket is not open. */
+	sendBinary(bytes: Uint8Array): boolean {
+		if (this.ws?.readyState !== WebSocket.OPEN) return false;
+		this.ws.send(bytes as Uint8Array<ArrayBuffer>);
+		return true;
+	}
+
+	/** Receive every binary frame of the socket. */
+	addBinaryListener(listener: (bytes: Uint8Array) => void): () => void {
+		this.binaryListeners.add(listener);
+		return () => this.binaryListeners.delete(listener);
 	}
 
 	// -----------------------------------------------------------------------
@@ -1429,6 +1478,8 @@ export class NarratorWSManager {
 			? `share=${encodeURIComponent(shareAuth.shareId)}&token=${encodeURIComponent(shareAuth.token)}`
 			: `token=${encodeURIComponent(token ?? "")}`;
 		const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
+		// Binary frames (outline live sessions) arrive as bytes, not Blobs.
+		ws.binaryType = "arraybuffer";
 		this.ws = ws;
 
 		ws.onopen = () => {
@@ -1455,6 +1506,17 @@ export class NarratorWSManager {
 			// Any inbound frame proves the socket still delivers, including a
 			// heartbeat `ping` on an otherwise idle narrator.
 			this._clearSyncProbe();
+			if (typeof event.data !== "string") {
+				const bytes = new Uint8Array(event.data as ArrayBuffer);
+				for (const listener of this.binaryListeners) {
+					try {
+						listener(bytes);
+					} catch (error) {
+						console.error("[NarratorWS] binary listener error", error);
+					}
+				}
+				return;
+			}
 			try {
 				const data = JSON.parse(event.data);
 				if (data.type === "ping") {
@@ -1541,7 +1603,9 @@ export class NarratorWSManager {
 					);
 					return;
 				}
-				this._dispatch(data);
+				dispatchTokenDanceRecovery(data);
+				// Block-keyed (v2) frames reach listeners as the v1 frames they stand for.
+				for (const frame of decodeBlockFrame(data)) this._dispatch(frame);
 			} catch {
 				if (import.meta.env.DEV) {
 					console.warn("[NarratorWSManager] Failed to parse WS message");
@@ -1565,9 +1629,9 @@ export class NarratorWSManager {
 			// supervisor), and it is usually back within seconds, so run a fresh
 			// backoff cycle instead of stranding the client until a visibility or
 			// network event happens to fire.
-			// 4001 = the session token this socket was opened with expired. HTTP
-			// sliding renewal has very likely already stored a fresh one, so retry
-			// immediately with whatever is in localStorage instead of backing off.
+			// 4001 = the session this socket was opened with ended. Retry immediately
+			// with whatever is in localStorage: after a re-login that is the new token,
+			// otherwise the upgrade fails and the app falls back to its login flow.
 			if (
 				ev.code === SESSION_EXPIRED_CLOSE_CODE ||
 				ev.code === SERVER_SHUTDOWN_CLOSE_CODE ||
@@ -1908,15 +1972,28 @@ export class NarratorWSManager {
 		this.syncProbeTimer = undefined;
 	}
 
-	private _scheduleSubscribe(handle: SubscriptionHandle, narratorIds: string[]): void {
+	private _scheduleSubscribe(
+		handle: SubscriptionHandle,
+		narratorIds: string[],
+		opts?: { downgrade?: boolean },
+	): void {
 		if (narratorIds.length === 0) return;
 		// When the socket isn't OPEN there's nothing to send now; reconnect replays
 		// every active handle via `_restoreSubscriptions`, so we simply drop this.
 		if (this.ws?.readyState !== WebSocket.OPEN) return;
-		queueMicrotask(() => this._sendSubscribe(handle, narratorIds));
+		queueMicrotask(() => this._sendSubscribe(handle, narratorIds, opts));
 	}
 
-	private _sendSubscribe(handle: SubscriptionHandle, narratorIds: string[]): void {
+	/**
+	 * `downgrade` only matters for `activity`: such a frame never lowers a narrator
+	 * the server already streams in full unless the client says the full handles are
+	 * gone. Without it, the frame just requests the activity snapshot.
+	 */
+	private _sendSubscribe(
+		handle: SubscriptionHandle,
+		narratorIds: string[],
+		opts?: { downgrade?: boolean },
+	): void {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 		const record = this.subscriptions.get(handle._id);
@@ -1956,6 +2033,10 @@ export class NarratorWSManager {
 			return;
 		}
 
+		const downgrade =
+			kind === "activity" &&
+			opts?.downgrade === true &&
+			activeNarratorIds.every((nId) => !this._hasFullSubscription(nId));
 		for (const narratorIds of chunkNarratorIds(activeNarratorIds)) {
 			ws.send(
 				JSON.stringify({
@@ -1963,6 +2044,7 @@ export class NarratorWSManager {
 					narratorIds,
 					kind,
 					...(requestId ? { requestId } : {}),
+					...(downgrade ? { downgrade: true } : {}),
 				}),
 			);
 		}

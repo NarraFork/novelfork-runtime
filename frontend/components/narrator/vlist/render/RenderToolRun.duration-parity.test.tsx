@@ -23,6 +23,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
@@ -104,11 +105,11 @@ function durationText(root: Element): string | null {
 }
 
 /** The card's header, via the real adapter → measure → render chain. */
-function cardHeader(): Element {
+function cardHeader(tc = BASH_TC): Element {
 	const seg: AdapterSegment = {
 		kind: "tool-run",
 		sourceMessages: [],
-		items: [{ blockIndex: 0, isSubagent: false, tc: BASH_TC }],
+		items: [{ blockIndex: 0, isSubagent: false, tc }],
 	};
 	const spec = adaptSegment(seg, CTX).find((s) => s.key === "tool-tu-parity");
 	if (!spec) throw new Error("adapter produced no tool card spec");
@@ -127,15 +128,15 @@ function cardHeader(): Element {
 }
 
 /** The folded row element, via the real adapter → measure → render chain. */
-function traceRow(): Element {
+function traceRow(tc = BASH_TC): Element {
 	const unit = adaptActivityUnit(
 		[
 			{
 				kind: "tool",
-				msg: { id: "m1", role: "assistant", contentJson: [] },
+				msg: rowWithElements({ id: "m1", role: "assistant" }, []),
 				blockIndex: 0,
 				isSubagent: false,
-				tc: BASH_TC,
+				tc,
 			},
 		],
 		"act-parity",
@@ -152,6 +153,44 @@ function traceRow(): Element {
 	expect(rows).toHaveLength(1);
 	return rows[0] as Element;
 }
+
+describe("file-tool card and folded-row duration parity", () => {
+	it("uses the screenshot's execution span rather than the 13s lifecycle", () => {
+		const tc = {
+			...BASH_TC,
+			toolName: "Edit",
+			streamStartedAt: 35_417,
+			streamCompletedAt: 40_192,
+			executionStartedAt: 40_259,
+			completedAt: 48_625,
+			durationMs: 13_209,
+			outputJson: { _text: "updated", _metadata: { execDurationMs: 8_366 } },
+		};
+		expect(durationText(cardHeader(tc))).toBe("8s");
+		expect(durationText(traceRow(tc))).toBe("8s");
+	});
+
+	it("subtracts measured file waits on both surfaces, including zero execution", () => {
+		for (const executionMs of [300, 0]) {
+			const tc = {
+				...BASH_TC,
+				toolName: "Edit",
+				outputJson: {
+					_text: "updated",
+					_metadata: {
+						execDurationMs: 1_200,
+						fileChangeTiming: { waitMs: 1_200 - executionMs, executionMs, totalMs: 1_200 },
+					},
+				},
+			};
+			const card = durationText(cardHeader(tc));
+			const row = durationText(traceRow(tc));
+			expect(card).not.toBeNull();
+			expect(row).toBe(card);
+			expect(row).toBe("0s");
+		}
+	});
+});
 
 describe("a bash call's duration does not change with the LOD", () => {
 	it("paints the SAME figure as a card and as a folded row", async () => {
@@ -173,7 +212,7 @@ describe("a bash call's duration does not change with the LOD", () => {
 			[
 				{
 					kind: "tool",
-					msg: { id: "m1", role: "assistant", contentJson: [] },
+					msg: rowWithElements({ id: "m1", role: "assistant" }, []),
 					blockIndex: 0,
 					isSubagent: false,
 					tc: BASH_TC,

@@ -80,7 +80,7 @@ afterAll(() => {
 	}
 });
 
-const GIT_KEYS = [["gitStatus"], ["chapterGitStatus"]];
+const GIT_KEYS = [["gitStatus"], ["gitLineStats"]];
 
 describe("useGitBadgeRefresh", () => {
 	test("invalidates the badge queries when the window regains focus", async () => {

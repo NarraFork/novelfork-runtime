@@ -10,13 +10,19 @@ import {
 	selectOffset,
 } from "./document-selection";
 
-const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
-const savedClipboardItem = Object.getOwnPropertyDescriptor(globalThis, "ClipboardItem");
+const savedGlobals = {
+	navigator: Object.getOwnPropertyDescriptor(globalThis, "navigator"),
+	ClipboardItem: Object.getOwnPropertyDescriptor(globalThis, "ClipboardItem"),
+	window: Object.getOwnPropertyDescriptor(globalThis, "window"),
+	document: Object.getOwnPropertyDescriptor(globalThis, "document"),
+	HTMLElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLElement"),
+	HTMLInputElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLInputElement"),
+	HTMLTextAreaElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLTextAreaElement"),
+};
 afterEach(() => {
-	for (const [key, value] of [
-		["navigator", savedNavigator],
-		["ClipboardItem", savedClipboardItem],
-	] as const) {
+	for (const [key, value] of Object.entries(savedGlobals) as Array<
+		[keyof typeof savedGlobals, PropertyDescriptor | undefined]
+	>) {
 		if (value) Object.defineProperty(globalThis, key, value);
 		else Reflect.deleteProperty(globalThis, key);
 	}
@@ -112,6 +118,67 @@ describe("document raw-offset interaction", () => {
 		activated = false;
 		await copy;
 	});
+	test("plain HTTP falls back to execCommand via copyTextToClipboard", async () => {
+		const source = "http-fallback-body";
+		const ref = textDocumentStore.importText("http-copy", source);
+		const copied: string[] = [];
+		class FakeElement {
+			value = "";
+			readOnly = false;
+			tabIndex = 0;
+			type = "text";
+			style: Record<string, string> = {};
+			setAttribute() {}
+			focus() {}
+			select() {}
+			setSelectionRange() {}
+			remove() {}
+		}
+		Object.defineProperty(globalThis, "ClipboardItem", { configurable: true, value: undefined });
+		Object.defineProperty(globalThis, "HTMLElement", {
+			configurable: true,
+			value: FakeElement,
+		});
+		Object.defineProperty(globalThis, "HTMLInputElement", {
+			configurable: true,
+			value: FakeElement,
+		});
+		Object.defineProperty(globalThis, "HTMLTextAreaElement", {
+			configurable: true,
+			value: FakeElement,
+		});
+		Object.defineProperty(globalThis, "window", {
+			configurable: true,
+			value: { isSecureContext: false },
+		});
+		const appended: FakeElement[] = [];
+		Object.defineProperty(globalThis, "document", {
+			configurable: true,
+			value: {
+				body: {
+					appendChild(el: FakeElement) {
+						appended.push(el);
+					},
+				},
+				activeElement: null,
+				createElement(_tag: string) {
+					return new FakeElement();
+				},
+				execCommand(cmd: string) {
+					if (cmd !== "copy") return false;
+					const el = appended[appended.length - 1];
+					if (el) copied.push(el.value);
+					return true;
+				},
+			},
+		});
+		Object.defineProperty(globalThis, "navigator", {
+			configurable: true,
+			value: { clipboard: { writeText: async () => {} } },
+		});
+		await copyDocument(ref);
+		expect(copied).toEqual([source]);
+	});
 	test("copy errors stay explicit rather than reporting success", async () => {
 		const ref = textDocumentStore.importText("error-copy", "all");
 		Object.defineProperty(globalThis, "ClipboardItem", { configurable: true, value: undefined });
@@ -173,4 +240,68 @@ describe("document raw-offset interaction", () => {
 			"cancelled",
 		);
 	});
+});
+describe("copy ownership across source retirement", () => {
+	for (const mode of ["writeText", "promised ClipboardItem"] as const) {
+		test(`${mode} finishes a full-source copy when the last streaming owner retires`, async () => {
+			const source = `${"FIRST\r\n\t中文😀".repeat(1000)}LAST`;
+			const ref = {
+				id: `retiring-copy-${mode}`,
+				epoch: "retiring-copy-epoch",
+				revision: 1,
+				length: source.length,
+				complete: true,
+				originKnown: true,
+			};
+			let enter = () => {};
+			let resume = () => {};
+			const entered = new Promise<void>((resolve) => {
+				enter = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				resume = resolve;
+			});
+			textDocumentStore.register(ref, async (snapshot, offset, limit) => {
+				enter();
+				await gate;
+				return { ref: snapshot, offset, text: source.slice(offset, offset + limit) };
+			});
+			const releaseOwner = textDocumentStore.retainSource(ref.id);
+			const copied: string[] = [];
+			class Item {
+				constructor(readonly data: Record<string, Promise<Blob>>) {}
+			}
+			Object.defineProperty(globalThis, "ClipboardItem", {
+				configurable: true,
+				value: mode === "writeText" ? undefined : Item,
+			});
+			Object.defineProperty(globalThis, "navigator", {
+				configurable: true,
+				value: {
+					clipboard:
+						mode === "writeText"
+							? {
+									writeText: async (text: string) => {
+										copied.push(text);
+									},
+								}
+							: {
+									write: async (items: Item[]) => {
+										copied.push(await (await items[0].data["text/plain"]).text());
+									},
+								},
+				},
+			});
+			const copy = copyDocument(ref).then(
+				() => ({ success: true }),
+				(error: unknown) => ({ success: false, error }),
+			);
+			await entered;
+			releaseOwner(true);
+			resume();
+			expect(await copy).toEqual({ success: true });
+			expect(copied).toEqual([source]);
+			expect(textDocumentStore.getSnapshot(ref.id)).toBeUndefined();
+		});
+	}
 });

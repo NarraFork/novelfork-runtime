@@ -9,16 +9,22 @@
  * by the verified narratorId).
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import type { TreeMessage } from "@frontend/lib/api/types";
+import { decodeBlockPage } from "@frontend/lib/block-protocol";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
-import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls, users } from "../../db/schema";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { publicNarratorShareRoutes } from "../../routes/public-narrator-shares";
-import {
-	createPublicShare,
-	type VerifiedPublicShare,
-} from "../public-narrator-share-service";
+import { createPublicShare, type VerifiedPublicShare } from "../public-narrator-share-service";
 
 const now = "2026-09-08T00:00:00.000Z";
 const owner = generateId();
@@ -34,7 +40,13 @@ app.onError((error, c) =>
 beforeAll(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
 	db.insert(users)
-		.values({ id: owner, username: `readthrough-${generateId()}`, passwordHash: "x", role: "user", createdAt: now })
+		.values({
+			id: owner,
+			username: `readthrough-${generateId()}`,
+			passwordHash: "x",
+			role: "user",
+			createdAt: now,
+		})
 		.run();
 });
 
@@ -107,9 +119,13 @@ function tool(narratorId: string, messageId: string): string {
 }
 
 async function shared(narratorId: string) {
-	const created = await createPublicShare(narratorId, { userId: owner, isAdmin: false }, {
-		guestName: "Visitor",
-	});
+	const created = await createPublicShare(
+		narratorId,
+		{ userId: owner, isAdmin: false },
+		{
+			guestName: "Visitor",
+		},
+	);
 	return created;
 }
 
@@ -127,28 +143,20 @@ describe("public share read-through endpoints", () => {
 		const share = await shared(narratorId);
 		const res = await get(share, "/pretext-document");
 		expect(res.status).toBe(200);
-		const page = (await res.json()) as {
-			messages: Array<{
-				id: string;
-				contentJson: Array<{
-					type: string;
-					text?: string;
-					id?: string;
-					status?: string;
-					inputJson?: unknown;
-					outputJson?: unknown;
-				}>;
-			}>;
+		// The page is envelopes + blocks; the share page renders the rows they decode to.
+		const page = decodeBlockPage(await res.json()) as {
+			messages: TreeMessage[];
 			hasPrev: boolean;
 			messageVersion: number;
 		};
 		const row = page.messages.find((m) => m.id === messageId);
 		expect(row).toBeDefined();
-		// Structure, not flattening: contentJson blocks survive as blocks.
-		expect(row?.contentJson[0]).toEqual({ type: "text", text: "hello **world**" });
+		// Structure, not flattening: the message's elements survive as elements.
+		const body = messageBody(row);
+		expect(body[0]).toEqual({ type: "text", text: "hello **world**" });
 		// The tool_use block is hydrated in place with the call's real payload —
 		// that is exactly the shape the vlist's tool card renders from.
-		const toolBlock = row?.contentJson.find((b) => b.type === "tool_use") as
+		const toolBlock = body.find((b) => b.type === "tool_use") as
 			| { id: string; status?: string; inputJson?: unknown; outputJson?: unknown }
 			| undefined;
 		expect(toolBlock?.id).toBe(toolUseId);
@@ -189,7 +197,7 @@ describe("public share read-through endpoints", () => {
 		message(narratorB, 0, "beta-secret");
 		const shareA = await shared(narratorA);
 		const res = await get(shareA, "/pretext-document");
-		const page = (await res.json()) as { messages: Array<{ contentJson: unknown }> };
+		const page = decodeBlockPage(await res.json()) as { messages: TreeMessage[] };
 		expect(JSON.stringify(page.messages)).toContain("alpha");
 		expect(JSON.stringify(page.messages)).not.toContain("beta-secret");
 	});
@@ -198,10 +206,17 @@ describe("public share read-through endpoints", () => {
 		const narratorId = narrator();
 		message(narratorId, 0, "hello");
 		const share = await shared(narratorId);
-		for (const authorization of [undefined, "Share wrong-token-wrong-token-wrong-token-wrong-tok", "Bearer x"]) {
-			const res = await app.request(`/api/public/narrator-shares/${share.share.id}/pretext-document`, {
-				...(authorization ? { headers: { Authorization: authorization } } : {}),
-			});
+		for (const authorization of [
+			undefined,
+			"Share wrong-token-wrong-token-wrong-token-wrong-tok",
+			"Bearer x",
+		]) {
+			const res = await app.request(
+				`/api/public/narrator-shares/${share.share.id}/pretext-document`,
+				{
+					...(authorization ? { headers: { Authorization: authorization } } : {}),
+				},
+			);
 			expect(res.status).toBe(404);
 		}
 	});

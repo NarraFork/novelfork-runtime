@@ -4,6 +4,8 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { ToolContext } from "../../../server/lib/agent/types";
 import { AppError } from "../../../server/lib/errors";
 import type { McpServerConfig } from "../../../server/lib/settings";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 
 const actualSettingsModule = { ...(await import("../../../server/lib/settings")) };
 const actualManagerModule = { ...(await import("../../../server/lib/mcp/manager")) };
@@ -102,9 +104,23 @@ mock.module("../../../server/lib/mcp/tool-bridge", () => ({
 const { mcpRoutes } = await import("../../../server/routes/mcp");
 
 let role: "admin" | "user" = "user";
+const ACTOR_ID = "mcp-test-user";
+
+/**
+ * `assertAdmin` authorizes against the LIVE role read through the session store, never the
+ * token's `role` claim. The middleware below only sets `c.get("user")`, so this seam makes
+ * the store report the acting user's current `role` (admin → allowed, user → 403). Without
+ * it the lookup would hit the real (empty) database and 401 USER_GONE instead of 403.
+ */
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({ id, role, tokenVersion: 0 }),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 const app = new Hono();
 app.use("*", async (c, next) => {
-	c.set("user", { sub: "mcp-test-user", role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+	c.set("user", { sub: ACTOR_ID, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 	await next();
 });
 app.onError((error, c) => {
@@ -144,6 +160,8 @@ async function jsonRequest(path: string, method: string, body: unknown): Promise
 
 beforeEach(() => {
 	role = "user";
+	// The 60s verified-user cache would otherwise freeze the role a prior test left
+	// cached for this actor; drop it so each test re-reads the live `role` via the seam.
 	connectedServerIds.clear();
 	lastTestConfig = null;
 	saveSettingsCalls = 0;
@@ -154,10 +172,124 @@ beforeEach(() => {
 });
 
 afterAll(() => {
+	setAuthStores(undefined);
 	mock.module("../../../server/lib/settings", () => actualSettingsModule);
 	mock.module("../../../server/lib/mcp/manager", () => actualManagerModule);
 	mock.module("../../../server/lib/mcp/tool-bridge", () => actualToolBridgeModule);
 	mock.restore();
+});
+
+describe("MCP loading modes", () => {
+	it("normalizes raw configs without changing per-tool permission switches", () => {
+		const raw = {
+			...actualSettingsModule.getDefaults(),
+			mcpServers: [
+				{ ...existingServer, id: "legacy-on", enabled: true },
+				{ ...existingServer, id: "legacy-off", enabled: false },
+				{
+					...existingServer,
+					id: "mode",
+					mode: "auto" as const,
+					enabled: false,
+					toolPermissions: [{ toolName: "demo", behavior: "ask" as const, enabled: false }],
+				},
+			],
+		};
+		expect(actualSettingsModule.normalizeMcpServerIds(raw)).toBe(true);
+		expect(raw.mcpServers.map((s) => s.mode)).toEqual(["resident", "disabled", "auto"]);
+		expect(raw.mcpServers[2].enabled).toBe(true);
+		expect(raw.mcpServers[2].toolPermissions?.[0].enabled).toBe(false);
+		expect(actualSettingsModule.normalizeMcpServerIds(raw)).toBe(false);
+	});
+
+	it("defaults new and imported servers to auto and rejects conflicting writes", async () => {
+		role = "admin";
+		const created = await jsonRequest("/servers", "POST", { name: "auto-new" });
+		expect(created.status).toBe(201);
+		expect(await created.json()).toMatchObject({ mode: "auto", enabled: true });
+		const conflict = await jsonRequest("/servers", "POST", { mode: "auto", enabled: false });
+		expect(conflict.status).toBe(400);
+		const imported = await jsonRequest("/servers/import", "POST", {
+			json: { mcpServers: { imported: { command: "demo" } } },
+		});
+		expect(imported.status).toBe(200);
+		expect(settingsState.mcpServers.find((s) => s.name === "imported")?.mode).toBe("auto");
+	});
+	it("preserves auto across legacy patch/connect and restores disabled as resident", async () => {
+		role = "admin";
+		Object.assign(settingsState.mcpServers[0], { mode: "auto", enabled: true });
+		const patched = await jsonRequest("/servers/existing", "PATCH", { enabled: true });
+		expect(await patched.json()).toMatchObject({ mode: "auto", enabled: true });
+		await request("/servers/existing/connect", { method: "POST" });
+		expect(settingsState.mcpServers[0].mode).toBe("auto");
+		const conflict = await jsonRequest("/servers/existing", "PATCH", {
+			mode: "disabled",
+			enabled: true,
+		});
+		expect(conflict.status).toBe(400);
+		await request("/servers/existing/disconnect", { method: "POST" });
+		expect(settingsState.mcpServers[0].mode).toBe("disabled");
+		await request("/servers/existing/connect", { method: "POST" });
+		expect(settingsState.mcpServers[0].mode).toBe("resident");
+	});
+
+	it("rejects conflicting existing-server test patches with 400", async () => {
+		role = "admin";
+		const before = structuredClone(settingsState.mcpServers);
+		const response = await jsonRequest("/servers/existing/test", "POST", {
+			mode: "auto",
+			enabled: false,
+		});
+		expect(response.status).toBe(400);
+		expect(lastTestConfig).toBeNull();
+		expect(settingsState.mcpServers).toEqual(before);
+	});
+
+	it("uses consistent temporary test modes without changing tool permission switches", async () => {
+		role = "admin";
+		Object.assign(settingsState.mcpServers[0], { mode: "resident", enabled: true });
+		const existingTest = await jsonRequest("/servers/existing/test", "POST", {
+			enabled: false,
+			toolPermissionPatch: { toolName: "demo", behavior: "ask", enabled: false },
+		});
+		expect(existingTest.status).toBe(200);
+		expect(lastTestConfig).toMatchObject({
+			id: "test-existing",
+			mode: "auto",
+			enabled: true,
+			toolPermissions: [{ toolName: "demo", behavior: "ask", enabled: false }],
+		});
+		expect(settingsState.mcpServers[0]).toMatchObject({ mode: "resident", enabled: true });
+		expect(saveSettingsCalls).toBe(0);
+
+		const newTest = await jsonRequest("/servers/test", "POST", {
+			name: "temporary",
+			mode: "disabled",
+			toolPermissions: [{ toolName: "demo", behavior: "ask", enabled: false }],
+		});
+		expect(newTest.status).toBe(200);
+		expect(lastTestConfig).toMatchObject({
+			id: "test",
+			mode: "auto",
+			enabled: true,
+			toolPermissions: [{ toolName: "demo", behavior: "ask", enabled: false }],
+		});
+	});
+
+	it("does not confuse a new server's loading switch with per-tool permissions", async () => {
+		role = "admin";
+		const response = await jsonRequest("/servers", "POST", {
+			name: "permissions",
+			enabled: false,
+			toolPermissions: [{ toolName: "demo", behavior: "ask", enabled: false }],
+		});
+		expect(response.status).toBe(201);
+		expect(await response.json()).toMatchObject({
+			mode: "disabled",
+			enabled: false,
+			toolPermissions: [{ toolName: "demo", behavior: "ask", enabled: false }],
+		});
+	});
 });
 
 describe("agent-created MCP servers remain manageable through the UI API", () => {
@@ -202,6 +334,79 @@ describe("agent-created MCP servers remain manageable through the UI API", () =>
 			expect((await request(`/servers/${server.id}`, { method: "DELETE" })).status).toBe(200);
 		}
 		expect(settingsState.mcpServers).toEqual([]);
+	});
+
+	it("validates raw arrays atomically without mutating inputs or settings", async () => {
+		const { narraforkAdminTool } = await import("../../../server/lib/agent/tools/narrafork-admin");
+		const before = structuredClone(settingsState.mcpServers);
+		const incoming = [
+			{ id: "existing", enabled: true },
+			{ id: "new", mode: "bad" },
+		];
+		for (const value of [{ mcpServers: incoming }, { mcpServers: {} }, { mcpServers: [null] }]) {
+			const result = await narraforkAdminTool.execute({ action: "update_settings", value }, ctx);
+			expect(result.isError).toBe(true);
+		}
+		expect(incoming[0]).toEqual({ id: "existing", enabled: true });
+		expect(settingsState.mcpServers).toEqual(before);
+		expect(saveSettingsCalls).toBe(0);
+	});
+
+	it("preserves raw policies by ID and retains creation defaults for new entries", async () => {
+		const { narraforkAdminTool } = await import("../../../server/lib/agent/tools/narrafork-admin");
+		Object.assign(settingsState.mcpServers[0], { mode: "auto", enabled: true });
+		const result = await narraforkAdminTool.execute(
+			{
+				action: "update_settings",
+				value: {
+					mcpServers: [{ id: "existing" }, { id: "new" }, { enabled: true }],
+				},
+			},
+			ctx,
+		);
+		expect(result.isError).toBeFalsy();
+		expect(settingsState.mcpServers.map((server) => [server.mode, server.enabled])).toEqual([
+			["auto", true],
+			["auto", true],
+			["resident", true],
+		]);
+	});
+
+	it("rejects invalid raw loading writes before saving any settings", async () => {
+		const { narraforkAdminTool } = await import("../../../server/lib/agent/tools/narrafork-admin");
+		for (const loading of [
+			{ mode: "auto", enabled: false },
+			{ mode: "disabled", enabled: true },
+			{ mode: "invalid" },
+			{ mode: null },
+			{ enabled: "true" },
+		]) {
+			const result = await narraforkAdminTool.execute(
+				{ action: "update_settings", value: { mcpServers: [{ ...existingServer, ...loading }] } },
+				ctx,
+			);
+			expect(result.isError).toBe(true);
+			expect(saveSettingsCalls).toBe(0);
+			expect(settingsState.mcpServers).toEqual([existingServer]);
+		}
+	});
+
+	it("applies legacy raw writes against existing mode without losing intent", async () => {
+		const { narraforkAdminTool } = await import("../../../server/lib/agent/tools/narrafork-admin");
+		Object.assign(settingsState.mcpServers[0], { mode: "auto", enabled: true });
+		for (const [enabled, mode] of [
+			[true, "auto"],
+			[false, "disabled"],
+			[true, "resident"],
+		] as const) {
+			const result = await narraforkAdminTool.execute(
+				{ action: "update_settings", value: { mcpServers: [{ ...existingServer, enabled }] } },
+				ctx,
+			);
+			expect(result.isError).toBeFalsy();
+			expect(settingsState.mcpServers[0]).toMatchObject({ mode, enabled });
+		}
+		expect(saveSettingsCalls).toBe(3);
 	});
 
 	it("writes McpAdmin additions through the real settings adapter before UI deletion", async () => {

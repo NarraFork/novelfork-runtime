@@ -45,7 +45,8 @@ export type DatabaseStorageCategoryKey = (typeof DATABASE_STORAGE_CATEGORY_KEYS)
 
 export type DatabaseTableKind = "table" | "virtual" | "shadow" | "internal";
 
-const SEARCH_TABLE_PREFIXES = ["chapters_fts", "narrator_messages_fts", "narrators_fts"];
+/** Search indexes: the envelope index (until it retires, P3c), the block index, titles. */
+const SEARCH_TABLE_PREFIXES = ["narrator_messages_fts", "narrator_blocks_fts", "narrators_fts"];
 
 export interface DatabaseStorageCategorySummary {
 	key: DatabaseStorageCategoryKey;
@@ -184,19 +185,7 @@ export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCa
 		return "sessions";
 	}
 	if (tableName === "api_requests") return "apiRequests";
-	if (
-		[
-			"projects",
-			"exploration_groups",
-			"chapters",
-			"chapter_edges",
-			"chapter_commits",
-			"merge_sessions",
-			"review_conclusions",
-		].includes(tableName)
-	) {
-		return "projects";
-	}
+	if (tableName === "projects") return "projects";
 	if (
 		[
 			"terminals",
@@ -491,24 +480,20 @@ export function measureTable(
 ): DatabaseStorageTableSummary {
 	const { dbstat, indexesByTable } = context;
 	const budget = createBusyRetryBudget();
-	const counted = readWithBusyRetry(
-		() => countQuery(sqlite, `FROM ${quoteIdentifier(table.name)}`),
-		budget,
-	);
+	// Row counts are a COUNT(*) per table. On a multi-GB database that is the multi-second part of
+	// the scan (about 4.6s serial on a 5.3GB file, once dbstat already supplied the bytes). The
+	// storage page decides what to clean from bytes, so the count is not measured.
 	// dbstat already gives exact page-level object sizes, so skip the extra SUM(length(...))
 	// full-table scan in that mode. Virtual tables are measured through their shadow tables.
 	const skipContentScan = dbstat.supported || table.kind === "virtual";
-	const measured = !counted.ok && isSqliteBusyError(counted.error)
-		? ({ ok: false, error: counted.error } as const)
-		: skipContentScan
-			? ({ ok: true, value: 0 } as const)
-			: readWithBusyRetry(
-					() => sumTableApproxBytes(sqlite, table.name, "t", `FROM ${quoteIdentifier(table.name)} t`),
-					budget,
-				);
+	const measured = skipContentScan
+		? ({ ok: true, value: 0 } as const)
+		: readWithBusyRetry(
+				() => sumTableApproxBytes(sqlite, table.name, "t", `FROM ${quoteIdentifier(table.name)} t`),
+				budget,
+			);
 
-	const readFailed = !counted.ok || !measured.ok;
-	const rowCount = counted.ok ? counted.value : null;
+	const readFailed = !measured.ok;
 	const approxContentBytes = measured.ok ? measured.value : 0;
 	const indexNames = indexesByTable.get(table.name) ?? [];
 	const diskBytes = dbstat.supported
@@ -521,7 +506,7 @@ export function measureTable(
 		name: table.name,
 		category: getDatabaseStorageCategory(table.name),
 		kind: table.kind,
-		rowCount,
+		rowCount: null,
 		approxContentBytes,
 		diskBytes,
 		indexBytes,
@@ -668,7 +653,6 @@ export interface SessionAggregateStats {
 	messages: number;
 	toolCalls: number;
 	apiRequests: number;
-	dumpsCleared: number;
 	approxBytes: number;
 }
 
@@ -677,7 +661,6 @@ const EMPTY_SESSION_AGGREGATE_STATS: SessionAggregateStats = {
 	messages: 0,
 	toolCalls: 0,
 	apiRequests: 0,
-	dumpsCleared: 0,
 	approxBytes: 0,
 };
 
@@ -750,21 +733,6 @@ export function collectSessionAggregateStats(
 		else if (relation.countAs === "apiRequests") apiRequests += count;
 	}
 
-	let dumpsCleared = 0;
-	if (tableExists(sqlite, "api_requests")) {
-		dumpsCleared = numberFromRow(
-			(
-				sqlite
-					.prepare(
-						`SELECT COUNT(*) AS count
-						 FROM api_requests ar
-						 WHERE ar.narrator_id IN (${targetSelect}) AND ar.raw_dump_json IS NOT NULL`,
-					)
-					.get(targetIds) as { count: unknown } | undefined
-			)?.count,
-		);
-	}
-
 	if (tableExists(sqlite, "background_tasks")) {
 		approxBytes += countAndSumTableBytes(
 			sqlite,
@@ -806,7 +774,6 @@ export function collectSessionAggregateStats(
 		messages,
 		toolCalls,
 		apiRequests,
-		dumpsCleared,
 		approxBytes,
 	};
 }
@@ -863,8 +830,8 @@ export function measureTables(
 /**
  * Full single-connection object-storage scan.
  *
- * This is the serial reference implementation: it is what the main-thread fallback runs, and what
- * the parallel worker path must match field-for-field.
+ * This is the serial reference implementation. The parallel worker path must match it
+ * field-for-field. A worker that cannot shard runs this function on its own connection.
  */
 export function scanDatabaseObjectStorage(
 	sqlite: Database,
@@ -889,4 +856,69 @@ export function scanDatabaseObjectStorage(
 		indexesByTable: context.indexesByTable,
 		tableSummaries,
 	});
+}
+
+/**
+ * Rebuild the measurement context from a `storageScanContext` snapshot.
+ *
+ * Shards use this instead of calling `loadScanContext`, which would walk `dbstat` again.
+ */
+export function measurementContextFromSnapshot(snapshot: {
+	tables: Array<{ name: string; kind: string }>;
+	dbstatSupported: boolean;
+	dbstatBytes: Array<[string, number]>;
+	indexesByTable: Array<[string, string[]]>;
+}): {
+	tables: ScanTableRef[];
+	dbstat: DbstatObjectBytes;
+	indexesByTable: Map<string, string[]>;
+} {
+	return {
+		tables: snapshot.tables.map((table) => ({
+			name: table.name,
+			kind: table.kind as DatabaseTableKind,
+		})),
+		dbstat: {
+			supported: snapshot.dbstatSupported,
+			bytesByName: new Map(snapshot.dbstatBytes),
+		},
+		indexesByTable: new Map(snapshot.indexesByTable),
+	};
+}
+
+export interface StorageByteSummary {
+	count: number;
+	approxBytes: number;
+	oldestAt: string | null;
+}
+
+const EMPTY_BYTE_SUMMARY: StorageByteSummary = { count: 0, approxBytes: 0, oldestAt: null };
+
+/** Byte total for tool-call payloads older than the cutoff. Same predicate as the cleanup preview. */
+export function summarizeToolCallPayloads(sqlite: Database, cutoffIso: string): StorageByteSummary {
+	if (!tableExists(sqlite, "narrator_tool_calls")) return { ...EMPTY_BYTE_SUMMARY };
+	const summary = sqlite
+		.prepare(
+			`SELECT
+				COUNT(*) AS count,
+				COALESCE(SUM(
+					length(CAST(coalesce(input_json, '') AS BLOB)) +
+					length(CAST(coalesce(output_json, '') AS BLOB))
+				), 0) AS approxBytes,
+				MIN(created_at) AS oldestAt
+			 FROM narrator_tool_calls
+			 WHERE created_at <= ?
+				 AND is_file_history_checkpoint = 0
+				 AND (input_json IS NOT NULL OR output_json IS NOT NULL)`,
+		)
+		.get(cutoffIso) as {
+		count: number | string | bigint;
+		approxBytes: number | string | bigint;
+		oldestAt: string | null;
+	} | null;
+	return {
+		count: numberFromRow(summary?.count),
+		approxBytes: numberFromRow(summary?.approxBytes),
+		oldestAt: summary?.oldestAt ?? null,
+	};
 }

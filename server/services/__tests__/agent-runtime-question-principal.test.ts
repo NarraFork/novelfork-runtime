@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -16,9 +16,9 @@ import type { ActiveNarrator } from "../narrator-session-state";
 
 // Real durable question -> answer injection -> scheduler -> resume -> runner ->
 // orchestrator. Model I/O, knowledge contents and device enumeration are observed seams.
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const questions = await import("../narrator-question-service");
 const { activeNarrators, waitForNarratorAdmissionWork } = await import("../narrator-session-state");
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
@@ -33,20 +33,17 @@ const adapter = {
 	formatTools: () => [],
 	buildHistory: async (messages: Array<{ role: string; contentJson: unknown }>) => ({
 		history: messages.map((message) => ({ role: message.role, content: message.contentJson })),
-		trailingToolResults: [],
 	}),
 	injectSystemPrompt: () => {},
 	chat: () => {
 		throw new Error("Question principal test must not contact a model");
 	},
-	formatToolResult: () => ({}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 } as unknown as ProviderAdapter;
-const unregister = provider.registerExternalProviderResolver((name) =>
-	name === "questionprincipal" ? adapter : null,
-);
+const unregister = provider.registerExternalProviderResolver({
+	resolve: (name) => (name === "questionprincipal" ? adapter : null),
+	listReadiness: () => [],
+});
 const PARENT = "principal-parent";
 const CHILD = "principal-child";
 const A = "question-owner-A";
@@ -73,7 +70,8 @@ function parentActive(userId: string): ActiveNarrator {
 	};
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	const now = new Date().toISOString();
 	for (const id of [A, B, C])
@@ -138,10 +136,19 @@ afterEach(async () => {
 	}
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregister();
-	mock.module("../../db", () => realDb);
 });
+
+/** Wait for the session's run to finish (owner released) and an optional condition. */
+async function runEnded(id: string, also: () => boolean = () => true) {
+	const deadline = Date.now() + 5_000;
+	while (getExecutionOwner(id) || !also()) {
+		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${id}'s run to end`);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
 
 const cases = [
 	{
@@ -238,20 +245,17 @@ describe("late async answers retain their durable execution principal", () => {
 		let builds = 0;
 		spyOn(adapter, "buildHistory").mockImplementation(async (...args) => {
 			const snapshot = await originalBuild(...args);
+			// The compressed packet omits the parent's old receipt on every build.
+			snapshot.history = snapshot.history.filter(
+				(entry) => !JSON.stringify(entry).includes("COMPRESSED_PARENT_BACKGROUND"),
+			);
 			if (++builds === 1) {
-				snapshot.history = snapshot.history.filter(
-					(entry) => !JSON.stringify(entry).includes("COMPRESSED_PARENT_BACKGROUND"),
-				);
 				expect(JSON.stringify(snapshot)).not.toContain("LATE_AFTER_PREBUILT");
 				prepared.resolve();
 				await release.promise;
 			}
 			return snapshot;
 		});
-		spyOn(adapter, "pushUserTurn").mockImplementation((history, content, _model, results) => {
-			history.push({ role: "user", content, toolResults: results });
-		});
-		spyOn(adapter, "pushAssistantTurn").mockImplementation(() => {});
 		spyOn(adapter, "chat").mockImplementation(async function* (params) {
 			params.onRequestStart?.();
 			const active = activeNarrators.get(CHILD);
@@ -263,13 +267,10 @@ describe("late async answers retain their durable execution principal", () => {
 			});
 			yield { text: "receipt applied" };
 		});
-		const { resumeSubagent } = await import("../subagent-resume");
-		const resumed = resumeSubagent({
-			subagentId: CHILD,
-			intent: "follow_up",
-			actor: "user",
-			prompt: "OLD_PREBUILT_PACKET",
-			createdBy: A,
+		// A user turn typed on the delegated session's own page: the same admission as any
+		// session, so the user's input establishes the run's principal.
+		const accepted = sessionService.acceptUserMessage(CHILD, "OLD_PREBUILT_PACKET", {
+			userId: A,
 			locale: "en",
 		});
 		await prepared.promise;
@@ -285,17 +286,33 @@ describe("late async answers retain their durable execution principal", () => {
 				?._questionAnswerAdoptedMessageIds?.has(answer.record.answerMessageId),
 		).not.toBe(true);
 		release.resolve();
-		const outcome = await resumed;
-		await outcome.terminalCompletion;
-		expect(requests).toHaveLength(1);
-		const packet = JSON.stringify({ history: requests[0].history, content: requests[0].content });
-		expect(packet.split("LATE_AFTER_PREBUILT")).toHaveLength(2);
+		expect((await accepted).buffered).toBe(false);
+		await runEnded(CHILD);
+		// The prebuilt request goes out as built; the late receipt is not stranded — the
+		// same run adopts it at its next safe boundary and sends it exactly once.
+		const packets = requests.map((request) =>
+			JSON.stringify({ history: request.history, content: request.content }),
+		);
+		expect(packets[0]).toContain("OLD_PREBUILT_PACKET");
+		expect(packets[0]).not.toContain("LATE_AFTER_PREBUILT");
+		const adoptedAt = packets.findIndex((entry) => entry.includes("LATE_AFTER_PREBUILT"));
+		expect(adoptedAt).toBeGreaterThan(0);
+		const last = requests[adoptedAt];
+		const packet = packets[adoptedAt];
+		// Exactly once in the request that adopts it: one history row, not also turn text.
+		expect(
+			(last?.history as unknown[]).filter((entry) =>
+				JSON.stringify(entry).includes("LATE_AFTER_PREBUILT"),
+			),
+		).toHaveLength(1);
+		expect(last?.content).not.toContain("LATE_AFTER_PREBUILT");
 		expect(packet).toContain("OLD_PREBUILT_PACKET");
 		expect(packet).not.toContain("COMPRESSED_PARENT_BACKGROUND");
 		expect(packet).toContain('kind=\\"human\\"');
 		expect(packet).toContain(`id=\\"${C}\\"`);
-		expect(requests[0].userId).toBe(A);
-		expect(requests[0].adopted).toEqual([answer.record.answerMessageId]);
+		// Every request of the run executes as the question's principal, never as C.
+		expect(requests.map((request) => request.userId)).toEqual(requests.map(() => A));
+		expect(last?.adopted).toEqual([answer.record.answerMessageId]);
 		const readReceipt = () =>
 			db
 				.select({ adoptedAt: narratorBufferedMessages.currentAdoptedAt })
@@ -371,18 +388,14 @@ describe("late async answers retain their durable execution principal", () => {
 			expect(row?.createdBy).toBe(C);
 			expect(resolveInjectionUserId(scenario.principal, PARENT)).toBe(scenario.principal);
 			await waitForNarratorAdmissionWork(PARENT, AbortSignal.timeout(3000));
+			await runEnded(CHILD);
 			// A deliberate new user turn is a NEW authorization choice, unlike the answer wake.
-			const { resumeSubagent } = await import("../subagent-resume");
-			const followup = await resumeSubagent({
-				subagentId: CHILD,
-				intent: "follow_up",
-				actor: "user",
-				prompt: "NEW_FOLLOWUP_FROM_B",
-				createdBy: B,
+			const followup = await sessionService.acceptUserMessage(CHILD, "NEW_FOLLOWUP_FROM_B", {
+				userId: B,
 				locale: "en",
 			});
-			expect(followup.started).toBe(true);
-			await followup.terminalCompletion;
+			expect(followup.buffered).toBe(false);
+			await runEnded(CHILD, () => executionUsers.length >= 2);
 			expect(executionUsers).toEqual([scenario.principal, B]);
 		});
 

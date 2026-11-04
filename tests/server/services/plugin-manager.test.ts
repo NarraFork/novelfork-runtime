@@ -1,8 +1,22 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+	cp,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rm,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES,
+	PROVIDER_REQUEST_MAX_BYTES,
+} from "@server/lib/plugins/protocol";
 import { integrationAuthorityService } from "@server/services/integration-authority-service";
 import { CapabilityBroker } from "@server/services/plugin-capability-broker";
 import { PluginHostDispatcher } from "@server/services/plugin-host-dispatcher";
@@ -37,11 +51,14 @@ const fixturePackage = fileURLToPath(
 	new URL("../../fixtures/plugins/packages/valid-package", import.meta.url),
 );
 const tempRoots: string[] = [];
+const drainBeforeCleanup: Array<() => Promise<void>> = [];
 
-async function makeTempRoot(): Promise<string> {
-	const root = await mkdtemp(join(tmpdir(), "narrafork-plugin-manager-"));
-	tempRoots.push(root);
-	return root;
+async function makeTempRoot(base = tmpdir()): Promise<string> {
+	const created = await mkdtemp(join(base, "narrafork-plugin-manager-"));
+	tempRoots.push(created);
+	// macOS /var and Windows short-name TEMP paths can alias the real directory.
+	// Give the catalog a canonical fixture root; never relax its containment checks.
+	return realpath(created);
 }
 
 async function makePackage(
@@ -55,6 +72,9 @@ async function makePackage(
 	const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
 	manifest.pluginId = pluginId;
 	manifest.displayName = pluginId;
+	const engine = manifest.engine as Record<string, unknown>;
+	engine.os = [process.platform];
+	engine.arch = [process.arch];
 	mutate?.(manifest);
 	await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 	return source;
@@ -68,8 +88,22 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+/** Await actual fire-and-forget lifecycle work, including handlers queued by another handler. */
+function trackRuntimeLifecycle(manager: PluginManager): () => Promise<void> {
+	const pending: Promise<void>[] = [];
+	const internal = manager as unknown as Record<string, (...args: unknown[]) => Promise<void>>;
+	for (const name of ["handleRuntimeStateChange", "observeRuntimeLifecycle"]) {
+		const original = internal[name]?.bind(manager);
+		if (!original) continue;
+		internal[name] = (...args) => {
+			const result = original(...args);
+			pending.push(result);
+			return result;
+		};
+	}
+	return async () => {
+		while (pending.length) await Promise.all(pending.splice(0));
+	};
 }
 
 class FakeRuntime {
@@ -256,22 +290,7 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 			if (blockCrash) restored.resolve();
 		},
 	});
-	// Observe the actual fire-and-forget handler promises, not a sleep followed by
-	// a binding-presence check. This also works before the serialization fix.
-	const pending: Promise<void>[] = [];
-	const internal = manager as unknown as Record<string, (...args: unknown[]) => Promise<void>>;
-	for (const name of ["handleRuntimeStateChange", "observeRuntimeLifecycle"]) {
-		const original = internal[name]?.bind(manager);
-		if (!original) continue;
-		internal[name] = (...args) => {
-			const result = original(...args);
-			pending.push(result);
-			return result;
-		};
-	}
-	const settle = async () => {
-		while (pending.length) await Promise.all(pending.splice(0));
-	};
+	const settle = trackRuntimeLifecycle(manager);
 	const source = await makePackage(root, pluginId, (manifest) => {
 		(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
 	});
@@ -323,10 +342,124 @@ async function makeLifecycleRaceFixture(pluginId: string) {
 }
 
 afterEach(async () => {
+	// Also release and drain held operations when Bun times out a test body.
+	for (const drain of drainBeforeCleanup.splice(0)) await drain();
 	for (const root of tempRoots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
 describe("PluginManager", () => {
+	test.each([
+		false,
+		true,
+	])("production frame options preserve ordinary and mixed plugins (%s)", async (mixed) => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const settle = trackRuntimeLifecycle(manager);
+		try {
+			const source = await makePackage(root, `com.example.frames-${mixed}`, (manifest) => {
+				if (!mixed) return;
+				const contributes = manifest.contributes as Record<string, unknown>;
+				contributes.tools = [
+					{
+						id: "echo",
+						title: "Echo",
+						execution: "server",
+						inputSchema: { type: "object", properties: { text: { type: "string" } } },
+					},
+				];
+				contributes.providers = [{ id: "model", title: "Model" }];
+				(manifest.permissions as Record<string, unknown>).host = [
+					"provider.register",
+					"provider.use",
+				];
+			});
+			const installed = await manager.install(source);
+			await manager.enable(installed.pluginId);
+			await manager.activate(installed.pluginId);
+			const options = supervisor.get(installed.pluginId)?.options;
+			expect(options).toBeDefined();
+			expect(options?.maxFrameBytes).toBe(mixed ? PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES : undefined);
+			expect(options?.maxOutboundFrameBytes).toBe(mixed ? PROVIDER_REQUEST_MAX_BYTES : undefined);
+		} finally {
+			await manager.shutdown();
+			await settle();
+		}
+	});
+
+	test("canonicalizes an aliased temporary parent before scanning fixture packages", async () => {
+		const parent = await makeTempRoot();
+		const actual = join(parent, "actual");
+		const alias = join(parent, "temp-alias");
+		await mkdir(actual);
+		await symlink(actual, alias, process.platform === "win32" ? "junction" : "dir");
+		const root = await makeTempRoot(alias);
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const installed = await manager.install(await makePackage(root, "com.example.temp-alias"));
+		expect(installed.compatibility).toBe("compatible");
+		expect(root).toBe(await realpath(root));
+		expect(root.startsWith(actual)).toBe(true);
+		await manager.enable(installed.pluginId);
+		expect((await manager.getStatus(installed.pluginId))?.desiredState).toBe("enabled");
+		expect(supervisor.startCount.size).toBe(0);
+	});
+
+	// This exercises production catalog compatibility decisions for every host OS,
+	// not native filesystem/runner behavior (the hosted matrix covers those).
+	test.each([
+		"linux",
+		"darwin",
+		"win32",
+	] as const)("fixture manifests support the %s host and still reject a different OS", async (hostOS) => {
+		const root = await makeTempRoot();
+		const original = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!original) throw new Error("Missing process.platform descriptor");
+		try {
+			Object.defineProperty(process, "platform", { ...original, value: hostOS });
+			const supervisor = new FakeSupervisor();
+			const manager = new PluginManager({
+				root: join(root, "plugins"),
+				disabled: false,
+				runtimeSupervisor: supervisor,
+			});
+			const matching = await makePackage(root, `com.example.matching-${hostOS}`);
+			const manifest = JSON.parse(await readFile(join(matching, "manifest.json"), "utf8"));
+			expect(manifest.engine.os).toEqual([hostOS]);
+			expect(manifest.engine.arch).toEqual([process.arch]);
+			const installed = await manager.install(matching);
+			expect(installed.compatibility).toBe("compatible");
+			await manager.enable(installed.pluginId);
+			expect((await manager.getStatus(installed.pluginId))?.desiredState).toBe("enabled");
+			const mismatching = await makePackage(
+				root,
+				`com.example.mismatching-${hostOS}`,
+				(manifest) => {
+					(manifest.engine as Record<string, unknown>).os = [
+						hostOS === "linux" ? "darwin" : "linux",
+					];
+				},
+			);
+			const incompatible = await manager.install(mismatching);
+			expect(incompatible.compatibility).toBe("incompatible");
+			await expect(manager.enable(incompatible.pluginId)).rejects.toMatchObject({
+				code: "PLUGIN_INCOMPATIBLE",
+			});
+			expect((await manager.getStatus(incompatible.pluginId))?.desiredState).toBe("disabled");
+			expect(supervisor.startCount.size).toBe(0);
+		} finally {
+			Object.defineProperty(process, "platform", original);
+		}
+	});
+
 	test("the production singleton wires the shared provider catalog refresher", () => {
 		// Injection-based lifecycle tests explicitly supply this dependency. The exported
 		// singleton also injects services, so it does NOT take the constructor's shared-default
@@ -950,6 +1083,40 @@ describe("PluginManager", () => {
 		expect(await manager.listPendingPermissionRequests(pluginId)).toHaveLength(0);
 	});
 
+	test("rejects enabling a package whose compatibility becomes unknown", async () => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const installed = await manager.install(await makePackage(root, "com.example.unknown"));
+		expect(installed.compatibility).toBe("compatible");
+		if (!installed.current) throw new Error("Installed plugin has no current package");
+		await writeFile(
+			join(
+				manager.root,
+				"packages",
+				installed.pluginId,
+				installed.current.version,
+				installed.current.hash,
+				"manifest.json",
+			),
+			"{",
+		);
+		await expect(manager.enable(installed.pluginId)).rejects.toMatchObject({
+			code: "PLUGIN_INCOMPATIBLE",
+		});
+		const status = await manager.getStatus(installed.pluginId);
+		expect(status?.packageStatus).toBe("corrupt");
+		expect(status?.diagnostics.map((diagnostic) => diagnostic.code)).toContain(
+			"MANIFEST_INVALID_JSON",
+		);
+		expect(status?.desiredState).toBe("disabled");
+		expect(supervisor.startCount.size).toBe(0);
+	});
+
 	test("rejects enabling an incompatible package", async () => {
 		const root = await makeTempRoot();
 		const source = await makePackage(root, "com.example.incompatible", (manifest) => {
@@ -1006,24 +1173,32 @@ describe("PluginManager", () => {
 		const pluginB = await manager.install(await makePackage(root, "com.example.concurrencyb"));
 		await Promise.all([manager.enable(pluginA.pluginId), manager.enable(pluginB.pluginId)]);
 		const gate = supervisor.gate(pluginA.pluginId);
-		const firstA = manager.activate(pluginA.pluginId);
-		await gate.entered;
-		const secondA = manager.activate(pluginA.pluginId);
-		await sleep(10);
-		expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
-
-		const statusB = await Promise.race([
-			manager.activate(pluginB.pluginId),
-			sleep(250).then(() => {
-				throw new Error("plugin B was blocked by plugin A");
-			}),
-		]);
-		expect(statusB.runtimeState).toBe("active");
-		gate.release();
-		const [statusA1, statusA2] = await Promise.all([firstA, secondA]);
-		expect(statusA1.runtimeState).toBe("active");
-		expect(statusA2.runtimeState).toBe("active");
-		expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+		const activations = [manager.activate(pluginA.pluginId)];
+		let draining: Promise<void> | undefined;
+		const drain = () =>
+			(draining ??= (async () => {
+				gate.release();
+				await Promise.allSettled(activations);
+			})());
+		drainBeforeCleanup.push(drain);
+		try {
+			await gate.entered;
+			activations.push(manager.activate(pluginA.pluginId));
+			expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+			const activatingB = manager.activate(pluginB.pluginId);
+			activations.push(activatingB);
+			// B must finish while A's gate is still held; this tests independence,
+			// not whether real Windows journal IO finishes inside an arbitrary 250ms.
+			const statusB = await activatingB;
+			expect(statusB.runtimeState).toBe("active");
+			gate.release();
+			const [statusA1, statusA2] = await Promise.all(activations.slice(0, 2));
+			expect(statusA1?.runtimeState).toBe("active");
+			expect(statusA2?.runtimeState).toBe("active");
+			expect(supervisor.startCount.get(pluginA.pluginId)).toBe(1);
+		} finally {
+			await drain();
+		}
 	});
 
 	test("isolates a revoked residual plugin during initialization", async () => {
@@ -1789,6 +1964,8 @@ describe("PluginManager", () => {
 			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
 			restorePluginLifecycle: platform.restorePlugin,
 		});
+		const settle = trackRuntimeLifecycle(manager);
+		drainBeforeCleanup.push(settle);
 		const source = await makePackage(root, pluginId, (manifest) => {
 			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
 		});
@@ -1807,9 +1984,9 @@ describe("PluginManager", () => {
 		await supervisor.start(pluginId);
 		expect(runtime.generation).toBe(generationBefore + 1);
 
-		// handleRuntimeStateChange is fire-and-forget from the onStateChange
-		// wrapper, so yield until the revoke+rebind settles.
-		await sleep(50);
+		// onStateChange enqueues revoke+rebind without awaiting it. Drain the actual
+		// handler promises instead of racing a fixed timer against filesystem work.
+		await settle();
 
 		// After the generation change the manager must have revoked the stale
 		// binding and re-registered it for the (still same) runtimeId.
@@ -1928,6 +2105,8 @@ describe("PluginManager", () => {
 			lifecycleRevokeCoordinator: platform.lifecycleRevokeCoordinator,
 			restorePluginLifecycle: platform.restorePlugin,
 		});
+		const settle = trackRuntimeLifecycle(manager);
+		drainBeforeCleanup.push(settle);
 		const source = await makePackage(root, pluginId, (manifest) => {
 			(manifest.permissions as Record<string, unknown>).host = ["diagnostics.readOwnLogs"];
 		});
@@ -1947,7 +2126,7 @@ describe("PluginManager", () => {
 		const beforeActive = runtime.state;
 		runtime.state = "active";
 		runtime.options.onStateChange?.("active", beforeActive);
-		await sleep(50);
+		await settle();
 
 		expect(hostServices.hasRuntimeBinding(pluginId, runtime.runtimeId)).toBe(true);
 		const binding = hostServices.getRuntimeBinding(pluginId, runtime.runtimeId);

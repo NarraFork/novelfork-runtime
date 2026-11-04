@@ -20,12 +20,15 @@ import type { FileTarget } from "@shared/file-reference";
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { useNarrator } from "../../hooks/useNarrator";
+import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import type { OutlinePanelState } from "../../lib/outline-panel";
 import { FileReferenceScopeProvider } from "../narrator/composer/FileReferenceScope";
 import { NarratorDockContext } from "../narrator/dock/NarratorDockContext";
 import { SubagentSessionPanelContent } from "../narrator/dock/panels";
-import { getFilePreviewType } from "../narrator/file-panel/FilePreviewModal";
+import { FilePanelContent } from "../narrator/file-panel/FilePanelContent";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../narrator/split-tree";
+import { OutlineHostProvider } from "../outline/outline-host";
 import {
 	type PluginUiSessionContext,
 	PluginUiSurfaceProvider,
@@ -41,7 +44,7 @@ import {
 	pluginPanelWindowHostContext,
 } from "./panel-window";
 
-const NarratorPanel = lazy(() =>
+const NarratorPanel = lazyWithRetry(() =>
 	import("../narrator/NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
 );
 const NarratorTerminal = lazy(() =>
@@ -61,7 +64,7 @@ const NarratorDetailsPanel = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("../narrator/spec/SpecPanel").then((m) => ({ default: m.SpecPanel })),
 );
-const GitPanel = lazy(() => import("../chapter/GitPanel").then((m) => ({ default: m.GitPanel })));
+const GitPanel = lazy(() => import("../git/GitPanel").then((m) => ({ default: m.GitPanel })));
 const BackgroundTasksPanel = lazy(() =>
 	import("../narrator/background/BackgroundTasksDrawer").then((m) => ({
 		default: m.BackgroundTasksPanel,
@@ -79,19 +82,14 @@ const AppearancePanel = lazy(() =>
 const FileTreePanel = lazy(() =>
 	import("../narrator/file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
 );
+const NarratorTimelinePanel = lazy(() =>
+	import("../narrator/timeline/NarratorTimelinePanel").then((m) => ({
+		default: m.NarratorTimelinePanel,
+	})),
+);
 const KnowledgeEntryPanelContent = lazy(() =>
 	import("../narrator/knowledge/KnowledgeEntryPanelContent").then((m) => ({
 		default: m.KnowledgeEntryPanelContent,
-	})),
-);
-const FileEditorContent = lazy(() =>
-	import("../narrator/file-editor/FileEditorContent").then((m) => ({
-		default: m.FileEditorContent,
-	})),
-);
-const FileViewerContent = lazy(() =>
-	import("../narrator/file-viewer/FileViewerContent").then((m) => ({
-		default: m.FileViewerContent,
 	})),
 );
 const ToolEditFileViewer = lazy(() =>
@@ -101,6 +99,9 @@ const ToolEditFileViewer = lazy(() =>
 );
 const PluginDockPanelView = lazy(() =>
 	import("../plugins/PluginDockPanel").then((m) => ({ default: m.PluginDockPanelView })),
+);
+const OutlinePanelContent = lazy(() =>
+	import("../outline/OutlinePanelContent").then((m) => ({ default: m.OutlinePanelContent })),
 );
 
 function PanelBoundary({ children }: { children: React.ReactNode }) {
@@ -200,11 +201,7 @@ function PanelContent({ descriptor }: { descriptor: PanelWindowDescriptor }) {
 			return <WebviewWindow initialConfig={descriptor.webviewConfig} />;
 		case "narrator-tool":
 			return (
-				<NarratorToolWindow
-					toolType={descriptor.toolType}
-					narratorId={descriptor.narratorId}
-					chapterId={descriptor.chapterId}
-				/>
+				<NarratorToolWindow toolType={descriptor.toolType} narratorId={descriptor.narratorId} />
 			);
 		case "file":
 			return <FileWindow descriptor={descriptor} />;
@@ -218,6 +215,8 @@ function PanelContent({ descriptor }: { descriptor: PanelWindowDescriptor }) {
 			);
 		case "plugin":
 			return <PluginWindow descriptor={descriptor} />;
+		case "outline":
+			return <OutlineWindow descriptor={descriptor} />;
 		default:
 			return <NarratorBoundWindow descriptor={descriptor} />;
 	}
@@ -253,16 +252,8 @@ function WebviewWindow({ initialConfig }: { initialConfig: WebviewLeafConfig }) 
 }
 
 /** The workspace's narrator-tool wrapper, resolved to the narrator-bound renderer. */
-function NarratorToolWindow({
-	toolType,
-	narratorId,
-	chapterId,
-}: {
-	toolType: string;
-	narratorId: string;
-	chapterId?: string | null;
-}) {
-	const d = normalizePanelWindowDescriptor({ panelType: toolType, narratorId, chapterId });
+function NarratorToolWindow({ toolType, narratorId }: { toolType: string; narratorId: string }) {
+	const d = normalizePanelWindowDescriptor({ panelType: toolType, narratorId });
 	if (!d || !("narratorId" in d)) return null;
 	return <NarratorBoundWindow descriptor={d} />;
 }
@@ -278,14 +269,13 @@ function NarratorBoundWindow({
 	descriptor: Extract<PanelWindowDescriptor, { narratorId: string }>;
 }) {
 	const { narratorId } = descriptor;
-	const chapterId = "chapterId" in descriptor ? descriptor.chapterId : undefined;
 	switch (descriptor.panelType) {
 		case "details":
 			return <DetailsWindow narratorId={narratorId} />;
 		case "spec":
 			return <SpecPanel narratorId={narratorId} onClose={closeWindow} chromeless />;
 		case "git":
-			return <GitPanel narratorId={narratorId} chapterId={chapterId} />;
+			return <GitPanel narratorId={narratorId} />;
 		case "browser":
 			return <BrowserWindow narratorId={narratorId} />;
 		case "tasks":
@@ -296,6 +286,8 @@ function NarratorBoundWindow({
 			return <NarratorUserChatPanel narratorId={narratorId} />;
 		case "appearance":
 			return <AppearancePanel />;
+		case "timeline":
+			return <NarratorTimelinePanel narratorId={narratorId} />;
 		case "filetree":
 			return <FileTreeWindow narratorId={narratorId} />;
 		default:
@@ -365,6 +357,19 @@ function FileWindow({
 	const { filePath, deviceId = "local", referenceOrigin, toolEdit } = descriptor;
 	const fileNarratorId = descriptor.fileNarratorId ?? descriptor.hostNarratorId;
 	const [dirty, setDirty] = useState(false);
+	const [largeFileConfirmed, setLargeFileConfirmed] = useState(
+		descriptor.largeFileConfirmed === true,
+	);
+	const confirmLargeFile = useCallback(() => {
+		const confirmed = normalizePanelWindowDescriptor({ ...descriptor, largeFileConfirmed: true });
+		if (!confirmed) return;
+		const url = new URL(window.location.href);
+		url.searchParams.set("d", JSON.stringify(confirmed));
+		// Keep consent private to this window and survive reload without granting
+		// another panel (or another file opened from a reference) permission.
+		window.history.replaceState(window.history.state, "", url.toString());
+		setLargeFileConfirmed(true);
+	}, [descriptor]);
 	useEffect(() => {
 		if (!dirty) return;
 		const handler = (event: BeforeUnloadEvent) => event.preventDefault();
@@ -390,32 +395,68 @@ function FileWindow({
 		[fileNarratorId],
 	);
 
-	const isText = getFilePreviewType(filePath) === "text";
 	return (
 		<FileReferenceScopeProvider value={scope}>
 			<PanelBoundary>
 				{toolEdit ? (
 					<ToolEditFileViewer key={filePath} reference={toolEdit} filePath={filePath} />
-				) : isText ? (
-					<FileEditorContent
-						key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
-						filePath={filePath}
-						narratorId={fileNarratorId}
-						deviceId={deviceId}
-						referenceOrigin={referenceOrigin}
-						onDirtyChange={setDirty}
-					/>
 				) : (
-					<FileViewerContent
+					<FilePanelContent
 						key={`${fileNarratorId}:${deviceId}:${filePath}`}
 						filePath={filePath}
 						narratorId={fileNarratorId}
 						deviceId={deviceId}
 						referenceOrigin={referenceOrigin}
+						onDirtyChange={setDirty}
+						confirmed={largeFileConfirmed}
+						onConfirm={confirmLargeFile}
 					/>
 				)}
 			</PanelBoundary>
 		</FileReferenceScopeProvider>
+	);
+}
+
+/**
+ * Outline window: the panel's content, navigated in place. Each navigation replaces the
+ * window's descriptor in its URL (no history entry), so a reload shows the same place; a
+ * Ctrl/Cmd-click opens another window, and an agent commit's session opens in a chat window.
+ */
+function OutlineWindow({
+	descriptor,
+}: {
+	descriptor: Extract<PanelWindowDescriptor, { panelType: "outline" }>;
+}) {
+	const [state, setState] = useState<OutlinePanelState>(() => {
+		const { panelType: _panelType, ...initial } = descriptor;
+		return initial;
+	});
+	const navigate = useCallback((next: OutlinePanelState) => {
+		setState(next);
+		const replaced = normalizePanelWindowDescriptor({ panelType: "outline", ...next });
+		if (!replaced) return;
+		try {
+			const url = new URL(window.location.href);
+			url.searchParams.set("d", JSON.stringify(replaced));
+			window.history.replaceState(window.history.state, "", url.toString());
+		} catch {
+			// The place still shows; only a reload would lose it.
+		}
+	}, []);
+	const openNew = useCallback(
+		(next: OutlinePanelState) => openPanelInWindow({ panelType: "outline", ...next }),
+		[],
+	);
+	const openSession = useCallback(
+		(narratorId: string) => openPanelInWindow({ panelType: "chat", narratorId }),
+		[],
+	);
+	return (
+		<OutlineHostProvider openSession={openSession}>
+			<PanelBoundary>
+				<OutlinePanelContent state={state} onChange={navigate} onOpenNew={openNew} />
+			</PanelBoundary>
+		</OutlineHostProvider>
 	);
 }
 

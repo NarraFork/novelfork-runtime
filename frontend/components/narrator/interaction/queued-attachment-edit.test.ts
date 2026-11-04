@@ -8,16 +8,22 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { BufferMessageSummary } from "../../../lib/api/types";
 import {
+	bindComposerEditFiles,
 	buildQueuedEditPayload,
 	canSubmitQueuedEdit,
+	composerEditDetailAttachments,
+	type ExistingComposerAttachment,
 	MAX_QUEUED_IMAGES,
 	MAX_QUEUED_TEXT_FILES,
+	projectComposerEdit,
 	type QueuedEditAttachmentState,
 	queuedEditTouchesAttachments,
 	remainingImageRoom,
 	remainingTextFileRoom,
+	seedComposerEditSession,
 	seedQueuedEditAttachments,
 } from "./queued-attachment-edit";
 
@@ -56,6 +62,36 @@ function state(overrides: Partial<QueuedEditAttachmentState> = {}): QueuedEditAt
 function fakeFile(name: string): File {
 	return new File(["x"], name, { type: "text/plain" });
 }
+
+describe("native media queued edits", () => {
+	const media = {
+		mediaId: "media-a",
+		filename: "voice.wav",
+		mediaType: "audio/wav",
+		size: 20,
+		uploadNarratorId: "owner",
+	};
+	test("media-only edits remain sendable and text edits retain stable references", () => {
+		const original = summary({ text: "", media: [media] });
+		const seeded = seedQueuedEditAttachments(original);
+		expect(seeded.keptMedia).toEqual([media]);
+		const draft = state({ keptMedia: seeded.keptMedia, newMedia: [] });
+		expect(canSubmitQueuedEdit(draft)).toBe(true);
+		expect(buildQueuedEditPayload(draft)).toMatchObject({
+			keepMediaIds: ["media-a"],
+			newMedia: [],
+		});
+		expect(queuedEditTouchesAttachments(original, draft)).toBe(false);
+	});
+	test("explicit removal sends an empty keep list and additions preserve binary files", () => {
+		const added = new File(["audio"], "voice.wav", { type: "audio/wav" });
+		const draft = state({ keptMedia: [], newMedia: [added] });
+		expect(canSubmitQueuedEdit(draft)).toBe(true);
+		expect(buildQueuedEditPayload(draft)).toMatchObject({ keepMediaIds: [], newMedia: [added] });
+		expect(queuedEditTouchesAttachments(summary({ media: [media] }), draft)).toBe(true);
+		expect(canSubmitQueuedEdit(state({ keptMedia: [], newMedia: [] }))).toBe(false);
+	});
+});
 
 describe("seedQueuedEditAttachments", () => {
 	test("separates images and text files from a summary", () => {
@@ -275,5 +311,285 @@ describe("queuedEditTouchesAttachments", () => {
 				}),
 			),
 		).toBe(true);
+	});
+});
+
+describe("semantic media composer edits", () => {
+	const refs = [
+		{
+			mediaId: "video-original",
+			filename: "same.webm",
+			mediaType: "video/webm",
+			size: 4,
+			uploadNarratorId: "source-owner",
+		},
+		{
+			mediaId: "audio-original",
+			filename: "same.webm",
+			mediaType: "audio/webm",
+			size: 4,
+			uploadNarratorId: "source-owner",
+		},
+	];
+	const resources = () =>
+		composerEditDetailAttachments({ images: [], textFiles: [], media: refs }, "fork-context") ?? [];
+	function doc(): ComposerDocument {
+		return {
+			version: 1,
+			assets: resources().map((resource, index) => ({
+				id: `media-${index}`,
+				kind: resource.kind,
+				name: resource.name,
+				size: resource.size,
+				mimeType: resource.mimeType,
+			})),
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "audio-first", assetId: "media-1" },
+						{ type: "text", text: " middle " },
+						{ type: "attachment", id: "video-last", assetId: "media-0" },
+					],
+				},
+			],
+		};
+	}
+	test("detail retains source-owned media and a combined audio/video lane despite visual reorder", () => {
+		const existing = resources();
+		expect(existing.map((resource) => [resource.mediaId, resource.uploadNarratorId])).toEqual([
+			["video-original", "source-owner"],
+			["audio-original", "source-owner"],
+		]);
+		const document = doc();
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: document },
+			existing,
+		);
+		const snapshot = projectComposerEdit(session, document);
+		expect(snapshot.keepMediaIds).toEqual(refs.map((media) => media.mediaId));
+		expect(snapshot.newMedia).toEqual([]);
+		expect(snapshot.newTextFiles).toEqual([]);
+		expect(snapshot.composerDocument).toEqual(document);
+	});
+	test("legacy media imports into chips, explicit deletion clears keeps, and undo restores IDs", () => {
+		const session = seedComposerEditSession({ text: "legacy", fileReferences: [] }, resources());
+		expect(session.document.assets.map((asset) => asset.kind)).toEqual(["video", "audio"]);
+		const cleared = projectComposerEdit(session, {
+			...session.document,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: "now text" }] }],
+		});
+		expect(cleared.keepMediaIds).toEqual([]);
+		expect(cleared.newMedia).toEqual([]);
+		expect(projectComposerEdit(session, session.document).keepMediaIds).toEqual([
+			"video-original",
+			"audio-original",
+		]);
+	});
+	test("same-name mixed new media stay separate, with manifest upload order independent from nodes", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: doc() },
+			resources(),
+		);
+		const audio = new File(["audio"], "same.webm", { type: "audio/webm" });
+		const video = new File(["video"], "same.webm", { type: "video/webm" });
+		const a = bindComposerEditFiles(session, [audio], "audio");
+		const v = bindComposerEditFiles(session, [video], "video");
+		const document = {
+			...session.document,
+			assets: [...v.assets, ...a.assets, ...session.document.assets],
+			paragraphs: [
+				{ children: [...v.nodes, ...a.nodes, ...session.document.paragraphs[0].children] },
+			],
+		};
+		const snapshot = projectComposerEdit(session, document);
+		expect(snapshot.newMedia).toEqual([audio, video]);
+		expect(snapshot.newTextFiles).toEqual([]);
+		expect(snapshot.composerDocument.assets.map((asset) => asset.id)).toEqual([
+			"media-0",
+			"media-1",
+			a.assets[0].id,
+			v.assets[0].id,
+		]);
+		expect(snapshot.composerDocument.paragraphs).toEqual(document.paragraphs);
+	});
+	test("rejects missing IDs, stale mixed lane and more than ten active media", () => {
+		expect(() =>
+			seedComposerEditSession({ text: "", fileReferences: [] }, [
+				{ ...resources()[0], mediaId: undefined },
+			]),
+		).toThrow("identity");
+		expect(() =>
+			seedComposerEditSession(
+				{ text: "", fileReferences: [], composerDocument: doc() },
+				[...resources()].reverse(),
+			),
+		).toThrow("out of date");
+		const session = seedComposerEditSession({ text: "", fileReferences: [] }, resources());
+		const added = bindComposerEditFiles(
+			session,
+			Array.from({ length: 9 }, () => new File(["x"], "a.wav", { type: "audio/wav" })),
+			"audio",
+		);
+		const document = {
+			...session.document,
+			assets: [...session.document.assets, ...added.assets],
+			paragraphs: [{ children: [...session.document.paragraphs[0].children, ...added.nodes] }],
+		};
+		expect(() => projectComposerEdit(session, document)).toThrow("Maximum 10");
+		const ten = {
+			...document,
+			paragraphs: [{ children: document.paragraphs[0].children.slice(0, -1) }],
+		};
+		const snapshot = projectComposerEdit(session, ten);
+		expect(snapshot.keepMediaIds.length + snapshot.newMedia.length).toBe(10);
+	});
+});
+
+// The same pure projection is consumed by queued and historical user editors.
+describe("semantic composer edits", () => {
+	const existing: ExistingComposerAttachment[] = [
+		{ kind: "image", imageId: "first-image", name: "same.png", size: 3, mimeType: "image/png" },
+		{ kind: "image", imageId: "second-image", name: "same.png", size: 3, mimeType: "image/png" },
+		{
+			kind: "textFile",
+			index: 0,
+			filePath: "/saved/one",
+			name: "same.txt",
+			size: 1,
+			mimeType: "text/plain",
+		},
+		{
+			kind: "textFile",
+			index: 1,
+			filePath: "/saved/two",
+			name: "same.txt",
+			size: 1,
+			mimeType: "text/plain",
+		},
+	];
+	function mixed(): ComposerDocument {
+		return {
+			version: 1,
+			assets: existing.map((resource, index) => ({
+				id: `asset-${index}`,
+				kind: resource.kind,
+				name: resource.name,
+				size: resource.size,
+				mimeType: resource.mimeType,
+			})),
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: " start😀 " },
+						{ type: "attachment", id: "node-file-two", assetId: "asset-3" },
+						{ type: "quote", id: "quote", label: "Source", text: "quoted text" },
+						{ type: "attachment", id: "node-image-two", assetId: "asset-1" },
+						{ type: "text", text: " middle " },
+						{ type: "attachment", id: "node-file-one", assetId: "asset-2" },
+						{ type: "attachment", id: "node-image-one", assetId: "asset-0" },
+						{ type: "text", text: " end " },
+					],
+				},
+			],
+		};
+	}
+	test("new record preserves interleaved occurrences but binds assets in server order", () => {
+		const document = mixed();
+		const session = seedComposerEditSession(
+			{ text: "ignored legacy text", fileReferences: [], composerDocument: document },
+			existing,
+		);
+		const snapshot = projectComposerEdit(session, session.document);
+		expect(snapshot.composerDocument).toEqual(document);
+		expect(snapshot.keepImageIds).toEqual(["first-image", "second-image"]);
+		expect(snapshot.keepTextFiles).toEqual([
+			{ index: 0, filename: "same.txt" },
+			{ index: 1, filename: "same.txt" },
+		]);
+		expect(snapshot.keepTextFilePaths).toEqual(["/saved/one", "/saved/two"]);
+		expect(snapshot.text).toContain(" start😀 ");
+		expect(snapshot.text.endsWith(" end ")).toBe(true);
+	});
+	test("legacy import uses the old grouping, without inventing historical mixed positions", () => {
+		const session = seedComposerEditSession({ text: "legacy body", fileReferences: [] }, existing);
+		expect(session.document.paragraphs[0].children.map((node) => node.type)).toEqual([
+			"attachment",
+			"attachment",
+			"attachment",
+			"attachment",
+		]);
+		expect(session.document.paragraphs[1].children).toEqual([
+			{ type: "text", text: "legacy body" },
+		]);
+	});
+	test("removal emits explicit empty keep arrays; undo restores identities from retained bindings", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: mixed() },
+			existing,
+		);
+		const removed: ComposerDocument = {
+			...session.document,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: "still text" }] }],
+		};
+		const cleared = projectComposerEdit(session, removed);
+		expect(cleared.keepImageIds).toEqual([]);
+		expect(cleared.keepTextFiles).toEqual([]);
+		expect(cleared.keepTextFilePaths).toEqual([]);
+		expect(projectComposerEdit(session, session.document).keepImageIds).toEqual([
+			"first-image",
+			"second-image",
+		]);
+	});
+	test("same-name new Files remain separate and reorder does not swap upload identity", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: mixed() },
+			existing,
+		);
+		const files = [fakeFile("same.txt"), fakeFile("same.txt")];
+		const added = bindComposerEditFiles(session, files, "textFile");
+		expect(added.assets[0].id).not.toBe(added.assets[1].id);
+		const edited: ComposerDocument = {
+			...session.document,
+			assets: [...[...added.assets].reverse(), ...session.document.assets],
+			paragraphs: [
+				{ children: [...[...added.nodes].reverse(), ...session.document.paragraphs[0].children] },
+			],
+		};
+		const result = projectComposerEdit(session, edited);
+		expect(result.newTextFiles).toEqual(files);
+		expect(result.composerDocument.assets.map((asset) => asset.id)).toEqual([
+			"asset-0",
+			"asset-1",
+			"asset-2",
+			"asset-3",
+			...added.assets.map((asset) => asset.id),
+		]);
+		expect(result.composerDocument.paragraphs).toEqual(edited.paragraphs);
+	});
+	test("missing resources, unknown versions and stale manifest counts fail closed", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: mixed() },
+			existing,
+		);
+		session.bindings.delete("asset-0");
+		expect(() => projectComposerEdit(session, session.document)).toThrow("missing");
+		expect(() =>
+			seedComposerEditSession(
+				{ text: "", fileReferences: [], composerDocument: mixed() },
+				existing.slice(1),
+			),
+		).toThrow("out of date");
+		expect(() =>
+			seedComposerEditSession(
+				{
+					text: "",
+					fileReferences: [],
+					composerDocument: { ...mixed(), version: 9 } as unknown as ComposerDocument,
+				},
+				existing,
+			),
+		).toThrow();
 	});
 });

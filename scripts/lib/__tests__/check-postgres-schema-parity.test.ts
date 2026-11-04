@@ -122,6 +122,125 @@ describe("parity fixture baseline", () => {
 	});
 });
 
+describe("table primary key parity", () => {
+	const compositeFixture = () => {
+		const source = fixture();
+		source.tables[1].columns[0].primary = false;
+		source.tables[1].primaryKeys = [{ name: "posts_scope_pk", columns: ["authorEmail", "id"] }];
+		return source;
+	};
+
+	test("compares table-level PKs without requiring inline column primary flags", () => {
+		const source = compositeFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+	});
+
+	test.each([
+		"name",
+		"order",
+		"wrong column",
+		"missing key",
+		"extra key",
+	])("detects %s drift", (change) => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		const table = target.tables[1];
+		switch (change) {
+			case "name":
+				table.primaryKeys[0].name = "renamed_pk";
+				break;
+			case "order":
+				table.primaryKeys[0].columns.reverse();
+				break;
+			case "wrong column":
+				table.primaryKeys[0].columns = ["id"];
+				break;
+			case "missing key":
+				table.primaryKeys = [];
+				break;
+			case "extra key":
+				table.primaryKeys.push({ name: "extra_pk", columns: ["id"] });
+				break;
+		}
+		expect(validateCoverage(source, target).join("\n")).toContain("primary key");
+	});
+
+	test("retains inline column primary flag comparison", () => {
+		const source = compositeFixture();
+		const target = structuredClone(source);
+		target.tables[1].columns[0].primary = true;
+		expect(validateCoverage(source, target)).toContain("column mismatch posts.id");
+	});
+});
+
+describe("constant expression index parity", () => {
+	const expressionFixture = () => {
+		const source = fixture();
+		source.tables[1].indexes.push({
+			name: "singleton",
+			columns: [],
+			expression: "1",
+			unique: true,
+			predicate: '"author_email" IS NOT NULL',
+		});
+		return source;
+	};
+	test("an exact constant expression retains a distinct structural signature", () => {
+		const source = expressionFixture();
+		expect(validateCoverage(source, structuredClone(source))).toEqual([]);
+		expect(
+			normalizeCoverage(source, "test").coverage.tables.find((table) => table.name === "posts")
+				?.indexes[0].expression,
+		).toBe("1");
+	});
+	test.each([
+		"2",
+		"1+0",
+		"(1)",
+		"lower(id)",
+		"",
+		"true",
+	])("rejects unknown expression %s even on both sides", (expression) => {
+		const source = expressionFixture();
+		source.tables[1].indexes[0].expression = expression;
+		expect(validateCoverage(source, structuredClone(source)).join(" ")).toContain(
+			"unsupported index expression",
+		);
+	});
+	test("removal or replacement with a column is a mismatch", () => {
+		const source = expressionFixture();
+		for (const columns of [[], ["id"]]) {
+			const target = structuredClone(source);
+			delete target.tables[1].indexes[0].expression;
+			target.tables[1].indexes[0].columns = columns;
+			expect(validateCoverage(source, target).length).toBeGreaterThan(0);
+		}
+	});
+	test("mixed terms, unknown fields and promotion to a unique constraint fail closed", () => {
+		for (const extras of [
+			{ columns: ["id"] },
+			{ unexpectedExpression: "1" },
+			{ emitAsUniqueConstraint: true },
+		]) {
+			const source = expressionFixture();
+			Object.assign(source.tables[1].indexes[0], extras);
+			expect(validateCoverage(source, structuredClone(source)).length).toBeGreaterThan(0);
+		}
+	});
+	test("a constant expression cannot cover a referenced column", () => {
+		const source = fixture();
+		source.tables[0].indexes[0] = {
+			name: "idx_users_email",
+			columns: [],
+			expression: "1",
+			unique: true,
+		};
+		expect(validateCoverage(source, structuredClone(source)).join(" ")).toContain(
+			"no unique constraint",
+		);
+	});
+});
+
 describe("foreign key constraint names", () => {
 	test("a renamed column-level constraint fails", () => {
 		const errors = mutate((target) => {
@@ -404,10 +523,133 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 115 tables and 1661 columns including resource inventory and context snapshots", () => {
-		expect(target.tables.length).toBe(115);
-		// 1658 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1661);
+	test("covers 135 tables and 1787 columns including durable reply context", () => {
+		expect(target.tables.length).toBe(135);
+		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
+		// plus the three PG-only insert_seq identity columns.
+		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
+		// Block storage (P1) adds 45: narrator_blocks (19), narrator_block_assets (3),
+		// narrator_block_sync_queue (1), narrator_text_snapshots (4), narrator_turns (10), six
+		// envelope columns and two ledger columns. The P2 backfill adds narrator_block_backfill (6)
+		// and narrator_block_diagnostics (4).
+		// Bot narrators add chat_messages.sender_narrator_id and reply_to_sender_narrator_id (2).
+		// Retiring the narrative line drops six tables (102 columns) and 19 columns elsewhere; the
+		// project index adds narrator_project_links (7) and projects.root_key. auth_sessions adds 8.
+		// The block sync's cost bookkeeping adds narrator_block_index_queue (2),
+		// narrator_blocks.ledger_revision and narrator_messages.blocks_content_hash.
+		// Historical token recalculation adds api_requests.token_accounting_version (1).
+		// Outline storage adds seven tables (67): outline_spaces (8), outline_blocks (14),
+		// outline_block_versions (13), outline_links (8), outline_commits (12),
+		// outline_live_updates (7) and outline_view_state (5).
+		// Account-scoped Git identity entry visibility adds two user_preferences columns.
+		// Native media adds narrator_buffered_messages.media_json.
+		// Outline tasks (P2) add outline_task_claims (9), outline_blocks.in_process,
+		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
+		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
+		// The outline task source (P2) adds narrators.task_backend.
+		// Locks and pending confirmation (P2) add outline_pending (25).
+		// Durable reply language adds narrators.reply_context without a NOT NULL constraint.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1787);
+		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "replyContext",
+					name: "reply_context",
+					pgType: "text",
+					notNull: false,
+				}),
+				expect.objectContaining({
+					property: "hiddenFromLists",
+					name: "hidden_from_lists",
+					pgType: "boolean",
+					notNull: true,
+					defaultExpression: "false",
+				}),
+				expect.objectContaining({
+					property: "modeltraceKey",
+					name: "modeltrace_key",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
+		expect(
+			target.tables.find((table) => table.name === "narrator_buffered_messages")?.columns,
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "mediaJson",
+					name: "media_json",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_context_pins")
+				?.columns.map((column) => column.property),
+		).toEqual(["generation", "narratorId", "segmentsJson"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_message_context_stats")
+				?.columns.map((column) => column.property),
+		).toEqual(["messageId", "role", "parentToolUseId", "segmentsJson"]);
+		expect(target.tables.some((table) => table.name === "narrator_context_char_pages")).toBe(false);
+		for (const name of ["narrator_drafts", "narrator_messages"]) {
+			expect(
+				target.tables
+					.find((table) => table.name === name)
+					?.columns.find((column) => column.property === "composerDocument"),
+			).toMatchObject({
+				name: "composer_document",
+				mode: "json",
+				pgType: "text",
+				notNull: false,
+			});
+		}
+		expect(
+			target.tables
+				.find((table) => table.name === "knowledge_injection_events")
+				?.columns.find((column) => column.property === "personalEntryId"),
+		).toMatchObject({
+			name: "personal_entry_id",
+			pgType: "text",
+			notNull: false,
+			references: { table: "knowledgeDrafts", column: "id", onDelete: "cascade" },
+		});
+		expect(target.tables.some((table) => table.name.startsWith("intelligent_ui_"))).toBe(false);
+		expect(
+			target.tables
+				.find((table) => table.name === "model_history_revision_contracts")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "installedVersion"]);
+		for (const [tableName, property, name] of [
+			["narrators", "modelHistoryRevision", "model_history_revision"],
+			["narrator_messages", "bodyRevision", "body_revision"],
+			["narrator_tool_calls", "modelRevision", "model_revision"],
+		]) {
+			expect(
+				target.tables
+					.find((table) => table.name === tableName)
+					?.columns.find((column) => column.property === property),
+			).toMatchObject({ name, pgType: "integer", notNull: true, defaultExpression: "0" });
+		}
+		expect(
+			target.tables
+				.find((table) => table.name === "user_git_identities")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "userId", "name", "email", "isDefault", "createdAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_git_identity_bindings")
+				?.columns.map((column) => column.property),
+		).toEqual(["id", "narratorId", "userId", "identityId", "updatedAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "background_tasks")
+				?.columns.find((column) => column.property === "backgroundKind"),
+		).toMatchObject({ name: "background_kind", notNull: true, defaultExpression: '"task"' });
 		for (const name of ["narrators", "api_requests"]) {
 			expect(
 				target.tables
@@ -420,6 +662,23 @@ describe("real schema parity", () => {
 				.find((table) => table.name === "narrator_worktree_resources")
 				?.columns.map((column) => column.property),
 		).toContain("scopeOwnerUserId");
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_question_events")
+				?.columns.map((column) => column.property),
+		).toEqual(["questionId", "messageId", "kind", "resolutionJson", "createdAt"]);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_questions")
+				?.columns.map((column) => column.property),
+		).toEqual(
+			expect.arrayContaining(["context", "resolutionJson", "withdrawReason", "summaryJson"]),
+		);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrators")
+				?.columns.map((column) => column.property),
+		).toContain("lastStopReason");
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {

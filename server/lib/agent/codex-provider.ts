@@ -1,4 +1,7 @@
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import { rejectNativeMedia, storedMessageMedia } from "./native-media";
+import type { ToolLoadingTarget } from "./tool-loading";
 
 // Codex Provider — uses the centralized CodexManager for multi-account OAuth
 // Wraps OpenAIProvider with dynamic credential selection
@@ -28,17 +31,19 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import {
-	appendCodexNativeTools,
 	applyOpenAIModelMetadata,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
+	isResponsesInputItem,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
 	resolveCodexRequestReasoningEffort,
 	stampReasoningSource,
+	withCodexNativeTools,
 } from "./openai-provider";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -46,7 +51,8 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import type { AgentToolUse, ResolvedToolDefinition } from "./types";
+import type { ResolvedToolDefinition } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 function getCodexProviderErrorMessage(err: unknown): string {
 	if (err instanceof Error) return err.message;
@@ -152,8 +158,6 @@ export class CodexProvider implements ProviderAdapter {
 	private useWebSocket: boolean;
 	private useWebSearch: boolean;
 	private useImageGeneration: boolean;
-	/** Cached dummy provider for synchronous operations (formatToolResult, pushUserTurn, etc.) */
-	private dummyProvider: OpenAIProvider;
 
 	constructor(options?: CodexProviderOptions) {
 		const mode = settings.codex?.loadBalancingMode;
@@ -164,19 +168,6 @@ export class CodexProvider implements ProviderAdapter {
 		this.useWebSocket = options?.useWebSocket ?? true;
 		this.useWebSearch = options?.useWebSearch ?? true;
 		this.useImageGeneration = options?.useImageGeneration ?? true;
-		// Create dummy provider once and reuse it
-		this.dummyProvider = new OpenAIProvider({
-			id: "codex",
-			name: "Codex",
-			prefix: "codex",
-			apiKey: "",
-			baseUrl: CODEX_BASE_URL,
-			defaultModel: "gpt-5.5",
-			apiMode: "codex",
-			codexWebSearch: this.useWebSearch,
-			codexImageGeneration: this.useImageGeneration,
-			...codexFingerprintConfig(),
-		});
 	}
 
 	/** Get or acquire a valid credential context. */
@@ -456,6 +447,13 @@ export class CodexProvider implements ProviderAdapter {
 		throw new Error("Codex request failed");
 	}
 
+	supportsNativeMediaInput(
+		_media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		_model: string,
+	): boolean {
+		return false;
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		// Use a dummy provider just for formatting
 		const dummy = new OpenAIProvider({
@@ -472,11 +470,16 @@ export class CodexProvider implements ProviderAdapter {
 		return dummy.formatTools(tools);
 	}
 
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "openai-responses", codexBackend: true };
+	}
+
 	async buildHistory(
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+	): Promise<BuiltHistory> {
+		rejectNativeMedia("Codex Responses", dbMessages.flatMap(storedMessageMedia));
 		const ctx = await this.getContext();
 		const provider = this.createProvider(ctx);
 		return provider.buildHistory(dbMessages, model, narratorId);
@@ -504,6 +507,7 @@ export class CodexProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		rejectNativeMedia("Codex Responses", [params.media, params.history, params.toolResults]);
 		// Use WebSocket mode if enabled
 		if (this.useWebSocket) {
 			yield* this.chatWebSocket(params);
@@ -613,7 +617,8 @@ export class CodexProvider implements ProviderAdapter {
 					authorization: ctx.authorization,
 					accountId: ctx.credential.accountId,
 					proxy: resolveOverride(settings.codex?.proxy),
-					sessionKey: params.stickySessionKey ?? params.conversationId,
+					sessionKey:
+						params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId,
 					conversationId: params.conversationId,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,
@@ -624,7 +629,6 @@ export class CodexProvider implements ProviderAdapter {
 					userAgent: fingerprint.userAgent,
 					extraHeaders: fingerprint.headers,
 					requestDump: params.requestDump,
-					requestDumpMaxBytes: settings.agent?.requestDumpMaxSize,
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					// Same neutrality rule as the SSE path: a policy violation is a
@@ -810,15 +814,16 @@ export class CodexProvider implements ProviderAdapter {
 		}
 		if ((params.content && params.content !== ".") || params.images?.length) {
 			if (params.images?.length) {
-				const parts: OAIContentPart[] = [];
-				if (params.content && params.content !== ".")
-					parts.push({ type: "text", text: params.content });
-				for (const img of params.images) {
-					parts.push({
-						type: "image_url",
-						image_url: { url: `data:image/${img.format};base64,${img.base64}` },
-					});
-				}
+				const text = params.content && params.content !== "." ? params.content : "";
+				const parts = orderUserContent(text, params.images, "after").map(
+					(part): OAIContentPart =>
+						part.type === "text"
+							? { type: "text", text: part.text }
+							: {
+									type: "image_url",
+									image_url: { url: `data:image/${part.image.format};base64,${part.image.base64}` },
+								},
+				);
 				messages.push({ role: "user", content: parts });
 			} else {
 				messages.push({ role: "user", content: params.content });
@@ -832,7 +837,7 @@ export class CodexProvider implements ProviderAdapter {
 		for (const msg of messages) {
 			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
 			const role = (msg as any).role;
-			if (role === "system" || role === "developer") {
+			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
 				if (typeof msg.content === "string") {
 					instructions += (instructions ? "\n\n" : "") + msg.content;
 				}
@@ -864,8 +869,7 @@ export class CodexProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		if (!instructions) markRuntimeInstructions(request);
-		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, params.model, {
+		const tools = withCodexNativeTools(params.tools, params.model, {
 			webSearch:
 				this.useWebSearch && isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
 			imageGeneration: this.useImageGeneration,
@@ -882,68 +886,6 @@ export class CodexProvider implements ProviderAdapter {
 
 		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
 		return request;
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		void toolName;
-		return this.dummyProvider.formatToolResult(toolUseId, output, isError, images);
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		this.dummyProvider.pushUserTurn(history, content, model, toolResults, images);
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: import("./provider").WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		this.dummyProvider.pushAssistantTurn(
-			history,
-			text,
-			toolUses,
-			reasoningBlocks,
-			webSearches,
-			messageId,
-			imageGenerations,
-			textOutputIndex,
-			redactedThinkingBlocks,
-			orderedContent,
-		);
 	}
 
 	async generate(text: string, model: string): Promise<string> {

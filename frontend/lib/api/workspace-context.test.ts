@@ -26,7 +26,6 @@ test("workspace context endpoints encode owner identity and pin switch to the ob
 		expectedRevision: 4,
 		requestId: "switch-id",
 		target: { deviceId: "local", cwd: "/new/path" },
-		expectedWorktreeKey: "new-key",
 	};
 	await api.getWorkspaceContext("n /1");
 	await api.switchWorkspaceContext("n /1", input);
@@ -50,7 +49,7 @@ test("worktree prepare/list/create use frozen shared endpoints; no extra confirm
 	});
 	expect(requests.map((r) => r.url)).toEqual([
 		"/api/narrators/n/git/worktrees/prepare",
-		"/api/narrators/n/git/worktrees?workspaceKey=workspace%20%2F%20key",
+		"/api/narrators/n/git/worktrees?workspaceKey=workspace+%2F+key",
 		"/api/narrators/n/git/worktrees",
 	]);
 	expect(JSON.parse(String(requests[0]?.input?.body))).toMatchObject({
@@ -58,11 +57,31 @@ test("worktree prepare/list/create use frozen shared endpoints; no extra confirm
 		expectedRevision: 4,
 	});
 });
-test("projectId paginated compatibility filter retains standalone all and cursor", async () => {
-	await api.listNarratorsPaginated({ projectId: "p /1", standalone: "all", cursor: "cursor" });
+test("worktree list fourth argument encodes pagination and keeps third argument cancellation", async () => {
+	const controller = new AbortController();
+	await api.listNarratorWorktrees("n /1", "wk /1", controller.signal, {
+		limit: 20,
+		cursor: "opaque+/=",
+		sort: "createdAt",
+		order: "asc",
+		search: "名称 / worktree",
+	});
+	const params = new URL(requests[0]?.url ?? "", "http://localhost").searchParams;
+	expect(params.get("workspaceKey")).toBe("wk /1");
+	expect(params.get("cursor")).toBe("opaque+/=");
+	expect(params.get("search")).toBe("名称 / worktree");
+	expect(params.get("sort")).toBe("createdAt");
+	expect(params.get("order")).toBe("asc");
+	expect(params.get("limit")).toBe("20");
+	controller.abort();
+	expect(requests[0]?.input?.signal?.aborted).toBe(true);
+});
+
+test("projectId paginated filter retains the cursor", async () => {
+	await api.listNarratorsPaginated({ projectId: "p /1", cursor: "cursor" });
 	const params = new URL(requests[0]?.url ?? "", "http://localhost").searchParams;
 	expect(params.get("projectId")).toBe("p /1");
-	expect(params.get("standalone")).toBe("all");
+	expect(params.has("standalone")).toBe(false);
 	expect(params.get("cursor")).toBe("cursor");
 });
 test("receipt reconciliation uses the original proposal at a distinct read-only endpoint", async () => {

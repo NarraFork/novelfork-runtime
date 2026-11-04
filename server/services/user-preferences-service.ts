@@ -1,7 +1,7 @@
 import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { containerInstances, narrators, terminals } from "../db/schema";
-import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
+import { narrators, terminals } from "../db/schema";
+import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
 import { getNarratorIdsWithDraft } from "./narrator-draft-service";
@@ -23,9 +23,6 @@ export function migrateTabTypes(tabs: Record<string, unknown>[]): void {
 export function getTabNarratorId(tab: Record<string, unknown>): string | undefined {
 	if (tab.type === "narrator" || tab.type === "subagent") {
 		return typeof tab.id === "string" ? tab.id : undefined;
-	}
-	if (tab.type === "chapter") {
-		return typeof tab.narratorId === "string" ? tab.narratorId : undefined;
 	}
 	return undefined;
 }
@@ -49,12 +46,20 @@ export async function enrichTabs(
 					id: narrators.id,
 					status: narrators.status,
 					substatus: narrators.substatus,
+					// 系统内部叙述者（ModelTrace 舱）不留在最近标签里：按钮按 id 打开，
+					// 但侧栏不该因此多出一条。
+					hiddenFromLists: narrators.hiddenFromLists,
 				})
 				.from(narrators)
 				.where(inArray(narrators.id, narratorIds)),
 			getNarratorIdsWithDraft(userId, narratorIds),
 		]);
-		const narratorMap = new Map(rows.map((r) => [r.id, r]));
+		const hiddenIds = new Set(rows.filter((r) => r.hiddenFromLists).map((r) => r.id));
+		const narratorMap = new Map(rows.filter((r) => !r.hiddenFromLists).map((r) => [r.id, r]));
+		for (let i = tabs.length - 1; i >= 0; i--) {
+			const nId = getTabNarratorId(tabs[i] ?? {});
+			if (nId && hiddenIds.has(nId)) tabs.splice(i, 1);
+		}
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
 			const row = nId ? narratorMap.get(nId) : undefined;
@@ -88,13 +93,24 @@ export async function enrichTabs(
 
 		// Active background task counts (subagents + bash + transfers). Lazy import
 		// matches the narrators route: the service pulls in half the agent runtime.
-		const { backgroundTaskService } = await import("./background-task-service");
-		const bgTaskCountMap = await backgroundTaskService.countActiveByParentBatch(narratorIds);
-		for (const tab of tabs) {
-			const nId = getTabNarratorId(tab);
-			if (nId && bgTaskCountMap.has(nId)) {
-				tab.activeBackgroundTaskCount = bgTaskCountMap.get(nId);
+		try {
+			const { backgroundTaskService } = await import("./background-task-service");
+			const bgTaskCountMap = await backgroundTaskService.countActiveKindsByParentBatch(narratorIds);
+			for (const tab of tabs) {
+				const nId = getTabNarratorId(tab);
+				if (nId) {
+					const counts = bgTaskCountMap.get(nId);
+					tab.activeBackgroundTaskCount = counts?.activeCount ?? 0;
+					tab.activeBackgroundWorkCount = counts?.activeWorkCount ?? 0;
+					tab.activeBackgroundServiceCount = counts?.activeServiceCount ?? 0;
+				}
 			}
+		} catch (err) {
+			// Keep existing counts (or omit unknown ones), without losing basic tab data.
+			logger.warn("Failed to load background counts for recent tabs", {
+				count: narratorIds.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
 
 		// Presence (from in-memory map)
@@ -106,40 +122,6 @@ export async function enrichTabs(
 				if (viewers && viewers.length > 0) {
 					tab.viewers = viewers;
 				}
-			}
-		}
-	}
-
-	// Container status for chapter tabs
-	const chapterIds = tabs.filter((t) => t.type === "chapter").map((t) => t.id as string);
-	if (chapterIds.length > 0) {
-		const containerRows = await db
-			.select({
-				chapterId: containerInstances.chapterId,
-				status: containerInstances.status,
-			})
-			.from(containerInstances)
-			.where(
-				and(
-					inArray(containerInstances.chapterId, chapterIds),
-					isNull(containerInstances.worktreeResourceId),
-				),
-			);
-
-		const containerStatusMap = new Map<string, string>();
-		for (const row of containerRows) {
-			if (row.chapterId === null) continue;
-			const existing = containerStatusMap.get(row.chapterId);
-			if (
-				!existing ||
-				(CONTAINER_STATUS_PRIORITY[row.status] ?? 0) > (CONTAINER_STATUS_PRIORITY[existing] ?? 0)
-			) {
-				containerStatusMap.set(row.chapterId, row.status);
-			}
-		}
-		for (const tab of tabs) {
-			if (tab.type === "chapter" && containerStatusMap.has(tab.id as string)) {
-				tab.containerStatus = containerStatusMap.get(tab.id as string);
 			}
 		}
 	}

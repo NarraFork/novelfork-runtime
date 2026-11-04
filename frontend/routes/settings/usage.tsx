@@ -1,3 +1,4 @@
+import { TokenRecalculationPanel } from "@frontend/components/usage-history/TokenRecalculationPanel";
 import { UsageBreakdownChart } from "@frontend/components/usage-history/UsageBreakdownChart";
 import { UsageHistoryChart } from "@frontend/components/usage-history/UsageHistoryChart";
 import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHistoryTable";
@@ -225,6 +226,7 @@ function SettingsUsagePage() {
 		() =>
 			[
 				"narrator",
+				"modeltrace",
 				"compact",
 				"context_ask",
 				"fork_summary",
@@ -317,18 +319,21 @@ function SettingsUsagePage() {
 				{/* Header */}
 				<Group justify="space-between">
 					<Title order={isMobile ? 3 : 2}>{t("usageHistoryTitle")}</Title>
-					<Button
-						size={isMobile ? "sm" : "md"}
-						leftSection={<IconRefresh size={isMobile ? 14 : 16} />}
-						variant="light"
-						onClick={() => {
-							refetchList();
-							refetchStats();
-							refetchTimeSeries();
-						}}
-					>
-						{t("usageHistoryRefresh")}
-					</Button>
+					<Group gap="xs">
+						<TokenRecalculationPanel />
+						<Button
+							size={isMobile ? "sm" : "md"}
+							leftSection={<IconRefresh size={isMobile ? 14 : 16} />}
+							variant="light"
+							onClick={() => {
+								refetchList();
+								refetchStats();
+								refetchTimeSeries();
+							}}
+						>
+							{t("usageHistoryRefresh")}
+						</Button>
+					</Group>
 				</Group>
 
 				{/* Shared filters */}

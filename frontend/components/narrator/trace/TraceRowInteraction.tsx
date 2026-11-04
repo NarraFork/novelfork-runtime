@@ -18,9 +18,11 @@
  * ── Height neutrality (load-bearing for the vlist path) ──
  * The vlist predicts every row's height arithmetically with zero DOM measurement,
  * so this wrapper must not change layout: selection uses `outline` (which does not
- * occupy space), both menus are portaled to document.body, and the inspector /
- * preview modals are lazy AND mounted only while open. An idle row therefore pays
- * nothing and measures exactly as before.
+ * occupy space), both menus are portaled to document.body, and the file-preview
+ * modal is lazy and mounted only while open. The tool-call inspector is owned by
+ * the list shell when that host is registered, so row eviction cannot close it;
+ * otherwise this row keeps a local fallback. An idle row therefore pays nothing
+ * and measures exactly as before.
  *
  * ── Placement ──
  * Deliberately OUTSIDE vlist/ so BOTH render paths can use it: the isolation guard
@@ -29,13 +31,14 @@
  * element); this one wraps a single row inside a trace.
  */
 
+import { useClipboard } from "@frontend/hooks/useClipboard";
 import { usePlatform } from "@frontend/hooks/usePlatform";
 import { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
 import type { ToolCallDetailRef } from "@frontend/lib/api/narrators";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
-import { useClipboard, useMediaQuery } from "@mantine/hooks";
+import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
 	IconCheck,
@@ -53,6 +56,7 @@ import {
 import { lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { CompactMenuSub } from "../compact/CompactMenuSub";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
 import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
@@ -62,17 +66,15 @@ import {
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "../message/MessageSelectionCtx";
+import { openHostedToolCallInspector } from "../tool-call/tool-call-inspector-host";
+import { useToolFileNavigation } from "../tool-call/useToolFileNavigation";
 import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { TraceRowIdentity } from "./trace-row-identity";
 
-// Both modals are only needed once a menu item fires, so both are lazy: a
-// scrolling trace never pays for their module graph (ToolCallInspector pulls
-// ContentViewer + Timeline; FilePreviewModal pulls the fs-preview fetch path).
+// The inspector is lazy; file navigation uses the authorized panel chain instead
+// of the unqualified local fs-preview path.
 const ToolCallInspector = lazy(() =>
 	import("../tool-call/ToolCallInspector").then((m) => ({ default: m.ToolCallInspector })),
-);
-const FilePreviewModal = lazy(() =>
-	import("../file-panel/FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
 );
 
 const SWIPE_REVEAL_WIDTH = 180;
@@ -115,10 +117,7 @@ export interface TraceRowInteractionProps {
 	onDetachBash?: (toolUseId: string) => void;
 	/** Cancel a background subagent task; absent → item hidden. */
 	onCancelBackgroundTask?: (narratorId: string) => void;
-	/**
-	 * Open a file-oriented tool's path in a read-only dock panel. Supplied only by
-	 * hosts that own a dockview surface; absent → item hidden.
-	 */
+	/** Legacy capability retained for callers; file tools now require target-bound navigation. */
 	onOpenFilePanel?: (filePath: string) => void;
 	/** Row body (the trace row's own markup). */
 	children: ReactNode;
@@ -137,7 +136,6 @@ export function TraceRowInteraction({
 	onDetachSubagent,
 	onDetachBash,
 	onCancelBackgroundTask,
-	onOpenFilePanel,
 	children,
 }: TraceRowInteractionProps) {
 	const interactive = useRenderInteractive();
@@ -148,9 +146,9 @@ export function TraceRowInteraction({
 	const platform = usePlatform();
 	const filePathClipboard = useClipboard({ timeout: 1500 });
 	const [inspectorOpened, setInspectorOpened] = useState(false);
-	const [previewOpened, setPreviewOpened] = useState(false);
 
 	const { blockId, messageId, blockIndex, blockIndices, copyText, tool } = identity;
+	const openToolFile = useToolFileNavigation(tool?.fileTarget, tool?.fileNarratorId);
 	const editNavigation = useToolEditNavigation({
 		toolName: tool?.toolName,
 		narratorId,
@@ -267,8 +265,7 @@ export function TraceRowInteraction({
 	);
 	// The file panel opens for any file-oriented tool (Read / Write / Edit): it
 	// shows the file's CURRENT on-disk content, so a write is a valid entry point.
-	const canOpenFilePanel =
-		!!editNavigation.open || !!(filePath && tool?.isFileTool && onOpenFilePanel);
+	const canOpenFilePanel = !!editNavigation.open || !!(tool?.isFileTool && openToolFile);
 	const hasToolActions = !!(
 		canViewSession ||
 		canDetach ||
@@ -320,7 +317,18 @@ export function TraceRowInteraction({
 				<Menu.Item
 					leftSection={<IconInfoCircle size={14} />}
 					onClick={() => {
-						setInspectorOpened(true);
+						const toolUseId = tool?.toolUseId;
+						const hosted =
+							narratorId != null &&
+							toolUseId != null &&
+							openHostedToolCallInspector({
+								narratorId,
+								toolUseId,
+								toolCallId: toolDetailRef?.toolCallId,
+								messageId: toolDetailRef?.messageId,
+								executionAttempt: toolDetailRef?.executionAttempt,
+							});
+						if (!hosted) setInspectorOpened(true);
 						swipe.closeSwipe();
 					}}
 				>
@@ -338,11 +346,17 @@ export function TraceRowInteraction({
 					{filePathClipboard.copied ? t("copied") : tNarrator("contextMenu_copyFilePath")}
 				</Menu.Item>
 			)}
-			{filePath && tool?.isReadTool && (
+			{filePath &&
+				(tool?.isFileTool || tool?.toolName === "Read" || tool?.toolName === "Write") &&
+				!editNavigation.open &&
+				(!tool?.fileTarget || !tool.fileNarratorId) && (
+					<Menu.Item disabled>{tNarrator("fileReferences.missingContext")}</Menu.Item>
+				)}
+			{openToolFile && tool?.isReadTool && (
 				<Menu.Item
 					leftSection={<IconEye size={14} />}
 					onClick={() => {
-						setPreviewOpened(true);
+						void openToolFile();
 						swipe.closeSwipe();
 					}}
 				>
@@ -354,7 +368,7 @@ export function TraceRowInteraction({
 					leftSection={<IconFileText size={14} />}
 					onClick={() => {
 						if (editNavigation.open) editNavigation.open();
-						else if (filePath) onOpenFilePanel?.(filePath);
+						else void openToolFile?.();
 						swipe.closeSwipe();
 					}}
 				>
@@ -370,7 +384,7 @@ export function TraceRowInteraction({
 				<Menu.Item
 					leftSection={<IconCopy size={14} />}
 					onClick={() => {
-						navigator.clipboard.writeText(copyText);
+						void copyTextToClipboard(copyText);
 						swipe.closeSwipe();
 					}}
 				>
@@ -561,17 +575,8 @@ export function TraceRowInteraction({
 				</Suspense>
 			)}
 
-			{/* File preview (Read tool) — mounted only while open (lazy chunk). */}
+			{/* Historical Edit preview stays mounted only while open. */}
 			{editNavigation.modal}
-			{previewOpened && filePath && (
-				<Suspense fallback={null}>
-					<FilePreviewModal
-						filePath={filePath}
-						opened={previewOpened}
-						onClose={() => setPreviewOpened(false)}
-					/>
-				</Suspense>
-			)}
 		</>
 	);
 }

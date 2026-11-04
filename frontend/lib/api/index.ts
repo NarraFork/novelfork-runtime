@@ -1,25 +1,30 @@
 import { authApi } from "./auth";
-import { chaptersApi } from "./chapters";
 import { chatApi } from "./chat";
 import { apiBase } from "./client";
+import { commandCodeApi } from "./commandcode";
+import { containersApi } from "./containers";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { grammarsApi } from "./grammars";
 import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
-import { modelCardsApi } from "./model-cards";
 import { narratorsApi } from "./narrators";
 import { notificationsApi } from "./notifications";
 import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
+import { outlineApi } from "./outline";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
+import { providerImportApi } from "./provider-import";
 import { scheduledTasksApi } from "./scheduled-tasks";
+import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
+import { storageTransferApi } from "./storage-transfer";
 import { systemLifecycleApi } from "./system-lifecycle";
 import { terminalsApi } from "./terminals";
+import { tokendanceApi } from "./tokendance";
 import { traitLayersApi } from "./trait-layers";
 import { workspaceContextApi } from "./workspace-context";
 
@@ -30,7 +35,7 @@ export function getAvatarUrl(userId: string, avatarImageId: string): string {
 export const api = {
 	...authApi,
 	...projectsApi,
-	...chaptersApi,
+	...containersApi,
 	...chatApi,
 	...narratorsApi,
 	...notificationsApi,
@@ -41,16 +46,21 @@ export const api = {
 	...grammarsApi,
 	...integrationsApi,
 	...miscApi,
-	...modelCardsApi,
 	...knowledgeApi,
 	...specApi,
 	...systemLifecycleApi,
 	...devicesApi,
 	...traitLayersApi,
+	...tokendanceApi,
 	...oauthAppsApi,
 	...oauthGrantsApi,
+	...outlineApi,
 	...scheduledTasksApi,
 	...pluginsApi,
+	...sessionInterchangeApi,
+	...commandCodeApi,
+	...storageTransferApi,
+	...providerImportApi,
 };
 
 export {
@@ -72,10 +82,10 @@ export {
 } from "./auth";
 export {
 	ApiError,
-	absorbRenewedToken,
 	authorizedFetch,
 	clearToken,
 	clearTokenOnSessionFailure,
+	endSession,
 	getToken,
 	isAbortError,
 	readFetchError,
@@ -105,12 +115,20 @@ export type {
 	KnowledgeBulkGrantResult,
 	KnowledgeCollection,
 	KnowledgeCollectionAcl,
+	KnowledgeCollectionListItem,
+	KnowledgeCollectionViewerCaps,
 	KnowledgeDeletePersonalEntryResult,
 	KnowledgeDraft,
 	KnowledgeDraftDiff,
 	KnowledgeDraftStatus,
 	KnowledgeEntry,
+	KnowledgeEntryDetail,
 	KnowledgeEntryLink,
+	KnowledgeEntryListItem,
+	KnowledgeEntryPage,
+	KnowledgeEntrySort,
+	KnowledgeEntryStatus,
+	KnowledgeEntryViewerCaps,
 	KnowledgeFinding,
 	KnowledgeFormat,
 	KnowledgeGrant,
@@ -124,7 +142,10 @@ export type {
 	KnowledgeLinkType,
 	KnowledgeOpenSubmission,
 	KnowledgePersonalEntry,
+	KnowledgePersonalEntryDetail,
 	KnowledgePersonalEntrySummary,
+	KnowledgePersonalEntryViewerCaps,
+	KnowledgePersonalSubmitBlocker,
 	KnowledgeRebaseStrategy,
 	KnowledgeReviewInboxCount,
 	KnowledgeReviewResult,
@@ -133,7 +154,11 @@ export type {
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 	KnowledgeSubmissionDetail,
+	KnowledgeSubmissionHistoryItem,
+	KnowledgeSubmissionListItem,
+	KnowledgeSubmissionOutcome,
 	KnowledgeSubmissionStatus,
+	KnowledgeSubmissionViewerCaps,
 	KnowledgeTag,
 	KnowledgeTagType,
 	KnowledgeTransferOwnerResult,
@@ -200,6 +225,9 @@ export type {
 	BaseContentBlock,
 	BlacklistCmd,
 	BlacklistDir,
+	BlockBackfillStatus,
+	BlockJobState,
+	BlockProjectionBlock,
 	BufferCreator,
 	BufferMessageSummary,
 	ChangelogEntry,
@@ -226,6 +254,7 @@ export type {
 	DatabaseStorageTableSummary,
 	DatabaseTableKind,
 	DatabaseVacuumResult,
+	EntitySearchResult,
 	HookApiRecord,
 	LearningAction,
 	LearningCategory,
@@ -241,14 +270,22 @@ export type {
 	LicenseTextSource,
 	MessageLocationResult,
 	PaginatedNarrators,
+	PromptLibraryEntryData,
+	PromptLibraryInputData,
 	PublicCodexPlanTier,
 	PublicCodexQuotaOverview,
 	PublicCodexQuotaSegment,
 	PublicCodexQuotaTrendPoint,
 	RuntimeScanResult,
-	SearchFallback,
-	SearchMetadata,
-	SearchResponse,
+	SearchRequest,
+	SearchSectionName,
+	SearchSectionPage,
+	SearchSectionsResponse,
+	SessionHitsResponse,
+	SessionSearchHit,
+	SessionSearchResult,
+	StorageCategoryJobState,
+	StorageCategoryKey,
 	StorageCategoryResult,
 	StorageScanJobState,
 	StorageScanJobStatus,
@@ -263,9 +300,4 @@ export type {
 	TreeMessage,
 	WhitelistCmd,
 	WhitelistDir,
-	WorkspaceBarrier,
-	WorkspaceBarrierObservation,
-	WorkspaceBarrierObservationResult,
-	WorkspaceBarrierRecoveryResult,
-	WorkspaceBarrierVerdict,
 } from "./types";

@@ -1,12 +1,71 @@
 import { afterAll, afterEach, expect, mock, test } from "bun:test";
-import type { GitWorkspaceCategory } from "@shared/git-workspace-events";
+import type { GitWorkspaceCategory, GitWorkspaceSnapshot } from "@shared/git-workspace-events";
+import { posixPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
+
+function required<T>(value: T | undefined): T {
+	if (value === undefined) throw new Error("Missing expected snapshot fixture value");
+	return value;
+}
+async function waitForState(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+	const deadline = performance.now() + timeoutMs;
+	while (!predicate()) {
+		if (performance.now() >= deadline)
+			throw new Error("Timed out waiting for observable Git watch state");
+		await new Promise<void>((resolve) => setTimeout(resolve, 1));
+	}
+}
+
 import type { GitWorkspaceTarget } from "../services/git-workspace";
 
 const accessModule = await import("../services/git-workspace-access");
 const watchModule = await import("../services/git-workspace-watch");
 const managementModule = await import("../services/git-management-service");
-const realPool = new watchModule.GitWorkspaceWatchPool(watchModule.probeGitWatch, 5);
+const completedSamples: Array<{ generation: number; worktree?: string }> = [];
+const snapshotFacts = (revision = 1) => ({
+	revision,
+	updating: false,
+	status: {
+		hasChanges: true,
+		staged: 0,
+		unstaged: 1,
+		untracked: 0,
+		totalFiles: 1,
+		totalFilesExact: true,
+		headSha: "sha",
+		branch: "main",
+		files: [{ status: " M", path: "private-file" }],
+	},
+	lineStats: {
+		linesAdded: 12,
+		linesRemoved: 2,
+		complete: false,
+		files: [{ path: "private-file", complete: false }],
+	},
+	detailsTruncated: true,
+});
+let subscriptions = 0;
+let invalidations = 0;
+const refreshed: GitWorkspaceTarget[] = [];
+const snapshotCallbacks: Array<(snapshot: GitWorkspaceSnapshot) => void> = [];
+const deniedUsers = new Set<string>();
+const realPool = new watchModule.GitWorkspaceWatchPool(
+	async (target, signal) => {
+		const sample = await watchModule.probeGitWatch(target, signal);
+		completedSamples.push({
+			generation: target.backend?.runtimeGeneration ?? 0,
+			worktree: sample.fingerprints.worktree,
+		});
+		return sample;
+	},
+	5,
+	{
+		status: async () => snapshotFacts().status,
+		lineStats: async () => snapshotFacts().lineStats,
+		invalidate: () => {},
+		validate: () => {},
+	},
+);
 let integrationTarget: GitWorkspaceTarget | undefined;
 const integrationCallbacks = new Set<(categories: GitWorkspaceCategory[]) => Promise<void>>();
 let denied = false;
@@ -22,7 +81,7 @@ mock.module("../services/git-workspace-access", () => ({
 		authorizations++;
 		principal = user.userId;
 		await hold;
-		if (denied) throw new Error("denied");
+		if (denied || deniedUsers.has(user.userId)) throw new Error("denied");
 		if (failure) throw failure;
 		if (integrationTarget) return integrationTarget;
 		return {
@@ -40,10 +99,20 @@ mock.module("../services/git-workspace-access", () => ({
 mock.module("../services/git-workspace-watch", () => ({
 	...watchModule,
 	GitWorkspaceWatchPool: class {
-		subscribe(target: GitWorkspaceTarget, changed: NonNullable<typeof notify>) {
+		refresh(target: GitWorkspaceTarget) {
+			refreshed.push(target);
+			if (integrationTarget) realPool.refresh(target);
+		}
+		subscribe(
+			target: GitWorkspaceTarget,
+			changed: NonNullable<typeof notify>,
+			snapshot?: (value: GitWorkspaceSnapshot) => void,
+		) {
+			subscriptions++;
+			if (snapshot) snapshotCallbacks.push(snapshot);
 			if (integrationTarget) {
 				integrationCallbacks.add(changed);
-				const stop = realPool.subscribe(target, changed);
+				const stop = realPool.subscribe(target, changed, snapshot);
 				return () => {
 					integrationCallbacks.delete(changed);
 					stop();
@@ -58,12 +127,20 @@ mock.module("../services/git-workspace-watch", () => ({
 }));
 mock.module("../services/git-management-service", () => ({
 	...managementModule,
-	invalidateGitWorkspace: () => {},
+	invalidateGitWorkspace: () => {
+		invalidations++;
+	},
 }));
 const { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } = await import(
 	"./git-workspace-ws"
 );
-const frames: { type: string; workspaceKey?: string }[] = [];
+const frames: {
+	type: string;
+	workspaceKey?: string;
+	snapshot?: GitWorkspaceSnapshot;
+	view?: string;
+	version?: number;
+}[] = [];
 const ws = {
 	data: { userId: "owner", userRole: "user" },
 	send(raw: string) {
@@ -83,8 +160,15 @@ afterEach(() => {
 	hold = undefined;
 	integrationTarget = undefined;
 	integrationCallbacks.clear();
+	completedSamples.length = 0;
 	frames.length = 0;
 	stops = 0;
+	subscriptions = 0;
+	invalidations = 0;
+	refreshed.length = 0;
+	snapshotCallbacks.length = 0;
+	deniedUsers.clear();
+	notify = undefined;
 });
 afterAll(() => {
 	mock.module("../services/git-workspace-access", () => accessModule);
@@ -98,12 +182,13 @@ test("ack contains server-resolved identity; notification rechecks principal", a
 	await notify?.(["worktree"]);
 	expect(frames.at(-1)?.type).toBe("git_workspace_changed");
 });
-test("denied subscription never acks; ambiguous target fails closed", async () => {
+test("denied subscription never acks; a target without a narrator fails closed", async () => {
 	denied = true;
 	await handleGitWorkspaceMessage(ws, message);
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
 	frames.length = 0;
-	await handleGitWorkspaceMessage(ws, { ...message, chapterId: "chapter" });
+	denied = false;
+	await handleGitWorkspaceMessage(ws, { ...message, narratorId: undefined });
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
 });
 test("revocation stops subscription without disclosing changes", async () => {
@@ -152,7 +237,12 @@ test("temporary device outage retries the subscription without browser polling",
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_subscribed"]);
 	expect(stops).toBe(1);
 	failure = undefined;
-	await new Promise((resolve) => setTimeout(resolve, 3100));
+	await waitForState(
+		() =>
+			frames.filter((frame) => frame.type === "git_workspace_subscribed").length === 2 &&
+			frames.at(-1)?.type === "git_workspace_changed",
+		4000,
+	);
 	expect(frames.filter((frame) => frame.type === "git_workspace_subscribed")).toHaveLength(2);
 	expect(frames.at(-1)?.type).toBe("git_workspace_changed");
 }, 10_000);
@@ -181,6 +271,9 @@ test("two sockets rebind a real shared watch pool after a generation change with
 			},
 			backend: {
 				kind: "remote",
+				deviceId: "remote",
+				pathFlavor: "posix",
+				paths: posixPathSemantics,
 				runtimeGeneration: boundGeneration,
 				supportsGitWorkspaceWatch: true,
 				gitWorkspace: async () => {
@@ -192,10 +285,15 @@ test("two sockets rebind a real shared watch pool after a generation change with
 		} as unknown as GitWorkspaceTarget;
 	};
 	integrationTarget = makeTarget();
+	let disposedCallbacks: Array<(categories: GitWorkspaceCategory[]) => Promise<void>> = [];
 	try {
 		await handleGitWorkspaceMessage(ws, message);
 		await handleGitWorkspaceMessage(other, message);
-		await Bun.sleep(20);
+		await waitForState(
+			() =>
+				integrationCallbacks.size === 2 &&
+				completedSamples.filter((sample) => sample.generation === 1).length >= 2,
+		);
 		expect(integrationCallbacks.size).toBe(2);
 		generation = 2;
 		integrationTarget = makeTarget();
@@ -203,7 +301,15 @@ test("two sockets rebind a real shared watch pool after a generation change with
 		// fresh A / stop B / subscribe fresh B, while the pool remains shared.
 		await Promise.all([...integrationCallbacks].map((callback) => callback(["worktree"])));
 		const before = rpcGenerations.length;
-		await Bun.sleep(30);
+		await waitForState(
+			() =>
+				completedSamples.filter((sample) => sample.generation === 2).length >= 2 &&
+				rpcGenerations.length > before &&
+				[frames, otherFrames].every(
+					(messages) =>
+						messages.filter((frame) => frame.type === "git_workspace_subscribed").length === 2,
+				),
+		);
 		expect(rpcGenerations.length).toBeGreaterThan(before);
 		expect(rpcGenerations.slice(before).every((value) => value === 2)).toBe(true);
 		for (const messages of [frames, otherFrames]) {
@@ -212,16 +318,27 @@ test("two sockets rebind a real shared watch pool after a generation change with
 			messages.length = 0;
 		}
 		content = "edited after reconnect";
-		await Bun.sleep(30);
+		await waitForState(
+			() =>
+				frames.some((frame) => frame.type === "git_workspace_changed") &&
+				otherFrames.some((frame) => frame.type === "git_workspace_changed"),
+		);
 		expect(frames.some((frame) => frame.type === "git_workspace_changed")).toBe(true);
 		expect(otherFrames.some((frame) => frame.type === "git_workspace_changed")).toBe(true);
+		disposedCallbacks = [...integrationCallbacks];
 	} finally {
 		releaseGitWorkspaceSubscriptions(ws);
 		releaseGitWorkspaceSubscriptions(other);
 	}
+	await waitForState(() => integrationCallbacks.size === 0);
 	const before = rpcGenerations.length;
-	await Bun.sleep(20);
+	const beforeAuthorization = authorizations;
+	const beforeFrames = JSON.stringify([frames, otherFrames]);
+	await Promise.all(disposedCallbacks.map((callback) => callback(["worktree"])));
+	await new Promise<void>((resolve) => setImmediate(resolve));
 	expect(rpcGenerations).toHaveLength(before);
+	expect(authorizations).toBe(beforeAuthorization);
+	expect(JSON.stringify([frames, otherFrames])).toBe(beforeFrames);
 });
 
 test("backpressure closes the socket instead of silently losing its only change", async () => {
@@ -235,6 +352,210 @@ test("backpressure closes the socket instead of silently losing its only change"
 	};
 	await handleGitWorkspaceMessage(congested, message);
 	expect(closed).toBe(true);
-	expect(stops).toBe(1);
+	expect(stops).toBe(0);
+	expect(subscriptions).toBe(0);
+	expect(snapshotCallbacks).toHaveLength(0);
 	expect(frames).toHaveLength(0);
+});
+
+test("subscription attaches after ACK without invalidating shared facts", async () => {
+	await handleGitWorkspaceMessage(ws, message);
+	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_subscribed"]);
+	expect(subscriptions).toBe(1);
+	expect(snapshotCallbacks).toHaveLength(1);
+	expect(invalidations).toBe(0);
+	expect(refreshed).toHaveLength(0);
+});
+
+test("summary and details independently authorize their shared snapshot projections", async () => {
+	await handleGitWorkspaceMessage(ws, { ...message, view: "summary" });
+	await handleGitWorkspaceMessage(ws, { ...message, subscriptionId: "details", view: "details" });
+	const before = authorizations;
+	for (const callback of snapshotCallbacks) callback(snapshotFacts());
+	await waitForState(
+		() => frames.filter((frame) => frame.type === "git_workspace_snapshot").length === 2,
+	);
+	expect(authorizations).toBe(before + 2);
+	const summary = required(frames.find((frame) => frame.view === "summary")?.snapshot);
+	const details = required(frames.find((frame) => frame.view === "details")?.snapshot);
+	expect(summary.status?.files).toBeUndefined();
+	expect(summary.lineStats?.files).toBeUndefined();
+	expect(summary.detailsTruncated).toBeUndefined();
+	expect(summary.lineStats).toEqual({ linesAdded: 12, linesRemoved: 2, complete: false });
+	expect(details).toEqual(snapshotFacts());
+	expect(invalidations).toBe(0);
+});
+
+test("one subscription switches summary to details and back by replaying its authorized snapshot", async () => {
+	await handleGitWorkspaceMessage(ws, { ...message, view: "summary" });
+	const publish = required(snapshotCallbacks[0]);
+	publish(snapshotFacts(42));
+	await waitForState(() => frames.length === 2);
+	const initial = required(frames.at(-1)?.snapshot);
+	expect(initial.status?.files).toBeUndefined();
+	expect(initial.lineStats?.files).toBeUndefined();
+	expect(authorizations).toBe(2);
+
+	await handleGitWorkspaceMessage(ws, { ...message, view: "details" });
+	expect(authorizations).toBe(3);
+	expect(frames.at(-1)).toMatchObject({
+		type: "git_workspace_snapshot",
+		view: "details",
+		snapshot: snapshotFacts(42),
+	});
+	expect(subscriptions).toBe(1);
+	expect(stops).toBe(0);
+	expect(invalidations).toBe(0);
+	expect(refreshed).toHaveLength(0);
+
+	await handleGitWorkspaceMessage(ws, { ...message, view: "summary" });
+	expect(authorizations).toBe(4);
+	expect(frames.at(-1)).toMatchObject({
+		type: "git_workspace_snapshot",
+		view: "summary",
+		snapshot: initial,
+	});
+	expect(frames.at(-1)?.snapshot?.detailsTruncated).toBeUndefined();
+	expect(frames.at(-1)?.snapshot?.status?.files).toBeUndefined();
+	expect(frames.at(-1)?.snapshot?.lineStats?.files).toBeUndefined();
+	expect(frames.map((frame) => frame.type)).toEqual([
+		"git_workspace_subscribed",
+		"git_workspace_snapshot",
+		"git_workspace_snapshot",
+		"git_workspace_snapshot",
+	]);
+	expect(frames.map((frame) => frame.version)).toEqual([1, 2, 3, 4]);
+	expect(subscriptions).toBe(1);
+	expect(snapshotCallbacks).toEqual([publish]);
+	expect(stops).toBe(0);
+	expect(invalidations).toBe(0);
+	expect(refreshed).toHaveLength(0);
+
+	// The original pool callback remains live and uses the newly selected projection.
+	publish(snapshotFacts(43));
+	await waitForState(() => frames.length === 5);
+	expect(frames.at(-1)).toMatchObject({ view: "summary", version: 5, snapshot: { revision: 43 } });
+	expect(frames.at(-1)?.snapshot?.status?.files).toBeUndefined();
+	expect(frames.at(-1)?.snapshot?.lineStats?.files).toBeUndefined();
+	expect(subscriptions).toBe(1);
+});
+
+test("revoked access rejects a same-id details upgrade without disclosing its retained snapshot", async () => {
+	await handleGitWorkspaceMessage(ws, { ...message, view: "summary" });
+	const publish = required(snapshotCallbacks[0]);
+	publish(snapshotFacts());
+	await waitForState(() => frames.length === 2);
+	expect(JSON.stringify(frames)).not.toContain("private-file");
+	denied = true;
+	await handleGitWorkspaceMessage(ws, { ...message, view: "details" });
+	expect(authorizations).toBe(3);
+	expect(frames.map((frame) => frame.type)).toEqual([
+		"git_workspace_subscribed",
+		"git_workspace_snapshot",
+		"git_workspace_error",
+	]);
+	expect(JSON.stringify(frames)).not.toContain("private-file");
+	expect(frames.some((frame) => frame.view === "details")).toBe(false);
+	expect(subscriptions).toBe(1);
+	expect(stops).toBe(1);
+	expect(invalidations).toBe(0);
+	expect(refreshed).toHaveLength(0);
+	publish(snapshotFacts(2));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	expect(frames).toHaveLength(3);
+	expect(authorizations).toBe(3);
+});
+
+test("a shared snapshot never bypasses another principal's revoked access", async () => {
+	const otherFrames: typeof frames = [];
+	const other = {
+		data: { userId: "viewer", userRole: "user" },
+		send: (raw: string) => {
+			otherFrames.push(JSON.parse(raw));
+		},
+	};
+	try {
+		await handleGitWorkspaceMessage(ws, message);
+		await handleGitWorkspaceMessage(other, message);
+		deniedUsers.add("viewer");
+		for (const callback of snapshotCallbacks) callback(snapshotFacts());
+		await waitForState(() => frames.length === 2 && otherFrames.length === 2);
+		expect(frames.at(-1)?.type).toBe("git_workspace_snapshot");
+		expect(otherFrames.map((frame) => frame.type)).toEqual([
+			"git_workspace_subscribed",
+			"git_workspace_error",
+		]);
+		expect(JSON.stringify(otherFrames)).not.toContain("private-file");
+		expect(stops).toBe(1);
+	} finally {
+		releaseGitWorkspaceSubscriptions(other);
+	}
+});
+
+test("manual refresh reauthorizes; a revoked or unknown subscription cannot refresh", async () => {
+	await handleGitWorkspaceMessage(ws, message);
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "missing" });
+	expect(refreshed).toHaveLength(0);
+	expect(authorizations).toBe(1);
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	expect(refreshed).toHaveLength(1);
+	expect(authorizations).toBe(2);
+	denied = true;
+	await handleGitWorkspaceMessage(ws, { type: "git_workspace_refresh", subscriptionId: "panel" });
+	expect(authorizations).toBe(3);
+	expect(refreshed).toHaveLength(1);
+	expect(stops).toBe(1);
+	expect(frames.at(-1)?.type).toBe("git_workspace_error");
+});
+
+test("pending snapshots coalesce to newest revision and its latest phase during authorization", async () => {
+	await handleGitWorkspaceMessage(ws, message);
+	let finish = () => {};
+	hold = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const publish = required(snapshotCallbacks[0]);
+	try {
+		publish({ ...snapshotFacts(10), updating: true });
+		publish({ ...snapshotFacts(12), updating: true });
+		publish(snapshotFacts(11));
+		publish(snapshotFacts(12));
+		expect(frames).toHaveLength(1);
+		finish();
+		await waitForState(() => frames.length === 2);
+		expect(frames[1]?.snapshot).toEqual(snapshotFacts(12));
+		expect(authorizations).toBe(2);
+		expect(frames[1]?.version).toBeGreaterThan(frames[0]?.version ?? 0);
+	} finally {
+		finish();
+	}
+});
+
+test("snapshot backpressure disposes an attached watcher and suppresses late snapshots", async () => {
+	let buffered = 0;
+	let closed = false;
+	const congested = {
+		...ws,
+		getBufferedAmount: () => buffered,
+		close: () => {
+			closed = true;
+		},
+	};
+	try {
+		await handleGitWorkspaceMessage(congested, message);
+		expect(subscriptions).toBe(1);
+		buffered = 300 * 1024;
+		const publish = required(snapshotCallbacks[0]);
+		publish(snapshotFacts());
+		await waitForState(() => closed);
+		expect(stops).toBe(1);
+		expect(frames).toHaveLength(1);
+		const checked = authorizations;
+		publish(snapshotFacts(2));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(authorizations).toBe(checked);
+		expect(frames).toHaveLength(1);
+	} finally {
+		releaseGitWorkspaceSubscriptions(congested);
+	}
 });

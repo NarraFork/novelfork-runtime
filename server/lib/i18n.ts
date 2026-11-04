@@ -2,7 +2,7 @@
  * Unified backend i18n module.
  *
  * Provides a single source of truth for all server-side localised strings.
- * Messages are organised by namespace (e.g. "tool.*", "merge.*", "gateway.*").
+ * Messages are organised by namespace (e.g. "tool.*", "gateway.*").
  */
 
 import {
@@ -32,8 +32,9 @@ const messages: Messages = {
 		"zh-CN": "用户在此工具调用执行前中断了会话。",
 	},
 	"tool.interruptedByServerRestart": {
-		en: "Tool execution was interrupted by a server restart.",
-		"zh-CN": "工具执行因服务器重启而中断。",
+		en: "The server restarted before this tool's final result was saved. If execution had started, its outcome is unknown and side effects may already have occurred. The tool was not automatically retried; inspect the actual state before retrying.",
+		"zh-CN":
+			"服务器重启时，此工具的最终结果尚未保存。如果执行已经开始，结果未知，可能已产生副作用。此工具未自动重执行，请先检查实际状态再决定是否重试。",
 	},
 	"tool.browserSessionLostAfterUpdate": {
 		en: "Your browser session(s) {ids} were lost while switching to the new version and could not be restored ({reason}). Please launch a new browser session if you still need one.",
@@ -233,11 +234,6 @@ Write the complete plan there, then call ExitPlanMode for approval. The plan fil
 		"zh-CN":
 			"你是 NarraFork 的问题反思关卡。AI 编程助手向用户提出了一个或多个问题，但当前会话允许自动继续。请根据对话上下文和项目意图，像谨慎的用户一样回答：选择安全、实用的默认值；当助手推荐项合理时优先采用；不要添加新的需求。如果提供了选项，请精确返回选项 label；多选问题返回用逗号分隔的选项 label。自由文本问题请给出简洁回答。只回复一个有效的 JSON 对象，将每个问题 key 映射到答案字符串。不要解释，不要 markdown 代码块。",
 	},
-	"tool.turnNudge": {
-		en: "\n\n[SYSTEM: You have used {turnIndex} of {maxTurns} turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
-		"zh-CN":
-			"\n\n[系统提示：你已使用 {turnIndex}/{maxTurns} 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
-	},
 	"tool.silentToolCallProgressReminder": {
 		en: `<progress_update_request>
 You have completed {count} tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.
@@ -251,14 +247,6 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 		"zh-CN":
 			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
 	},
-	"tool.brokenToolCallReminder": {
-		en: `[SYSTEM: Your previous {toolNames} call(s) had invalid or missing input and were not executed. The broken calls and their results have been removed from model history to save context. Invalid input alone does not establish that an output/token limit was reached.
-
-Retry with complete, valid JSON containing all required parameters. If a large input may have exceeded the output budget, split it into smaller calls (aim for under 10,000 characters per call). For a new large file, use a skeleton-first approach: Write the opening and closing code with numbered SPLICE markers (SPLICE_1, SPLICE_2, etc.) using the file type's comment syntax, then use Edit to fill each marker with a manageable section. Do not overwrite an existing file with Write.]`,
-		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用参数无效或缺失，因此未执行。损坏的调用及其结果已从模型历史中移除以节省上下文。仅凭参数无效，无法认定触及输出或 token 上限。
-
-请使用完整、有效的 JSON 重试，并提供全部必填参数。如果大输入可能超出输出预算，请拆分为更小的调用（建议每次小于 10,000 字符）。对于大型新文件，采用骨架优先策略：先用 Write 写入开头、结尾及编号的 SPLICE 标记（如 SPLICE_1、SPLICE_2，使用对应文件类型的注释语法），再用 Edit 逐个填充大小适中的片段。不要用 Write 覆盖已有文件。]`,
-	},
 	"tool.brokenToolCallInputPlaceholder": {
 		en: "[Tool input invalid or missing — not executed]",
 		"zh-CN": "[工具参数无效或缺失，未执行]",
@@ -268,9 +256,13 @@ Retry with complete, valid JSON containing all required parameters. If a large i
 		"zh-CN":
 			"工具参数无效或缺失，未执行。请提供完整、有效的 JSON 及全部必填参数后重试。这不一定是输出或 token 上限导致；必要时将大输入拆分为更小的调用。",
 	},
-	"tool.skippedForSoftStop": {
-		en: "Tool not executed because queued user feedback requested a safe stop after the previous tool.",
-		"zh-CN": "因排队中的用户反馈要求在上一个工具后安全停止，此工具未执行。",
+	"tool.skippedForPassEnd": {
+		en: "Tool not executed: this pass ended (plan approved, workspace changed or decision made) before this call started.",
+		"zh-CN": "本轮在此工具开始前已结束（计划已批准、工作区已变更或已做出决定），此工具未执行。",
+	},
+	"tool.cancelledForInterrupt": {
+		en: "Tool not executed: an interrupting user message cancelled this response before the call started.",
+		"zh-CN": "用户的打断消息在此工具开始前取消了本次回复，此工具未执行。",
 	},
 	"tool.interruptionContinue": {
 		en: "Your previous response was cut off by the completion token limit. Please continue from where you left off.",
@@ -295,34 +287,19 @@ Retry with complete, valid JSON containing all required parameters. If a large i
 			'[可选工具 "{toolName}" 刚刚从本次会话中卸载。除非它再次被加载，否则不要使用这个工具。]',
 	},
 	"tool.forkNarratorSuccess": {
-		en: "New narrator forked successfully.\n\nNarrator ID: {narratorId}\nTitle: {title}\n{chapterInfo}\nThe new narrator is now running independently with your message.",
+		en: "New narrator forked successfully.\n\nNarrator ID: {narratorId}\nTitle: {title}\n\nThe new narrator is now running independently with your message.",
 		"zh-CN":
-			"叙述者分叉成功。\n\n叙述者 ID：{narratorId}\n标题：{title}\n{chapterInfo}\n新叙述者正在独立运行你的消息。",
-	},
-	"tool.forkNarratorChapterInfo": {
-		en: "Chapter ID: {chapterId}\nChapter: {chapterTitle}\n",
-		"zh-CN": "章节 ID：{chapterId}\n章节：{chapterTitle}\n",
+			"叙述者分叉成功。\n\n叙述者 ID：{narratorId}\n标题：{title}\n\n新叙述者正在独立运行你的消息。",
 	},
 	"tool.forkNarratorError": {
 		en: "Failed to fork narrator: {error}",
 		"zh-CN": "分叉叙述者失败：{error}",
 	},
 	"tool.forkNarratorDepthExceeded": {
-		en: "Refused: this narrator is already {depth} forks deep, and the limit is {limit}. Each fork creates a chapter, a git worktree and a narrator that can fork again, so the chain is capped. Do the work here, or ask the user to start a new branch.",
+		en: "Refused: this narrator is already {depth} forks deep, and the limit is {limit}. Each fork creates a narrator that can fork again, so the chain is capped. Do the work here, or ask the user to start a new session.",
 		"zh-CN":
-			"已拒绝：当前叙述者已处于第 {depth} 层分叉，上限是 {limit} 层。每次分叉都会创建章节、git worktree 和一个还能继续分叉的叙述者，因此链条有上限。请在当前叙述者内完成工作，或请用户另起一个分支。",
+			"已拒绝：当前叙述者已处于第 {depth} 层分叉，上限是 {limit} 层。每次分叉都会创建一个还能继续分叉的叙述者，因此链条有上限。请在当前叙述者内完成工作，或请用户另开一个会话。",
 	},
-	// --- merge.* (migrated from prompt-i18n.ts mergeSummaryLabels) ---
-	"merge.branch": { en: "Branch", "zh-CN": "分支" },
-	"merge.mergedInto": { en: "Merged into", "zh-CN": "合并到" },
-	"merge.strategy": { en: "Strategy", "zh-CN": "策略" },
-	"merge.mergeCommit": { en: "Merge commit", "zh-CN": "合并提交" },
-	"merge.mergedBy": { en: "Merged by", "zh-CN": "合并者" },
-	"merge.chapterTitle": { en: "Chapter title", "zh-CN": "章节标题" },
-	"merge.description": { en: "Description", "zh-CN": "描述" },
-	"merge.commits": { en: "Commits", "zh-CN": "提交记录" },
-	"merge.diffSummary": { en: "Diff summary", "zh-CN": "变更统计" },
-	"merge.headerMerged": { en: "Branch Merged", "zh-CN": "分支已合并" },
 	// --- gateway.* (IM gateway command responses) ---
 	"gateway.rateLimited": {
 		en: "⏳ Rate limited. Please wait a moment.",
@@ -560,6 +537,29 @@ Continue investigating or refining the plan there, then call ExitPlanMode to sub
 			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
 	},
 
+	// Loop-control notices: rows the loop writes so a rebuilt request says what it sent.
+	"sidecar.noticeTurnNudge": {
+		en: "[SYSTEM: You have used {turnIndex} of {maxTurns} turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
+		"zh-CN":
+			"[系统提示：你已使用 {turnIndex}/{maxTurns} 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
+	},
+	"sidecar.noticeBrokenCall": {
+		en: `[SYSTEM: Your previous {toolNames} call(s) had invalid or missing input and were not executed. The broken calls and their results have been removed from model history to save context. Invalid input alone does not establish that an output/token limit was reached.
+
+Retry with complete, valid JSON containing all required parameters. If a large input may have exceeded the output budget, split it into smaller calls (aim for under 10,000 characters per call). For a new large file, use a skeleton-first approach: Write the opening and closing code with numbered SPLICE markers (SPLICE_1, SPLICE_2, etc.) using the file type's comment syntax, then use Edit to fill each marker with a manageable section. Do not overwrite an existing file with Write.]`,
+		"zh-CN": `[系统提示：你上一次的 {toolNames} 调用参数无效或缺失，因此未执行。损坏的调用及其结果已从模型历史中移除以节省上下文。仅凭参数无效，无法认定触及输出或 token 上限。
+
+请使用完整、有效的 JSON 重试，并提供全部必填参数。如果大输入可能超出输出预算，请拆分为更小的调用（建议每次小于 10,000 字符）。对于大型新文件，采用骨架优先策略：先用 Write 写入开头、结尾及编号的 SPLICE 标记（如 SPLICE_1、SPLICE_2，使用对应文件类型的注释语法），再用 Edit 逐个填充大小适中的片段。不要用 Write 覆盖已有文件。]`,
+	},
+	"sidecar.noticeContinue": {
+		en: "Continue.",
+		"zh-CN": "继续。",
+	},
+	"sidecar.noticeWorkspaceChanged": {
+		en: "Working directory changed. Continue using the newly installed workspace context; unstarted calls from the previous pass were not executed.",
+		"zh-CN": "工作目录已切换。请在新安装的工作区上下文中继续；上一轮尚未开始的调用没有执行。",
+	},
+
 	// prose — `{source}Heading` prefixes the text; absent ⇒ emitted bare.
 	// Only behavior_fence has one (was: buildBehaviorFenceReminder). A buffered user
 	// message is the user's own words and gets no prefix.
@@ -643,6 +643,11 @@ Result preview: {preview}`,
 	},
 	"sidecar.emptyResult": {
 		en: "(empty)",
+	},
+	"sidecar.noActiveBackgroundTasks": {
+		en: "[System] There are currently no other active task-type background tasks for this session (background services are excluded); process the completed results and continue any remaining work now instead of ending the turn merely to wait for background tasks.",
+		"zh-CN":
+			"[系统] 当前会话已无其他进行中的任务型后台任务（不含后台服务）；请立即处理已完成的结果并推进剩余工作，不要仅为等待后台任务而结束本轮。",
 	},
 
 	// messages — was: formatParentInboundMessage (parent-inbound-queue.ts) and the
@@ -841,20 +846,18 @@ export type ToolMessageKey =
 	| "planModeCancelled"
 	| "suggestAnswerSystem"
 	| "questionReflectionSystem"
-	| "turnNudge"
 	| "silentToolCallProgressReminder"
 	| "pipelineExitConfirmation"
-	| "brokenToolCallReminder"
 	| "brokenToolCallInputPlaceholder"
 	| "brokenToolCallResult"
-	| "skippedForSoftStop"
+	| "skippedForPassEnd"
+	| "cancelledForInterrupt"
 	| "interruptionContinue"
 	| "resumeAfterTransientError"
 	| "userContinue"
 	| "toolLoaded"
 	| "toolUnloaded"
 	| "forkNarratorSuccess"
-	| "forkNarratorChapterInfo"
 	| "forkNarratorError"
 	| "forkNarratorDepthExceeded";
 
@@ -868,23 +871,4 @@ export function getToolMessageWithParams(
 	params: Record<string, string | number> = {},
 ): string {
 	return t(`tool.${key}`, locale, params);
-}
-
-export type MergeSummaryLabelKey =
-	| "branch"
-	| "mergedInto"
-	| "strategy"
-	| "mergeCommit"
-	| "mergedBy"
-	| "chapterTitle"
-	| "description"
-	| "commits"
-	| "diffSummary"
-	| "headerMerged";
-
-export function getMergeSummaryLabel(
-	key: MergeSummaryLabelKey,
-	locale: Locale = DEFAULT_LOCALE,
-): string {
-	return t(`merge.${key}`, locale);
 }

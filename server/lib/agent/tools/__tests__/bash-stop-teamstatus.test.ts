@@ -1,9 +1,26 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
-
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { delegationRegistration } from "@server/lib/validators/runtime-registration";
+import {
+	compileDelegationPolicy,
+	resolveRuntimePolicy,
+	UNRESTRICTED_RUNTIME_POLICY,
+} from "@server/services/agent-runtime/policy";
+import * as oauthRuntime from "@server/services/oauth-narrator-runtime-policy";
+import * as traitLayers from "@server/services/trait-layer-service";
+import {
+	getUpdateCoordinationStatus,
+	resetUpdateCoordinationForTests,
+	scheduleUpdate,
+	tryAcquireFinalUpdateExecution,
+	waitForBackgroundBashDrain,
+} from "@server/services/update-coordinator";
+import type { ExecHandle, ExecutionBackend } from "../../execution/backend";
+import { localBackend } from "../../execution/local-backend";
 import { toolRegistry } from "../../tool-registry";
 import { PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
 import "../index";
-import { bashTool } from "../bash";
+import { bashTool, resolveBashTimeoutMs } from "../bash";
+import { stopTool } from "../stop";
 import { teamStatusTool } from "../team-status";
 
 // --- Background task service stub (drives list/cancel behaviour) ---
@@ -12,6 +29,9 @@ type FakeTask = {
 	id: string;
 	parentNarratorId: string;
 	type: "bash" | "agent";
+	subagentNarratorId?: string;
+	backgroundKind?: "task" | "service";
+	error?: string;
 	status: string;
 	effectiveStatus?: string;
 	command: string | null;
@@ -22,7 +42,10 @@ type FakeTask = {
 
 const tasks = new Map<string, FakeTask>();
 const cancelled: string[] = [];
+const cancelledAgents: string[] = [];
 const taskOutput = new Map<string, string>();
+const abortControllers = new Map<string, AbortController>();
+const killHandlers = new Map<string, () => void>();
 
 const realBackgroundTaskServiceModule = {
 	...(await import("@server/services/background-task-service")),
@@ -32,6 +55,9 @@ const realNarratorServiceModule = {
 };
 const realNarratorSubagentModule = {
 	...(await import("@server/services/narrator-subagent")),
+};
+const realAgentRuntimeRunModule = {
+	...(await import("@server/services/agent-runtime/run")),
 };
 
 const fakeBackgroundTaskService = {
@@ -55,11 +81,17 @@ const fakeBackgroundTaskService = {
 	// terminal tail, with the remainder reported rather than dropped silently.
 	async listTeamBashTasks(input: {
 		parentNarratorIds: string[];
+		teamRootId?: string;
 		limit: number;
 		recentTerminalLimit: number;
 		query?: string;
 	}) {
 		const parentIds = new Set(input.parentNarratorIds);
+		if (input.teamRootId) {
+			for (const n of narrators.values()) {
+				if (n.parentNarratorId === input.teamRootId) parentIds.add(n.id);
+			}
+		}
 		const needle = input.query?.trim().toLowerCase();
 		const matching = [...tasks.values()]
 			.filter((t) => t.type === "bash" && parentIds.has(t.parentNarratorId))
@@ -88,6 +120,10 @@ const fakeBackgroundTaskService = {
 	async cancel(id: string) {
 		const task = tasks.get(id);
 		if (!task || task.status !== "running") return false;
+		abortControllers.get(id)?.abort();
+		killHandlers.get(id)?.();
+		// Let process-exit callbacks race the durable cancellation update.
+		await Promise.resolve();
 		task.status = "cancelled";
 		cancelled.push(id);
 		return true;
@@ -96,6 +132,7 @@ const fakeBackgroundTaskService = {
 		id: string;
 		parentNarratorId: string;
 		command: string;
+		backgroundKind?: "task" | "service";
 		alias?: string;
 		title?: string;
 	}) {
@@ -105,14 +142,26 @@ const fakeBackgroundTaskService = {
 			type: "bash",
 			status: "running",
 			command: input.command,
+			backgroundKind: input.backgroundKind ?? "task",
 			alias: input.alias ?? null,
 			title: input.title ?? null,
 			canCancelActiveWork: true,
 		});
 		return tasks.get(input.id);
 	},
-	registerAbortController() {},
-	registerKillHandler() {},
+	registerAbortController(id: string, controller: AbortController) {
+		abortControllers.set(id, controller);
+	},
+	registerKillHandler(id: string, kill: () => void) {
+		killHandlers.set(id, kill);
+	},
+	isCancellationRequested(id: string) {
+		return abortControllers.get(id)?.signal.aborted ?? false;
+	},
+	async markCancelled(id: string) {
+		const task = tasks.get(id);
+		if (task) task.status = "cancelled";
+	},
 	appendOutput(id: string, output: string) {
 		taskOutput.set(id, (taskOutput.get(id) ?? "") + output);
 	},
@@ -123,9 +172,12 @@ const fakeBackgroundTaskService = {
 		const task = tasks.get(id);
 		if (task) task.status = "completed";
 	},
-	async markFailed(id: string) {
+	async markFailed(id: string, error: string) {
 		const task = tasks.get(id);
-		if (task) task.status = "failed";
+		if (task) {
+			task.status = "failed";
+			task.error = error;
+		}
 	},
 	async markTimedOut(id: string) {
 		const task = tasks.get(id);
@@ -149,9 +201,29 @@ type FakeNarrator = {
 	title: string | null;
 	lastActivityAt?: string;
 	traits?: string[];
+	runtimeRegistrationJson?: unknown;
 };
 
-const narrators = new Map<string, FakeNarrator>();
+/** Delegated rows are stored registered: their creator holds the control grant. */
+class NarratorFixtures extends Map<string, FakeNarrator> {
+	override set(id: string, narrator: FakeNarrator) {
+		const delegated = narrator.parentNarratorId && narrator.variant.startsWith("subagent");
+		return super.set(
+			id,
+			delegated && narrator.runtimeRegistrationJson === undefined
+				? {
+						...narrator,
+						runtimeRegistrationJson: delegationRegistration(
+							narrator.parentNarratorId as string,
+							narrator.variant.slice("subagent:".length) || "general",
+						),
+					}
+				: narrator,
+		);
+	}
+}
+
+const narrators = new NarratorFixtures();
 
 const fakeNarratorService = {
 	async listSubagentsForBroadcast(parentNarratorId: string, senderId: string, now = Date.now()) {
@@ -176,7 +248,7 @@ const fakeNarratorService = {
 			recentIdleTruncated: idle.length > 100,
 		};
 	},
-	async listSubagentsByParent(parentNarratorId: string) {
+	async listTeamMembers(parentNarratorId: string) {
 		return [...narrators.values()].filter((n) => n.parentNarratorId === parentNarratorId);
 	},
 	// Mirrors the real bounded view: active members first, then newest, with the
@@ -240,6 +312,18 @@ const teamFileChanges = new Map<string, Map<string, Set<string>>>();
 const deliveredMessages: DeliveredMessage[] = [];
 let deliveryHook: ((targetId: string) => Promise<string | undefined>) | undefined;
 
+// Stop(agent) cancels through the task handle (its registered abort controller is the
+// run's cancel signal) or, with no live task, the run control itself. Both cancellers
+// are observed: `cancelled` (task handle) and `cancelledAgents` (run control).
+const liveRuns = new Set<string>();
+mock.module("@server/services/agent-runtime/run", () => ({
+	...realAgentRuntimeRunModule,
+	async controlRun(narratorId: string, action: { kind: string }) {
+		cancelledAgents.push(`${action.kind}:${narratorId}`);
+		return action.kind === "cancel" && liveRuns.delete(narratorId);
+	},
+}));
+
 mock.module("@server/services/narrator-subagent", () => ({
 	registerTaskAlias(_parentNarratorId: string, _taskId: string, title?: string) {
 		return { alias: title || "background-bash", conflicted: false };
@@ -286,10 +370,18 @@ mock.module("@server/services/agent-communication", () => ({
 	},
 }));
 
+// These in-memory narrator fixtures are ordinary (non-OAuth) sessions with no stored
+// ceiling; the real ceiling path is covered by narrator-unified-runtime-contract.test.ts.
+spyOn(oauthRuntime, "assertOAuthNarratorRuntimeActive").mockResolvedValue(null);
+const ceilingSpy = spyOn(traitLayers, "resolveNarratorRuntimePolicy").mockResolvedValue(
+	UNRESTRICTED_RUNTIME_POLICY,
+);
+
 afterAll(() => {
 	mock.module("@server/services/background-task-service", () => realBackgroundTaskServiceModule);
 	mock.module("@server/services/narrator-service", () => realNarratorServiceModule);
 	mock.module("@server/services/narrator-subagent", () => realNarratorSubagentModule);
+	mock.module("@server/services/agent-runtime/run", () => realAgentRuntimeRunModule);
 	mock.module("@server/services/agent-communication", () => realAgentCommunicationModule);
 	mock.restore();
 });
@@ -308,23 +400,407 @@ function makeCtx(narratorId: string, parentNarratorId?: string): ToolContext {
 function seed() {
 	tasks.clear();
 	taskOutput.clear();
+	abortControllers.clear();
+	killHandlers.clear();
 	cancelled.length = 0;
+	cancelledAgents.length = 0;
+	liveRuns.clear();
 	narrators.clear();
+	// Team roots are read from their own rows; nobody controls these primaries.
+	for (const id of ["primary", "parent"])
+		narrators.set(id, {
+			id,
+			parentNarratorId: null,
+			variant: "primary",
+			status: "idle",
+			title: null,
+		});
 	teamFileChanges.clear();
 	deliveredMessages.length = 0;
 	deliveryHook = undefined;
 }
 
-describe("Bash stop mode", () => {
-	test("schema: command is optional and stop is exposed as mutually exclusive", () => {
-		expect(bashTool.parameters.safeParse({ stop: "task-1" }).success).toBe(true);
+describe("Bash background kinds", () => {
+	test("public and normal-session raw schemas expose background_kind", () => {
+		for (const schema of [bashTool.rawJsonSchema]) {
+			expect(schema?.additionalProperties).toBe(false);
+			const properties = schema?.properties as Record<string, unknown>;
+			expect(properties.background_kind).toMatchObject({
+				type: "string",
+				enum: ["task", "service"],
+				default: "task",
+			});
+			expect(properties.background_kind).toHaveProperty(
+				"description",
+				expect.stringContaining("dev/preview/watch"),
+			);
+		}
+	});
+
+	test("static raw schema retains background metadata regardless of runtime restrictions", () => {
+		const schema = bashTool.rawJsonSchema;
+		const properties = schema?.properties as Record<string, { description: string }>;
+		expect(properties.background_kind).toMatchObject({
+			type: "string",
+			enum: ["task", "service"],
+			default: "task",
+		});
+		expect(properties.background_kind.description).toContain("service");
+		expect(properties.run_in_background.description).not.toContain("Forbidden");
+		expect(properties).not.toHaveProperty("stop");
+	});
+	test("services do not implicitly opt out of the background timeout", () => {
+		const args = bashTool.parameters.parse({
+			command: "dev-server",
+			run_in_background: true,
+			background_kind: "service",
+		}) as { run_in_background: boolean; timeout?: number };
+		expect(resolveBashTimeoutMs(args.run_in_background, args.timeout)).toBe(5 * 60 * 60 * 1_000);
+		expect(resolveBashTimeoutMs(true, 0)).toBeUndefined();
+	});
+
+	test("aborted service admission is cancelled rather than failed", async () => {
+		seed();
+		const controller = new AbortController();
+		const ctx = makeCtx("parent");
+		ctx.signal = controller.signal;
+		const release = mock(() => {});
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer() {
+				controller.abort();
+				return true;
+			},
+			release,
+		};
+		await bashTool.execute(
+			{ command: "true", run_in_background: true, background_kind: "service" },
+			ctx,
+		);
+		const task = [...tasks.values()][0];
+		expect(task.status).toBe("cancelled");
+		expect(task.error).toBeUndefined();
+		expect(release).toHaveBeenCalledTimes(1);
+	});
+	test("remote service uses shared metadata and cancellation beats an exit-zero callback", async () => {
+		seed();
+		let finish!: (code: number) => void;
+		const exited = new Promise<number>((resolve) => {
+			finish = resolve;
+		});
+		const handle: ExecHandle = {
+			exited,
+			onData() {},
+			isExited: () => false,
+			kill: async () => {
+				finish(0);
+			},
+		};
+		const execCommand = mock(async () => handle);
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		ctx.executionTarget = {
+			deviceId: "remote-fixture",
+			backendKind: "remote",
+			cwd: "/workspace",
+			pathFlavor: backend.pathFlavor,
+			runtimeGeneration: backend.runtimeGeneration,
+			selectionSource: "explicit",
+		};
+		await bashTool.execute(
+			{ command: "dev-server", run_in_background: true, background_kind: "service" },
+			ctx,
+		);
+		const task = [...tasks.values()][0];
+		expect(task.backgroundKind).toBe("service");
+		const deadline = Date.now() + 2_000;
+		while (!killHandlers.has(task.id) && Date.now() < deadline) await Bun.sleep(1);
+		expect(execCommand).toHaveBeenCalledTimes(1);
+		expect(execCommand.mock.calls[0]).not.toContainEqual(
+			expect.objectContaining({ backgroundKind: "service" }),
+		);
+		const listing = await teamStatusTool.execute({ action: "list_bash" }, ctx);
+		expect(listing.output).toContain("kind=bash | background_kind=service");
+		// Simulate a cancel controller owned by another generation/runtime: only
+		// the synchronous service signal is available to the exit callback.
+		abortControllers.set(task.id, new AbortController());
+		abortControllers.get(task.id)?.abort();
+		finish(0);
+		while (task.status === "running" && Date.now() < deadline) await Bun.sleep(1);
+		expect(task.status).toBe("cancelled");
+		expect(task.error).toBeUndefined();
+	});
+
+	test.each([
+		"task",
+		"service",
+	] as const)("maintenance drains %s startup but only waits for finite task completion", async (backgroundKind) => {
+		seed();
+		resetUpdateCoordinationForTests();
+		const startup = Promise.withResolvers<ExecHandle>();
+		const spawnRequested = Promise.withResolvers<void>();
+		const monitored = Promise.withResolvers<void>();
+		const exit = Promise.withResolvers<number>();
+		const released = Promise.withResolvers<void>();
+		const completionEntered = Promise.withResolvers<void>();
+		const persistCompletion = Promise.withResolvers<void>();
+		const markCompleted = fakeBackgroundTaskService.markCompleted;
+		const completionSpy =
+			backgroundKind === "task"
+				? spyOn(fakeBackgroundTaskService, "markCompleted").mockImplementation(async (id) => {
+						completionEntered.resolve();
+						await persistCompletion.promise;
+						await markCompleted(id);
+					})
+				: undefined;
+		const handle: ExecHandle = {
+			exited: exit.promise,
+			onData() {
+				monitored.resolve();
+			},
+			isExited: () => false,
+			kill: mock(async () => exit.resolve(0)),
+		};
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand: async () => {
+				spawnRequested.resolve();
+				return startup.promise;
+			},
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		ctx.executionTarget = {
+			deviceId: "remote-fixture",
+			backendKind: "remote",
+			cwd: "/workspace",
+			pathFlavor: backend.pathFlavor,
+			runtimeGeneration: backend.runtimeGeneration,
+			selectionSource: "explicit",
+		};
+		const lease = tryAcquireFinalUpdateExecution("background_bash", "parent");
+		expect(lease).not.toBeNull();
+		const release = mock(() => {
+			lease?.release();
+			released.resolve();
+		});
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer: () => true,
+			release,
+		};
+		try {
+			await bashTool.execute(
+				{ command: "fixture", run_in_background: true, background_kind: backgroundKind },
+				ctx,
+			);
+			await spawnRequested.promise;
+			const task = [...tasks.values()][0];
+			scheduleUpdate(undefined, "system_shutdown");
+			let drained = false;
+			const drain = waitForBackgroundBashDrain().then(() => {
+				drained = true;
+			});
+			await Promise.resolve();
+			expect(drained).toBe(false);
+			expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+			expect(release).not.toHaveBeenCalled();
+
+			startup.resolve(handle);
+			await monitored.promise;
+			expect(killHandlers.has(task.id)).toBe(true);
+			if (backgroundKind === "service") {
+				await drain;
+				expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(0);
+				expect(release).toHaveBeenCalledTimes(1);
+			} else {
+				expect(drained).toBe(false);
+				expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+				expect(release).not.toHaveBeenCalled();
+			}
+			expect(task.status).toBe("running");
+			expect(handle.kill).not.toHaveBeenCalled();
+
+			exit.resolve(0);
+			if (backgroundKind === "task") {
+				await completionEntered.promise;
+				expect(drained).toBe(false);
+				expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+				expect(release).not.toHaveBeenCalled();
+				persistCompletion.resolve();
+			}
+			await drain;
+			await released.promise;
+			// Service release precedes exit, so allow the durable terminal callback to settle.
+			const deadline = Date.now() + 2_000;
+			while (task.status === "running" && Date.now() < deadline) await Bun.sleep(1);
+			expect(task.status).toBe(backgroundKind === "service" ? "failed" : "completed");
+			expect(release).toHaveBeenCalledTimes(1);
+		} finally {
+			startup.resolve(handle);
+			exit.resolve(0);
+			persistCompletion.resolve();
+			await released.promise;
+			completionSpy?.mockRestore();
+			resetUpdateCoordinationForTests();
+		}
+	});
+
+	test("failed service startup persists failure and releases the drain lease once", async () => {
+		seed();
+		resetUpdateCoordinationForTests();
+		const startup = Promise.withResolvers<ExecHandle>();
+		const released = Promise.withResolvers<void>();
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand: () => startup.promise,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		const lease = tryAcquireFinalUpdateExecution("background_bash", "parent");
+		const release = mock(() => {
+			lease?.release();
+			released.resolve();
+		});
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer: () => true,
+			release,
+		};
+		try {
+			await bashTool.execute(
+				{ command: "fixture", run_in_background: true, background_kind: "service" },
+				ctx,
+			);
+			scheduleUpdate(undefined, "system_shutdown");
+			expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+			startup.reject(new Error("fixture spawn failure"));
+			await released.promise;
+			await waitForBackgroundBashDrain();
+			expect([...tasks.values()][0]).toMatchObject({
+				status: "failed",
+				error: expect.stringContaining("fixture spawn failure"),
+			});
+			expect(release).toHaveBeenCalledTimes(1);
+		} finally {
+			resetUpdateCoordinationForTests();
+		}
+	});
+
+	test("schema defaults commands to task and rejects legacy stop", () => {
+		expect(bashTool.parameters.parse({ command: "true" })).toMatchObject({
+			background_kind: "task",
+		});
+		expect(bashTool.parameters.safeParse({ stop: "id" }).success).toBe(false);
+		expect(
+			bashTool.parameters.safeParse({ command: "true", background_kind: "service" }).success,
+		).toBe(false);
+		expect(bashTool.parameters.safeParse({ stop: "id", background_kind: "task" }).success).toBe(
+			false,
+		);
+		expect(
+			bashTool.parameters.safeParse({
+				command: "true",
+				run_in_background: true,
+				background_kind: "service",
+			}).success,
+		).toBe(true);
+	});
+
+	test("direct execution rejects invalid kind combinations before permissions", async () => {
+		const ctx = makeCtx("parent");
+		let permissions = 0;
+		ctx.requestPermission = async () => {
+			permissions++;
+			return { behavior: "allow" };
+		};
+		for (const args of [
+			{ command: "true", background_kind: "other" },
+			{ command: "true", background_kind: "service" },
+			{ stop: "id", background_kind: "task" },
+		])
+			expect((await bashTool.execute(args, ctx)).isError).toBe(true);
+		expect(permissions).toBe(0);
+	});
+
+	for (const backgroundKind of ["task", "service"] as const) {
+		test(`${backgroundKind} exit zero has the correct terminal outcome`, async () => {
+			seed();
+			const result = await bashTool.execute(
+				{ command: "true", run_in_background: true, background_kind: backgroundKind },
+				makeCtx("parent"),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain(`Background bash ${backgroundKind} started`);
+			const task = [...tasks.values()][0];
+			expect(task.backgroundKind).toBe(backgroundKind);
+			const deadline = Date.now() + 2_000;
+			while (task.status === "running" && Date.now() < deadline) await Bun.sleep(1);
+			expect(task.status).toBe(backgroundKind === "service" ? "failed" : "completed");
+			if (backgroundKind === "service")
+				expect(task.error).toContain("exited unexpectedly (exit code: 0)");
+		});
+	}
+
+	test("explicit service stop cancels rather than reporting an unexpected exit", async () => {
+		seed();
+		await bashTool.execute(
+			{ command: "sleep 20", run_in_background: true, background_kind: "service" },
+			makeCtx("parent"),
+		);
+		const task = [...tasks.values()][0];
+		const deadline = Date.now() + 2_000;
+		while (!killHandlers.has(task.id) && Date.now() < deadline) await Bun.sleep(1);
+		expect(
+			(await stopTool.execute({ type: "bash", id: task.id }, makeCtx("parent"))).isError,
+		).toBeFalsy();
+		await Bun.sleep(20);
+		expect(task.status).toBe("cancelled");
+		expect(task.error).toBeUndefined();
+	});
+});
+
+describe("Stop tool", () => {
+	test("Bash requires a nonblank command and does not expose legacy stop", () => {
+		for (const args of [{}, { stop: "task-1" }, { command: "" }, { command: " \t\n" }])
+			expect(bashTool.parameters.safeParse(args).success).toBe(false);
 		expect(bashTool.parameters.safeParse({ command: "echo hi" }).success).toBe(true);
 		const raw = bashTool.rawJsonSchema as {
-			properties?: Record<string, { description?: string } | undefined>;
+			properties?: Record<string, unknown>;
 			required?: string[];
 		};
-		expect(raw.required ?? []).toHaveLength(0);
-		expect(raw.properties?.stop?.description).toContain("Mutually exclusive");
+		expect(raw.required).toContain("command");
+		expect(raw.properties).not.toHaveProperty("stop");
+	});
+
+	test("Stop schema requires an explicit type and nonblank trimmed id", () => {
+		for (const args of [
+			{},
+			{ id: "task-1" },
+			{ type: "bash" },
+			{ type: "other", id: "task-1" },
+			{ type: "bash", id: "" },
+			{ type: "agent", id: " \t\n" },
+		])
+			expect(stopTool.parameters.safeParse(args).success).toBe(false);
+		expect(stopTool.parameters.parse({ type: "bash", id: " task-1 " })).toEqual({
+			type: "bash",
+			id: "task-1",
+		});
+		expect(stopTool.rawJsonSchema?.required).toEqual(expect.arrayContaining(["type", "id"]));
 	});
 
 	test("stop without command cancels a running background bash task", async () => {
@@ -339,7 +815,7 @@ describe("Bash stop mode", () => {
 			title: "Long task",
 			canCancelActiveWork: true,
 		});
-		const result = await bashTool.execute({ stop: "my-task" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "my-task" }, makeCtx("parent"));
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("cancelled");
 		expect(cancelled).toEqual(["bash_1"]);
@@ -357,7 +833,7 @@ describe("Bash stop mode", () => {
 			title: null,
 			canCancelActiveWork: false,
 		});
-		const result = await bashTool.execute({ stop: "bash_2" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "bash_2" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("not running");
 	});
@@ -374,12 +850,12 @@ describe("Bash stop mode", () => {
 			title: null,
 			canCancelActiveWork: true,
 		});
-		const result = await bashTool.execute({ stop: "bash_3" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "bash_3" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("does not belong");
 	});
 
-	test("stop rejects agent tasks and points to Agent stop", async () => {
+	test("bash stop rejects agent tasks before cancellation", async () => {
 		seed();
 		tasks.set("agent_1", {
 			id: "agent_1",
@@ -391,23 +867,189 @@ describe("Bash stop mode", () => {
 			title: null,
 			canCancelActiveWork: true,
 		});
-		const result = await bashTool.execute({ stop: "agent_1" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "agent_1" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("agent task");
+		expect(result.output).toContain("agent");
+		expect(cancelled).toEqual([]);
+	});
+
+	for (const selector of ["agent-task", "agent-alias"]) {
+		test(`agent stop resolves ${selector} and cancels the validated child narrator`, async () => {
+			seedAgentTask();
+			// The run registers its cancel signal as the task's abort controller.
+			const runCancel = new AbortController();
+			abortControllers.set("agent-task", runCancel);
+			const result = await stopTool.execute(
+				{ type: "agent", id: ` ${selector} ` },
+				makeCtx("parent"),
+			);
+			expect(result.isError).toBeFalsy();
+			expect(result.output).toContain("cancelled");
+			expect(cancelled).toEqual(["agent-task"]);
+			expect(runCancel.signal.aborted).toBe(true);
+			expect(cancelledAgents).toEqual([]);
+			expect(tasks.get("agent-task")?.status).toBe("cancelled");
+		});
+	}
+
+	test("agent stop cancels a live run directly when its task handle is no longer running", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.status = "completed";
+		liveRuns.add("child-agent");
+		const result = await stopTool.execute({ type: "agent", id: "agent-task" }, makeCtx("parent"));
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("cancelled");
+		expect(cancelled).toEqual([]);
+		expect(cancelledAgents).toEqual(["cancel:child-agent"]);
+		expect(task.status).toBe("completed");
+	});
+
+	function seedAgentTask() {
+		seed();
+		tasks.set("agent-task", {
+			id: "agent-task",
+			parentNarratorId: "parent",
+			type: "agent",
+			subagentNarratorId: "child-agent",
+			status: "running",
+			command: null,
+			alias: "agent-alias",
+			title: "Agent task",
+			canCancelActiveWork: true,
+		});
+		narrators.set("child-agent", {
+			id: "child-agent",
+			parentNarratorId: "parent",
+			variant: "subagent:general",
+			status: "working",
+			title: "Child agent",
+		});
+	}
+
+	test("a ceiling without orchestration cannot stop agents, even ones it controls", async () => {
+		seedAgentTask();
+		// Same rule for any caller: the delegation template's ceiling denies spawnAgent.
+		ceilingSpy.mockResolvedValueOnce(
+			resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]),
+		);
+		const result = await stopTool.execute(
+			{ type: "agent", id: "agent-task" },
+			makeCtx("parent", "grandparent"),
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("capability ceiling");
+		expect(cancelledAgents).toEqual([]);
+		expect(cancelled).toEqual([]);
+	});
+
+	test("subagents can stop only their own Bash tasks", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.type = "bash";
+		const sibling = await stopTool.execute(
+			{ type: "bash", id: task.id },
+			makeCtx("sibling", "grandparent"),
+		);
+		expect(sibling.isError).toBe(true);
+		expect(cancelled).toEqual([]);
+		const own = await stopTool.execute(
+			{ type: "bash", id: task.id },
+			makeCtx("parent", "grandparent"),
+		);
+		expect(own.isError).toBeFalsy();
+		expect(cancelled).toEqual([task.id]);
+		expect(cancelledAgents).toEqual([]);
+	});
+
+	test("agent stop rejects a Bash task before calling either canceller", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.type = "bash";
+		const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("type bash");
+		expect(cancelled).toEqual([]);
+		expect(cancelledAgents).toEqual([]);
+	});
+
+	for (const invalid of ["foreign-task", "foreign-child", "primary-child", "missing-child"]) {
+		test(`agent stop rejects ${invalid} without cancellation`, async () => {
+			seedAgentTask();
+			const task = tasks.get("agent-task") as FakeTask;
+			const child = narrators.get("child-agent") as FakeNarrator;
+			if (invalid === "foreign-task") {
+				task.parentNarratorId = "other-parent";
+				task.type = "bash";
+			}
+			if (invalid === "foreign-child") {
+				child.parentNarratorId = "other-parent";
+				child.runtimeRegistrationJson = delegationRegistration("other-parent", "general");
+			}
+			if (invalid === "primary-child") {
+				child.variant = "primary";
+				child.runtimeRegistrationJson = null;
+			}
+			if (invalid === "missing-child") narrators.clear();
+			const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain(
+				invalid === "foreign-task" ? "does not belong" : "not a direct child",
+			);
+			expect(cancelled).toEqual([]);
+			expect(cancelledAgents).toEqual([]);
+			expect(task.status).toBe("running");
+		});
+	}
+
+	test("agent stop reports a completed task without changing its terminal status", async () => {
+		seedAgentTask();
+		const task = tasks.get("agent-task") as FakeTask;
+		task.status = "completed";
+		const result = await stopTool.execute({ type: "agent", id: task.id }, makeCtx("parent"));
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("not running");
+		expect(task.status).toBe("completed");
+		expect(cancelled).toEqual([]);
+	});
+
+	test("invalid direct Stop calls cannot cancel or infer a target", async () => {
+		seedAgentTask();
+		for (const args of [
+			{},
+			{ id: "agent-task" },
+			{ type: "agent" },
+			{ type: "other", id: "agent-task" },
+			{ type: "agent", id: "" },
+			{ type: "bash", id: " \t\n" },
+		]) {
+			const result = await stopTool.execute(args, makeCtx("parent"));
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Invalid Stop parameters");
+		}
+		expect(cancelled).toEqual([]);
+		expect(cancelledAgents).toEqual([]);
 	});
 
 	test("stop rejects unknown task ids", async () => {
 		seed();
-		const result = await bashTool.execute({ stop: "missing" }, makeCtx("parent"));
+		const result = await stopTool.execute({ type: "bash", id: "missing" }, makeCtx("parent"));
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("does not exist");
 	});
 
-	test("command and stop together are rejected", async () => {
+	test("legacy Bash stop is explicitly rejected before command execution", async () => {
 		seed();
-		const result = await bashTool.execute({ command: "echo hi", stop: "x" }, makeCtx("parent"));
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("not both");
+		const ctx = makeCtx("parent");
+		const requestPermission = mock(async () => ({ behavior: "allow" as const }));
+		ctx.requestPermission = requestPermission;
+		for (const args of [{ stop: "x" }, { command: "echo hi", stop: "x" }]) {
+			const result = await bashTool.execute(args, ctx);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Stop");
+		}
+		expect(requestPermission).not.toHaveBeenCalled();
+		expect(cancelled).toEqual([]);
 	});
 
 	test("neither command nor stop is an error", async () => {
@@ -483,6 +1125,7 @@ describe("TeamStatus actions", () => {
 		const result = await teamStatusTool.execute({ action: "list" }, makeCtx("sub-1", "parent"));
 		expect(result.output).toContain("kind=agent");
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("(you)");
 		expect(result.output).toContain("alias=tests");
 		expect(result.output).toContain("canCancel=true");
@@ -512,6 +1155,7 @@ describe("TeamStatus actions", () => {
 			makeCtx("sub-1", "parent"),
 		);
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("id=bash_self");
 		expect(result.output).toContain("alias=self-task");
 	});
@@ -567,6 +1211,7 @@ describe("TeamStatus actions", () => {
 			makeCtx("sub-1", "parent"),
 		);
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("git log --oneline -5");
 		expect(result.output).not.toContain("kind=agent");
 	});
@@ -585,6 +1230,7 @@ describe("TeamStatus actions", () => {
 		});
 		const result = await teamStatusTool.execute({ action: "list" }, makeCtx("primary"));
 		expect(result.output).toContain("kind=bash");
+		expect(result.output).toContain("background_kind=task");
 		expect(result.output).toContain("alias=build");
 	});
 
@@ -639,10 +1285,14 @@ describe("TeamStatus actions", () => {
 			broadcast: true,
 			await: false,
 			targetCount: 1,
+			// A successful broadcast states the working-only rule by CODE — the bubble
+			// translates it — and carries no failure detail.
+			warningCodes: ["broadcastWorkingOnly"],
 			targetNames: ["Worker"],
 			recentIdle: [],
 			targets: [{ id: "sub-1", label: "worker", title: "Worker", status: "queued" }],
 		});
+		expect(result.metadata).not.toHaveProperty("warningDetails");
 		expect(deliveredMessages).toHaveLength(1);
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
@@ -759,6 +1409,10 @@ describe("TeamStatus actions", () => {
 			broadcast: false,
 			await: false,
 			targetCount: 1,
+			// The status is reported as a raw value: the bubble builds the sentence from
+			// its own `communicationWarning_*` / `status_*` translations.
+			warningCodes: ["sendTargetNotWorking"],
+			warningStatus: "idle",
 			targets: [
 				{
 					id: "sub-1",
@@ -768,7 +1422,6 @@ describe("TeamStatus actions", () => {
 					status: "queued",
 				},
 			],
-			warning: "(warning: target is idle, message may not be received)",
 		});
 		expect(deliveredMessages[0]).toMatchObject({
 			targetId: "sub-1",
@@ -893,6 +1546,10 @@ describe("TeamStatus broadcast status scope", () => {
 		expect(result.isError).toBe(true);
 		expect(result.metadata).toMatchObject({
 			targetCount: 1,
+			// Per-target failures stay free text (they name a target and an error, which
+			// has no translation), while the rule itself is a code.
+			warningCodes: ["broadcastWorkingOnly"],
+			warningDetails: ["name-failed: Error: queue full"],
 			targets: [{ id: "ok" }],
 			targetNames: ["Name ending", "Name failed", "Name ok"],
 		});
@@ -917,7 +1574,11 @@ describe("TeamStatus broadcast status scope", () => {
 		);
 		expect(peak).toBe(4);
 		expect(deliveredMessages).toHaveLength(4);
-		expect(result.metadata).toMatchObject({ targetCount: 4 });
+		expect(result.metadata).toMatchObject({
+			targetCount: 4,
+			// Cancellation is a code too: the bubble owns the sentence.
+			warningCodes: ["broadcastWorkingOnly", "broadcastCancelled"],
+		});
 		expect(result.output).toContain("Broadcast cancelled");
 	});
 });

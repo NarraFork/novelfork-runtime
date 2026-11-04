@@ -2,7 +2,6 @@ import { REASONING_EFFORT_VALUES, type ReasoningEffort } from "@shared/reasoning
 import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent-model-policy";
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
-import { shouldUseNativeSearch } from "../../search/native";
 import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
@@ -24,7 +23,7 @@ import baseDescription from "./task.txt" with { type: "text" };
 
 /** Build a dynamic model list string from all visible models. */
 function getAvailableModelsList(): string {
-	const models = getSubagentVisibleModels();
+	const models = getSubagentVisibleModels().slice().sort();
 	if (models.length > 0) {
 		return models.join(", ");
 	}
@@ -37,9 +36,12 @@ function filterSubagentModels(models: string[]): string[] {
 }
 
 const MODEL_PARAM_BASE =
-	"Override the model for this subagent. An explicit model or a selected per-type/custom model preference pins the child independently. Otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Allowed model pools still apply.";
+	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects its first entry and pins the child independently. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Explicit models must also be allowed by the pool.";
 
-function getModelParameterDescription(config?: AgentConfig): string {
+/** Dynamic prompt context only; never used to construct tool definitions. */
+export function buildSubagentModelContext(
+	config?: Pick<AgentConfig, "subagentModelRestrictionDescription">,
+): string {
 	// Per-narrator custom restriction trait takes precedence and already describes the pools.
 	if (config?.subagentModelRestrictionDescription) {
 		return `${MODEL_PARAM_BASE}\n\n${config.subagentModelRestrictionDescription}`;
@@ -87,79 +89,85 @@ function getModelParameterDescription(config?: AgentConfig): string {
 }
 
 function buildParameters() {
-	return z.object({
-		description: z
-			.string()
-			.optional()
-			.describe("A short (3-5 word) description of the task (required when launching a new agent)"),
-		subagent_type: z
-			.string()
-			.optional()
-			.describe(
-				'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
+	return z.preprocess(
+		(input, ctx) => {
+			// Check the original input before unknown object fields can be stripped.
+			if (input && typeof input === "object" && Object.hasOwn(input, "stop")) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["stop"],
+					message: 'Agent no longer accepts stop. Use Stop({ type: "agent", id }) instead.',
+				});
+			}
+			return input;
+		},
+		z.object({
+			description: z
+				.string()
+				.optional()
+				.describe(
+					"A short (3-5 word) description of the task (required when launching a new agent)",
+				),
+			subagent_type: z
+				.string()
+				.optional()
+				.describe(
+					'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
+				),
+			run_in_background: z
+				.boolean()
+				.optional()
+				.describe(
+					"Set to true to run this agent in the background. You will be notified when it completes.",
+				),
+			takeover_by_user: z.boolean().optional().describe(TAKEOVER_BY_USER_DESCRIPTION),
+			timeout: looseNumber(
+				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
 			),
-		run_in_background: z
-			.boolean()
-			.optional()
-			.describe(
-				"Set to true to run this agent in the background. You will be notified when it completes.",
-			),
-		takeover_by_user: z.boolean().optional().describe(TAKEOVER_BY_USER_DESCRIPTION),
-		timeout: looseNumber(
-			"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
-		),
-		model: z.string().optional().describe(getModelParameterDescription()),
-		reasoning_effort: z
-			.enum(REASONING_EFFORT_VALUES)
-			.optional()
-			.describe(REASONING_EFFORT_DESCRIPTION),
-		workdir: z
-			.string()
-			.optional()
-			.describe(
-				"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
-			),
-		prompt: z
-			.string()
-			.optional()
-			.describe("The task for the agent to perform (required when launching a new agent)"),
-		alias: z
-			.string()
-			.optional()
-			.describe(
-				'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
-					"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-					"Use this alias with Await or Send to reference the task later.",
-			),
-		stop: z
-			.string()
-			.optional()
-			.describe(
-				"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
-			),
-		archive: z
-			.string()
-			.optional()
-			.describe(
-				"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
-					"Running work is stopped first. Archived subagents are excluded from TeamStatus " +
-					"broadcast (@all members) and will not be woken by broadcasts; direct Send to them is also rejected.",
-			),
-		unarchive: z
-			.string()
-			.optional()
-			.describe(
-				"Restore an archived subagent by its ID or alias so it can receive messages and " +
-					"broadcasts again. When provided, no new agent is launched.",
-			),
-	});
+			model: z.string().optional().describe(MODEL_PARAM_BASE),
+			reasoning_effort: z
+				.enum(REASONING_EFFORT_VALUES)
+				.optional()
+				.describe(REASONING_EFFORT_DESCRIPTION),
+			workdir: z
+				.string()
+				.optional()
+				.describe(
+					"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
+				),
+			prompt: z
+				.string()
+				.optional()
+				.describe("The task for the agent to perform (required when launching a new agent)"),
+			alias: z
+				.string()
+				.optional()
+				.describe(
+					'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
+						"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
+						"Use this alias with Await or Send to reference the task later.",
+				),
+
+			archive: z
+				.string()
+				.optional()
+				.describe(
+					"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
+						"Running work is stopped first. Archived subagents are excluded from TeamStatus " +
+						"broadcast (@all members) and will not be woken by broadcasts; direct Send to them is also rejected.",
+				),
+			unarchive: z
+				.string()
+				.optional()
+				.describe(
+					"Restore an archived subagent by its ID or alias so it can receive messages and " +
+						"broadcasts again. When provided, no new agent is launched.",
+				),
+		}),
+	);
 }
 
-function usesNativeWebSearch(config: AgentConfig): boolean {
-	return shouldUseNativeSearch(config.provider, config.model);
-}
-
-function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
+function buildRawJsonSchema(): Record<string, unknown> {
 	return {
 		type: "object" as const,
 		properties: {
@@ -188,7 +196,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 				type: "number",
 			},
 			model: {
-				description: getModelParameterDescription(config),
+				description: MODEL_PARAM_BASE,
 				type: "string",
 			},
 			reasoning_effort: {
@@ -208,11 +216,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 					"Use this alias with Await or Send to reference the task later.",
 				type: "string",
 			},
-			stop: {
-				description:
-					"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
-				type: "string",
-			},
+
 			archive: {
 				description:
 					"Archive a subagent by its ID or alias. When provided, no new agent is launched. " +
@@ -239,7 +243,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 /**
  * Resolve an Agent archive/unarchive selector to a narrator id.
  *
- * Order mirrors stop mode, then falls through to the shared Send/Await selector
+ * Resolve a scoped task alias, then fall through to the shared Send/Await selector
  * grammar so a title or slug printed by TeamStatus can be archived directly.
  */
 async function resolveArchiveTargetId(callerNarratorId: string, selector: string): Promise<string> {
@@ -264,21 +268,9 @@ async function resolveArchiveTargetId(callerNarratorId: string, selector: string
 
 export const agentTool: ToolDefinition = {
 	name: "Agent",
-	description(config: AgentConfig) {
-		if (usesNativeWebSearch(config)) {
-			return baseDescription.replaceAll("WebSearch", "web_search (native)");
-		}
-		return baseDescription;
-	},
-	get parameters() {
-		return buildParameters();
-	},
-	get rawJsonSchema() {
-		return buildRawJsonSchema();
-	},
-	getRawJsonSchema(config?: AgentConfig) {
-		return buildRawJsonSchema(config);
-	},
+	description: `${baseDescription}\nTo cancel a running background agent, use Stop({ type: "agent", id }). Agent only launches, archives, or unarchives agents; it does not accept stop. Consult the current model and tool-availability context for available models, search tools and runtime restrictions.`,
+	parameters: buildParameters(),
+	rawJsonSchema: buildRawJsonSchema(),
 	async execute(args, ctx): Promise<ToolResult> {
 		const raw = args as {
 			prompt?: string;
@@ -291,19 +283,25 @@ export const agentTool: ToolDefinition = {
 			reasoning_effort?: ReasoningEffort;
 			workdir?: string;
 			alias?: string;
-			stop?: string;
 			archive?: string;
 			unarchive?: string;
 			// Legacy parameter name (pre-rename compat)
 			background?: boolean;
 		};
 
+		if (args && typeof args === "object" && Object.hasOwn(args, "stop")) {
+			return {
+				output: 'Agent no longer accepts stop. Use Stop({ type: "agent", id }) instead.',
+				isError: true,
+			};
+		}
+
 		// Lifecycle commands are mutually exclusive with each other and with launch.
-		const lifecycleModes = [raw.stop, raw.archive, raw.unarchive].filter(Boolean);
+		const lifecycleModes = [raw.archive, raw.unarchive].filter(Boolean);
 		if (lifecycleModes.length > 1) {
 			return {
 				output:
-					"Agent tool error: stop, archive, and unarchive are mutually exclusive — provide only one.",
+					"Agent tool error: archive and unarchive are mutually exclusive — provide only one.",
 				isError: true,
 			};
 		}
@@ -313,43 +311,40 @@ export const agentTool: ToolDefinition = {
 			try {
 				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.archive);
 				const { narratorService } = await import("@server/services/narrator-service");
-				const { isSubagentVariant } = await import("@server/lib/narrator-utils");
+				const { authorizeAgentControl } = await import("@server/services/narrator-control");
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 
-				const narrator = await narratorService.getById(targetId).catch(() => null);
-				if (!narrator) {
+				if (!(await narratorService.getById(targetId).catch(() => null))) {
 					return {
 						output: `Agent archive error: no subagent found for "${raw.archive}".`,
 						isError: true,
 					};
 				}
-				if (!isSubagentVariant(narrator.variant)) {
-					return {
-						output: `Agent archive error: "${raw.archive}" is not a subagent.`,
-						isError: true,
-					};
-				}
-				if (narrator.parentNarratorId !== ctx.narratorId) {
+				// Archiving is a control action: only the registered controller may do it.
+				const narrator = await authorizeAgentControl({
+					callerNarratorId: ctx.narratorId,
+					targetNarratorId: targetId,
+					action: "archive",
+					userId: ctx.userId,
+				}).catch(() => null);
+				if (!narrator) {
 					return {
 						output: `Agent archive error: "${raw.archive}" is not a direct child subagent of this narrator.`,
 						isError: true,
 					};
 				}
 				const label = agentLabelFromNarrator(narrator, ctx.narratorId);
-				if (narrator.status === "archived") {
-					return {
-						output: `Agent ${label} (${narrator.id}) is already archived. It remains excluded from TeamStatus broadcast (@all members) until unarchived.`,
-					};
-				}
-
 				const { interruptAndArchiveSubagent } = await import("@server/services/subagent-lifecycle");
-				const archived = await interruptAndArchiveSubagent(narrator.id, {
-					parentNarratorId: ctx.narratorId,
-				});
+				const archived = await interruptAndArchiveSubagent(narrator.id);
 				if (!archived.ok) {
 					return {
 						output: `Agent archive error: failed to archive "${raw.archive}" (${archived.error ?? "unknown"}).`,
 						isError: true,
+					};
+				}
+				if (archived.alreadyArchived) {
+					return {
+						output: `Agent ${label} (${narrator.id}) is already archived. It remains excluded from TeamStatus broadcast (@all members) until unarchived.`,
 					};
 				}
 
@@ -373,23 +368,23 @@ export const agentTool: ToolDefinition = {
 			try {
 				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.unarchive);
 				const { narratorService } = await import("@server/services/narrator-service");
-				const { isSubagentVariant } = await import("@server/lib/narrator-utils");
+				const { authorizeAgentControl } = await import("@server/services/narrator-control");
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
 
-				const narrator = await narratorService.getById(targetId).catch(() => null);
-				if (!narrator) {
+				if (!(await narratorService.getById(targetId).catch(() => null))) {
 					return {
 						output: `Agent unarchive error: no subagent found for "${raw.unarchive}".`,
 						isError: true,
 					};
 				}
-				if (!isSubagentVariant(narrator.variant)) {
-					return {
-						output: `Agent unarchive error: "${raw.unarchive}" is not a subagent.`,
-						isError: true,
-					};
-				}
-				if (narrator.parentNarratorId !== ctx.narratorId) {
+				// Archiving is a control action: only the registered controller may do it.
+				const narrator = await authorizeAgentControl({
+					callerNarratorId: ctx.narratorId,
+					targetNarratorId: targetId,
+					action: "archive",
+					userId: ctx.userId,
+				}).catch(() => null);
+				if (!narrator) {
 					return {
 						output: `Agent unarchive error: "${raw.unarchive}" is not a direct child subagent of this narrator.`,
 						isError: true,
@@ -415,45 +410,15 @@ export const agentTool: ToolDefinition = {
 			}
 		}
 
-		// --- Stop mode: cancel a running background agent task ---
-		if (raw.stop) {
-			try {
-				const { resolveTaskAlias, cancelBackgroundTask } = await import(
-					"@server/services/narrator-subagent"
-				);
-				let taskId = resolveTaskAlias(ctx.narratorId, raw.stop);
-
-				// If alias registry didn't resolve (returned raw input), try DB lookup
-				if (taskId === raw.stop) {
-					const { backgroundTaskService } = await import(
-						"@server/services/background-task-service"
-					);
-					const task = await backgroundTaskService.getByAlias(raw.stop, ctx.narratorId);
-					if (task) taskId = task.id;
-				}
-
-				const cancelled = await cancelBackgroundTask(taskId);
-				if (cancelled) {
-					return { output: `Background agent task ${raw.stop} has been cancelled.` };
-				}
-				return {
-					output: `Background agent task ${raw.stop} is not running (may have already completed or does not exist).`,
-					isError: true,
-				};
-			} catch (err) {
-				return {
-					output: `Agent stop error: ${err instanceof Error ? err.message : String(err)}`,
-					isError: true,
-				};
-			}
-		}
-
 		const { prompt, description, subagent_type, model, reasoning_effort, workdir, alias } = raw;
 		// Normalize timeout leniently: floats/strings/negatives → sane non-negative int
 		// (0 = no wall-clock limit).
 		const timeout = normalizeNumber(raw.timeout, { min: 0, max: Number.MAX_SAFE_INTEGER });
-		// Prefer new name, fall back to legacy name for in-flight conversations
-		const run_in_background = raw.run_in_background ?? raw.background;
+		// Prefer new name, fall back to legacy name for in-flight conversations.
+		// A bot never runs one in the foreground: that would hold its loop — and every
+		// person waiting on a reply — for the whole task. The result arrives as its next
+		// input instead, like any background completion.
+		const run_in_background = ctx.bot ? true : (raw.run_in_background ?? raw.background);
 
 		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
 		const resolvedWorkdir = workdir ? resolvePath(ctx.cwd, workdir) : ctx.cwd;

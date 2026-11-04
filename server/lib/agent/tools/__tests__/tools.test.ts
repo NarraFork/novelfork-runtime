@@ -7,7 +7,7 @@ import { db } from "../../../../db";
 import { narrators } from "../../../../db/schema";
 import type { ExecutionBackend } from "../../execution/backend";
 import { targetPathSemantics } from "../../execution/path-semantics";
-import type { AgentConfig, ToolContext, ToolDefinition } from "../../types";
+import type { ToolContext, ToolDefinition } from "../../types";
 import { askUserQuestionTool } from "../ask-user-question";
 import {
 	bashTool,
@@ -61,6 +61,14 @@ function makeTruncatedBackend(onWrite: () => void): ExecutionBackend {
 		pathFlavor: "posix",
 		runtimeGeneration: 1,
 		statFile: async () => ({ isDirectory: false, isFile: true, size: 20_000_000 }),
+		// Every real backend resolves the queue identity before IO; the truncated read
+		// is what this fixture exercises, so the identity itself is a fixed path.
+		resolvePathIdentity: async (path: string) => ({
+			lexicalPath: path,
+			canonicalPath: path,
+			exists: true,
+			runtimeGeneration: 1,
+		}),
 		readFileBytes: async () => ({
 			bytes: new TextEncoder().encode("truncated prefix"),
 			truncated: true,
@@ -878,29 +886,15 @@ describe("Grep schema validation", () => {
 // ============================================================
 
 describe("Bash", () => {
-	test("exposes review-only Git guidance and forbidden control parameters", () => {
-		const reviewConfig = { reviewReadOnlyBash: true } as AgentConfig;
-		const description =
-			typeof bashTool.description === "function"
-				? bashTool.description(reviewConfig)
-				: bashTool.description;
-		const schema = bashTool.getRawJsonSchema?.(reviewConfig);
-		const properties = schema?.properties as Record<string, { description?: string }>;
-		expect(description).toContain("local Git inspection");
-		expect(properties.command.description).toContain("read-only git invocation");
-		expect(properties.command.description).toContain("exactly one git command");
-		expect(properties.command.description).toContain("environment variable assignments");
-		expect(properties.run_in_background.description).toContain("Forbidden");
-		expect(properties.stop.description).toContain("Forbidden");
-	});
-
-	test("keeps the normal Bash description for ordinary sessions", () => {
-		const normalConfig = {} as AgentConfig;
-		const description =
-			typeof bashTool.description === "function"
-				? bashTool.description(normalConfig)
-				: bashTool.description;
-		expect(description).toContain("Executes a given bash command");
+	test("exposes a static schema without embedding review-only restrictions", () => {
+		const properties = bashTool.rawJsonSchema?.properties as Record<
+			string,
+			{ description?: string }
+		>;
+		expect(bashTool.description).toContain("Executes a given bash command");
+		expect(properties.command.description).toContain("non-empty command");
+		expect(properties.run_in_background.description).not.toContain("Forbidden");
+		expect(properties).not.toHaveProperty("stop");
 	});
 
 	test("executes simple command", async () => {
@@ -1150,6 +1144,38 @@ describe("zodToJsonSchema", () => {
 		});
 	});
 
+	test("keeps any and unknown values permissive", () => {
+		const schema = z.object({
+			value: z.record(z.string(), z.unknown()),
+			items: z.array(z.any()),
+		});
+
+		expect(zodToJsonSchema(schema)).toMatchObject({
+			properties: {
+				value: { type: "object", additionalProperties: {} },
+				items: { type: "array", items: {} },
+			},
+		});
+	});
+
+	test("converts preprocess schemas using the output object", () => {
+		const schema = z.preprocess((input) => input, z.object({ command: z.string() }));
+		expect(zodToJsonSchema(schema)).toMatchObject({
+			type: "object",
+			properties: { command: { type: "string" } },
+			required: ["command"],
+		});
+	});
+
+	test("converts ordinary pipes using the input object", () => {
+		const schema = z.object({ input: z.string() }).transform(({ input }) => ({ output: input }));
+		expect(zodToJsonSchema(schema)).toMatchObject({
+			type: "object",
+			properties: { input: { type: "string" } },
+			required: ["input"],
+		});
+	});
+
 	test("converts enum schema", () => {
 		const schema = z.object({
 			mode: z.enum(["a", "b", "c"]),
@@ -1250,10 +1276,11 @@ describe("Agent tool rawJsonSchema", () => {
 		);
 	});
 
-	test("model description includes available models list", () => {
+	test("model description preserves selection rules without dynamic candidates", () => {
 		const schema = requireRawJsonSchema(agentTool);
 		const props = schema.properties ?? {};
-		expect(props.model?.description).toContain("Available models:");
+		expect(props.model?.description).toContain("Explicit models must also be allowed by the pool");
+		expect(props.model?.description).not.toContain("Available models:");
 	});
 
 	test("rawJsonSchema no longer includes resume parameter", () => {
@@ -1262,12 +1289,11 @@ describe("Agent tool rawJsonSchema", () => {
 		expect(props.resume).toBeUndefined();
 	});
 
-	test("rawJsonSchema is dynamic (getter, not static)", () => {
-		// Accessing rawJsonSchema twice should return equal but not identical objects
+	test("rawJsonSchema is a reusable static object", () => {
 		const a = agentTool.rawJsonSchema;
 		const b = agentTool.rawJsonSchema;
-		expect(a).toEqual(b);
-		expect(a).not.toBe(b);
+		expect(a).toBe(b);
+		expect(Object.getOwnPropertyDescriptor(agentTool, "rawJsonSchema")?.get).toBeUndefined();
 	});
 
 	test("resolveToolJsonSchema uses rawJsonSchema over Zod", () => {
@@ -1310,6 +1336,7 @@ import { extractPipelineTool, startPipelineTool } from "../pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";
 import { sendTool } from "../send";
 import { skillTool } from "../skill";
+import { stopTool } from "../stop";
 import { teamStatusTool } from "../team-status";
 import { webFetchTool } from "../web-fetch";
 import { webSearchTool } from "../web-search";
@@ -1360,6 +1387,7 @@ const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "ExitPlanMode"]);
 const toolsWithRawJsonSchema = [
 	agentTool,
 	bashTool,
+	stopTool,
 	readTool,
 	writeTool,
 	editTool,
@@ -1391,20 +1419,78 @@ describe("rawJsonSchema parity for all tools", () => {
 			}
 		});
 
-		(skip ? test.skip : test)(`${tool.name}: rawJsonSchema.required matches Zod required`, () => {
-			const zodSchema = zodToJsonSchema(tool.parameters);
-			const zodRequired = new Set((zodSchema.required as string[]) ?? []);
-			const rawRequired = new Set(requireRawJsonSchema(tool).required ?? []);
-			// rawJsonSchema must not require fields that Zod considers optional
-			for (const key of rawRequired) {
-				expect(zodRequired).toContain(key);
-			}
-			// Zod required fields must also be required in rawJsonSchema
-			for (const key of zodRequired) {
-				expect(rawRequired).toContain(key);
-			}
-		});
+		(skip ? test.skip : test)(
+			`${tool.name}: required fields honor the advertised/runtime contract`,
+			() => {
+				const zodSchema = zodToJsonSchema(tool.parameters);
+				const zodRequired = new Set((zodSchema.required as string[]) ?? []);
+				const rawRequired = new Set(requireRawJsonSchema(tool).required ?? []);
+				if (tool.name === "AskUserQuestion") {
+					// Model-facing calls advertise asking. Runtime maintenance may withdraw
+					// an existing question without presenting any new question (tested below).
+					expect([...rawRequired]).toEqual(["questions"]);
+					expect([...zodRequired]).toEqual([]);
+					return;
+				}
+				// rawJsonSchema must not require fields that Zod considers optional
+				for (const key of rawRequired) {
+					expect(zodRequired).toContain(key);
+				}
+				// Zod required fields must also be required in rawJsonSchema
+				for (const key of zodRequired) {
+					expect(rawRequired).toContain(key);
+				}
+			},
+		);
 	}
+});
+
+describe("AskUserQuestion advertised/maintenance contract (intentional)", () => {
+	test("advertises questions as required without requiring maintenance-only fields", () => {
+		const raw = requireRawJsonSchema(askUserQuestionTool);
+		expect(raw.required).toEqual(["questions"]);
+		expect(raw.properties?.questions).toBeDefined();
+		expect(raw.properties?.withdraw).toBeDefined();
+		expect(raw.required).not.toContain("withdraw");
+		expect(raw.required).not.toContain("async");
+	});
+
+	test("runtime accepts a withdraw-only maintenance call with no new questions", () => {
+		const input = { withdraw: ["own-question-id"] };
+		const parsed = askUserQuestionTool.parameters.safeParse(input);
+		expect(parsed.success).toBe(true);
+		if (!parsed.success) throw new Error("Valid withdrawal failed schema validation");
+		expect(parsed.data).toEqual(input);
+		expect(parsed.data).not.toHaveProperty("questions");
+	});
+
+	test("runtime rejects empty operations instead of silently accepting missing questions", () => {
+		for (const input of [
+			{},
+			{ async: true },
+			{ questions: [] },
+			{ withdraw: [] },
+			{ questions: [], withdraw: [] },
+		]) {
+			expect(askUserQuestionTool.parameters.safeParse(input).success).toBe(false);
+		}
+	});
+
+	test("new questions still require a nonempty header and options, including combined maintenance", () => {
+		const question = { header: "Choose", options: [] };
+		expect(askUserQuestionTool.parameters.safeParse({ questions: [question] }).success).toBe(true);
+		expect(
+			askUserQuestionTool.parameters.safeParse({
+				questions: [question],
+				withdraw: ["own-question-id"],
+			}).success,
+		).toBe(true);
+		for (const invalid of [{ options: [] }, { header: " " }, { header: "Choose" }]) {
+			expect(askUserQuestionTool.parameters.safeParse({ questions: [invalid] }).success).toBe(
+				false,
+			);
+		}
+	});
 });
 
 describe("ExitPlanMode schema divergence (intentional)", () => {

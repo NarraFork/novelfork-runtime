@@ -13,6 +13,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { getLocaleFallbackChain } from "@shared/i18n-locales";
+import { preparedMatchesRelease, type UpdateSourceIdentity } from "@shared/update-identity";
 import {
 	IconAlertTriangle,
 	IconCheck,
@@ -22,6 +23,7 @@ import {
 	IconPower,
 	IconX,
 } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform, useUpdateCapability } from "../hooks/usePlatform";
@@ -29,6 +31,7 @@ import {
 	type UpdateDownloadResult,
 	useUpdateApply,
 	useUpdateDownload,
+	useUpdateNotes,
 } from "../hooks/useUpdateCheck";
 import { useUpdateScheduleStatus } from "../hooks/useUpdateSchedule";
 import { api } from "../lib/api";
@@ -36,6 +39,14 @@ import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
 import { clearPwaCache, waitForUpdatedServerAndReload } from "../lib/pwa";
 import {
+	DEFAULT_GITHUB_REPOSITORY,
+	sameUpdateSource,
+	settingsSourceIdentity,
+	updateCheckErrorKey,
+	updateSettingsKey,
+} from "../lib/update-source";
+import {
+	type PreparedUpdateStatus,
 	resolveUpdateCoordinationCounts,
 	shouldAssumeLocalSchedule,
 	shouldShowUpdateScheduleButton,
@@ -65,12 +76,18 @@ function resolveNotes(
 }
 
 export interface UpdateModalData {
+	preparedStatus?: PreparedUpdateStatus;
 	latestVersion?: string;
 	currentVersion?: string;
 	releaseInfo?: {
+		sourceIdentity?: UpdateSourceIdentity;
+		source?: "github" | "update-server";
+		repository?: string;
 		version: string;
 		releaseDate: string;
 		releaseNotes?: string | Record<string, string>;
+		notesDeferred?: boolean;
+		notesAvailable?: boolean;
 		path: string;
 		sha512: string;
 		files: Array<{ url: string; size: number; sha512: string }>;
@@ -89,6 +106,8 @@ export interface UpdateModalData {
 	releaseDate?: string;
 	downloadSize?: number;
 	totalSize?: number;
+	strategy?: "full" | "zstd";
+	settingsKey?: string;
 }
 
 export interface UpdateModalProps {
@@ -99,7 +118,14 @@ export interface UpdateModalProps {
 
 export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { t, i18n } = useTranslation("common");
-	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
+	const {
+		download,
+		cancel,
+		reset,
+		progress: downloadProgress,
+		result,
+		isDownloading,
+	} = useUpdateDownload();
 	const { apply, isApplying, applyResult } = useUpdateApply();
 	const restartWaitRef = useRef<{ targetVersion?: string; controller: AbortController } | null>(
 		null,
@@ -143,12 +169,53 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		downloadSize,
 		totalSize,
 	} = data;
-	const requestedTargetVersion = releaseInfo?.version ?? latestVersion;
+	// Subscribe to saved settings without starting an extra admin-only request.
+	const { data: savedSettings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		enabled: false,
+	});
+	const recommendationState = useRef({ data, invalidated: false });
+	if (recommendationState.current.data !== data) {
+		recommendationState.current = { data, invalidated: false };
+	}
+	const savedConfigurationChanged =
+		!!savedSettings &&
+		((data.settingsKey !== undefined &&
+			data.settingsKey !== updateSettingsKey(savedSettings.update)) ||
+			(!!releaseInfo &&
+				!sameUpdateSource(releaseInfo, {
+					source: savedSettings.update?.source ?? "github",
+					repository: savedSettings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
+					sourceIdentity: releaseInfo.sourceIdentity
+						? (settingsSourceIdentity(savedSettings.update, releaseInfo.sourceIdentity.platform) ??
+							undefined)
+						: undefined,
+				})));
+	// Switching back does not revive an old recommendation; only a fresh check replaces data.
+	if (savedConfigurationChanged) recommendationState.current.invalidated = true;
+	const recommendationInvalidated = recommendationState.current.invalidated;
+	// Bind the artifact the user saw, not whichever same-version file the next poll returns.
+	const selectedPrepared = useRef<{
+		data: UpdateModalData;
+		status?: PreparedUpdateStatus;
+		previousResult: UpdateDownloadResult | null;
+	}>({ data, status: data.preparedStatus, previousResult: result });
+	if (selectedPrepared.current.data !== data) {
+		selectedPrepared.current = { data, status: data.preparedStatus, previousResult: result };
+	}
+	// Reopening explicitly selects the badge's current artifact; an old successful download
+	// must not override that fresh selection. An in-flight download still finishes normally.
+	const selectedDownloadResult = result !== selectedPrepared.current.previousResult ? result : null;
+	// The old terminal progress belongs to the ignored result too. Keep live progress intact.
+	const progress = result && !selectedDownloadResult ? null : downloadProgress;
+	const requestedTargetVersion =
+		selectedPrepared.current.status?.version ?? releaseInfo?.version ?? latestVersion;
 	// A 409 download response can transparently re-check and switch to a newer release.
 	// From that point onward, status polling, apply scheduling, and reload readiness must
 	// follow the version actually downloaded rather than the modal's stale check payload.
-	const targetVersion = result?.success
-		? (result.version ?? requestedTargetVersion)
+	const targetVersion = selectedDownloadResult?.success
+		? (selectedDownloadResult.version ?? requestedTargetVersion)
 		: requestedTargetVersion;
 
 	const assumeScheduled = shouldAssumeLocalSchedule({
@@ -180,8 +247,12 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		assumeScheduled,
 	});
 
+	if (!selectedPrepared.current.status && preparedStatus?.ready) {
+		selectedPrepared.current.status = preparedStatus;
+	}
+
 	const handleDownload = (options?: { retry?: boolean }) => {
-		if (!downloadAvailable || !releaseInfo) return;
+		if (!downloadAvailable || !releaseInfo || recommendationInvalidated) return;
 		download(releaseInfo, options);
 	};
 
@@ -214,7 +285,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		setScheduleAbandonedLocally(false);
 		setServerConfirmedSchedule(false);
 		setScheduleClaimedAt(null);
-		const applyResponse = await apply(targetVersion);
+		const applyResponse = await apply(
+			effectiveResult?.version ?? targetVersion,
+			effectiveResult?.preparedIdentity?.id,
+		);
 		if (!applyResponse.success) return;
 		if ("scheduled" in applyResponse && applyResponse.scheduled) {
 			setScheduleClaimedAt(Date.now());
@@ -242,7 +316,8 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		setIsCancellingSchedule(true);
 		setCancelError(null);
 		try {
-			await api.cancelUpdate();
+			const response = await api.cancelUpdate();
+			if (!response.success) throw new Error(response.error ?? t("updateCancelScheduleFailed"));
 			// The attempt is over as far as this client is concerned. Releasing the optimistic claim
 			// here is what lets the poll wind down once the coordinator reports idle; leaving it set
 			// kept `/api/update/status` running once a second indefinitely.
@@ -311,17 +386,16 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 
 	const savingsPercent =
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
-	const preparedStatusDetails = preparedStatus;
-	const preparedStatusMatches =
-		preparedStatusDetails?.ready &&
-		!!targetVersion &&
-		preparedStatusDetails.version === targetVersion;
+	const preparedStatusDetails = selectedPrepared.current.status;
+	// A mismatching artifact may still be explicitly applied, but must not borrow release metadata.
+	const hasSelectedPreparedArtifact = preparedStatusDetails?.ready === true;
 	const restoredInstructions = preparedStatusDetails?.instructions;
 	const restoredResult: UpdateDownloadResult | null =
-		preparedStatusMatches && preparedStatusDetails
+		hasSelectedPreparedArtifact && preparedStatusDetails
 			? {
 					success: true,
 					version: preparedStatusDetails.version,
+					preparedIdentity: preparedStatusDetails.preparedIdentity,
 					ready: preparedStatusDetails.ready,
 					updatePath: preparedStatusDetails.updatePath ?? preparedStatusDetails.newBinaryPath,
 					newBinaryPath: preparedStatusDetails.newBinaryPath,
@@ -348,7 +422,24 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					},
 				}
 			: null;
-	const effectiveResult = result ?? restoredResult;
+	const effectiveResult = selectedDownloadResult?.success
+		? selectedDownloadResult
+		: (restoredResult ?? selectedDownloadResult);
+	const selectedIdentity = effectiveResult?.preparedIdentity;
+	const preparedSource = selectedIdentity?.sourceIdentity;
+	const recommendationMatchesPrepared =
+		!effectiveResult?.success || preparedMatchesRelease(selectedIdentity, releaseInfo);
+	const showRecommendation = !recommendationInvalidated && recommendationMatchesPrepared;
+	const preparedChanged =
+		!!selectedIdentity &&
+		!!preparedStatus?.preparedIdentity &&
+		selectedIdentity.id !== preparedStatus.preparedIdentity.id;
+	const deferredNotes = useUpdateNotes(
+		releaseInfo,
+		opened && showRecommendation && !preparedChanged,
+		preparedStatus?.preparedIdentity?.id ?? selectedIdentity?.id,
+	);
+	const displayedVersion = effectiveResult?.version ?? targetVersion;
 
 	const preparedBinaryPath =
 		effectiveResult?.instructions?.newBinaryPath ??
@@ -364,31 +455,35 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		!!preparedCommand &&
 		(!preparedBinaryPath || stripQuotes(preparedCommand) !== stripQuotes(preparedBinaryPath));
 	const statusErrorIsCurrent =
-		!!preparedStatusDetails?.error &&
+		!!preparedStatus?.error &&
 		(applyAttemptStartedAt === null || preparedStatusUpdatedAt >= applyAttemptStartedAt);
-	const coordinationFailed = statusErrorIsCurrent && preparedStatusDetails?.scheduled !== true;
+	// A failed rollback still owns this attempt; only cancellation may release it. Never
+	// turn its error into an idle state that offers another /apply against the held sources.
+	const cleanupRetryPending = preparedStatus?.cleanupRetryPending === true;
+	const coordinationFailed =
+		!cleanupRetryPending && statusErrorIsCurrent && preparedStatus?.scheduled !== true;
 	// An operator cancellation lands in the same error field as a genuine failure, but it is an
 	// expected outcome rather than something that went wrong.
-	const coordinationCancelled =
-		coordinationFailed && preparedStatusDetails?.errorKind === "cancelled";
-	const updateScheduled = coordinationFailed
-		? false
-		: applyResult?.scheduled === true || preparedStatusDetails?.scheduled === true;
+	const coordinationCancelled = coordinationFailed && preparedStatus?.errorKind === "cancelled";
+	const updateScheduled =
+		cleanupRetryPending ||
+		(!coordinationFailed &&
+			(applyResult?.scheduled === true || preparedStatus?.scheduled === true));
 	const coordinationPhase =
-		preparedStatusDetails?.scheduled || coordinationFailed
-			? preparedStatusDetails.phase
-			: (applyResult?.phase ?? preparedStatusDetails?.phase);
-	const coordinationCountsSource = preparedStatusDetails?.scheduled
-		? preparedStatusDetails
-		: (applyResult ?? preparedStatusDetails ?? {});
+		preparedStatus?.scheduled || cleanupRetryPending || coordinationFailed
+			? preparedStatus?.phase
+			: (applyResult?.phase ?? preparedStatus?.phase);
+	const coordinationCountsSource = preparedStatus?.scheduled
+		? preparedStatus
+		: (applyResult ?? preparedStatus ?? {});
 	const {
 		pendingBackgroundBashCount,
 		pendingOrdinaryExecutionCount,
 		resumableExecutionCount,
 		pausedToolCount,
 	} = resolveUpdateCoordinationCounts(coordinationCountsSource);
-	const waitBlockers = updateScheduled ? (preparedStatusDetails?.blockers ?? []) : [];
-	const cancelRequested = updateScheduled && preparedStatusDetails?.cancelRequested === true;
+	const waitBlockers = updateScheduled ? (preparedStatus?.blockers ?? []) : [];
+	const cancelRequested = updateScheduled && preparedStatus?.cancelRequested === true;
 	const canRestartIntoUpdate =
 		autoApplyAvailable &&
 		!updateScheduled &&
@@ -412,12 +507,18 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const serverStopped = applyResult?.success && !applyResult.restarting;
 	const rawDownloadError = result && !result.success ? result.error : null;
 	const isZstdMissing = rawDownloadError === "ZSTD_CLI_MISSING";
-	const downloadError = isZstdMissing ? null : rawDownloadError;
+	const downloadErrorKey = updateCheckErrorKey(result?.code);
+	const downloadError = isZstdMissing
+		? null
+		: rawDownloadError && downloadErrorKey !== "updateCheckFailed"
+			? t(downloadErrorKey)
+			: rawDownloadError;
 	const applyError =
 		cancelError ??
+		(cleanupRetryPending ? (preparedStatus?.error ?? t("updateCleanupRetryDescription")) : null) ??
 		restartWaitError ??
 		(applyResult && !applyResult.success ? applyResult.error : null) ??
-		(statusErrorIsCurrent ? preparedStatusDetails?.error : null) ??
+		(statusErrorIsCurrent ? preparedStatus?.error : null) ??
 		null;
 
 	// Once the coordinator has confirmed a schedule, its own reports drive the poll and the local
@@ -428,26 +529,79 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	}, [preparedStatus?.scheduled]);
 
 	useEffect(() => {
-		if (coordinationFailed) {
+		if (coordinationFailed || cleanupRetryPending) {
 			restartWaitRef.current?.controller.abort();
 			restartWaitRef.current = null;
+			if (cleanupRetryPending) setRestartWaitError(null);
 			return;
 		}
 		if (updateScheduled && coordinationPhase === "restarting") {
 			void startRestartWait(targetVersion);
 		}
-	}, [coordinationFailed, coordinationPhase, startRestartWait, targetVersion, updateScheduled]);
+	}, [
+		cleanupRetryPending,
+		coordinationFailed,
+		coordinationPhase,
+		startRestartWait,
+		targetVersion,
+		updateScheduled,
+	]);
 
 	return (
 		<Modal
 			opened={opened}
 			onClose={handleClose}
-			title={t("updateDownloadTitle", { version: targetVersion ?? latestVersion })}
+			title={t("updateDownloadTitle", { version: displayedVersion ?? latestVersion })}
 			size="lg"
 			centered
 		>
 			<Stack gap="md">
-				{releaseDate && (
+				{recommendationInvalidated && (
+					<Alert color="orange" variant="light">
+						{t("updateSourceChanged")}
+					</Alert>
+				)}
+				{effectiveResult?.success && (
+					<Stack gap="xs">
+						<Text size="sm">
+							{preparedSource?.source === "github"
+								? t("updateSourceGithub", { repository: preparedSource.repository })
+								: preparedSource?.source === "update-server"
+									? `${t("updateSourceServer")}: ${preparedSource.repository} · ${preparedSource.serverUrl} / ${preparedSource.product}`
+									: t("updatePreparedUnknownSource")}
+							{preparedSource && ` · ${preparedSource.channel} · ${preparedSource.platform}`}
+						</Text>
+						{selectedIdentity && (
+							<Text size="xs" c="dimmed" style={{ overflowWrap: "anywhere" }}>
+								SHA-512: {selectedIdentity.sha512} · {formatBytes(selectedIdentity.sizeBytes)}
+							</Text>
+						)}
+						{preparedChanged && <Alert color="orange">{t("updatePreparedChanged")}</Alert>}
+						{!selectedIdentity && <Alert color="orange">{t("updateApplyIdentityRequired")}</Alert>}
+					</Stack>
+				)}
+				{!showRecommendation && progress?.strategy && (
+					<Badge variant="outline">
+						{t(progress.strategy === "zstd" ? "updateStrategyZstd" : "updateStrategyFull")}
+					</Badge>
+				)}
+				{releaseInfo && showRecommendation && (
+					<Group gap="xs">
+						<Badge variant="light">
+							{releaseInfo.source === "github"
+								? t("updateSourceGithub", { repository: releaseInfo.repository })
+								: `${t("updateSourceServer")}: ${releaseInfo.repository}`}
+						</Badge>
+						<Badge variant="outline">
+							{t(
+								(progress?.strategy ?? data.strategy) === "zstd"
+									? "updateStrategyZstd"
+									: "updateStrategyFull",
+							)}
+						</Badge>
+					</Group>
+				)}
+				{releaseDate && showRecommendation && (
 					<Text size="xs" c="dimmed">
 						{formatLocaleDate(releaseDate, {
 							year: "numeric",
@@ -458,74 +612,95 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 				)}
 
 				{/* Release notes */}
-				<div>
-					<Text size="sm" fw={500} mb={4}>
-						{t("updateReleaseNotes")}
-					</Text>
-					<ScrollArea.Autosize mah={300}>
-						{releaseNotesPerVersion && releaseNotesPerVersion.length > 1 ? (
-							<Stack gap="md">
-								{releaseNotesPerVersion.map(
-									(v: {
-										version: string;
-										releaseDate: string;
-										releaseNotes?: string | Record<string, string>;
-									}) => {
-										const notes = resolveNotes(v.releaseNotes, i18n.language);
-										return (
-											<div key={v.version}>
-												<Group gap="xs" mb={4}>
-													<Badge size="xs" variant="light">
-														v{v.version}
-													</Badge>
-													<Text size="xs" c="dimmed">
-														{formatLocaleDate(v.releaseDate, {
-															year: "numeric",
-															month: "short",
-															day: "numeric",
-														})}
-													</Text>
-												</Group>
-												{notes ? (
-													<MarkdownContent text={notes} />
-												) : (
-													<Text size="sm" c="dimmed" fs="italic">
-														{t("updateNoNotes")}
-													</Text>
-												)}
-											</div>
-										);
-									},
-								)}
-							</Stack>
-						) : (
-							(() => {
-								const notes = resolveNotes(releaseNotes, i18n.language);
-								return notes ? (
-									<MarkdownContent text={notes} />
-								) : (
-									<Text size="sm" c="dimmed" fs="italic">
-										{t("updateNoNotes")}
-									</Text>
-								);
-							})()
-						)}
-					</ScrollArea.Autosize>
-				</div>
-
-				{savingsPercent > 0 && !effectiveResult?.success && (
-					<Text size="xs" c="dimmed">
-						{t("updatePatchInfo", {
-							downloadSize: formatBytes(downloadSize ?? 0),
-							totalSize: formatBytes(totalSize ?? 0),
-						})}
-					</Text>
+				{showRecommendation && (
+					<div>
+						<Text size="sm" fw={500} mb={4}>
+							{t("updateReleaseNotes")}
+						</Text>
+						<ScrollArea.Autosize mah={300}>
+							{releaseNotesPerVersion && releaseNotesPerVersion.length > 1 ? (
+								<Stack gap="md">
+									{releaseNotesPerVersion.map(
+										(v: {
+											version: string;
+											releaseDate: string;
+											releaseNotes?: string | Record<string, string>;
+										}) => {
+											const notes = resolveNotes(v.releaseNotes, i18n.language);
+											return (
+												<div key={v.version}>
+													<Group gap="xs" mb={4}>
+														<Badge size="xs" variant="light">
+															v{v.version}
+														</Badge>
+														<Text size="xs" c="dimmed">
+															{formatLocaleDate(v.releaseDate, {
+																year: "numeric",
+																month: "short",
+																day: "numeric",
+															})}
+														</Text>
+													</Group>
+													{notes ? (
+														<MarkdownContent text={notes} />
+													) : (
+														<Text size="sm" c="dimmed" fs="italic">
+															{t("updateNoNotes")}
+														</Text>
+													)}
+												</div>
+											);
+										},
+									)}
+								</Stack>
+							) : (
+								(() => {
+									const notes = resolveNotes(
+										releaseInfo?.notesDeferred
+											? (deferredNotes.data?.notes ?? undefined)
+											: (releaseNotes ?? releaseInfo?.releaseNotes),
+										i18n.language,
+									);
+									return notes ? (
+										<MarkdownContent text={notes} />
+									) : (
+										<Text size="sm" c="dimmed" fs="italic">
+											{t(
+												deferredNotes.isFetching
+													? "updateNotesLoading"
+													: deferredNotes.isError
+														? "updateNotesUnavailable"
+														: "updateNoNotes",
+											)}
+										</Text>
+									);
+								})()
+							)}
+						</ScrollArea.Autosize>
+					</div>
 				)}
+
+				{progress?.fallback && releaseInfo && (
+					<Alert color="yellow" variant="light">
+						{t("updateDeltaFallback")}
+					</Alert>
+				)}
+				{savingsPercent > 0 &&
+					!progress?.fallback &&
+					!recommendationInvalidated &&
+					!effectiveResult?.success && (
+						<Text size="xs" c="dimmed">
+							{t("updatePatchInfo", {
+								downloadSize: formatBytes(downloadSize ?? 0),
+								totalSize: formatBytes(totalSize ?? 0),
+							})}
+						</Text>
+					)}
 
 				<Divider />
 
 				{/* Download button */}
-				{!progress && !effectiveResult && (
+				{!progress && !effectiveResult && !recommendationInvalidated && (
 					<Button
 						fullWidth
 						leftSection={<IconDownload size={16} />}
@@ -588,8 +763,10 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							color="orange"
 							size="xs"
 							mt={8}
-							disabled={!downloadAvailable}
-							title={downloadUnavailableReason}
+							disabled={!downloadAvailable || recommendationInvalidated}
+							title={
+								recommendationInvalidated ? t("updateSourceChanged") : downloadUnavailableReason
+							}
 							onClick={() => {
 								reset();
 								handleDownload({ retry: true });
@@ -758,7 +935,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							</Alert>
 						)}
 
-						{updateScheduled && !restartStarted && (
+						{updateScheduled && !restartStarted && !cleanupRetryPending && (
 							<Stack gap="xs">
 								{waitBlockers.length > 0 && (
 									<Stack gap={2}>
@@ -815,7 +992,22 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					</Alert>
 				)}
 
-				{restartStarted && (
+				{cleanupRetryPending && (
+					<Stack gap="xs">
+						<Text size="sm">{t("updateCleanupRetryDescription")}</Text>
+						<Button
+							variant="light"
+							color="red"
+							leftSection={<IconX size={14} />}
+							onClick={handleCancelSchedule}
+							loading={isCancellingSchedule}
+						>
+							{t("updateRetryCancellation")}
+						</Button>
+					</Stack>
+				)}
+
+				{restartStarted && !cleanupRetryPending && (
 					<Stack gap="sm">
 						<Alert color="blue" variant="light" icon={<IconPower size={16} />}>
 							{t("updateRestarting")}

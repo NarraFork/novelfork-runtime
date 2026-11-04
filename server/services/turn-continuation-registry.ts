@@ -70,9 +70,7 @@ export type ContinuationDisposition =
 	 * check for everybody in order to describe one source honestly.
 	 *
 	 * `via` names the carrying source and must itself be `handled` by this audience,
-	 * which is verified — otherwise this becomes a way to point at nothing. Real case:
-	 * permission feedback for a subagent is queued by `bufferSubagentUserMessage`, so it
-	 * is consumed at the `buffered-message` boundary the loop already has.
+	 * which is verified — otherwise this becomes a way to point at nothing.
 	 */
 	| { kind: "handledVia"; via: string; reason: string }
 	/**
@@ -138,12 +136,6 @@ const na = (reason: string): ContinuationDisposition => ({ kind: "notApplicable"
 // biome-ignore lint/correctness/noUnusedVariables: retained as the vocabulary for the next gap found; see above.
 const gap = (reason: string): ContinuationDisposition => ({ kind: "gap", reason });
 
-const handledVia = (via: string, reason: string): ContinuationDisposition => ({
-	kind: "handledVia",
-	via,
-	reason,
-});
-
 /**
  * Every continuation source, in the order the loops consult them.
  *
@@ -191,7 +183,7 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 	{
 		id: "model-unavailable",
 		summary:
-			"The provider is blocked but self-recovering: NUG credential pool disabled, or Kimi quota exhausted. Park on the availability poller or the published reset instant.",
+			"The provider is blocked but self-recovering: NUG credential pool disabled, or a Kimi / OpenCode Go plan quota (or long rate limit) exhausted. Park on the availability poller or the published reset instant.",
 		outcome: "suspend",
 		mutexGroup: "request-refused",
 		dispositions: {
@@ -282,34 +274,10 @@ export const CONTINUATION_SOURCES: readonly ContinuationSource[] = [
 			"immediately after the tool completes rather than after the whole turn.",
 		dispositions: {
 			primary: handled,
-			// Closed. This WAS a real gap: a subagent's tool calls go through the same
-			// `handlePermission`, so a user could approve one with attached text and that text
-			// was silently dropped — both the payload and the soft-stop flag were keyed through
-			// `activeNarrators`, which a subagent has no entry in.
-			//
-			subagent: handledVia(
-				"buffered-message",
-				"A subagent reaches the same two effects through its own plumbing rather than the " +
-					"primary's: `deliverSubagentPermissionFeedback` routes the text through " +
-					'`bufferSubagentUserMessage`, which both queues it as a `role: "user"` turn and ' +
-					"arms the soft stop the loop already reads via " +
-					"`shouldStopSubagentForBufferedMessage`. It is therefore consumed at the " +
-					"buffered-message boundary, and a marker of its own would name a branch that " +
-					"does not exist.",
-			),
-		},
-	},
-	{
-		id: "review-git-guard",
-		summary: "A review narrator modified files; reset the worktree and tell it to continue.",
-		outcome: "inject",
-		dispositions: {
-			primary: handled,
-			subagent: na(
-				"The guard resets a review CHAPTER's git state and concludes the review through " +
-					"review-service. A review subagent has no chapter of its own to reset and does not " +
-					"own a review record; its read-only tool filter is what keeps it from writing.",
-			),
+			// Closed. Every session has the same `activeNarrators` entry and the one
+			// orchestrator, so a delegated run adopts approval feedback through the same
+			// `pendingFeedback` + `_feedbackSoftStop` branch as any session.
+			subagent: handled,
 		},
 	},
 	{
@@ -438,10 +406,10 @@ export const NON_SOURCE_ASYMMETRIES: readonly {
 		verdict: "essential",
 		detail:
 			"Not a gap. The flag disables streaming-time eager tool execution, which is a real " +
-			"throughput cost, and the primary loop does not need it: both eager-start sites are " +
-			"already gated on `observeSoftStopForTurn()`, so a cut-in stops the turn at the right " +
-			"boundary either way. `loop-cutin-boundary.test.ts` pins exactly this — the same " +
-			"scenario produces identical executed/skipped sets with and without the flag. Setting " +
+			"throughput cost, and the primary loop does not need it: a user cut-in never skips a " +
+			"produced call, and host stops gate both eager-start sites on `observeSoftStopForTurn()`, " +
+			"so the turn ends at the right boundary either way. `loop-cutin-boundary.test.ts` pins " +
+			"this — the same scenario executes the same calls with and without the flag. Setting " +
 			"it for the primary would cost parallel-tool latency and buy nothing. The subagent " +
 			"keeps it because it is the stricter guarantee and a subagent's turns are short.",
 	},

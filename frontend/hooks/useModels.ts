@@ -1,3 +1,4 @@
+import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
 import { api } from "../lib/api";
@@ -140,6 +141,12 @@ export function getConfiguredFallbackModels(
 	for (const provider of (settings.nugProviders ?? []) as Array<Record<string, unknown>>) {
 		registerProvider(provider, "nug", "apiKey", true);
 	}
+	if (
+		settings.tokendance?.connected &&
+		!settings.tokendance.disabled &&
+		!disabledPrefixes.has("tokendance")
+	)
+		configuredPrefixes.set("tokendance", { name: settings.tokendance.name || "TokenDance" });
 	if (settings.codexAvailable && !disabledPrefixes.has("codex")) {
 		configuredPrefixes.set("codex", { name: "Codex", type: "codex" });
 	}
@@ -213,6 +220,13 @@ export function useAllModels() {
 	// narrator waits for a temporarily-unavailable model to recover. Re-fetch
 	// settings (which carry the NUG model list + `available` flags) so the picker
 	// reflects recovery/outage live.
+	useEffect(() => {
+		if (settingsData?.commandcodeModelsPending !== true) return;
+		const timer = setTimeout(() => {
+			void qc.invalidateQueries({ queryKey: ["settings"] });
+		}, 1_500);
+		return () => clearTimeout(timer);
+	}, [settingsData?.commandcodeModelsPending, qc]);
 	useEffect(() => {
 		const onAvailabilityChanged = () => {
 			qc.invalidateQueries({ queryKey: ["settings"] });
@@ -478,6 +492,17 @@ export function useAllModels() {
 				}))
 			: [];
 
+		// --- Command Code models (fetched from the Provider API, cached server-side) ---
+		const commandcodeModelIds: string[] = settingsData?.commandcodeModels ?? [];
+		const commandcodeModels: ModelOption[] = settingsData?.commandcodeAvailable
+			? commandcodeModelIds.map((id) => ({
+					value: modelValue("CommandCode", id),
+					label: id,
+					provider: "CommandCode",
+					bareModel: id,
+				}))
+			: [];
+
 		// --- Plugin provider models (from the host provider registry) ---
 		// Values are already `prefix:modelId`. Models from a disabled plugin arrive with
 		// `available: false` so the picker can show them as temporarily unusable rather
@@ -565,7 +590,21 @@ export function useAllModels() {
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of nugByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType, group.nugProviderId);
+		const tokenDance = settingsData?.tokendance as TokenDancePublicConnection | undefined;
+		providerLabels.tokendance = tokenDance?.name || "TokenDance";
+		if (tokenDance?.connected && tokenDance.disabled) disabledProviders.add("tokendance");
+		if (tokenDance?.connected)
+			addGroup(
+				"tokendance",
+				tokenDance.models.map((m) => ({
+					value: `tokendance:${m.id}`,
+					label: m.name || m.id,
+					provider: "tokendance",
+					contextWindow: m.context_length,
+				})),
+			);
 		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
+		if (commandcodeModels.length > 0) addGroup("CommandCode", commandcodeModels, "CommandCode");
 		// Executable-plugin providers, after every builtin so a plugin never reorders
 		// the familiar provider list. Each group already carries fully-prefixed values.
 		for (const group of pluginProviderGroups) {
@@ -763,6 +802,7 @@ export function useAllModels() {
 			aggregations,
 			/** Codex models only. */
 			codexModels,
+			commandcodeModels,
 			/** OpenAI models grouped by provider. */
 			openaiByProvider,
 			/** Anthropic models grouped by provider. */

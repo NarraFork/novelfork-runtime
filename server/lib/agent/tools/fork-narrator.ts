@@ -1,7 +1,6 @@
-import { FORK_WORKTREE_SOURCES, type ForkWorktreeSource } from "@shared/chapter-fork";
+import { FORK_WORKTREE_SOURCES, type ForkWorktreeSource } from "@shared/fork-worktree-source";
 import { formatOriginLabel } from "@shared/message-origin";
 import { z } from "zod/v4";
-import { getVisibleModels } from "../../settings";
 import {
 	exceedsForkDepthLimit,
 	FORK_NARRATOR_MAX_DEPTH,
@@ -11,95 +10,85 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 import baseDescription from "./fork-narrator.txt" with { type: "text" };
 
-function getAvailableModelsList(): string {
-	const models = getVisibleModels();
-	return models.length > 0 ? models.join(", ") : "(no models configured yet)";
-}
-
 export const forkNarratorTool: ToolDefinition = {
 	name: "ForkNarrator",
-	get description() {
-		return baseDescription;
-	},
-	get parameters() {
-		return z.object({
-			mode: z
-				.enum(["fresh", "fork"])
-				.describe(
+	description: baseDescription,
+	parameters: z.object({
+		mode: z
+			.enum(["fresh", "fork"])
+			.describe(
+				'"fresh" = new narrator with no history; "fork" = inherit current conversation history',
+			),
+		message: z.string().describe("The initial message to send to the new narrator"),
+		title: z.string().optional().describe("Title for the new independent narrator"),
+		inheritMode: z
+			.enum(["full", "compressed"])
+			.optional()
+			.describe(
+				'Only used when mode="fork". "full" = share message refs (default); "compressed" = AI-generated summary',
+			),
+		worktreeSource: z
+			.enum(FORK_WORKTREE_SOURCES)
+			.optional()
+			.describe(
+				"Deprecated and rejected. Use the explicit CreateWorktree resource tool to create filesystem resources.",
+			),
+		commitSha: z
+			.string()
+			.min(1)
+			.optional()
+			.describe(
+				"Deprecated and rejected. Use the explicit CreateWorktree resource tool to select a commit.",
+			),
+		model: z
+			.string()
+			.optional()
+			.describe(
+				"Override the model for the new narrator. Consult the current model context for available models.",
+			),
+	}),
+	rawJsonSchema: {
+		type: "object" as const,
+		properties: {
+			mode: {
+				description:
 					'"fresh" = new narrator with no history; "fork" = inherit current conversation history',
-				),
-			message: z.string().describe("The initial message to send to the new narrator"),
-			title: z.string().optional().describe("Title for the new independent narrator"),
-			inheritMode: z
-				.enum(["full", "compressed"])
-				.optional()
-				.describe(
-					'Only used when mode="fork". "full" = share message refs (default); "compressed" = AI-generated summary',
-				),
-			worktreeSource: z
-				.enum(FORK_WORKTREE_SOURCES)
-				.optional()
-				.describe(
-					"Deprecated and rejected. Use the explicit Worktree resource tool to create filesystem resources.",
-				),
-			commitSha: z
-				.string()
-				.min(1)
-				.optional()
-				.describe(
-					"Deprecated and rejected. Use the explicit Worktree resource tool to select a commit.",
-				),
-			model: z
-				.string()
-				.optional()
-				.describe(
-					`Override the model for the new narrator. Available models: ${getAvailableModelsList()}`,
-				),
-		});
-	},
-	get rawJsonSchema() {
-		return {
-			type: "object" as const,
-			properties: {
-				mode: {
-					description:
-						'"fresh" = new narrator with no history; "fork" = inherit current conversation history',
-					type: "string",
-					enum: ["fresh", "fork"],
-				},
-				message: {
-					description: "The initial message to send to the new narrator",
-					type: "string",
-				},
-				title: {
-					description: "Title for the new independent narrator",
-					type: "string",
-				},
-				inheritMode: {
-					description:
-						'Only used when mode="fork". "full" = share message refs (default); "compressed" = AI-generated summary',
-					type: "string",
-					enum: ["full", "compressed"],
-				},
-				worktreeSource: {
-					description:
-						"Deprecated and rejected. Use the explicit Worktree resource tool to create filesystem resources.",
-					type: "string",
-					enum: [...FORK_WORKTREE_SOURCES],
-				},
-				commitSha: {
-					description:
-						"Deprecated and rejected. Use the explicit Worktree resource tool to select a commit.",
-					type: "string",
-				},
-				model: {
-					description: `Override the model for the new narrator. Available models: ${getAvailableModelsList()}`,
-					type: "string",
-				},
+				type: "string",
+				enum: ["fresh", "fork"],
 			},
-			required: ["mode", "message"],
-			additionalProperties: false,
-		};
+			message: {
+				description: "The initial message to send to the new narrator",
+				type: "string",
+			},
+			title: {
+				description: "Title for the new independent narrator",
+				type: "string",
+			},
+			inheritMode: {
+				description:
+					'Only used when mode="fork". "full" = share message refs (default); "compressed" = AI-generated summary',
+				type: "string",
+				enum: ["full", "compressed"],
+			},
+			worktreeSource: {
+				description:
+					"Deprecated and rejected. Use the explicit CreateWorktree resource tool to create filesystem resources.",
+				type: "string",
+				enum: [...FORK_WORKTREE_SOURCES],
+			},
+			commitSha: {
+				description:
+					"Deprecated and rejected. Use the explicit CreateWorktree resource tool to select a commit.",
+				type: "string",
+			},
+			model: {
+				description:
+					"Override the model for the new narrator. Consult the current model context for available models.",
+				type: "string",
+			},
+		},
+		required: ["mode", "message"],
+		additionalProperties: false,
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const { mode, message, title, inheritMode, worktreeSource, commitSha, model } = args as {
@@ -115,7 +104,7 @@ export const forkNarratorTool: ToolDefinition = {
 		if (worktreeSource !== undefined || commitSha !== undefined) {
 			return {
 				output:
-					"ForkNarrator creates an independent conversation, not files. Use the explicit Worktree resource tool for worktreeSource or commitSha.",
+					"ForkNarrator creates an independent conversation, not files. Use the explicit CreateWorktree resource tool for worktreeSource or commitSha.",
 				isError: true,
 			};
 		}
@@ -131,10 +120,7 @@ export const forkNarratorTool: ToolDefinition = {
 			// Refuse before creating anything. A forked narrator holds this same tool and
 			// its first message is written by the AI that forked it, so nothing else stops
 			// a chain — every hop starts another independent running loop.
-			const parentDepth = await resolveForkDepth({
-				id: parent.id,
-				chapterId: parent.chapterId ?? null,
-			});
+			const parentDepth = await resolveForkDepth({ id: parent.id });
 			if (exceedsForkDepthLimit(parentDepth)) {
 				return {
 					output: getToolMessageWithParams("forkNarratorDepthExceeded", locale, {
@@ -151,6 +137,7 @@ export const forkNarratorTool: ToolDefinition = {
 				userId: ctx.userId ?? null,
 				model,
 				locale: ctx.locale,
+				callingToolCallId: ctx.toolCallBinding?.toolCallId,
 			});
 			const newNarratorId = newNarrator.id;
 			const newTitle = newNarrator.title ?? title ?? "Forked narrator";
@@ -183,7 +170,6 @@ export const forkNarratorTool: ToolDefinition = {
 				output: getToolMessageWithParams("forkNarratorSuccess", locale, {
 					narratorId: newNarratorId,
 					title: newTitle,
-					chapterInfo: "",
 				}),
 			};
 		} catch (err) {

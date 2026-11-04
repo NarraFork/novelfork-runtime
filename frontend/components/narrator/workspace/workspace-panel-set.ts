@@ -13,8 +13,8 @@
  *
  *   - a layout entry naming a panel that is not a member is dropped;
  *   - a member the layout does not mention is appended (the caller adds it live);
- *   - a dependent panel (tool / subagent / file / knowledge) survives only while its
- *     host narrator is still a member.
+ *   - a dependent panel (tool / subagent / file / knowledge, an outline page a session
+ *     opened) survives only while its host narrator is still a member.
  *
  * So a damaged layout costs POSITIONS, never a panel. This module is deliberately free
  * of React and dockview imports so that guarantee can be tested directly.
@@ -79,6 +79,11 @@ function layoutEntryIdentity(params: Record<string, unknown>, panelId: string): 
 		// only handle is the dockview panel id it was stored under.
 		return `panel:${stripPanelIdPrefix(panelId)}`;
 	}
+	// An outline member is added under its row's dom id like the kinds above; an outline
+	// resource (with a host) is a dependent and never reaches here in the reconcile path.
+	if (panelType === "outline" && typeof params.hostNarratorId !== "string") {
+		return `panel:${stripPanelIdPrefix(panelId)}`;
+	}
 	return null;
 }
 
@@ -101,6 +106,11 @@ function dependentHostNarratorId(params: Record<string, unknown>): string | null
 		return typeof narratorId === "string" ? narratorId : null;
 	}
 	if (panelType === "subagent" || panelType === "file" || panelType === "knowledge") {
+		const hostNarratorId = params.hostNarratorId;
+		return typeof hostNarratorId === "string" ? hostNarratorId : null;
+	}
+	if (panelType === "outline") {
+		// A session's outline resource lives and dies with its host; a member does not.
 		const hostNarratorId = params.hostNarratorId;
 		return typeof hostNarratorId === "string" ? hostNarratorId : null;
 	}
@@ -344,26 +354,33 @@ export type SurfaceRefreshDecision = "rebuild" | "adopt-baseline" | "ignore";
  * Decide what a mounted surface should do when the workspace query delivers a
  * DIFFERENT layout than the one the surface was built from.
  *
- * This is the guard that was missing when the query cache went stale: a refetch
- * can deliver a layout written by another session (or by this one before a
- * cache-less save), and blindly honouring it would either clobber the user's
- * in-progress arrangement or — worse — let the stale arrangement be persisted
- * back over the newer one on the next layout change.
+ * With `workspace_changed` events pushing cross-device changes into a refetch,
+ * this decision runs on every remote edit, not just on stale-cache mounts:
  *
  *   - "ignore": the incoming tree IS the surface's baseline (our own save echoed
- *     back through the cache) — nothing to do.
- *   - "adopt-baseline": the user has local edits; the surface keeps them and the
- *     next persist will make the server agree. The baseline still advances so a
- *     later identical refetch is "ignore".
- *   - "rebuild": no local edits, so the server layout is strictly newer
- *     information — rebuild the surface from it.
+ *     back through the cache), or the read is STALE — its revision is not newer
+ *     than the baseline's, so it cannot carry anything we have not seen.
+ *   - "adopt-baseline": the user has UNSAVED local edits; the surface keeps them
+ *     and the pending persist will make the server agree (last-writer-wins). The
+ *     baseline still advances so a later identical refetch is "ignore".
+ *   - "rebuild": the server layout is strictly newer and nothing local is
+ *     unsaved — rebuild the surface from it.
+ *
+ * The revision guard is what replaced the old sticky "any local edit since
+ * mount" flag: a read that started before our own save can deliver an older
+ * tree with a higher-looking tree string, and only the revision tells it apart
+ * from a genuinely newer remote layout. A null baseline has no revision to
+ * compare against, so a real incoming tree always rebuilds there.
  */
 export function decideSurfaceRefresh(input: {
-	localEdit: boolean;
+	unsaved: boolean;
 	builtTree: string | null;
+	builtRevision: number;
 	incomingTree: string | null | undefined;
+	incomingRevision: number;
 }): SurfaceRefreshDecision {
 	const incoming = input.incomingTree ?? null;
 	if (incoming === input.builtTree) return "ignore";
-	return input.localEdit ? "adopt-baseline" : "rebuild";
+	if (input.builtTree !== null && input.incomingRevision <= input.builtRevision) return "ignore";
+	return input.unsaved ? "adopt-baseline" : "rebuild";
 }

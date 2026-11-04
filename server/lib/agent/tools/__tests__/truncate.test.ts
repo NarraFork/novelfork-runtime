@@ -1,6 +1,17 @@
-import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
-import { MAX_BYTES, MAX_LINES, truncateOutput } from "../../truncate";
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { logger } from "../../../logger";
+import { cleanupTruncatedOutputs, MAX_BYTES, MAX_LINES, truncateOutput } from "../../truncate";
 
 // ============================================================
 // truncateOutput — dual limits + file persistence
@@ -23,7 +34,10 @@ describe("truncateOutput", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.outputPath).toBeDefined();
 		expect(result.content).toContain("truncated");
-		expect(result.content).toContain("Read with offset/limit");
+		expect(result.content).toContain("You MUST use Read (path: the file above)");
+		expect(result.content).toContain("then use Read with a small offset/limit range");
+		expect(result.content).toContain(result.outputPath as string);
+		expect(readFileSync(result.outputPath as string, "utf-8")).toBe(text);
 
 		// The kept portion (between the "...N truncated..." header and the "⚠️" hint)
 		// should not exceed MAX_LINES lines.
@@ -44,6 +58,12 @@ describe("truncateOutput", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.outputPath).toBeDefined();
 		expect(result.content).toContain("bytes truncated");
+		const preview = result.content.split("\n\n")[1];
+		expect(Buffer.byteLength(preview, "utf-8")).toBeLessThanOrEqual(MAX_BYTES);
+		expect(preview.split("\n").length).toBeLessThanOrEqual(MAX_LINES);
+		const outputPath = result.outputPath;
+		if (!outputPath) throw new Error("Byte-truncated output has no saved file");
+		expect(readFileSync(outputPath, "utf-8")).toBe(text);
 	});
 
 	test("persists full output to a file when truncated", () => {
@@ -81,11 +101,9 @@ describe("truncateOutput", () => {
 		// Exactly MAX_LINES lines, each short enough to stay under MAX_BYTES
 		const lines = Array.from({ length: MAX_LINES }, (_, i) => `${i}`);
 		const text = lines.join("\n");
-		// Only test if total bytes are within limit
-		if (Buffer.byteLength(text, "utf-8") <= MAX_BYTES) {
-			const result = truncateOutput(text);
-			expect(result.truncated).toBe(false);
-		}
+		expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(MAX_BYTES);
+		const result = truncateOutput(text);
+		expect(result.truncated).toBe(false);
 	});
 
 	test("empty string is not truncated", () => {
@@ -127,5 +145,83 @@ describe("truncateOutput", () => {
 		const lines = Array.from({ length: MAX_LINES + 10 }, (_, i) => `x${i}`);
 		const result = truncateOutput(lines.join("\n"));
 		expect(result.outputPath).toContain("narrafork-tool-output");
+	});
+});
+
+describe("truncated output cleanup timing", () => {
+	test("reports scan/stat/unlink work and keeps unexpired or unrelated files", () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-truncate-cleanup-test-"));
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+			for (const [filename, text] of [
+				["tool_old", "abc"],
+				["toolcall_old", "xy"],
+				["unrelated", "keep"],
+			]) {
+				const path = join(directory, filename);
+				writeFileSync(path, text);
+				utimesSync(path, old, old);
+			}
+			writeFileSync(join(directory, "tool_new"), "new");
+			const oldDirectory = join(directory, "tool_directory");
+			mkdirSync(oldDirectory);
+			utimesSync(oldDirectory, old, old);
+			cleanupTruncatedOutputs(directory);
+			expect(existsSync(join(directory, "tool_old"))).toBe(false);
+			expect(existsSync(join(directory, "toolcall_old"))).toBe(false);
+			expect(existsSync(join(directory, "tool_new"))).toBe(true);
+			expect(existsSync(join(directory, "unrelated"))).toBe(true);
+			expect(existsSync(oldDirectory)).toBe(true);
+			const completed = info.mock.calls.find(
+				([message]) => message === "Truncated output cleanup completed",
+			)?.[1];
+			expect(completed).toMatchObject({
+				directoryAvailable: true,
+				entries: 5,
+				scanned: 4,
+				deleted: 2,
+				deletedBytes: 5,
+				errors: 1,
+			});
+			for (const field of ["durationMs", "readDirectoryMs", "statMs", "unlinkMs"]) {
+				expect(completed?.[field]).toBeGreaterThanOrEqual(0);
+			}
+		} finally {
+			mock.restore();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("missing output directory is still non-fatal and records a skipped scan", () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-truncate-cleanup-test-"));
+		const info = spyOn(logger, "info").mockImplementation(() => {});
+		try {
+			expect(() => cleanupTruncatedOutputs(join(directory, "missing"))).not.toThrow();
+			expect(
+				info.mock.calls.find(([message]) => message === "Truncated output cleanup completed")?.[1],
+			).toMatchObject({ directoryAvailable: false, entries: 0, scanned: 0, deleted: 0 });
+		} finally {
+			mock.restore();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("slow cleanup emits a warning with phase durations", () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-truncate-cleanup-test-"));
+		spyOn(logger, "info").mockImplementation(() => {});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		let elapsed = 0;
+		spyOn(performance, "now").mockImplementation(() => (elapsed += 100));
+		try {
+			cleanupTruncatedOutputs(directory);
+			expect(
+				warn.mock.calls.find(([message]) => message === "Truncated output cleanup completed")?.[1],
+			).toMatchObject({ durationMs: 300, readDirectoryMs: 100 });
+		} finally {
+			mock.restore();
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });

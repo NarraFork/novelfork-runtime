@@ -3,6 +3,8 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { CodexOAuthError } from "../../../server/lib/codex-auth";
 import { AppError } from "../../../server/lib/errors";
+import type { AuthSessionStore } from "../../../server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 
 type CodexTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
 
@@ -24,6 +26,7 @@ const settingsState: {
 let saveSettingsCalls = 0;
 let codexImportedCredentials: unknown[] = [];
 let codexRemoveUnhealthyCalls = 0;
+let codexCredentialUpdates: Array<{ id: string; fields: unknown }> = [];
 let managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 let browserCallbackUrls: string[] = [];
 let browserCallbackError: string | Error | null = null;
@@ -76,6 +79,9 @@ mock.module("../../../server/lib/codex-manager", () => ({
 			tierOrder: [...managerTierOrder],
 			effectiveTierOrder: getEffectiveTierOrder(),
 		}),
+		updateCredential: (id: string, fields: unknown) => {
+			codexCredentialUpdates.push({ id, fields });
+		},
 		setLoadBalancingMode: () => {},
 		setTierOrder: (tierOrder: CodexTier[]) => {
 			managerTierOrder = [...tierOrder];
@@ -162,6 +168,23 @@ const authUser = {
 	iat: 0,
 	exp: Number.MAX_SAFE_INTEGER,
 };
+
+/**
+ * `assertAdmin` authorizes against the LIVE role read through the session store, never the
+ * token's `role` claim. The middleware below only sets `c.get("user")`, so this seam makes
+ * the store report the acting admin as an admin; without it the admin-gated routes would
+ * hit the real (empty) database and 401 USER_GONE.
+ */
+const sessionStoreSeam: AuthSessionStore = {
+	...authSessionStore,
+	findSessionState: async (id) => ({
+		id,
+		role: id === authUser.sub ? "admin" : "user",
+		tokenVersion: 0,
+	}),
+};
+setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
+
 const app = new Hono();
 app.use("*", async (c, next) => {
 	c.set("auth", { type: "session", user: authUser });
@@ -183,12 +206,14 @@ beforeEach(() => {
 	saveSettingsCalls = 0;
 	codexImportedCredentials = [];
 	codexRemoveUnhealthyCalls = 0;
+	codexCredentialUpdates = [];
 	managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 	browserCallbackUrls = [];
 	browserCallbackError = null;
 });
 
 afterAll(() => {
+	setAuthStores(undefined);
 	// Re-point every globally-mocked module back to the real implementation so
 	// settings / manager / logger mocks don't leak into later suites.
 	for (const [specifier, factory] of Object.entries(realCodexModules)) {
@@ -198,6 +223,77 @@ afterAll(() => {
 });
 
 describe("codex routes validation", () => {
+	it.each([
+		true,
+		false,
+	])("accepts useCreditQuota=%s and forwards the validated patch", async (useCreditQuota) => {
+		const fields = { displayName: "Credit account", priority: 1.5, useCreditQuota };
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(fields),
+		});
+		expect(res.status).toBe(200);
+		expect(codexCredentialUpdates).toEqual([{ id: "credit-account", fields }]);
+	});
+
+	it.each([
+		{},
+		{ displayName: "Renamed" },
+		{ priority: -2 },
+	])("preserves optional patch fields %j", async (fields) => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(fields),
+		});
+		expect(res.status).toBe(200);
+		expect(codexCredentialUpdates).toEqual([{ id: "credit-account", fields }]);
+	});
+
+	it.each([
+		["true"],
+		["false"],
+		[1],
+		[0],
+		[null],
+		[[]],
+		[{}],
+	])("rejects non-boolean useCreditQuota=%j without mutating manager", async (useCreditQuota) => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ useCreditQuota }),
+		});
+		expect(res.status).toBe(400);
+		expect(codexCredentialUpdates).toEqual([]);
+	});
+
+	it.each([
+		{ displayName: 123 },
+		{ displayName: null },
+		{ priority: "2" },
+		{ priority: null },
+	])("rejects malformed legacy patch fields %j", async (fields) => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(fields),
+		});
+		expect(res.status).toBe(400);
+		expect(codexCredentialUpdates).toEqual([]);
+	});
+
+	it("rejects non-finite JSON priority without mutating manager", async () => {
+		const res = await app.request("/credentials/credit-account", {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: '{"priority":1e9999}',
+		});
+		expect(res.status).toBe(400);
+		expect(codexCredentialUpdates).toEqual([]);
+	});
+
 	it("defaults websocket mode to enabled when unset", async () => {
 		const res = await app.request("/status");
 

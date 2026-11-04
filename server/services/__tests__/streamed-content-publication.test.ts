@@ -59,7 +59,7 @@ const thought = "先分析，再运行工具。";
 const text = "我先检查源文件。";
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	getActiveReasoningSource: () => "test:channel",
 	async *chat(params) {
@@ -131,9 +131,6 @@ const provider: ProviderAdapter = {
 		}
 		await bounded(releaseProvider.promise);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -150,9 +147,11 @@ mock.module("../../lib/agent/provider", () => ({
 	}),
 }));
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
+const { withRuntimePolicyTrait } = await import("../../lib/runtime-policy-trait");
 const { agentLoop } = await import("../../lib/agent/loop");
 await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
+const { handlePermission } = await import("../narrator-permission");
 const {
 	processEvent,
 	clearStreamingSnapshot,
@@ -178,18 +177,28 @@ toolRegistry.register({
 	},
 });
 
+const childCeiling = withRuntimePolicyTrait([], {
+	version: 1,
+	tools: ["PublicationHold"],
+	deny: ["spawnAgent", "awaitAgent", "askUserQuestion"],
+});
+
 function seed(subagent: boolean) {
 	const now = new Date().toISOString();
 	for (const id of subagent ? ["parent", "child"] : ["main"]) {
 		sqlite
 			.prepare(
-				"INSERT INTO narrators (id, type, variant, parent_narrator_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+				"INSERT INTO narrators (id, type, variant, parent_narrator_id, traits, permission_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.run(
 				id,
 				id === "child" ? "subagent" : "primary",
 				id === "child" ? "subagent:general" : "primary",
 				id === "child" ? "parent" : null,
+				// The final start gate enforces the stored ceiling; the delegated fixture's
+				// ceiling must admit this file's test tool like any other allowed tool.
+				JSON.stringify(id === "child" ? childCeiling : []),
+				"bypassPermissions",
 				now,
 				now,
 			);
@@ -219,15 +228,31 @@ function makeContext(subagent: boolean): EventHandlerContext {
 }
 
 function makeConfig(ctx: EventHandlerContext): AgentConfig {
+	const signal = new AbortController().signal;
+	const cwd = process.env.NARRAFORK_HOME as string;
 	return {
 		narratorId: ctx.narratorId,
 		conversationId: ctx.conversationId,
 		provider: "test",
 		model: "test:model",
-		cwd: process.env.NARRAFORK_HOME as string,
-		signal: new AbortController().signal,
+		cwd,
+		signal,
 		silentToolCallThreshold: -1,
-		permissionHandler: async () => ({ behavior: "allow" }),
+		// An in-memory `allow` is not an approval receipt. Exercise the real
+		// permission writer so the real final-start gate can validate this attempt.
+		permissionHandler: (name, input, id, options) =>
+			handlePermission(
+				ctx.narratorId,
+				signal,
+				name,
+				input,
+				id,
+				cwd,
+				"en",
+				ctx.broadcastTargetId,
+				options,
+				ctx.parentToolUseId,
+			),
 		onToolExecutionStarting: (toolUseId, binding, startedAt) =>
 			narratorPersistence.claimToolCallExecution(ctx.narratorId, toolUseId, binding, startedAt),
 	};
@@ -279,9 +304,9 @@ describe("real loop content publication before tools", () => {
 				const events: AgentEvent[] = [];
 				let messageId: string | undefined;
 				const running = executeAgentLoop(
-					{ config, userText: "Inspect then report", history: [], eventContext: ctx },
+					{ config, userText: "Inspect then report", history: { rows: [] }, eventContext: ctx },
 					{
-						eventSource: agentLoop(config, "Inspect then report", []),
+						eventSource: agentLoop(config, "Inspect then report", { rows: [] }),
 						processEventFn: async (event, context, hooks) => {
 							const result = await processEvent(event, context, hooks);
 							events.push(event);
@@ -317,6 +342,7 @@ describe("real loop content publication before tools", () => {
 					for (const block of committed.blocks.slice(0, 2)) {
 						expect(block.id).toBeString();
 						expect(block.revision).toBeNumber();
+						expect(block.completed).toBe(route === "native-metadata");
 					}
 					if (route === "native-metadata")
 						expect(committed.blocks[0]).toMatchObject({
@@ -361,6 +387,7 @@ describe("real loop content publication before tools", () => {
 					const result = await bounded(running);
 					expect(result.hasError).toBe(false);
 					const final = readMessage(messageId as string);
+					expect(final.blocks.slice(0, 2).every((block) => block.completed === true)).toBe(true);
 					expect(final.seq).toBe(committed.seq);
 					expect(final.blocks.map((block) => block.type)).toEqual([
 						"reasoning",
@@ -395,7 +422,7 @@ describe("real loop content publication before tools", () => {
 				executeAgentLoop({
 					config: makeConfig(ctx),
 					userText: "Fail closed",
-					history: [],
+					history: { rows: [] },
 					eventContext: ctx,
 				}),
 			).rejects.toBeInstanceOf(CriticalEventPersistenceError);

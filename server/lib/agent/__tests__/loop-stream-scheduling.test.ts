@@ -47,7 +47,7 @@ const names = [
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -57,9 +57,6 @@ const provider: ProviderAdapter = {
 		}
 		yield* script(params);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -145,7 +142,7 @@ function run(
 		...overrides,
 	};
 	return (async () => {
-		for await (const event of agentLoop(config, "execute in order", [])) {
+		for await (const event of agentLoop(config, "execute in order", { rows: [] })) {
 			events.push(event);
 			await onEvent?.(event);
 		}
@@ -172,67 +169,77 @@ describe("event-driven immediate guidance", () => {
 			guidance.abort();
 			let softStopTaken = false;
 			let softStopCalls = 0;
-			const pushes: Parameters<ProviderAdapter["pushUserTurn"]>[] = [];
-			const originalUser = provider.pushUserTurn;
-			provider.pushUserTurn = (...args) => {
-				pushes.push(args);
-			};
 			script = async function* () {
 				yield { text: "Unexpected provider activation" };
 				throw new Error("Pre-aborted guidance activated provider");
 			};
-			const results = [
-				{ toolUseId: "previous", output: "completed before guidance", isError: false },
-			];
 			const events: AgentEvent[] = [];
-			const history: unknown[] = [];
-			try {
-				for await (const event of agentLoop(
-					{
-						narratorId: "n-preaborted-guidance",
-						conversationId: "conv-preaborted-guidance",
-						provider: "test",
-						model: "test:model",
-						cwd: "/tmp",
-						signal: new AbortController().signal,
-						[channel]: guidance.signal,
-						permissionHandler: async () => ({ behavior: "allow" }),
-						shouldStop: () => {
-							softStopCalls++;
-							softStopTaken = true;
-							return true;
-						},
+			for await (const event of agentLoop(
+				{
+					narratorId: "n-preaborted-guidance",
+					conversationId: "conv-preaborted-guidance",
+					provider: "test",
+					model: "test:model",
+					cwd: "/tmp",
+					signal: new AbortController().signal,
+					[channel]: guidance.signal,
+					permissionHandler: async () => ({ behavior: "allow" }),
+					shouldYieldToInput: () => {
+						softStopCalls++;
+						softStopTaken = true;
+						return true;
 					},
-					"queued guidance",
-					history,
-					results,
-				))
-					events.push(event);
-				expect(attempts).toBe(0);
-				expect(softStopTaken).toBe(true);
-				expect(softStopCalls).toBe(1);
-				expect(pushes).toHaveLength(1);
-				expect(pushes[0]?.[0]).toEqual(history);
-				expect(pushes[0]?.[1]).toBe("queued guidance");
-				expect(pushes[0]?.[3]).toBe(results);
-				expect(events).toEqual([{ type: "turn_complete", turnIndex: 0 }]);
-			} finally {
-				provider.pushUserTurn = originalUser;
-			}
+				},
+				"queued guidance",
+			))
+				events.push(event);
+			// The queued input stays with the host (nothing was sent, nothing is written).
+			expect(attempts).toBe(0);
+			expect(softStopTaken).toBe(true);
+			expect(softStopCalls).toBe(1);
+			expect(events).toEqual([{ type: "turn_complete", turnIndex: 0 }]);
 		});
 	}
 
-	for (const phase of ["before-first-token", "text", "reasoning", "tool-input"] as const) {
-		test(`cancels a silent provider during ${phase} without retry or whole-run abort`, async () => {
+	test("cancels a provider that has not streamed anything without retry or whole-run abort", async () => {
+		const guidance = new AbortController();
+		const parent = new AbortController();
+		script = async function* (params) {
+			queueMicrotask(() => guidance.abort());
+			await waitForAbort(params.signal);
+		};
+		const events = await run({
+			guidanceSignal: guidance.signal,
+			signal: parent.signal,
+			maxTransientRetries: 10,
+		});
+		expect(attempts).toBe(1);
+		expect(parent.signal.aborted).toBe(false);
+		expect(started).toEqual([]);
+		expectSuccess(events);
+		expect(events.at(-1)?.type).toBe("turn_complete");
+		expect(events.filter((e) => e.type === "assistant_message")).toEqual([]);
+	});
+
+	for (const phase of ["text", "reasoning", "tool-input"] as const) {
+		test(`lets the ${phase} block finish and cuts at the next tool call`, async () => {
 			const guidance = new AbortController();
 			const parent = new AbortController();
+			let providerSignal: AbortSignal | undefined;
 			script = async function* (params) {
+				providerSignal = params.signal;
 				if (phase === "text") yield { text: "partial answer" };
 				if (phase === "reasoning") yield { reasoning: "partial thought", reasoningOutputIndex: 0 };
 				if (phase === "tool-input")
 					yield { toolUseChunk: { toolUseId: "partial", name: "Read", input: '{"value":"' } };
-				queueMicrotask(() => guidance.abort());
-				await waitForAbort(params.signal);
+				guidance.abort();
+				await nextTick();
+				expect(params.signal.aborted).toBe(false);
+				if (phase === "text") yield { text: ", completed" };
+				if (phase === "reasoning") yield { reasoning: " completed", reasoningOutputIndex: 0 };
+				if (phase === "tool-input") yield { toolUses: [tool("Read", "partial", 0)] };
+				yield { toolUses: [tool("Write", "cut", 1)] };
+				throw new Error("Stream continued past the guidance cut point");
 			};
 			const events = await run({
 				guidanceSignal: guidance.signal,
@@ -240,22 +247,74 @@ describe("event-driven immediate guidance", () => {
 				maxTransientRetries: 10,
 			});
 			expect(attempts).toBe(1);
+			expect(providerSignal?.aborted).toBe(true);
 			expect(parent.signal.aborted).toBe(false);
-			expect(started).toEqual([]);
+			// The call completed before the cut is executed, never skipped.
+			expect(started).toEqual(phase === "tool-input" ? ["partial"] : []);
 			expectSuccess(events);
 			expect(events.at(-1)?.type).toBe("turn_complete");
-			if (phase === "before-first-token")
-				expect(events.filter((e) => e.type === "assistant_message")).toEqual([]);
+			const message = events.find((e) => e.type === "assistant_message");
+			expect(
+				message?.type === "assistant_message" && message.toolUses.map((t) => t.toolUseId),
+			).toEqual(phase === "tool-input" ? ["partial"] : []);
+			expect(events.some((e) => e.type === "tool_result" && e.toolUseId === "cut")).toBe(false);
 			if (phase === "text")
-				expect(
-					events.some((e) => e.type === "assistant_message" && e.text === "partial answer"),
-				).toBe(true);
+				expect(message?.type === "assistant_message" && message.text).toBe(
+					"partial answer, completed",
+				);
 			if (phase === "reasoning")
 				expect(
-					events.some((e) => e.type === "block_complete" && e.block.type === "reasoning"),
+					events.some(
+						(e) =>
+							e.type === "block_complete" &&
+							e.block.type === "reasoning" &&
+							JSON.stringify(e.block).includes("partial thought completed"),
+					),
 				).toBe(true);
+			if (phase === "tool-input")
+				expect(
+					events.find((e) => e.type === "tool_result" && e.toolUseId === "partial"),
+				).toMatchObject({ output: "ok:partial", isError: false });
 		});
 	}
+
+	test("a response that ends on its own after guidance keeps all of its output", async () => {
+		const guidance = new AbortController();
+		script = async function* () {
+			yield { text: "first half" };
+			guidance.abort();
+			await nextTick();
+			yield { text: " and second half" };
+		};
+		const events = await run({ guidanceSignal: guidance.signal });
+		expect(attempts).toBe(1);
+		expectSuccess(events);
+		expect(events.find((e) => e.type === "assistant_message")).toMatchObject({
+			text: "first half and second half",
+		});
+		expect(events.at(-1)?.type).toBe("turn_complete");
+	});
+
+	test("urgent guidance after live guidance still cancels a stalled stream", async () => {
+		const guidance = new AbortController();
+		const urgent = new AbortController();
+		script = async function* (params) {
+			yield { text: "partial" };
+			guidance.abort();
+			await nextTick();
+			expect(params.signal.aborted).toBe(false);
+			queueMicrotask(() => urgent.abort());
+			await waitForAbort(params.signal);
+		};
+		const events = await run({
+			guidanceSignal: guidance.signal,
+			urgentGuidanceSignal: urgent.signal,
+		});
+		expect(attempts).toBe(1);
+		expectSuccess(events);
+		expect(events.find((e) => e.type === "assistant_message")).toMatchObject({ text: "partial" });
+		expect(events.at(-1)?.type).toBe("turn_complete");
+	});
 
 	test("preserves running parallel signals and drains every result exactly once", async () => {
 		const guidance = new AbortController();
@@ -271,29 +330,32 @@ describe("event-driven immediate guidance", () => {
 			expect(toolSignals.get("b")?.aborted).toBe(false);
 			a.release();
 			b.release();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
 		const events = await run({ guidanceSignal: guidance.signal });
 		expect(providerSignal?.aborted).toBe(true);
-		expect(started).toEqual(["a", "b"]);
-		for (const id of ["a", "b"])
+		expect(started).toEqual(["a", "b", "queued"]);
+		for (const id of ["a", "b", "queued"])
 			expect(
 				events.filter((e) => e.type === "tool_result" && e.toolUseId === id && !e.isError),
 			).toHaveLength(1);
-		expect(events.find((e) => e.type === "tool_result" && e.toolUseId === "queued")).toMatchObject({
-			metadata: { skippedForSoftStop: true },
-		});
+		expect(events.some((e) => e.type === "tool_result" && e.toolUseId === "cut")).toBe(false);
 		expectSuccess(events);
+		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
-	test("revokes pending permission preparation before any body starts", async () => {
+	test("keeps a pending permission request open and runs the call once granted", async () => {
 		const guidance = new AbortController();
 		const permissionEntered = gate();
+		const guided = gate();
 		let permissionSignal: AbortSignal | undefined;
 		script = async function* (params) {
 			yield { toolUses: [tool("Read", "permission", 0)] };
 			await permissionEntered.promise;
 			guidance.abort();
+			guided.resolve();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
 		const events = await run({
@@ -301,19 +363,21 @@ describe("event-driven immediate guidance", () => {
 			permissionHandler: async (_name, _input, _id, options) => {
 				permissionSignal = options?.signal;
 				permissionEntered.resolve();
-				if (!options?.signal) throw new Error("Missing preparation signal");
-				return waitForAbort(options.signal);
+				await guided.promise;
+				await nextTick();
+				return { behavior: "allow" };
 			},
 		});
-		expect(permissionSignal?.aborted).toBe(true);
-		expect(started).toEqual([]);
-		expect(
-			events.filter((e) => e.type === "tool_result" && e.toolUseId === "permission"),
-		).toHaveLength(1);
+		expect(permissionSignal?.aborted).toBe(false);
+		expect(started).toEqual(["permission"]);
+		expect(events.filter((e) => e.type === "tool_result" && e.toolUseId === "permission")).toEqual([
+			expect.objectContaining({ output: "ok:permission", isError: false }),
+		]);
 		expectSuccess(events);
+		expect(events.at(-1)?.type).toBe("turn_complete");
 	});
 
-	test("guidance during the before snapshot cannot claim or run the tool body", async () => {
+	test("guidance during the before snapshot still runs the tool body", async () => {
 		const guidance = new AbortController();
 		const beforeEntered = gate();
 		const releaseBefore = gate();
@@ -322,6 +386,7 @@ describe("event-driven immediate guidance", () => {
 			await beforeEntered.promise;
 			guidance.abort();
 			releaseBefore.resolve();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
 		const events = await run({
@@ -331,48 +396,43 @@ describe("event-driven immediate guidance", () => {
 				await releaseBefore.promise;
 			},
 		});
-		expect(started).toEqual([]);
-		expect(
-			events.filter((e) => e.type === "tool_result" && e.toolUseId === "snapshot"),
-		).toHaveLength(1);
+		expect(started).toEqual(["snapshot"]);
+		expect(events.filter((e) => e.type === "tool_result" && e.toolUseId === "snapshot")).toEqual([
+			expect.objectContaining({ output: "ok:snapshot", isError: false }),
+		]);
 		expectSuccess(events);
 	});
 
-	test("guidance commits matched assistant/tool results to model history", async () => {
+	test("guidance settles the matched assistant step and its results for the host", async () => {
 		const guidance = new AbortController();
 		const a = watch("history", true);
-		const assistantTurns: Parameters<ProviderAdapter["pushAssistantTurn"]>[] = [];
-		const userTurns: Parameters<ProviderAdapter["pushUserTurn"]>[] = [];
-		const originalAssistant = provider.pushAssistantTurn;
-		const originalUser = provider.pushUserTurn;
-		provider.pushAssistantTurn = (...args) => {
-			assistantTurns.push(args);
-		};
-		provider.pushUserTurn = (...args) => {
-			userTurns.push(args);
-		};
 		script = async function* (params) {
 			yield { text: "partial" };
 			yield { toolUses: [tool("Read", "history", 0), tool("Write", "queued", 1)] };
 			await a.started;
 			guidance.abort();
 			a.release();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
-		try {
-			await run({ guidanceSignal: guidance.signal });
-			expect(assistantTurns).toHaveLength(1);
-			expect(assistantTurns[0]?.[1]).toBe("partial");
-			expect(assistantTurns[0]?.[2]?.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
-			expect(userTurns).toHaveLength(2);
-			expect(userTurns[1]?.[3]).toEqual([
-				expect.objectContaining({ toolUseId: "history", output: "ok:history", isError: false }),
-				expect.objectContaining({ toolUseId: "queued", isError: true }),
-			]);
-		} finally {
-			provider.pushAssistantTurn = originalAssistant;
-			provider.pushUserTurn = originalUser;
-		}
+		const events = await run({ guidanceSignal: guidance.signal });
+		// The step the host stores: the text and the calls before the cut, not the cut call.
+		const steps = events.filter((event) => event.type === "assistant_message");
+		expect(steps).toHaveLength(1);
+		const step = steps[0] as Extract<AgentEvent, { type: "assistant_message" }>;
+		expect(step.text).toBe("partial");
+		expect(step.toolUses.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
+		// Each call settles exactly once, and both run: guidance never skips a produced call.
+		const results = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
+				event.type === "tool_result",
+		);
+		expect(results.map((result) => [result.toolUseId, result.isError])).toEqual([
+			["history", false],
+			["queued", false],
+		]);
+		expect(results[0]?.output).toBe("ok:history");
+		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
 	for (const mode of ["urgent", "urgent-post-stream", "safe-then-hard-abort"] as const) {
@@ -389,6 +449,7 @@ describe("event-driven immediate guidance", () => {
 				if (mode === "urgent-post-stream") return;
 				if (mode === "urgent") urgent.abort();
 				else guidance.abort();
+				yield { toolUses: [tool("Write", "cut", 9)] };
 				await waitForAbort(params.signal);
 			};
 			try {
@@ -992,10 +1053,33 @@ describe("ordered streaming tool scheduling", () => {
 		expectSuccess(await result);
 	});
 
+	for (const name of ["Agent", "Await", "Send"]) {
+		test(`${name} starts mid-stream together with a following parallel Read`, async () => {
+			const control = watch("control", true);
+			const read = watch("read", true);
+			const streamPending = gate();
+			const endStream = gate();
+			script = async function* () {
+				yield { toolUses: [tool(name, "control", 0), tool("Read", "read", 1)] };
+				streamPending.resolve();
+				await endStream.promise;
+			};
+			const result = run();
+			try {
+				await streamPending.promise;
+				await control.started;
+				await read.started;
+				expect(started).toEqual(["control", "read"]);
+			} finally {
+				control.release();
+				read.release();
+				endStream.resolve();
+			}
+			expectSuccess(await result);
+		});
+	}
+
 	for (const name of [
-		"Agent",
-		"Await",
-		"Send",
 		"EnterPlanMode",
 		"DangerConfirm",
 		"TaskReflectConfirm",
@@ -1004,7 +1088,9 @@ describe("ordered streaming tool scheduling", () => {
 		"Edit",
 	]) {
 		const virtualWrite = name === "Write" || name === "Edit";
-		test(`${virtualWrite ? `virtual spec ${name}` : name} defers itself and following Read until stream end`, async () => {
+		test(`${virtualWrite ? `virtual spec ${name}` : name} runs mid-stream and releases a following Read only once its result is consumed`, async () => {
+			const control = watch("control", true);
+			const read = watch("read");
 			const streamPending = gate();
 			const endStream = gate();
 			script = async function* () {
@@ -1015,14 +1101,26 @@ describe("ordered streaming tool scheduling", () => {
 					],
 				};
 				streamPending.resolve();
+				// The provider goes quiet: nothing but a settled tool can move the loop now.
 				await endStream.promise;
 			};
-			const result = run();
+			const startedWhenConsumed: string[][] = [];
+			const result = run({}, (event) => {
+				if (event.type === "tool_result" && event.toolUseId === "control")
+					startedWhenConsumed.push([...started]);
+			});
 			try {
 				await streamPending.promise;
+				await control.started;
 				await nextTick();
-				expect(started).toEqual([]);
+				expect(started).toEqual(["control"]);
+				control.release();
+				// Read starts while the stream is still open, after control's result was
+				// consumed: effects applied by the consumer are visible to it.
+				await read.started;
+				expect(startedWhenConsumed).toEqual([["control"]]);
 			} finally {
+				control.release();
 				endStream.resolve();
 			}
 			expectSuccess(await result);
@@ -1220,6 +1318,8 @@ describe("detached eager tool results after interruption", () => {
 					signal: ac.signal,
 					requireToolCallBinding: true,
 					onToolExecutionStarting: async (_id, binding) => binding,
+					// Observer-order fixture has no DB actor; real authorization is covered separately.
+					onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
 					onToolExecutionAfter: async ({ toolUse, result }) => {
 						if (toolUse.toolUseId !== "write") return;
 						expect(result?.output).toBe("ok:write");
@@ -1275,6 +1375,8 @@ describe("detached eager tool results after interruption", () => {
 						signal: ac.signal,
 						requireToolCallBinding: true,
 						onToolExecutionStarting: async (_id, binding) => binding,
+						// Observer-order fixture has no DB actor; real authorization is covered separately.
+						onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
 						onDetachedToolResult: async (event) => {
 							detached.push(event);
 							persisted.resolve();

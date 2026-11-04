@@ -129,6 +129,18 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "gen_ui",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "GenUI",
+			descriptionEn:
+				"GenUI — draw UI in the conversation as it is generated, composed from the project's own component kit (or built-in components), and preview workspace UI files",
+			descriptionZh:
+				"GenUI — 在对话中边生成边绘制界面，使用项目自己的组件包（或内置组件）组合，并可预览工作区 UI 文件",
+		},
+	},
+	{
 		id: "notification",
 		type: "tool",
 		category: "tools",
@@ -278,6 +290,19 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 			descriptionEn:
 				"Knowledge review — review and approve/reject publish requests into the global base, resolve conflicts",
 			descriptionZh: "知识库审阅 — 审阅并批准/驳回发布到全局库的请求，解决冲突",
+		},
+	},
+
+	{
+		id: "outline_edit",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "OutlineEdit",
+			descriptionEn:
+				"Outline edit — write the block outline with markdown outlines: add, replace, move, delete, check off tasks (needs the outline turned on)",
+			descriptionZh:
+				"大纲编辑 — 用 markdown 大纲写块大纲：新增、改写、移动、删除、勾选任务（需开启大纲）",
 		},
 	},
 

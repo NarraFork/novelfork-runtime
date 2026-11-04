@@ -32,6 +32,13 @@ import {
 } from "@shared/file-change-protocol";
 import { AppError } from "../lib/errors";
 import {
+	bodyLengthSql,
+	boundedBodyText,
+	hasBlockStorage,
+	hasRowsOnlyBodies,
+} from "../lib/narrator-bodies";
+import { settings } from "../lib/settings";
+import {
 	createFileChangeIdentity,
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
@@ -104,6 +111,8 @@ export interface RevertSelectionTool {
 	messageId: string;
 	toolUseId: string;
 	toolName: string;
+	/** Bounded scalar extracted in SQL; never materialize the full tool input. */
+	genUiAction?: string | null;
 	status: string;
 	isBackground: number;
 	executionIdentityVersion: number;
@@ -122,6 +131,7 @@ export interface RevertSelectionTool {
 }
 export interface RevertSelectionOperation {
 	id: string;
+	journalSeq: number;
 	executionSegmentId: string | null;
 	evidenceVersion: number;
 	sourceInstanceId: string;
@@ -267,7 +277,7 @@ interface ScopeState {
  * history writers must bump messageVersion, and execution must recheck returned versions/digests.
  * A direct unversioned write after its source's last verification can still race the preview.
  *
- * Current FK actions are inventoried explicitly, including spec revisions/chapter commits;
+ * Current FK actions are inventoried explicitly, including spec revisions;
  * COW of a shared partial message counts retained tool payload bytes without loading them.
  * No record is physically deleted by this class. Device authorization/current-state checks,
  * history execution, reversal, blob publication and plan proof generation remain downstream.
@@ -524,7 +534,7 @@ export class RevertSelectionService {
 	private ref(state: ScopeState, narratorId: string, messageId: string): RefRow {
 		const ref = this.one<RefRow>(
 			state,
-			`${REF_SELECT} WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
+			`${refSelect(this.database.$client)} WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
 			[narratorId, messageId],
 		);
 		if (!ref) throw fail("NOT_FOUND", "Selected message has no actual owning ref");
@@ -576,7 +586,7 @@ export class RevertSelectionService {
 		for (;;) {
 			const page = this.rows<RefRow>(
 				state,
-				`${REF_SELECT} WHERE r.narrator_id = ? AND (r.seq, r.rowid) >= (?, ?) ORDER BY r.seq, r.rowid LIMIT ?`,
+				`${refSelect(this.database.$client)} WHERE r.narrator_id = ? AND (r.seq, r.rowid) >= (?, ?) ORDER BY r.seq, r.rowid LIMIT ?`,
 				[narratorId, cursor.seq, cursor.rowid, REVERT_SELECTION_PAGE_ITEMS + 1],
 			);
 			for (const ref of page.slice(0, REVERT_SELECTION_PAGE_ITEMS))
@@ -605,14 +615,19 @@ export class RevertSelectionService {
 		return summary;
 	}
 	private readBody(state: ScopeState, ref: RefRow): string {
-		const content = this.one<{ body: string }>(
-			state,
-			"SELECT content_json AS body FROM narrator_messages WHERE id = ? AND octet_length(content_json) = ? AND octet_length(content_json) <= ? LIMIT 1",
-			[ref.id, ref.contentBytes, REVERT_SELECTION_LIMITS.messageBytes],
-			false,
+		this.check(state);
+		state.queries++;
+		const body = boundedBodyText(
+			this.database.$client,
+			ref.id,
+			bodiesFromBlocks(this.database.$client),
+			{
+				exactBytes: ref.contentBytes,
+				maxBytes: REVERT_SELECTION_LIMITS.messageBytes,
+			},
 		);
-		if (!content) throw fail("STALE", "Message changed before bounded inspection");
-		return content.body;
+		if (body === undefined) throw fail("STALE", "Message changed before bounded inspection");
+		return body;
 	}
 
 	private async message(
@@ -772,17 +787,22 @@ export class RevertSelectionService {
 			});
 			return;
 		}
-		const isFileTool = ["Write", "Edit", "StructSed"].includes(tool.toolName);
+		const isUiShow = tool.toolName === "GenUI" && tool.genUiAction === "show";
+		const isFileTool =
+			["Write", "Edit", "StructSed"].includes(tool.toolName) ||
+			(tool.toolName === "GenUI" && !isUiShow);
 		const isDelegationTool = ["Agent", "Task"].includes(tool.toolName);
 		if (!isFileTool && !isDelegationTool) {
 			this.add(state, state.result.noDiskTools, {
 				toolCallId: tool.id,
-				reason: READ_ONLY_TOOLS.has(tool.toolName) ? "read_only" : "non_file_change",
+				reason: isUiShow || READ_ONLY_TOOLS.has(tool.toolName) ? "read_only" : "non_file_change",
 			});
 			return;
 		}
 		if (isFileTool && (!["success", "fail"].includes(tool.status) || Boolean(tool.isBackground))) {
-			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "pending" });
+			// An unfinished attempt is not proof of zero IO. Keep earlier settled effects
+			// available, but leave coverage partial until this file attempt has settled.
+			this.issue(state, { code: "FILE_TOOL_PENDING", toolCallId: tool.id });
 			return;
 		}
 		if (!["success", "fail"].includes(tool.status))
@@ -984,11 +1004,12 @@ export class RevertSelectionService {
 			? JSON.parse(operation.executionBindingJson)
 			: null;
 		if (
-			!binding ||
-			binding.deviceId !== tool.executionDeviceId ||
-			binding.runtimeGeneration !== tool.runtimeGeneration ||
+			(operation.evidenceVersion === 2 &&
+				(!binding ||
+					binding.deviceId !== tool.executionDeviceId ||
+					binding.runtimeGeneration !== tool.runtimeGeneration)) ||
 			tool.executionIdentityVersion !== 1 ||
-			operation.evidenceVersion !== 2 ||
+			![2, 3].includes(operation.evidenceVersion) ||
 			operation.sourceKind !== "tool" ||
 			operation.sourceId !== origin ||
 			operation.toolCallId !== origin ||
@@ -1039,8 +1060,9 @@ export class RevertSelectionService {
 					FILE_CHANGE_LIMITS.historyToolRelatedChanges,
 					"selected effects",
 				);
-				const effect = decodeEffect(row, operation.attempt);
-				integer(effect.scopeRevision, 0, Number.MAX_SAFE_INTEGER, "scope revision");
+				const effect = decodeEffect(row, operation.attempt, operation.journalSeq);
+				if (effect.scopeRevision !== null)
+					integer(effect.scopeRevision, 0, Number.MAX_SAFE_INTEGER, "legacy scope revision");
 				const actualScope = this.one<{
 					id: string;
 					sourceInstanceId: string;
@@ -1056,7 +1078,6 @@ export class RevertSelectionService {
 				);
 				if (
 					!actualScope ||
-					actualScope.status !== "active" ||
 					JSON.stringify(
 						Object.entries(createFileChangeIdentity(actualScope, effect.identity)).sort(),
 					) !== JSON.stringify(Object.entries(effect.identity).sort())
@@ -1111,9 +1132,13 @@ export class RevertSelectionService {
 					this.issue(state, { code: "EFFECT_PIN_MISSING", operationId: operation.id });
 				if (
 					effect.phase !== "apply" ||
-					!binding ||
-					!effect.executionReceipt ||
-					!fileChangeExecutionBindingMatches(binding, effect.executionReceipt.executionBinding) ||
+					(operation.evidenceVersion === 2 &&
+						(!binding ||
+							!effect.executionReceipt ||
+							!fileChangeExecutionBindingMatches(
+								binding,
+								effect.executionReceipt.executionBinding,
+							))) ||
 					(!hasConfirmedNoFileChange(effect) && !hasSettledMeasuredFileEffect(effect))
 				)
 					this.issue(state, { code: "EFFECT_UNRESOLVED", operationId: operation.id });
@@ -1197,16 +1222,26 @@ function sourceRowsDigest(rows: unknown[]): string {
 }
 
 const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
- acl_root_narrator_id AS aclRootNarratorId, chapter_id AS chapterId, context_project_id AS contextProjectId,
+ acl_root_narrator_id AS aclRootNarratorId, context_project_id AS contextProjectId,
  message_version AS messageVersion, refs_inherited_from AS refsInheritedFrom, status,
  parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators`;
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
-const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
- coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
- octet_length(m.content_json) + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
+/** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
+const bodiesFromBlocks = (db: Database) =>
+	hasBlockStorage(db) && (settings.narratorBlocks.read || hasRowsOnlyBodies(db));
+/** Refs with their message's sizes; a body is measured as readers read it. */
+const refSelect = (db: Database) => {
+	const body = bodyLengthSql("m", bodiesFromBlocks(db));
+	return `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
+ coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, ${body} AS contentBytes,
+ ${body} + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
  m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha
  FROM narrator_message_refs r LEFT JOIN narrator_messages m ON m.id = r.message_id`;
+};
 const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS messageId, tool_use_id AS toolUseId, tool_name AS toolName, status,
+ CASE WHEN tool_name = 'GenUI' AND octet_length(input_json) <= 8192
+ THEN CASE WHEN json_valid(input_json) THEN CASE WHEN json_extract(input_json, '$.action') = 'show'
+ THEN 'show' ELSE 'create' END END END AS genUiAction,
  is_background AS isBackground, execution_identity_version AS executionIdentityVersion, execution_origin_tool_call_id AS executionOriginToolCallId,
  execution_attempt AS executionAttempt, file_change_operation_id AS fileChangeOperationId, execution_device_id AS executionDeviceId,
  execution_path_flavor AS executionPathFlavor, resolved_file_path AS resolvedFilePath, canonical_file_path AS canonicalFilePath,
@@ -1214,13 +1249,13 @@ const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS message
  coalesce(octet_length(input_json),0) + coalesce(octet_length(output_json),0) + coalesce(octet_length(execution_targets_json),0) AS copyBytes
  FROM narrator_tool_calls`;
 const OPERATION_SELECT = `SELECT id, execution_segment_id AS executionSegmentId, evidence_version AS evidenceVersion, source_instance_id AS sourceInstanceId, source_kind AS sourceKind, source_id AS sourceId,
- attempt, tool_call_id AS toolCallId, narrator_id AS narratorId, project_id AS projectId, request_digest AS requestDigest,
+ attempt, journal_seq AS journalSeq, tool_call_id AS toolCallId, narrator_id AS narratorId, project_id AS projectId, request_digest AS requestDigest,
  CASE WHEN octet_length(execution_binding_json) <= ${FILE_CHANGE_LIMITS.metadataBytes} THEN execution_binding_json END AS executionBindingJson,
  expected_effect_count AS expectedEffectCount, prepared_effect_count AS preparedEffectCount, settled_effect_count AS settledEffectCount,
  unresolved_effect_count AS unresolvedEffectCount, evidence_bytes AS evidenceBytes, execution_outcome AS executionOutcome,
  effect_outcome AS effectOutcome, settlement, coverage, attribution_grade AS attributionGrade, reason, finished_at AS finishedAt, updated_at AS updatedAt FROM file_change_operations`;
 const EFFECT_SELECT = `SELECT id, operation_id AS operationId, scope_id AS scopeId, file_key AS fileKey, scope_revision AS scopeRevision, mutation_id AS mutationId,
- request_digest AS requestDigest, phase, outcome, settlement, attribution_grade AS attribution, execution_confirmed AS executionConfirmed,
+ request_digest AS requestDigest, phase, outcome, disk_outcome AS diskOutcome, settlement, attribution_grade AS attribution, execution_confirmed AS executionConfirmed,
  lines_added AS linesAdded, lines_removed AS linesRemoved, before_blob_digest AS beforeBlobDigest, intended_after_blob_digest AS intendedAfterBlobDigest,
  observed_after_blob_digest AS observedAfterBlobDigest,
  CASE WHEN octet_length(identity_json) <= ${FILE_CHANGE_LIMITS.metadataBytes} THEN identity_json END AS identity,
@@ -1234,7 +1269,8 @@ interface EffectRow {
 	operationId: string;
 	scopeId: string;
 	fileKey: string;
-	scopeRevision: number;
+	scopeRevision: number | null;
+	diskOutcome: "applied" | "not_applied" | "unknown" | null;
 	mutationId: string;
 	requestDigest: string;
 	phase: FileChangeReversalEffect["phase"];
@@ -1253,7 +1289,11 @@ interface EffectRow {
 	observedAfter: string | null;
 	receipt: string | null;
 }
-function decodeEffect(row: EffectRow, attempt: number): FileChangeReversalEffect {
+function decodeEffect(
+	row: EffectRow,
+	attempt: number,
+	journalSeq: number,
+): FileChangeReversalEffect {
 	if (!row.identity || !row.beforeState || !row.intendedAfter || !row.observedAfter)
 		throw fail("METADATA_INVALID", "Missing or oversized effect metadata");
 	return {
@@ -1275,8 +1315,38 @@ function decodeEffect(row: EffectRow, attempt: number): FileChangeReversalEffect
 		linesAdded: row.linesAdded,
 		linesRemoved: row.linesRemoved,
 		scopeRevision: row.scopeRevision,
+		journalSeq,
+		diskOutcome: row.diskOutcome,
 	};
 }
+/** Explicit snapshots need a fully enumerated target set and each original before state. */
+export function isSnapshotSelectionComplete(selection: RevertSelectionResult): boolean {
+	if (
+		!selection.selectionComplete ||
+		selection.issues.some(
+			(issue) => !["EFFECT_UNRESOLVED", "OPERATION_UNRESOLVED"].includes(issue.code),
+		)
+	)
+		return false;
+	const counts = new Map<string, number>();
+	for (const effect of selection.effects) {
+		if (
+			effect.phase !== "apply" ||
+			effect.before.kind === "unknown" ||
+			effect.before.kind === "symlink" ||
+			(effect.before.kind === "regular" && effect.before.mode === null)
+		)
+			return false;
+		counts.set(effect.operationId, (counts.get(effect.operationId) ?? 0) + 1);
+	}
+	return selection.operations.every(
+		(operation) =>
+			operation.expectedEffectCount !== null &&
+			operation.expectedEffectCount === (counts.get(operation.id) ?? 0) &&
+			(operation.expectedEffectCount > 0 || isNoDispatch(operation)),
+	);
+}
+
 function isNoDispatch(op: RevertSelectionOperation) {
 	return (
 		op.expectedEffectCount === 0 &&
@@ -1306,7 +1376,6 @@ function stateRef(state: FileChangeState) {
 type AssociationSpec = readonly [table: string, column: string, index: string, idColumn?: string];
 const MESSAGE_ASSOCIATIONS: readonly AssociationSpec[] = [
 	["narrators", "fork_message_id", "idx_narrators_fork_message"],
-	["chapter_commits", "narrator_message_id", "idx_chapter_commits_narrator_message"],
 	["spec_file_revisions", "source_message_id", "idx_spec_file_revisions_source_message"],
 	["narrator_patches", "message_id", "idx_patches_message"],
 	["api_requests", "message_id", "idx_api_requests_message"],

@@ -1,16 +1,27 @@
-import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import type { NativeMediaInput } from "@shared/media-attachments";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { GeminiProviderConfig } from "../settings";
-import { parseModelId, settings } from "../settings";
+import { parseModelId } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
+import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { isCompletionLimitReason } from "./error-handling";
+import { GeminiMediaFiles } from "./gemini-media-files";
 import { reportInputCharacters } from "./input-characters";
+import {
+	createNativeMediaDumpEncoder,
+	interactionInlineMedia,
+	storedMessageMedia,
+	supportsNativeMediaProtocolInput,
+} from "./native-media";
+import { buildOpencodeSessionHeader } from "./opencode-session";
+import { type NeutralTurn, projectHistory, webSearchSummary } from "./projection";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -20,15 +31,18 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
-import { signatureSourcesCompatible } from "./reasoning-source";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
+import { unsupportedResponseFormatReason } from "./response-format";
+import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
-import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import { ApiError, type ResolvedToolDefinition } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 const GEMINI_IDENTITY: Record<string, string> = {
 	en: "You are an AI coding assistant with access to tools for reading, writing, and editing files, running shell commands, searching codebases, and more. You MUST use your tools to accomplish tasks — do not just describe what you would do. When the user asks you to do something, take action by calling the appropriate tools.",
@@ -43,7 +57,6 @@ export const GEMINI_MAX_STREAM_BYTES = 64 * 1024 * 1024;
 export const GEMINI_MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
 export const GEMINI_MAX_TEXT_BYTES = 16 * 1024 * 1024;
 export const GEMINI_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024;
-export const GEMINI_MAX_REQUEST_DUMP_BYTES = 4 * 1024 * 1024;
 
 interface GeminiSystemMarker {
 	type: "system";
@@ -86,10 +99,28 @@ interface GeminiFunctionResultStep {
 	call_id: string;
 	name: string;
 	result: unknown;
+	_nativeMedia?: NativeMediaInput[];
+}
+
+function expandInteractionToolResults(
+	results: GeminiFunctionResultStep[],
+): GeminiInteractionStep[] {
+	const steps: GeminiInteractionStep[] = results.map(({ _nativeMedia, ...step }) => step);
+	const media = results.flatMap((result) =>
+		(result._nativeMedia ?? []).flatMap((item): GeminiInputContent[] => [
+			{
+				type: "text",
+				text: `Tool result media source: ${JSON.stringify({ toolCallId: result.call_id })}`,
+			},
+			interactionInlineMedia(item),
+		]),
+	);
+	if (media.length) steps.push({ type: "user_input", content: media });
+	return steps;
 }
 
 interface GeminiInputContent {
-	type: "text" | "image";
+	type: "text" | "image" | "audio" | "video";
 	text?: string;
 	data?: string;
 	mime_type?: string;
@@ -174,31 +205,6 @@ function byteLength(text: string): number {
 	return new TextEncoder().encode(text).byteLength;
 }
 
-function resolveDumpLimit(configured: number | undefined): number {
-	if (configured == null) return DEFAULT_DUMP_MAX_BYTES;
-	if (configured < 0) return GEMINI_MAX_REQUEST_DUMP_BYTES;
-	return Math.min(configured, GEMINI_MAX_REQUEST_DUMP_BYTES);
-}
-
-function truncateUtf8ToBytes(
-	text: string,
-	maxBytes: number,
-): { text: string; bytes: number; truncated: boolean } {
-	const fullBytes = byteLength(text);
-	if (fullBytes <= maxBytes) return { text, bytes: fullBytes, truncated: false };
-	let low = 0;
-	let high = text.length;
-	while (low < high) {
-		const mid = Math.ceil((low + high) / 2);
-		if (byteLength(text.slice(0, mid)) <= maxBytes) low = mid;
-		else high = mid - 1;
-	}
-	// Avoid persisting a dangling high surrogate if the byte boundary split a pair.
-	if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
-	const accepted = text.slice(0, low);
-	return { text: accepted, bytes: byteLength(accepted), truncated: true };
-}
-
 function assertByteLimit(value: string, limit: number, label: string): void {
 	const size = byteLength(value);
 	if (size > limit) {
@@ -208,9 +214,15 @@ function assertByteLimit(value: string, limit: number, label: string): void {
 
 export class GeminiInteractionsProvider implements ProviderAdapter {
 	private config: GeminiProviderConfig;
+	private mediaFiles: GeminiMediaFiles;
 
 	constructor(config: GeminiProviderConfig) {
 		this.config = config;
+		this.mediaFiles = new GeminiMediaFiles({
+			baseUrl: this.baseUrl(),
+			apiKey: config.apiKey,
+			fetch: (input, init) => this.pfetch(input, init),
+		});
 	}
 
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -230,6 +242,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		return (this.config.baseUrl || DEFAULT_GEMINI_BASE).replace(/\/+$/, "");
 	}
 
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		return supportsNativeMediaProtocolInput("interactions", media, model);
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		return tools.map((tool): GeminiFunctionDeclaration => {
 			const schema = sanitizeGeminiSchema(resolveToolJsonSchema(tool));
@@ -246,10 +265,22 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
-		return this.buildGeminiHistory(dbMessages);
+		model: string,
+		narratorId?: string,
+	): Promise<BuiltHistory> {
+		assertModelInputModalities(model, dbMessages.flatMap(storedMessageMedia));
+		const projected = await projectHistory(
+			dbMessages,
+			{
+				strict: hasCredentialBoundReasoning(parseModelId(model).model),
+				reasoningSource: this.getActiveReasoningSource(),
+			},
+			narratorId,
+		);
+		return {
+			history: this.interactionsWireHistory(projected.turns),
+			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
+		};
 	}
 
 	injectSystemPrompt(
@@ -266,6 +297,10 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 	}
 
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "gemini-compatible" };
+	}
+
 	getActiveReasoningSource(): string | undefined {
 		return `gemini:${this.config.prefix}:interactions`;
 	}
@@ -273,10 +308,12 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const model = parseModelId(params.model).model;
 		const { systemInstruction, steps } = splitSystemAndSteps(params.history as GeminiHistoryItem[]);
-		steps.push(...(params.toolResults as GeminiFunctionResultStep[]));
-		appendCurrentUserInput(steps, params.content, params.images);
+		steps.push(
+			...expandInteractionToolResults((params.toolResults ?? []) as GeminiFunctionResultStep[]),
+		);
+		appendCurrentUserInput(steps, params.content, params.images, params.media);
 
-		const body = this.buildRequestBody({
+		let body = this.buildRequestBody({
 			model: params.model,
 			maxOutputTokens: params.maxOutputTokens,
 			steps,
@@ -285,17 +322,18 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 			stream: true,
 		});
+		body = await this.mediaFiles.prepare(body, "interactions", params.signal);
 		await reportInputCharacters(params, body);
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, params.signal);
 
 		const url = `${this.baseUrl()}/interactions`;
-		const headers = this.headers(true);
-		params.requestDump?.setRequest({
+		const headers = this.headers(true, params.conversationId);
+		params.requestDump?.beginResponseAttempt({
 			transport: "http",
+			method: "POST",
 			url,
 			headers: sanitizeHeaders(headers),
-			body,
+			bodyText: await createNativeMediaDumpEncoder()(body, bodyText, params.signal),
 		});
 		logger.debug("Gemini Interactions request", {
 			model,
@@ -306,195 +344,40 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 
 		params.onRequestStart?.();
+		params.streamProgress?.beginAttempt();
 		const response = await this.pfetch(url, {
 			method: "POST",
 			headers,
 			body: bodyText,
 			signal: params.signal,
+		}).catch((error) => {
+			params.requestDump?.setResponseError(error);
+			params.requestDump?.finishResponseCapture(false);
+			throw error;
 		});
+		params.streamProgress?.onHeaders(response.status);
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
 
-		const dumpLimit = resolveDumpLimit(settings.agent?.requestDumpMaxSize);
-		if (!response.ok) {
-			const errorText = await readResponseTextWithLimit(response, GEMINI_MAX_SSE_EVENT_BYTES);
-			params.requestDump?.setResponseBodyText(truncateUtf8ToBytes(errorText, dumpLimit).text);
-			throw interactionHttpError(response.status, errorText);
-		}
 		if (!response.body) throw new Error("Gemini Interactions API returned no body");
-
-		let dumpText = "";
-		let dumpedBytes = 0;
-		let dumpTruncated = false;
-		const onRawChunk = params.requestDump
-			? (chunk: string) => {
-					if (dumpTruncated) return;
-					const remaining = dumpLimit - dumpedBytes;
-					if (remaining <= 0) {
-						dumpTruncated = true;
-						return;
-					}
-					const accepted = truncateUtf8ToBytes(chunk, remaining);
-					dumpText += accepted.text;
-					dumpedBytes += accepted.bytes;
-					if (accepted.truncated) dumpTruncated = true;
-					params.requestDump?.setResponseBodyText(dumpText);
-				}
-			: undefined;
-
+		const tap = captureResponseStream(response.body, params.requestDump, params.streamProgress);
 		try {
-			yield* this.parseSSEStream(response.body, onRawChunk);
+			if (!response.ok) {
+				const errorText = await readResponseTextWithLimit(
+					new Response(tap.stream),
+					GEMINI_MAX_SSE_EVENT_BYTES,
+				);
+				throw interactionHttpError(response.status, errorText);
+			}
+			yield* this.parseSSEStream(tap.stream);
 		} catch (error) {
 			params.requestDump?.setResponseError(error);
 			throw error;
 		} finally {
-			if (params.requestDump && dumpTruncated) {
-				const marker = "\n\n[... response dump truncated]";
-				const prefix = truncateUtf8ToBytes(
-					dumpText,
-					Math.max(0, dumpLimit - byteLength(marker)),
-				).text;
-				params.requestDump.setResponseBodyText(`${prefix}${marker}`);
-			}
+			tap.finish();
 		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		assertByteLimit(output, GEMINI_MAX_TEXT_BYTES, "tool result text");
-		let result: unknown = isError ? { error: output } : output;
-		if (!isError && images?.length) {
-			result = [
-				{ type: "text", text: output },
-				...images.map((image) => ({
-					type: "image",
-					data: image.base64,
-					mime_type: `image/${image.format}`,
-				})),
-			];
-		}
-		return {
-			type: "function_result",
-			call_id: toolUseId,
-			name: toolName ?? toolUseId,
-			result,
-		} satisfies GeminiFunctionResultStep;
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const steps = history as GeminiHistoryItem[];
-		steps.push(...(toolResults as GeminiFunctionResultStep[]));
-		appendCurrentUserInput(steps, content, images);
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		_webSearches?: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }>,
-		_messageId?: string,
-		_imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const ordered: Array<{ index: number; sequence: number; step: GeminiInteractionStep }> = [];
-		let sequence = 0;
-		if (orderedContent) {
-			reasoningBlocks = [];
-			toolUses = [];
-			text = "";
-			for (const [index, block] of orderedContent.entries()) {
-				if (block.type === "text" && block.text)
-					ordered.push({
-						index,
-						sequence: sequence++,
-						step: { type: "model_output", content: block.text },
-					});
-				else if (block.type === "reasoning") reasoningBlocks.push({ ...block, outputIndex: index });
-				else if (block.type === "tool_use") toolUses.push({ ...block, outputIndex: index });
-			}
-		}
-		const currentSource = this.getActiveReasoningSource();
-
-		for (const block of reasoningBlocks ?? []) {
-			const metadata = block.providerMetadata;
-			const signature = extractThoughtSignature(metadata, currentSource);
-			ordered.push({
-				index: block.outputIndex ?? Number.MAX_SAFE_INTEGER - 2,
-				sequence: sequence++,
-				step: {
-					type: "thought",
-					...(metadata?.gemini?.stepId ? { id: metadata.gemini.stepId } : {}),
-					...(signature ? { signature } : {}),
-					...(block.text ? { summary: [{ type: "text", text: block.text }] } : {}),
-				},
-			});
-		}
-		if (text) {
-			ordered.push({
-				index: textOutputIndex ?? Number.MAX_SAFE_INTEGER - 1,
-				sequence: sequence++,
-				step: { type: "model_output", content: text },
-			});
-		}
-		for (const toolUse of toolUses) {
-			const { args, signature, signatureSource } = extractArgsAndSignature(toolUse.input);
-			const replaySignature = signatureSourcesCompatible(
-				toolUse.thoughtSignatureSource ?? signatureSource,
-				currentSource,
-			)
-				? (toolUse.thoughtSignature ?? signature)
-				: undefined;
-			if (
-				replaySignature &&
-				!(reasoningBlocks ?? []).some(
-					(block) =>
-						extractThoughtSignature(block.providerMetadata, currentSource) === replaySignature,
-				)
-			) {
-				ordered.push({
-					index: toolUse.outputIndex ?? Number.MAX_SAFE_INTEGER,
-					sequence: sequence++,
-					step: { type: "thought", signature: replaySignature },
-				});
-			}
-			ordered.push({
-				index: toolUse.outputIndex ?? Number.MAX_SAFE_INTEGER,
-				sequence: sequence++,
-				step: {
-					type: "function_call",
-					id: toolUse.toolUseId,
-					name: toolUse.name,
-					arguments: args,
-				},
-			});
-		}
-		ordered.sort((a, b) => a.index - b.index || a.sequence - b.sequence);
-		(history as GeminiHistoryItem[]).push(...ordered.map((item) => item.step));
 	}
 
 	async generate(text: string, model: string): Promise<string> {
@@ -507,7 +390,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.generateStreaming({
+		const result = await this.generateStreaming({
 			model,
 			systemInstruction,
 			userText: text,
@@ -517,6 +400,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
+		// The Interactions surface has no JSON-Schema output mode, so a requested
+		// responseFormat is reported as degraded rather than silently dropped.
+		if (!options?.responseFormat || result.responseFormatDegraded) return result;
+		return {
+			...result,
+			responseFormatDegraded: unsupportedResponseFormatReason("Gemini Interactions"),
+		};
 	}
 
 	async generateWithHistory(
@@ -551,13 +441,29 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 	}
 
-	private headers(stream: boolean): Record<string, string> {
-		return {
+	private headers(stream: boolean, conversationId?: string): Record<string, string> {
+		const fingerprint = resolveClientFingerprint({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+			extraHeaders: this.config.extraHeaders,
+			conversationId,
+		});
+		const headers = new Headers({
 			"Content-Type": "application/json",
 			"x-goog-api-key": this.getApiKey(),
 			"Api-Revision": INTERACTIONS_REVISION,
+			"User-Agent": fingerprint.userAgent,
 			...(stream ? { Accept: "text/event-stream" } : {}),
-		};
+			...buildOpencodeSessionHeader({
+				baseUrl: this.baseUrl(),
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		});
+		// HTTP names are case-insensitive; extra headers replace, never comma-join defaults.
+		for (const [name, value] of Object.entries(fingerprint.headers)) headers.set(name, value);
+		return Object.fromEntries(headers.entries());
 	}
 
 	private buildRequestBody(options: {
@@ -577,7 +483,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		};
 		if (options.systemInstruction) body.system_instruction = options.systemInstruction;
 		if (options.tools?.length) body.tools = options.tools;
-		const metadata = effectiveProviderMetadata(options.model);
+		const metadata = effectiveModelProfile(options.model);
 		const effort = resolveMetadataReasoning(metadata, options.reasoningEffort);
 		// This adapter has no verified Interactions disable mapping. Do not silently
 		// turn an explicit, supported disable request into low/minimal thinking.
@@ -619,7 +525,6 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
 	}): Promise<GenerateMetaResult> {
-		const model = parseModelId(options.model).model;
 		const body = this.buildRequestBody({
 			model: options.model,
 			maxOutputTokens: options.maxOutputTokens,
@@ -628,8 +533,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			reasoningEffort: options.reasoningEffort,
 			stream: true,
 		});
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, options.signal);
 		const response = await this.pfetch(`${this.baseUrl()}/interactions`, {
 			method: "POST",
 			headers: this.headers(true),
@@ -671,147 +575,107 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		return { text, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
-	private buildGeminiHistory(dbMessages: DbMessage[]): {
-		history: GeminiHistoryItem[];
-		trailingToolResults: GeminiFunctionResultStep[];
-		trailingUserText?: string;
-	} {
-		const topLevel = dbMessages.filter(
-			(message) =>
-				!message.parentToolUseId &&
-				(message.role === "user" || message.role === "assistant" || message.role === "sys"),
-		);
-		if (topLevel.at(-1)?.role === "user") topLevel.pop();
-
+	/** Second projection stage for Interactions: neutral turns → steps. */
+	private interactionsWireHistory(turns: readonly NeutralTurn[]): GeminiHistoryItem[] {
 		const history: GeminiHistoryItem[] = [];
-		let pendingToolResults: GeminiFunctionResultStep[] = [];
-		const flushToolResults = () => {
-			if (pendingToolResults.length > 0) {
-				history.push(...pendingToolResults);
-				pendingToolResults = [];
+		for (const turn of turns) {
+			if (turn.kind === "input") {
+				for (const item of turn.items) {
+					const images = item.images.flatMap((image) => (image ? [image] : []));
+					if (!images.length && !item.media?.length) {
+						if (item.text) history.push({ type: "user_input", content: item.text });
+						continue;
+					}
+					history.push({
+						type: "user_input",
+						content: [
+							...orderUserContent(item.text, images, "after").map(
+								(part): GeminiInputContent =>
+									part.type === "text"
+										? { type: "text", text: part.text }
+										: { type: "image", data: part.image.base64, mime_type: part.image.mediaType },
+							),
+							...(item.media ?? []).map(interactionInlineMedia),
+						],
+					});
+				}
+				continue;
 			}
-		};
-
-		for (const message of topLevel) {
-			if (message.role === "assistant") {
-				flushToolResults();
-
-				const content = Array.isArray(message.contentJson)
-					? (message.contentJson as Array<Record<string, unknown>>)
-					: [];
-				const completedCalls =
-					message.toolCalls?.filter(
-						(call) => call.status === "success" || call.status === "fail",
-					) ?? [];
-				const toolBlocks = new Map(
-					content
-						.filter(
-							(block) =>
-								block.type === "tool_use" &&
-								(typeof block.id === "string" || typeof block.toolUseId === "string"),
-						)
-						.map((block) => [(block.id ?? block.toolUseId) as string, block]),
-				);
-				const ordered: Array<{ index: number; sequence: number; step: GeminiInteractionStep }> = [];
-				const seenThoughtSignatures = new Set<string>();
-				let sequence = 0;
-
-				for (const block of content) {
-					const outputIndex = numericOutputIndex(block.outputIndex);
-					if (block.type === "reasoning") {
-						const metadata = block.providerMetadata as
-							| import("./types").ReasoningProviderMetadata
-							| undefined;
-						const signature = extractThoughtSignature(metadata, this.getActiveReasoningSource());
-						if (signature) seenThoughtSignatures.add(signature);
-						ordered.push({
-							index: outputIndex ?? Number.MAX_SAFE_INTEGER - 2,
-							sequence: sequence++,
-							step: {
-								type: "thought",
-								...(metadata?.gemini?.stepId ? { id: metadata.gemini.stepId } : {}),
-								...(signature ? { signature } : {}),
-								...(typeof block.text === "string" && block.text
-									? { summary: [{ type: "text", text: block.text }] }
-									: {}),
-							},
-						});
-					} else if (block.type === "text" && typeof block.text === "string" && block.text) {
-						ordered.push({
-							index: outputIndex ?? Number.MAX_SAFE_INTEGER - 1,
-							sequence: sequence++,
-							step: { type: "model_output", content: block.text },
-						});
-					}
-				}
-
-				if (!content.some((block) => block.type === "text") && message.contentText) {
-					ordered.push({
-						index: Number.MAX_SAFE_INTEGER - 1,
-						sequence: sequence++,
-						step: { type: "model_output", content: message.contentText },
-					});
-				}
-
-				for (const call of completedCalls) {
-					const block = toolBlocks.get(call.toolUseId);
-					const input = block?.input ?? call.inputJson;
-					const { args, signature, signatureSource } = extractArgsAndSignature(input);
-					const blockSignature =
-						typeof block?.thoughtSignature === "string" ? block.thoughtSignature : undefined;
-					const blockSignatureSource =
-						typeof block?.thoughtSignatureSource === "string"
-							? block.thoughtSignatureSource
-							: signatureSource;
-					const thoughtSignature = signatureSourcesCompatible(
-						blockSignatureSource,
-						this.getActiveReasoningSource(),
-					)
-						? (blockSignature ?? signature)
-						: undefined;
-					if (thoughtSignature && !seenThoughtSignatures.has(thoughtSignature)) {
-						seenThoughtSignatures.add(thoughtSignature);
-						ordered.push({
-							index: numericOutputIndex(block?.outputIndex) ?? Number.MAX_SAFE_INTEGER,
-							sequence: sequence++,
-							step: { type: "thought", signature: thoughtSignature },
-						});
-					}
-					ordered.push({
-						index: numericOutputIndex(block?.outputIndex) ?? Number.MAX_SAFE_INTEGER,
-						sequence: sequence++,
-						step: {
-							type: "function_call",
-							id: call.toolUseId,
-							name: call.toolName,
-							arguments: args,
-						},
-					});
-					const output = outputToText(call.outputJson);
-					pendingToolResults.push({
+			if (turn.kind === "tool_results") {
+				for (const result of turn.results) {
+					history.push({
 						type: "function_result",
-						call_id: call.toolUseId,
-						name: call.toolName,
-						result: call.status === "fail" ? { error: output } : output,
+						call_id: result.wireId,
+						name: result.name,
+						// Images ride with a successful result, as the live turn sends them.
+						result: result.isError
+							? { error: result.text }
+							: result.images.length
+								? [
+										{ type: "text", text: result.text },
+										...result.images.map((image) => ({
+											type: "image",
+											data: image.base64,
+											mime_type: image.mediaType,
+										})),
+									]
+								: result.text,
 					});
 				}
-				ordered.sort((a, b) => a.index - b.index || a.sequence - b.sequence);
-				history.push(...ordered.map((item) => item.step));
-			} else if (message.role === "user") {
-				flushToolResults();
-				const text = message.contentText || "";
-				if (text) history.push({ type: "user_input", content: text });
-			} else {
-				flushToolResults();
-				const blocks = Array.isArray(message.contentJson)
-					? (message.contentJson as Array<{ type?: string; text?: string }>)
-					: [];
-				const text = modelTextFromContentBlocks(blocks) || message.contentText || "";
-				if (text) history.push({ type: "user_input", content: text });
+				const media = turn.results.flatMap((result) =>
+					(result.media ?? []).flatMap((item): GeminiInputContent[] => [
+						{
+							type: "text",
+							text: `Tool result media source: ${JSON.stringify({ toolCallId: result.wireId })}`,
+						},
+						interactionInlineMedia(item),
+					]),
+				);
+				if (media.length) history.push({ type: "user_input", content: media });
+				continue;
+			}
+			const searches = turn.items.filter((item) => item.kind === "web_search");
+			// Searches ran on another provider; the model only learns of them as context.
+			if (searches.length)
+				history.push({ type: "user_input", content: searches.map(webSearchSummary).join("\n") });
+			// A call's signature rides on a thought step; one already carried by a thought
+			// is not repeated.
+			const seenSignatures = new Set<string>();
+			for (const item of turn.items) {
+				if (item.kind === "reasoning") {
+					const gemini = (item.credentials.gemini ?? {}) as {
+						thoughtSignature?: unknown;
+						stepId?: unknown;
+					};
+					const signature =
+						item.sameSource && typeof gemini.thoughtSignature === "string"
+							? gemini.thoughtSignature
+							: undefined;
+					if (signature) seenSignatures.add(signature);
+					history.push({
+						type: "thought",
+						...(item.sameSource && typeof gemini.stepId === "string" ? { id: gemini.stepId } : {}),
+						...(signature ? { signature } : {}),
+						...(item.text ? { summary: [{ type: "text", text: item.text }] } : {}),
+					});
+				} else if (item.kind === "text") {
+					history.push({ type: "model_output", content: item.text });
+				} else if (item.kind === "tool_call") {
+					const signature = item.signature?.sameSource ? item.signature.value : undefined;
+					if (signature && !seenSignatures.has(signature)) {
+						seenSignatures.add(signature);
+						history.push({ type: "thought", signature });
+					}
+					history.push({
+						type: "function_call",
+						id: item.wireId,
+						name: item.name,
+						arguments: item.input,
+					});
+				}
 			}
 		}
-
-		return { history, trailingToolResults: pendingToolResults };
+		return history;
 	}
 
 	private async *parseSSEStream(
@@ -888,21 +752,24 @@ function appendCurrentUserInput(
 	steps: GeminiHistoryItem[],
 	content: string,
 	images?: Array<{ format: string; base64: string }>,
+	media?: NativeMediaInput[],
 ): void {
 	const hasText = !!content && content !== ".";
-	if (!hasText && !images?.length) {
+	if (!hasText && !images?.length && !media?.length) {
 		if (steps.length === 0) steps.push({ type: "user_input", content: content || "." });
 		return;
 	}
-	if (!images?.length) {
+	if (!images?.length && !media?.length) {
 		steps.push({ type: "user_input", content });
 		return;
 	}
-	const parts: GeminiInputContent[] = [];
-	if (hasText) parts.push({ type: "text", text: content });
-	for (const image of images) {
-		parts.push({ type: "image", data: image.base64, mime_type: `image/${image.format}` });
-	}
+	const parts = orderUserContent(hasText ? content : "", images ?? [], "after").map(
+		(part): GeminiInputContent =>
+			part.type === "text"
+				? { type: "text", text: part.text }
+				: { type: "image", data: part.image.base64, mime_type: `image/${part.image.format}` },
+	);
+	parts.push(...(media ?? []).map(interactionInlineMedia));
 	steps.push({ type: "user_input", content: parts });
 }
 
@@ -1367,10 +1234,15 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
@@ -1378,10 +1250,13 @@ function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): U
 
 function mapUsage(usage: GeminiInteractionUsage | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0;
+	const cachedInputTokens = usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0;
 	return {
-		inputTokens: usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? 0,
+		// Interactions 原始输入计数包含缓存读取。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.total_output_tokens ?? usage.output_tokens ?? usage.completion_tokens ?? 0,
-		cachedInputTokens: usage.total_cached_tokens ?? usage.cached_input_tokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens:
 			usage.total_thought_tokens ?? usage.thought_tokens ?? usage.reasoning_tokens ?? 0,
@@ -1401,45 +1276,8 @@ function mapUsageStream(usage: GeminiInteractionUsage): NonNullable<ParsedStream
 	};
 }
 
-function extractThoughtSignature(
-	metadata: import("./types").ReasoningProviderMetadata | undefined,
-	currentSource: string | undefined,
-): string | undefined {
-	const signature = metadata?.gemini?.thoughtSignature;
-	if (!signature) return undefined;
-	return signatureSourcesCompatible(metadata.signatureSource, currentSource)
-		? signature
-		: undefined;
-}
-
 export const GEMINI_THOUGHT_SIGNATURE_KEY = "__geminiThoughtSignature";
 export const GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY = "__geminiThoughtSignatureSource";
-
-function extractArgsAndSignature(input: unknown): {
-	args: Record<string, unknown>;
-	signature?: string;
-	signatureSource?: string;
-} {
-	if (!input || typeof input !== "object" || Array.isArray(input)) {
-		return { args: (input as Record<string, unknown>) ?? {} };
-	}
-	const record = input as Record<string, unknown>;
-	if (!(GEMINI_THOUGHT_SIGNATURE_KEY in record)) return { args: record };
-	const {
-		[GEMINI_THOUGHT_SIGNATURE_KEY]: signature,
-		[GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY]: signatureSource,
-		...args
-	} = record;
-	return {
-		args,
-		signature: typeof signature === "string" ? signature : undefined,
-		signatureSource: typeof signatureSource === "string" ? signatureSource : undefined,
-	};
-}
-
-function numericOutputIndex(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
 
 export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {
 	return sanitizeNode(schema) as Record<string, unknown>;
@@ -1485,8 +1323,12 @@ function sanitizeNode(node: unknown): unknown {
 	const output: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
 		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
+		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
+			continue;
+		}
 		if (key === "const") {
-			output.enum = [value];
+			// Gemini's enum field accepts strings only; retain the type for other literals.
+			if (typeof value === "string") output.enum = [value];
 		} else if (key === "properties" && value && typeof value === "object") {
 			output.properties = Object.fromEntries(
 				Object.entries(value as Record<string, unknown>).map(([name, schema]) => [

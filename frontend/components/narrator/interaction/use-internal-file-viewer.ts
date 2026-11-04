@@ -1,9 +1,9 @@
 import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { notifications } from "@mantine/notifications";
 import type { FileTarget } from "@shared/file-reference";
-import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useFilePanelNavigation } from "../file-panel/file-panel-navigation";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { FileNavigationOptions } from "../composer/FileReferenceScope";
+import { useFilePanelNavigationReceiver } from "../file-panel/file-panel-navigation";
 import { nextHighlightRequestId } from "../panels/panel-kind";
 
 export interface UseInternalFileViewerOptions {
@@ -15,13 +15,16 @@ export interface UseInternalFileViewerOptions {
 export interface UseInternalFileViewerResult {
 	/** Path shown in the off-dock file drawer, or null when closed. */
 	internalFileViewerPath: string | null;
-	setInternalFileViewerPath: React.Dispatch<React.SetStateAction<string | null>>;
+	/** Returns false when unsaved edits or an active save prevent closing/replacement. */
+	setInternalFileViewerPath: (path: string | null) => boolean;
+	onFileEditorDirtyChange: (blocked: boolean) => void;
+	canExitFileEditor: () => boolean;
 	/** Resolved reference target backing the current viewer (selection/highlight). */
 	internalFileViewerTarget: (FileTarget & { highlightRequestId: string }) | null;
 	/** Open a plain file path (via the dock panel when present, else the drawer). */
 	handleOpenFilePanel: ((filePath: string) => void) | undefined;
 	/** Resolve + open a file reference target (dock panel or internal drawer). */
-	handleOpenReferencedFile: (target: FileTarget) => Promise<void>;
+	handleOpenReferencedFile: (target: FileTarget, options?: FileNavigationOptions) => Promise<void>;
 	/** Whether a file reference can be opened from this panel at all. */
 	canOpenReferencedFile: boolean;
 }
@@ -42,65 +45,150 @@ export function useInternalFileViewer(
 ): UseInternalFileViewerResult {
 	const { narratorId, isWorkspacePreview, t } = options;
 
-	const [internalFileViewerPath, setInternalFileViewerPath] = useState<string | null>(null);
+	const [internalFileViewerPath, setViewerPath] = useState<string | null>(null);
+	const currentFileRef = useRef<{ path: string; deviceId: string } | null>(null);
+	const exitBlockedRef = useRef(false);
+	const onFileEditorDirtyChange = useCallback((blocked: boolean) => {
+		exitBlockedRef.current = blocked;
+	}, []);
+	const canReplaceFile = useCallback(
+		(path: string | null, deviceId = "local") => {
+			const current = currentFileRef.current;
+			if (!exitBlockedRef.current || (current?.path === path && current.deviceId === deviceId))
+				return true;
+			notifications.show({
+				color: "yellow",
+				message: t("fileEditor.unsavedBlockExit"),
+				autoClose: 5000,
+			});
+			return false;
+		},
+		[t],
+	);
+	const canExitFileEditor = useCallback(() => canReplaceFile(null), [canReplaceFile]);
 	const [internalFileViewerTarget, setInternalFileViewerTarget] = useState<
 		(FileTarget & { highlightRequestId: string }) | null
 	>(null);
 	const fileNavigationRef = useRef(0);
 	const fileNavigationAbortRef = useRef<AbortController | null>(null);
-	const dockOpenFilePanel = useFilePanelNavigation();
+	const setInternalFileViewerPath = useCallback(
+		(path: string | null) => {
+			if (!canReplaceFile(path)) return false;
+			fileNavigationRef.current++;
+			fileNavigationAbortRef.current?.abort();
+			// Reopening the same local resource must not downgrade a scoped reference.
+			if (
+				path &&
+				currentFileRef.current?.path === path &&
+				currentFileRef.current.deviceId === "local"
+			)
+				return true;
+			currentFileRef.current = path ? { path, deviceId: "local" } : null;
+			setInternalFileViewerTarget(null);
+			setViewerPath(path);
+			return true;
+		},
+		[canReplaceFile],
+	);
+	const navigation = useFilePanelNavigationReceiver();
+	const dockOpenFilePanel = navigation.openFilePanel;
+	const receiver = navigation.receiver;
 	const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;
+	const latestNavigation = useRef({
+		narratorId,
+		dockOpenFilePanel,
+		useInternalViewer,
+		getReceiver: navigation.getReceiver,
+	});
+	useLayoutEffect(() => {
+		latestNavigation.current = {
+			narratorId,
+			dockOpenFilePanel,
+			useInternalViewer,
+			getReceiver: navigation.getReceiver,
+		};
+	});
 	const handleOpenFilePanel = useMemo(() => {
 		if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);
 		if (useInternalViewer)
 			return (filePath: string) => {
-				setInternalFileViewerTarget(null);
 				setInternalFileViewerPath(filePath);
 			};
 		return undefined;
-	}, [dockOpenFilePanel, useInternalViewer]);
+	}, [dockOpenFilePanel, useInternalViewer, setInternalFileViewerPath]);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: cancel navigation when the owning narrator changes
-	useEffect(
+	// biome-ignore lint/correctness/useExhaustiveDependencies: receiver/session lifetime invalidates in-flight navigation even when the target stays unchanged
+	useLayoutEffect(
 		() => () => {
 			fileNavigationRef.current++;
 			fileNavigationAbortRef.current?.abort();
 		},
-		[narratorId],
+		[narratorId, receiver, useInternalViewer],
 	);
 	const handleOpenReferencedFile = useCallback(
-		async (target: FileTarget) => {
+		async (target: FileTarget, options: FileNavigationOptions = {}) => {
+			if (
+				options.signal?.aborted ||
+				options.isCurrent?.() === false ||
+				latestNavigation.current.narratorId !== narratorId
+			)
+				return;
 			const request = ++fileNavigationRef.current;
 			fileNavigationAbortRef.current?.abort();
 			const controller = new AbortController();
 			fileNavigationAbortRef.current = controller;
+			const abort = () => controller.abort(options.signal?.reason);
+			if (options.signal?.aborted) abort();
+			else options.signal?.addEventListener("abort", abort, { once: true });
+			const requestReceiver = latestNavigation.current.getReceiver();
+			const isCurrent = () => {
+				if (
+					request !== fileNavigationRef.current ||
+					latestNavigation.current.narratorId !== narratorId ||
+					controller.signal.aborted ||
+					options.isCurrent?.() === false
+				)
+					return false;
+				if (latestNavigation.current.getReceiver() !== requestReceiver) {
+					controller.abort();
+					return false;
+				}
+				return true;
+			};
 			try {
+				if (!isCurrent()) return;
 				const { targets } = await fileReferenceApi.resolve(narratorId, [target], controller.signal);
-				if (request !== fileNavigationRef.current || !targets[0]) return;
+				if (!isCurrent() || !targets[0]) return;
 				const resolved = targets[0];
 				const highlightRequestId = nextHighlightRequestId();
-				if (dockOpenFilePanel) {
-					dockOpenFilePanel(resolved.path, undefined, {
+				const latest = latestNavigation.current;
+				if (latest.dockOpenFilePanel) {
+					if (!isCurrent()) return;
+					latest.dockOpenFilePanel(resolved.path, undefined, {
 						fileNarratorId: narratorId,
 						deviceId: resolved.deviceId,
 						selection: resolved.selection,
 						highlightRequestId,
 						referenceOrigin: true,
 					});
-				} else if (useInternalViewer) {
+				} else if (latest.useInternalViewer) {
+					if (!canReplaceFile(resolved.path, resolved.deviceId) || !isCurrent()) return;
+					currentFileRef.current = { path: resolved.path, deviceId: resolved.deviceId };
 					setInternalFileViewerTarget({ ...resolved, highlightRequestId });
-					setInternalFileViewerPath(resolved.path);
+					setViewerPath(resolved.path);
 				}
 			} catch (error) {
-				if (request === fileNavigationRef.current)
+				if (isCurrent())
 					notifications.show({
 						color: "red",
 						title: t("fileReferences.openFailed"),
 						message: error instanceof Error ? error.message : String(error),
 					});
+			} finally {
+				options.signal?.removeEventListener("abort", abort);
 			}
 		},
-		[narratorId, dockOpenFilePanel, useInternalViewer, t],
+		[narratorId, canReplaceFile, t],
 	);
 
 	const canOpenReferencedFile = !isWorkspacePreview && (!!dockOpenFilePanel || useInternalViewer);
@@ -108,6 +196,8 @@ export function useInternalFileViewer(
 	return {
 		internalFileViewerPath,
 		setInternalFileViewerPath,
+		onFileEditorDirtyChange,
+		canExitFileEditor,
 		internalFileViewerTarget,
 		handleOpenFilePanel,
 		handleOpenReferencedFile,

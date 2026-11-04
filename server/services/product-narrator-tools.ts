@@ -43,8 +43,7 @@ export function resolveProductNarratorCwd(
 	return (
 		runtimeProductIntegration.resolveNarratorCwd?.(input) ??
 		resolveNarratorSessionCwd(
-			input.narratorCwd,
-			input.worktreePath,
+			input.narratorCwd || input.worktreePath,
 			input.projectGitPath,
 			input.fallbackCwd,
 		)

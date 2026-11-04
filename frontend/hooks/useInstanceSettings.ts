@@ -1,6 +1,12 @@
 import { notifications } from "@mantine/notifications";
 import { DEFAULT_BRAND_ICON_COLOR } from "@shared/branding";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
+import {
+	DEFAULT_RECORDING_REQUEST_BYTES,
+	DEFAULT_RECORDING_RESPONSE_BYTES,
+	type RecordingSettings,
+	type RequestEvidenceAutoPin,
+} from "@shared/request-recording";
 import type {
 	SubagentAllowedModels,
 	SubagentModelReasoningEfforts,
@@ -17,7 +23,10 @@ import type {
 	DirectoryWhitelistRuleInput,
 } from "../lib/api/types";
 import { normalizeRuleTargetSelector } from "../lib/api/types";
+import { FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL } from "../lib/constants";
+import { DEFAULT_GITHUB_REPOSITORY, type UpdateSource } from "../lib/update-source";
 import { normalizeUrlProtocol } from "../lib/url";
+import { PROJECT_DIR_STATUS_QUERY_KEY } from "./useProjectDirStatus";
 
 export type DefaultNarratorVisibility = "auto" | "private" | "public";
 export type DefaultNarratorWriteAudience = "auto" | "owner" | "project" | "public";
@@ -32,11 +41,14 @@ export interface InstanceSettingsState {
 	projectDir: string;
 	// TLS
 	tlsEnabled: boolean;
+	tlsAutoReissue: boolean;
 	tlsCertFile: string;
 	tlsKeyFile: string;
 	tlsPassphrase: string;
 	tlsCaFile: string;
 	// Update
+	updateSource: UpdateSource;
+	updateGithubRepository: string;
 	updateServerUrl: string;
 	updateChannel: "stable" | "beta";
 	updateAutoDownload: boolean;
@@ -60,8 +72,10 @@ export interface InstanceSettingsState {
 	legacyEncoding: boolean;
 	freshShellEnv: boolean;
 	translateReasoning: boolean;
-	requestDumpEnabled: boolean;
-	requestDumpErrorsOnly: boolean;
+	ringEnabled: boolean;
+	ringRequestBytes: number;
+	ringResponseBytes: number;
+	autoPin: RequestEvidenceAutoPin;
 	defaultNarratorVisibility: DefaultNarratorVisibility;
 	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
 	defaultStartInPlanMode: boolean;
@@ -106,18 +120,8 @@ export interface InstanceSettingsState {
 	globalBlacklistDirs: DirectoryBlacklistRuleInput[];
 	globalCommandWhitelist: CommandWhitelistRuleInput[];
 	globalCommandBlacklist: CommandBlacklistRuleInput[];
-	// Chapters
-	maxWorktrees: number;
-	maxContainers: number;
-	sizeWarning: number;
-	autoSave: boolean;
-	dormantMinutes: number;
+	// Workspace
 	treeSnapshots: boolean;
-	// Containers
-	portStart: number;
-	portEnd: number;
-	proxyEnabled: boolean;
-	proxyPort: number;
 }
 
 type Setters = {
@@ -145,6 +149,75 @@ function normalizeSharedRules<
 	})) as T[];
 }
 
+/** Older servers/configurations omit these fields; zero and false are explicit settings. */
+export function readRequestRecordingSettings(
+	evidence?: Partial<RecordingSettings>,
+): RecordingSettings {
+	return {
+		ringEnabled: evidence?.ringEnabled ?? true,
+		ringRequestBytes: evidence?.ringRequestBytes ?? DEFAULT_RECORDING_REQUEST_BYTES,
+		ringResponseBytes: evidence?.ringResponseBytes ?? DEFAULT_RECORDING_RESPONSE_BYTES,
+		autoPin: evidence?.autoPin ?? "off",
+	};
+}
+
+/** Meta references a model field may hold instead of a model ID. */
+const META_MODEL_REFERENCES = new Set([FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL]);
+
+/**
+ * Normalize one stored model reference into settings-form state.
+ *
+ * `fallback` follows `??` semantics: only an absent value uses it, an explicit
+ * empty string stays empty (the server reads both differently).
+ *
+ * The legacy prefix strip heals settings written by builds that pushed every
+ * stored value through `ensurePrefix`, turning a `__default__` summary model
+ * into `openai:__default__`. The Select only offers the bare sentinel, so a
+ * prefixed one renders the role as empty — and the next save would persist the
+ * broken value all over again.
+ */
+export function normalizeSettingsModelRef(value: string | null | undefined, fallback = ""): string {
+	const stored = (value ?? fallback).trim();
+	const separator = stored.indexOf(":");
+	// "provider:__default__" is the same instruction as "__default__"; the model
+	// list has no such entry, only the sentinel.
+	const model = separator > 0 ? stored.slice(separator + 1) : "";
+	if (META_MODEL_REFERENCES.has(model)) return model;
+	return ensurePrefix(stored);
+}
+
+/** The subset of `agent` settings the form holds as model references. */
+interface AgentModelRefSettings {
+	defaultModel?: string;
+	summaryModel?: string;
+	translationModel?: string;
+	promptOptimizeModel?: string;
+	subagentModels?: Partial<Record<"explore" | "plan" | "search" | "review", string>>;
+}
+
+/**
+ * Build every model-reference field of the settings form.
+ *
+ * Kept as one exported function so the mapping stays directly testable: a role
+ * that silently loses its sentinel only shows up as an empty Select after a
+ * reload, which is exactly the failure this mapping exists to prevent.
+ */
+export function readInstanceModelRefs(agent?: AgentModelRefSettings) {
+	return {
+		defaultModel: normalizeSettingsModelRef(agent?.defaultModel),
+		summaryModel: normalizeSettingsModelRef(agent?.summaryModel),
+		translationModel: normalizeSettingsModelRef(agent?.translationModel, FOLLOW_SUMMARY_MODEL),
+		promptOptimizeModel: normalizeSettingsModelRef(
+			agent?.promptOptimizeModel,
+			FOLLOW_SUMMARY_MODEL,
+		),
+		subagentExploreModel: normalizeSettingsModelRef(agent?.subagentModels?.explore),
+		subagentPlanModel: normalizeSettingsModelRef(agent?.subagentModels?.plan),
+		subagentSearchModel: normalizeSettingsModelRef(agent?.subagentModels?.search),
+		subagentReviewModel: normalizeSettingsModelRef(agent?.subagentModels?.review),
+	};
+}
+
 function makeDefaults(): InstanceSettingsState {
 	return {
 		port: 7778,
@@ -152,10 +225,13 @@ function makeDefaults(): InstanceSettingsState {
 		openBrowser: "app",
 		projectDir: "",
 		tlsEnabled: false,
+		tlsAutoReissue: true,
 		tlsCertFile: "",
 		tlsKeyFile: "",
 		tlsPassphrase: "",
 		tlsCaFile: "",
+		updateSource: "github",
+		updateGithubRepository: DEFAULT_GITHUB_REPOSITORY,
 		updateServerUrl: "",
 		updateChannel: "stable",
 		updateAutoDownload: false,
@@ -165,7 +241,7 @@ function makeDefaults(): InstanceSettingsState {
 		// fallback, so an unconfigured instance never displays a model the user
 		// never selected as if it were active.
 		defaultModel: "",
-		permissionMode: "acceptEdits",
+		permissionMode: "bypassPermissions",
 		summaryModel: "",
 		translationModel: "__summary__",
 		promptOptimizeModel: "__summary__",
@@ -180,8 +256,7 @@ function makeDefaults(): InstanceSettingsState {
 		legacyEncoding: false,
 		freshShellEnv: false,
 		translateReasoning: false,
-		requestDumpEnabled: false,
-		requestDumpErrorsOnly: false,
+		...readRequestRecordingSettings(),
 		defaultNarratorVisibility: "auto",
 		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
@@ -215,16 +290,7 @@ function makeDefaults(): InstanceSettingsState {
 		globalBlacklistDirs: [],
 		globalCommandWhitelist: [],
 		globalCommandBlacklist: [],
-		maxWorktrees: 10,
-		maxContainers: 5,
-		sizeWarning: 500,
-		autoSave: true,
-		dormantMinutes: 0,
 		treeSnapshots: true,
-		portStart: 10000,
-		portEnd: 20000,
-		proxyEnabled: false,
-		proxyPort: 7780,
 	};
 }
 
@@ -241,6 +307,10 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 			// Use setQueryData to synchronously update the cache instead of
 			// invalidateQueries which triggers cascading refetches.
 			qc.setQueryData(["settings"], data);
+			void qc.invalidateQueries({ queryKey: PROJECT_DIR_STATUS_QUERY_KEY });
+			// Drop stale recommendations and cancel in-flight checks, not prepared binaries/status.
+			void qc.resetQueries({ queryKey: ["update-check"] });
+			void qc.invalidateQueries({ queryKey: ["update-check"], refetchType: "none" });
 		},
 	});
 
@@ -258,33 +328,25 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				openBrowser: settings.server?.openBrowser ?? "app",
 				projectDir: settings.paths?.defaultProjectDir ?? "",
 				tlsEnabled: settings.server?.tls?.enabled ?? false,
+				tlsAutoReissue: settings.server?.tls?.autoReissue ?? true,
 				tlsCertFile: settings.server?.tls?.certFile ?? "",
 				tlsKeyFile: settings.server?.tls?.keyFile ?? "",
 				tlsPassphrase: "",
 				tlsCaFile: settings.server?.tls?.caFile ?? "",
+				updateSource: settings.update?.source ?? "github",
+				updateGithubRepository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 				updateServerUrl: settings.update?.serverUrl ?? "",
 				updateChannel: settings.update?.channel ?? "stable",
 				updateAutoDownload: settings.update?.autoDownload ?? false,
 				brandName: settings.branding?.name ?? "",
 				brandIconColor: settings.branding?.iconColor ?? DEFAULT_BRAND_ICON_COLOR,
-				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? ""),
+				...readInstanceModelRefs(settings.agent),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultNarratorVisibility: settings.agent?.defaultNarratorVisibility ?? "auto",
 				defaultNarratorWriteAudience: settings.agent?.defaultNarratorWriteAudience ?? "auto",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
-				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? ""),
-				translationModel: settings.agent?.translationModel?.startsWith("__")
-					? settings.agent.translationModel
-					: ensurePrefix(settings.agent?.translationModel ?? "__summary__"),
-				promptOptimizeModel: settings.agent?.promptOptimizeModel?.startsWith("__")
-					? settings.agent.promptOptimizeModel
-					: ensurePrefix(settings.agent?.promptOptimizeModel ?? "__summary__"),
 				promptOptimizeContextMaxMessages: settings.agent?.promptOptimizeContextMaxMessages ?? 3,
 				maxTurns: settings.agent?.maxTurns ?? 1000,
-				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
-				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
-				subagentSearchModel: ensurePrefix(settings.agent?.subagentModels?.search ?? ""),
-				subagentReviewModel: ensurePrefix(settings.agent?.subagentModels?.review ?? ""),
 				subagentAllowedModels: {
 					explore: settings.agent?.subagentAllowedModels?.explore ?? [],
 					plan: settings.agent?.subagentAllowedModels?.plan ?? [],
@@ -296,8 +358,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
-				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
-				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
+				...readRequestRecordingSettings(settings.requestEvidence),
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planModeAllowInlinePlan: settings.agent?.planModeAllowInlinePlan ?? true,
 				permissionRuleAutoApprove: settings.agent?.permissionRuleAutoApprove ?? false,
@@ -340,16 +401,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				globalCommandBlacklist: normalizeSharedRules<CommandBlacklistRuleInput>(
 					settings.agent?.commandBlacklist,
 				),
-				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
-				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
-				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
-				autoSave: settings.chapters?.autoSaveOnDormant ?? true,
-				dormantMinutes: settings.chapters?.dormantAfterMinutes ?? 0,
-				treeSnapshots: settings.chapters?.treeSnapshotsEnabled ?? true,
-				portStart: settings.containers?.portRangeStart ?? 10000,
-				portEnd: settings.containers?.portRangeEnd ?? 20000,
-				proxyEnabled: settings.containers?.proxy?.enabled ?? false,
-				proxyPort: settings.containers?.proxy?.port ?? 7780,
+				treeSnapshots: settings.workspace?.treeSnapshotsEnabled ?? true,
 			};
 			serverSnapshot.current = snap;
 			setState(snap);
@@ -380,6 +432,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 			...state,
 			dangerReflectionEnabled: state.dangerReflectionLevel !== "off",
 			updateServerUrl: normalizedUpdateServerUrl,
+			updateGithubRepository: state.updateGithubRepository.trim(),
 		};
 		updateSettings.mutate(
 			{
@@ -389,6 +442,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					openBrowser: state.openBrowser,
 					tls: {
 						enabled: state.tlsEnabled,
+						autoReissue: state.tlsAutoReissue,
 						certFile: state.tlsCertFile,
 						keyFile: state.tlsKeyFile,
 						...(state.tlsPassphrase && { passphrase: state.tlsPassphrase }),
@@ -425,8 +479,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					legacyEncoding: state.legacyEncoding,
 					freshShellEnv: state.freshShellEnv,
 					translateReasoning: state.translateReasoning,
-					requestDumpEnabled: state.requestDumpEnabled,
-					requestDumpErrorsOnly: state.requestDumpErrorsOnly,
 					defaultNarratorVisibility: state.defaultNarratorVisibility,
 					defaultNarratorWriteAudience: state.defaultNarratorWriteAudience,
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
@@ -474,24 +526,17 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					commandWhitelist: state.globalCommandWhitelist,
 					commandBlacklist: state.globalCommandBlacklist,
 				},
-				chapters: {
-					maxActiveWorktrees: state.maxWorktrees,
-					maxActiveContainers: state.maxContainers,
-					worktreeSizeWarningMb: state.sizeWarning,
-					autoSaveOnDormant: state.autoSave,
-					dormantAfterMinutes: state.dormantMinutes,
-					treeSnapshotsEnabled: state.treeSnapshots,
+				requestEvidence: {
+					ringEnabled: state.ringEnabled,
+					ringRequestBytes: state.ringRequestBytes,
+					ringResponseBytes: state.ringResponseBytes,
+					autoPin: state.autoPin,
 				},
-				containers: {
-					portRangeStart: state.portStart,
-					portRangeEnd: state.portEnd,
-					proxy: {
-						enabled: state.proxyEnabled,
-						port: state.proxyPort,
-					},
-				},
+				workspace: { treeSnapshotsEnabled: state.treeSnapshots },
 				editor: { type: "vscode" },
 				update: {
+					source: state.updateSource,
+					githubRepository: state.updateGithubRepository.trim(),
 					// Send "" (not undefined) so clearing the field resets the server
 					// back to the built-in default instead of keeping the old value.
 					serverUrl: normalizedUpdateServerUrl,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -11,6 +11,7 @@ import {
 	narratorToolCalls,
 	worktreeTreeSnapshots,
 } from "../db/schema";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { normalizePathForComparison } from "../lib/platform-path";
@@ -24,7 +25,9 @@ import {
 	recordTreeSnapshotBefore,
 	type TreeSnapshotSession,
 } from "./narrator-tree-snapshot-hooks";
+import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import { peekClaim } from "./worktree-write-claims";
 
 const createdNarrators: string[] = [];
 const tempDirs: string[] = [];
@@ -134,7 +137,7 @@ afterEach(async () => {
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
 	}
 	for (const dir of tempDirs.splice(0)) {
-		await worktreeTreeSnapshot.destroy(dir).catch(() => {});
+		rmSync(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, dir), { recursive: true, force: true });
 		await db
 			.delete(worktreeTreeSnapshots)
 			.where(eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(dir)));
@@ -271,12 +274,22 @@ describe("narrator tree snapshot hooks", () => {
 		expect(secondResult.before).not.toBe(firstResult.after);
 		if (!secondResult.before || !secondResult.after) throw new Error("missing boundaries");
 
-		const reversed = await worktreeTreeSnapshot.reverseAndRestore(repo, [
-			{ before: secondResult.before, after: secondResult.after, ownedPaths: ["shared.txt"] },
-		]);
-		expect(reversed.conflicts).toEqual([]);
-		expect(reversed.changedFiles).toEqual(["shared.txt"]);
-		expect(readFileSync(path, "utf8")).toBe(content(1, 1));
+		// The second call's own window starts from the human's bytes, so its delta is
+		// only the AI's edit and the human edit is never attributed to it.
+		const preview = (tree: string) =>
+			worktreeTreeSnapshot.readFilePreviewAtTree(repo, tree, "shared.txt", LOCAL_DEVICE_ID, 4096, {
+				signal: new AbortController().signal,
+				timeoutMs: 15_000,
+			});
+		expect(await preview(secondResult.before)).toEqual({
+			status: "available",
+			content: content(1, 1),
+		});
+		expect(await preview(secondResult.after)).toEqual({
+			status: "available",
+			content: content(2, 1),
+		});
+		expect(secondResult.changedFiles).toEqual(["shared.txt"]);
 	});
 
 	test("failed path measurement stays unknown rather than recording an owned no-op", async () => {
@@ -301,27 +314,6 @@ describe("narrator tree snapshot hooks", () => {
 		});
 		expect(row?.treeHashBefore).not.toBe(row?.treeHashAfter);
 		expect(row?.ownedPathsJson).toBeNull();
-	});
-
-	test("restoring a recorded boundary undoes the tool's writes", async () => {
-		const repo = await createRepo("nf-hook-restore-");
-		const narratorId = await createNarrator(repo);
-		const session = makeSession(repo);
-		writeFileSync(join(repo, "a.txt"), "original\n");
-
-		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
-		await recordTreeSnapshotBefore(session, narratorId, toolUseId);
-		await safeSpawn({
-			cmd: ["sh", "-c", "printf 'wrecked\\n' > a.txt && printf 'junk\\n' > b.txt"],
-			cwd: repo,
-			timeout: 15_000,
-		});
-		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
-
-		const beforeHash = result.before;
-		if (!beforeHash) throw new Error("expected a recorded before-boundary");
-		await worktreeTreeSnapshot.restore(repo, beforeHash);
-		expect(await worktreeTreeSnapshot.capture(repo)).toBe(beforeHash);
 	});
 
 	test("a remote execution target records no snapshot", async () => {
@@ -367,8 +359,8 @@ describe("narrator tree snapshot hooks", () => {
 
 		// The escape hatch for worktrees whose whole-tree scan is not viable: with
 		// the setting off, the tool path records no boundaries and never spawns git.
-		const previous = settings.chapters.treeSnapshotsEnabled;
-		settings.chapters.treeSnapshotsEnabled = false;
+		const previous = settings.workspace.treeSnapshotsEnabled;
+		settings.workspace.treeSnapshotsEnabled = false;
 		try {
 			const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
 			await recordTreeSnapshotBefore(session, narratorId, toolUseId);
@@ -380,7 +372,7 @@ describe("narrator tree snapshot hooks", () => {
 			expect(result.changedFiles).toEqual([]);
 			expect(session._lastTreeHash).toBeUndefined();
 		} finally {
-			settings.chapters.treeSnapshotsEnabled = previous;
+			settings.workspace.treeSnapshotsEnabled = previous;
 		}
 
 		// Re-enabled, the same session captures again (the cache was never poisoned
@@ -417,20 +409,31 @@ describe("unfinished tool lifecycles", () => {
 		// never runs. This is the leak.
 		await recordTreeSnapshotBefore(neighbour, neighbourId, "threw-mid-write", ["target.txt"]);
 		abandonTreeSnapshot(neighbour, neighbourId, "threw-mid-write");
+		const sealedAt = peekClaim(repo, "threw-mid-write")?.to;
+		if (sealedAt == null) throw new Error("Abandoned claim must be sealed");
 
-		// A shell command starting afterwards genuinely writes that file, and must keep
-		// it: without the seal the abandoned claim still overlaps and subtracts it.
-		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
-		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
-		writeFileSync(join(repo, "target.txt"), "written-by-shell\n");
-		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+		// Equal-ms endpoints conservatively overlap. This case needs a strictly
+		// later shell window, not a race against the clock's millisecond resolution.
+		const realNow = Date.now;
+		const clock = spyOn(Date, "now").mockImplementation(() => Math.max(realNow(), sealedAt + 1));
+		try {
+			// A shell command starting afterwards genuinely writes that file, and must keep
+			// it: without the seal the abandoned claim still overlaps and subtracts it.
+			const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+			await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+			expect(peekClaim(repo, toolUseId)?.from).toBeGreaterThan(sealedAt);
+			writeFileSync(join(repo, "target.txt"), "written-by-shell\n");
+			const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
-		expect(result.changedFiles).toEqual(["target.txt"]);
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-			columns: { ownedPathsJson: true },
-		});
-		expect(row?.ownedPathsJson).toEqual(["target.txt"]);
+			expect(result.changedFiles).toEqual(["target.txt"]);
+			const row = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.toolUseId, toolUseId),
+				columns: { ownedPathsJson: true },
+			});
+			expect(row?.ownedPathsJson).toEqual(["target.txt"]);
+		} finally {
+			clock.mockRestore();
+		}
 	});
 
 	test("an abandoned call still shadows a neighbour inside the span it occupied", async () => {
@@ -475,17 +478,30 @@ describe("unfinished tool lifecycles", () => {
 		await recordTreeSnapshotBefore(other, otherId, "still-running", ["two.txt"]);
 
 		abandonSessionTreeSnapshots(aborted, abortedId);
+		const sealedAt = peekClaim(repo, "edit-a")?.to;
+		if (sealedAt == null) throw new Error("Aborted claim must be sealed");
+		expect(peekClaim(repo, "edit-b")?.to).toBe(sealedAt);
+		expect(peekClaim(repo, "still-running")?.to).toBeNull();
 
-		const { toolUseId } = await seedToolCall(shellId, "Bash", 1);
-		await recordTreeSnapshotBefore(shell, shellId, toolUseId, null);
-		writeFileSync(join(repo, "one.txt"), "shell-wrote-this\n");
-		writeFileSync(join(repo, "two.txt"), "shell-wrote-this\n");
-		const result = await recordTreeSnapshotAfter(shell, shellId, toolUseId);
+		// The registry conservatively includes equal-millisecond endpoints. This case
+		// requires a strictly later window, not a race against the wall clock's granularity.
+		const realNow = Date.now;
+		const clock = spyOn(Date, "now").mockImplementation(() => Math.max(realNow(), sealedAt + 1));
+		try {
+			const { toolUseId } = await seedToolCall(shellId, "Bash", 1);
+			await recordTreeSnapshotBefore(shell, shellId, toolUseId, null);
+			expect(peekClaim(repo, toolUseId)?.from).toBeGreaterThan(sealedAt);
+			writeFileSync(join(repo, "one.txt"), "shell-wrote-this\n");
+			writeFileSync(join(repo, "two.txt"), "shell-wrote-this\n");
+			const result = await recordTreeSnapshotAfter(shell, shellId, toolUseId);
 
-		// `one.txt` survives (its claim was sealed before the shell window opened);
-		// `two.txt` is still claimed by the narrator that is actually running.
-		expect(result.workspaceDelta.sort()).toEqual(["one.txt", "two.txt"]);
-		expect(result.changedFiles).toEqual(["one.txt"]);
+			// `one.txt` survives (its claim was sealed before the shell window opened);
+			// `two.txt` is still claimed by the narrator that is actually running.
+			expect(result.workspaceDelta.sort()).toEqual(["one.txt", "two.txt"]);
+			expect(result.changedFiles).toEqual(["one.txt"]);
+		} finally {
+			clock.mockRestore();
+		}
 	});
 
 	test("abandoning drops the staged boundary and the cached hash", async () => {

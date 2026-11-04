@@ -1,3 +1,4 @@
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
 /**
  * RenderToolCall.tsx — Render copy for the ToolCallCard (batch-2 P10).
  *
@@ -30,8 +31,11 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { GenUICard } from "@frontend/components/gen-ui/GenUICard";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
+import { resolveServerUrl } from "@frontend/lib/base-path";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
+import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
 	STRUCT_THEME_DARK,
@@ -42,7 +46,6 @@ import {
 	Badge,
 	Box,
 	Button,
-	CopyButton,
 	Divider,
 	Group,
 	NumberInput,
@@ -54,7 +57,6 @@ import {
 	ThemeIcon,
 	Tooltip,
 	UnstyledButton,
-	useComputedColorScheme,
 } from "@mantine/core";
 import {
 	CARD_SHIMMER_CLASS,
@@ -87,6 +89,16 @@ import { resolveToolRowStatusMark, TraceRowStatusGlyph } from "./trace-row-statu
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
+import { resolveToolCallTiming } from "@shared/tool-display-duration";
+import { CopyButton } from "../../../common/CopyButton";
+import {
+	QUOTE_FILE_ATTR,
+	QUOTE_PART_ATTR,
+	QUOTE_TOOL_ATTR,
+	QUOTE_TOOL_ID_ATTR,
+	QUOTE_TOOL_SUMMARY_ATTR,
+	quoteSectionPart,
+} from "../../composer/quote-source-attrs";
 import { DocumentCodeBody } from "../../content/DocumentCodeBody";
 import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
 import { queueDocumentFind } from "../../content/document-find-intent";
@@ -142,6 +154,7 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
+import { ROW_BUTTON_CLASS, ROW_FLEX_CLASS, rowFlexStyle } from "./row-chrome";
 import { ShareFilePreview } from "./ShareFilePreview";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
@@ -244,10 +257,10 @@ function formatPlanSource(template: string, file: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Category → colour (mirrors ToolCallCard getCategoryColor). Kept local to the
-// vlist render layer so it never imports the heavy ToolCallCard module; exported
-// so a subagent card's recent-call rows tint their chips from the same table the
-// tool header and the trace rows use.
+// Category → colour (mirrors getCategoryColor in tool-display.ts). Kept local so
+// the vlist render layer does not import the classifier; exported so a subagent
+// card's recent-call rows tint their chips from the same table the tool header
+// and the trace rows use.
 // ─────────────────────────────────────────────────────────────────────────────
 export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	read: "lime",
@@ -265,6 +278,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	taskOutput: "indigo",
 	agent: "pink",
 	await: "indigo",
+	stop: "orange",
 	contextAsk: "indigo",
 	send: "blue",
 	ask: "blue",
@@ -277,9 +291,27 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	skill: "grape",
 	browser: "teal",
 	knowledge: "grape",
+	outline: "teal",
+	// Mirrors getCategoryColor's terminal yellow. A missing key here made the header
+	// chip receive `undefined`, which Mantine's colour parser throws on.
+	schedule: "yellow",
 	workspace: "gray",
 	generic: "gray",
 };
+
+/**
+ * Chip tint for a category string coming off the adapter.
+ *
+ * `CATEGORY_COLOR` is complete for `ToolCategory`, but the registry casts the
+ * adapter's plain string through `AnyData`. A value the table does not know must
+ * still paint: `undefined` reaches Mantine's colour parser, which throws
+ * "Failed to parse color" and the root error boundary replaces the narrator view.
+ * Unknown or absent → gray, the same tint `generic` already uses.
+ */
+export function categoryColor(category: string | null | undefined): string {
+	if (!category) return "gray";
+	return CATEGORY_COLOR[category as ToolCategory] ?? "gray";
+}
 
 const STATUS_COLOR: Record<ToolCallStatus, string> = {
 	pending: "yellow",
@@ -325,23 +357,32 @@ function InlineLines({
 	frame,
 	availableWidth,
 	color,
+	unlinkedColor,
 	leadingSlot,
-	href,
+	href: rawHref,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
 	availableWidth: number;
 	color?: string;
+	/** The colour when `href` turns out not to be a link here (an outline link nothing opens). */
+	unlinkedColor?: string;
 	/** Optional glyph drawn in the reserved indent lane (spec-task status icon). */
 	leadingSlot?: React.ReactNode;
 	/**
 	 * When set, the whole measured line box becomes an external link. Drawn as an
 	 * overlay so the pretext line geometry stays the single source of truth (an
 	 * <a> wrapper would let the browser re-lay out the fragments).
+	 *
+	 * An outline link (a block address, a commit) opens an outline panel beside the
+	 * session instead, and is plain text where nothing can open it.
 	 */
 	href?: string | null;
 }) {
 	const lines = useInlineLines(block, availableWidth);
+	const outlineLink = useOutlineLinkProps(rawHref);
+	const href = outlineLink === null ? null : (outlineLink?.href ?? rawHref);
+	if (outlineLink === null && unlinkedColor !== undefined) color = unlinkedColor;
 	return (
 		<div
 			style={{
@@ -355,8 +396,9 @@ function InlineLines({
 			{href ? (
 				<a
 					href={href}
-					target="_blank"
-					rel="noopener noreferrer"
+					{...(outlineLink
+						? { onClick: outlineLink.onClick, "data-outline-link": "" }
+						: { target: "_blank", rel: "noopener noreferrer" })}
 					title={href}
 					style={{
 						position: "absolute",
@@ -492,20 +534,20 @@ function ToolHeaderRow({
 	onTerminate,
 	terminateLabel,
 }: ToolHeaderRowProps) {
-	const color = CATEGORY_COLOR[category];
+	const color = categoryColor(category);
 	const statusColor = STATUS_COLOR[status];
 	const statusMark = resolveToolRowStatusMark(status, { reflectionStatus, queuedBehindUpstream });
 	const running = isRunningStatus(status);
 	return (
-		<Group
+		// biome-ignore lint/a11y/noStaticElementInteractions: role/tabIndex/keyboard handler are set together whenever the row is togglable
+		// biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-expanded is only emitted alongside role="button"
+		<div
 			data-nf-card-header
+			className={ROW_FLEX_CLASS}
 			// The header doubles as the card's selectable surface: Ctrl/Cmd/Shift+Click
 			// must reach the row's selection wrapper (which ignores role="button"
 			// targets) instead of being treated as an interactive island.
 			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
-			gap={HEADER_CELL_GAP}
-			wrap="nowrap"
-			align="center"
 			// A keyboard and a screen reader cannot use a bare `onClick` on a div. That
 			// matters most for a DRILLED-IN trace row: its summary line (which did carry
 			// these attributes) is not painted, so this header is the ONLY control that
@@ -515,6 +557,7 @@ function ToolHeaderRow({
 			tabIndex={onToggle ? 0 : undefined}
 			aria-expanded={onToggle ? opened : undefined}
 			style={{
+				...rowFlexStyle(HEADER_CELL_GAP),
 				height: headerRowHeight(),
 				cursor: onToggle ? "pointer" : "default",
 				userSelect: "none",
@@ -689,7 +732,7 @@ function ToolHeaderRow({
 			>
 				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 			</span>
-		</Group>
+		</div>
 	);
 }
 
@@ -791,6 +834,9 @@ export interface ToolTimingLabels {
 	/** Carries a literal `{duration}` placeholder. */
 	total: string;
 	permissionWait: string;
+	streaming?: string;
+	wait?: string;
+	executionSpan?: string;
 	execution: string;
 	/** Carries a literal `{time}` placeholder (aria-label / group tooltip). */
 	startedAt: string;
@@ -809,6 +855,9 @@ const DEFAULT_TIMING_LABELS: ToolTimingLabels = {
 	completed: "Execution completed",
 	total: "Total {duration}",
 	permissionWait: "Permission wait {duration}",
+	streaming: "Streaming duration: {duration}",
+	wait: "Waiting {duration}",
+	executionSpan: "Execution span (includes unmeasured waits) {duration}",
 	execution: "Execution {duration}",
 	startedAt: "Started at {time}",
 	timeoutSeconds: "Timeout (seconds)",
@@ -833,7 +882,9 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
 		timing.streamCompletedAt != null ||
 		timing.permissionStartedAt != null ||
 		timing.executionStartedAt != null ||
-		timing.completedAt != null
+		timing.completedAt != null ||
+		timing.fileChangeTiming != null ||
+		timing.execDurationMs != null
 	);
 }
 
@@ -844,33 +895,25 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
  * the chunked version readable:
  *   - the generic "Started" row is SUPPRESSED when it coincides with one of the
  *     named phases (otherwise every card shows the same timestamp twice), and
- *   - `completed` falls back through executionStarted + displayed duration, then
- *     earliest start + final duration, so a card whose completion stamp never
- *     persisted still closes out its timeline.
+ *   - completion stamps are never inferred from an attributed duration: it can
+ *     include streaming/waits and exclude preceding sibling execution. Summaries
+ *     use the same measured phases as the inspector without moving timestamps.
  */
 function ToolTimingBreakdown({
 	timing,
-	displayDurationMs,
 	labels,
 }: {
 	timing: ToolTimingStamps;
 	displayDurationMs?: number | null;
 	labels: ToolTimingLabels;
 }) {
-	const resolvedStart = earliestToolStartMs(timing);
 	const explicitCandidates = [timing.startedAt, timing.createdAt].filter(
 		(value): value is number => value != null,
 	);
 	const explicitStarted = explicitCandidates.length > 0 ? Math.min(...explicitCandidates) : null;
 	const { streamStartedAt, streamCompletedAt, permissionStartedAt, executionStartedAt } = timing;
-	const finalDurationMs = timing.durationMs ?? displayDurationMs ?? null;
-	const completed =
-		timing.completedAt ??
-		(executionStartedAt != null && displayDurationMs != null
-			? executionStartedAt + displayDurationMs
-			: resolvedStart != null && finalDurationMs != null
-				? resolvedStart + finalDurationMs
-				: null);
+	const phases = resolveToolCallTiming(timing);
+	const completed = phases.completed;
 	const genericStarted =
 		explicitStarted != null &&
 		explicitStarted !== streamStartedAt &&
@@ -898,7 +941,13 @@ function ToolTimingBreakdown({
 		] as Array<{ key: string; label: string; time: number | null }>
 	).filter((step): step is { key: string; label: string; time: number } => step.time != null);
 
-	if (steps.length === 0) return null;
+	if (
+		steps.length === 0 &&
+		phases.totalMs == null &&
+		phases.executionMs == null &&
+		phases.waitMs == null
+	)
+		return null;
 
 	const precise = (ms: number) => formatDurationText(ms, { style: "precise" });
 
@@ -926,9 +975,23 @@ function ToolTimingBreakdown({
 					</Group>
 				);
 			})}
-			{resolvedStart != null && completed != null ? (
+			{phases.totalMs != null ? (
 				<Text size="xs" c="dimmed">
-					{fillLabel(labels.total, "duration", precise(Math.max(0, completed - resolvedStart)))}
+					{fillLabel(labels.total, "duration", precise(phases.totalMs))}
+				</Text>
+			) : null}
+			{phases.streamingMs != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(
+						labels.streaming ?? "Streaming duration: {duration}",
+						"duration",
+						precise(phases.streamingMs),
+					)}
+				</Text>
+			) : null}
+			{phases.waitMs != null ? (
+				<Text size="xs" c="dimmed">
+					{fillLabel(labels.wait ?? "Waiting {duration}", "duration", precise(phases.waitMs))}
 				</Text>
 			) : null}
 			{permissionStartedAt != null && executionStartedAt != null ? (
@@ -940,12 +1003,14 @@ function ToolTimingBreakdown({
 					)}
 				</Text>
 			) : null}
-			{executionStartedAt != null && completed != null ? (
+			{phases.executionMs != null ? (
 				<Text size="xs" c="dimmed">
 					{fillLabel(
-						labels.execution,
+						phases.fileWaitMs != null
+							? labels.execution
+							: (labels.executionSpan ?? labels.execution),
 						"duration",
-						precise(Math.max(0, completed - executionStartedAt)),
+						precise(phases.executionMs),
 					)}
 				</Text>
 			) : null}
@@ -1124,9 +1189,10 @@ export function ToolTimingArea({
 			: merged.title;
 
 	const trigger = (
-		<UnstyledButton
+		<button
 			ref={triggerRef}
 			type="button"
+			className={ROW_BUTTON_CLASS}
 			aria-label={ariaLabel}
 			onFocus={breakdownMount.ensure}
 			style={{
@@ -1167,7 +1233,7 @@ export function ToolTimingArea({
 			}}
 		>
 			{text}
-		</UnstyledButton>
+		</button>
 	);
 
 	const withBreakdown = showBreakdown ? (
@@ -1423,16 +1489,38 @@ function sectionLabelText(labels: DetailLabels, label: ToolSectionLabel): string
 	return labels.sections?.[label] ?? DEFAULT_SECTION_LABELS[label];
 }
 
+/**
+ * The absolute URL a share link is copied as.
+ *
+ * The card's action carries a server-authored `/api/shares/…` PATH (see
+ * `resolveServerUrl`): as a clipboard value it is unusable on its own, because
+ * pasting it into a browser address bar or a chat has no host to resolve against.
+ * The origin is the frontend's own, which is what the reader opening the link needs.
+ */
+function shareLinkForCopy(path: string): string {
+	const origin = globalThis.location?.origin ?? "";
+	return origin && path.startsWith("/") ? `${origin}${path}` : path;
+}
+
+/** Test-only handle: the copy button renders its value into a click handler, which a
+ * static render cannot reach, so RenderToolCall.sharelink.test.tsx asserts the
+ * mapping itself. */
+export const __TEST__shareLinkForCopy = shareLinkForCopy;
+
 /** Action controls on a meta row: the share card's download + copy-link buttons. */
 function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: DetailLabels }) {
 	return (
 		<Group gap="xs" wrap="nowrap" style={{ height: "100%", alignItems: "center" }}>
-			{actions.map((action) =>
-				action.kind === "download" ? (
+			{actions.map((action) => {
+				// Resolve the mount prefix at render time: the value is persisted with the
+				// message, so a producer-side fix could not reach rows already written. The
+				// download href needs the prefix, the copied text needs prefix + origin.
+				const href = resolveServerUrl(action.value);
+				return action.kind === "download" ? (
 					<Button
 						key={`download-${action.value}`}
 						component="a"
-						href={action.value}
+						href={href}
 						size="xs"
 						variant="light"
 						color="green"
@@ -1441,7 +1529,7 @@ function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: De
 						{labels.download}
 					</Button>
 				) : (
-					<CopyButton key={`copy-${action.value}`} value={action.value} timeout={2000}>
+					<CopyButton key={`copy-${action.value}`} value={shareLinkForCopy(href)} timeout={2000}>
 						{({ copied, copy }) => (
 							<Button
 								size="xs"
@@ -1454,8 +1542,8 @@ function MetaActions({ actions, labels }: { actions: ToolRowAction[]; labels: De
 							</Button>
 						)}
 					</CopyButton>
-				),
-			)}
+				);
+			})}
 		</Group>
 	);
 }
@@ -1498,7 +1586,7 @@ function HighlightedBody({ text, lang }: { text: string; lang: string | undefine
  * `TokenFlowText`, so the exactness check and the plain-text fallback apply identically.
  */
 function CustomHighlightedBody({ text, kind }: { text: string; kind: "struct-view" }) {
-	const dark = useComputedColorScheme("dark") !== "light";
+	const dark = useSharedComputedColorScheme("dark") !== "light";
 	// Synchronous: unlike Shiki there is no grammar or WASM to fetch, so there is nothing
 	// to cache and no pending state to render around.
 	const tokens = useMemo(
@@ -1544,8 +1632,9 @@ function DetailBlocks({
 	narratorId?: string;
 	/**
 	 * "Open full session" affordance for a call waiting on a subagent
-	 * (Await-agent / single-target Send). Painted on the FIRST badges row — the
-	 * meta header — where the call's type/target/timeout chips already live.
+	 * (Await-agent / single-target Send). Painted on the identity row when the
+	 * card has one (Await), otherwise on the FIRST badges row (Send's target
+	 * chips) — each is the row that names the session being opened.
 	 */
 	openSession?: { onOpen: () => void; label: string };
 	/** This card is the newest task board of a RUNNING narrator (see SpecTaskIcon). */
@@ -1556,11 +1645,46 @@ function DetailBlocks({
 	const color = kind === "error" ? "var(--mantine-color-red-text)" : undefined;
 	const isSpecTasks = kind === "spec-tasks";
 	const isError = kind === "error";
-	// The open-session button rides the FIRST badges row (the meta header), so a
-	// card whose detail has several badge rows paints it exactly once.
+	// The open-session button rides the identity row when one exists (an Await
+	// card), else the first badges row (a Send card's target chips), so a card
+	// whose detail has several such rows paints it exactly once.
 	const openSessionIndex = openSession
-		? blocks.findIndex((b) => b.kind === "fixed" && b.tag === "detail-meta-badges")
+		? (() => {
+				const identityIndex = blocks.findIndex(
+					(b) => b.kind === "fixed" && b.tag === "detail-meta-identity",
+				);
+				return identityIndex >= 0
+					? identityIndex
+					: blocks.findIndex((b) => b.kind === "fixed" && b.tag === "detail-meta-badges");
+			})()
 		: -1;
+	// One shared button for both host rows. The rows are measured at
+	// META_BADGE_ROW and their boxes are overflow-hidden, so the button resets the
+	// compact-xs root's fixed 22px height to fit the same lane as the content
+	// beside it — nothing here can move the measured geometry.
+	const openSessionButton = openSession ? (
+		<Button
+			data-testid="tool-open-session"
+			size="compact-xs"
+			variant="subtle"
+			styles={{
+				root: {
+					height: "auto",
+					minHeight: 0,
+					padding: "0 6px",
+					fontSize: typographyMetrics().size.xs,
+					lineHeight: `${META_BADGE_ROW - 2}px`,
+					flexShrink: 0,
+				},
+			}}
+			onClick={(e: React.MouseEvent) => {
+				e.stopPropagation();
+				openSession.onOpen();
+			}}
+		>
+			{openSession.label}
+		</Button>
+	) : null;
 	return (
 		<div style={{ position: "relative", width: availableWidth, height }}>
 			{blocks.map((block, index) => {
@@ -1600,6 +1724,7 @@ function DetailBlocks({
 							frame={bf}
 							availableWidth={availableWidth}
 							color={href ? "var(--mantine-color-teal-text)" : lineColor}
+							unlinkedColor={lineColor}
 							leadingSlot={iconSlot}
 							href={href}
 						/>
@@ -1642,6 +1767,15 @@ function DetailBlocks({
 					typeof data.text === "string"
 						? data.text
 						: null;
+				// The Await identity row: the resolved child's slug · id in copyable
+				// monospace, with the open-session button at its right. Fixed-height
+				// block, so the text truncates rather than ever wrapping.
+				const identity =
+					block.kind === "fixed" &&
+					block.tag === "detail-meta-identity" &&
+					typeof data.identity === "string"
+						? data.identity
+						: null;
 				return (
 					<div
 						// biome-ignore lint/suspicious/noArrayIndexKey: blocks are a stable ordered list
@@ -1655,6 +1789,14 @@ function DetailBlocks({
 							overflow: "hidden",
 						}}
 					>
+						{identity != null ? (
+							<Group gap={6} wrap="nowrap" style={{ alignItems: "center", height: "100%" }}>
+								<Text size="xs" c="dimmed" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }}>
+									{identity}
+								</Text>
+								{index === openSessionIndex ? openSessionButton : null}
+							</Group>
+						) : null}
 						{badges.length > 0 ? (
 							<Group gap={4} wrap="wrap" style={{ alignItems: "center" }}>
 								{badges.map((b, i) => (
@@ -1668,35 +1810,10 @@ function DetailBlocks({
 										{b.label}
 									</Badge>
 								))}
-								{/* "Open full session" rides the meta header's badges row (the
-							    card's second line). The row is measured at META_BADGE_ROW
-							    (16px) and its box is overflow-hidden, so the button resets
-							    the compact-xs root's fixed 22px height to fit the same
-							    lane as the size-xs badges beside it — nothing here can
-							    move the measured geometry. */}
-								{openSession && index === openSessionIndex ? (
-									<Button
-										data-testid="tool-open-session"
-										size="compact-xs"
-										variant="subtle"
-										styles={{
-											root: {
-												height: "auto",
-												minHeight: 0,
-												padding: "0 6px",
-												fontSize: typographyMetrics().size.xs,
-												lineHeight: `${META_BADGE_ROW - 2}px`,
-												flexShrink: 0,
-											},
-										}}
-										onClick={(e: React.MouseEvent) => {
-											e.stopPropagation();
-											openSession.onOpen();
-										}}
-									>
-										{openSession.label}
-									</Button>
-								) : null}
+								{/* "Open full session" on a Send card rides the target badges row
+							    (an Await card hosts it on the identity row instead). The index is
+							    unique per block, so the two rows can never both draw it. */}
+								{index === openSessionIndex ? openSessionButton : null}
 							</Group>
 						) : null}
 						{progress ? <MetaProgress progress={progress} /> : null}
@@ -1832,6 +1949,19 @@ function askRoleColor(role: string, selected: boolean): string | undefined {
 	}
 }
 
+/** The path row of a file tool card. Edit appends `:line`; the quote reader strips that. */
+function quoteFilePath(detail: MeasuredToolDetail | null): string | undefined {
+	if (!detail) return undefined;
+	for (const section of detail.sections) {
+		if (section.key !== "meta.file" && section.key !== "meta.target") continue;
+		const model = section.measuredBody.model;
+		if (model.kind !== "meta-rows") continue;
+		const text = model.rows.map((row) => row.text.trim()).find((row) => row.length > 0);
+		if (text) return text;
+	}
+	return undefined;
+}
+
 function DetailRegion({
 	detail,
 	availableWidth,
@@ -1846,7 +1976,7 @@ function DetailRegion({
 	availableWidth: number;
 	labels: DetailLabels;
 	narratorId?: string;
-	/** "Open full session" affordance for an Await-agent card's badges row. */
+	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
 	viewTargets?: readonly VListViewTarget[];
 	viewControls?: VListViewControls;
@@ -1854,48 +1984,52 @@ function DetailRegion({
 }) {
 	return (
 		<div style={{ position: "relative", width: availableWidth, height: detail.height }}>
-			{detail.sections.map((section) => (
-				<Fragment key={section.key}>
-					{section.label ? (
-						<Text
-							size="xs"
-							fw={500}
+			{detail.sections.map((section) => {
+				const part = quoteSectionPart(section.key);
+				return (
+					<Fragment key={section.key}>
+						{section.label ? (
+							<Text
+								size="xs"
+								fw={500}
+								style={{
+									position: "absolute",
+									top: section.top,
+									left: 0,
+									width: availableWidth,
+									height: typographyMetrics().line.xs,
+								}}
+							>
+								{sectionLabelText(labels, section.label)}
+							</Text>
+						) : null}
+						<div
+							{...(part ? { [QUOTE_PART_ATTR]: part } : {})}
 							style={{
 								position: "absolute",
-								top: section.top,
+								top: section.bodyTop,
 								left: 0,
 								width: availableWidth,
-								height: typographyMetrics().line.xs,
+								height: section.bodyHeight,
 							}}
 						>
-							{sectionLabelText(labels, section.label)}
-						</Text>
-					) : null}
-					<div
-						style={{
-							position: "absolute",
-							top: section.bodyTop,
-							left: 0,
-							width: availableWidth,
-							height: section.bodyHeight,
-						}}
-					>
-						<RenderToolBody
-							measured={section.measuredBody}
-							labels={labels}
-							narratorId={narratorId}
-							openSession={openSession}
-							viewTarget={
-								section.measuredBody.model.kind === "capped"
-									? findViewTarget(viewTargets, section.measuredBody.model.source)
-									: undefined
-							}
-							viewControls={viewControls}
-							specTasksLive={specTasksLive}
-						/>
-					</div>
-				</Fragment>
-			))}
+							<RenderToolBody
+								measured={section.measuredBody}
+								labels={labels}
+								narratorId={narratorId}
+								openSession={openSession}
+								viewTarget={
+									section.measuredBody.model.kind === "capped"
+										? findViewTarget(viewTargets, section.measuredBody.model.source)
+										: undefined
+								}
+								viewControls={viewControls}
+								specTasksLive={specTasksLive}
+							/>
+						</div>
+					</Fragment>
+				);
+			})}
 		</div>
 	);
 }
@@ -1913,7 +2047,7 @@ export function RenderToolBody({
 	measured: MeasuredToolBody;
 	labels?: DetailLabels;
 	narratorId?: string;
-	/** "Open full session" affordance for an Await-agent card's badges row. */
+	/** "Open full session" affordance for an Await-agent card's identity row. */
 	openSession?: { onOpen: () => void; label: string };
 	viewTarget?: VListViewTarget;
 	viewControls?: VListViewControls;
@@ -1932,6 +2066,30 @@ export function RenderToolBody({
 		}),
 		[blocks, frame, contentWidth, frame.contentHeight, frame.usedWidth],
 	);
+	if (model.kind === "gen-ui")
+		return (
+			<GenUICard
+				narratorId={narratorId}
+				file={model.file}
+				publicSummary={model.publicSummary}
+				historyUnavailable={model.historyUnavailable}
+				inline={
+					model.text === undefined
+						? undefined
+						: {
+								source: model.text,
+								live: model.live === true,
+								title: model.title,
+								runtime: model.runtime,
+								formToolUseId: model.formToolUseId,
+								stateKey: model.stateKey,
+							}
+				}
+				kit={model.kit}
+				appShownAt={model.appShownAt}
+				height={height}
+			/>
+		);
 	if (model.kind === "ask")
 		return (
 			<AskDetailBlocks
@@ -2455,9 +2613,8 @@ export function RenderToolCall({
 							availableWidth={contentWidth}
 							labels={merged}
 							narratorId={narratorId}
-							// The "open full session" button lives on the badges row of the
-							// card's meta header (the second line), not the toggleable header
-							// row — see DetailBlocks.
+							// The "open full session" button lives on the identity row of the
+							// card's meta area, not the toggleable header row — see DetailBlocks.
 							openSession={
 								onOpenSession ? { onOpen: onOpenSession, label: merged.openSession } : undefined
 							}
@@ -2475,13 +2632,20 @@ export function RenderToolCall({
 			{liveSlot}
 		</>
 	);
+	const quoteFile = quoteFilePath(measured.detail);
+	const quoteSource = {
+		[QUOTE_TOOL_ATTR]: measured.toolName,
+		[QUOTE_TOOL_SUMMARY_ATTR]: measured.summary,
+		...(quoteFile ? { [QUOTE_FILE_ATTR]: quoteFile } : {}),
+		...(measured.toolUseId ? { [QUOTE_TOOL_ID_ATTR]: measured.toolUseId } : {}),
+	};
 
 	// In a run: no border, a trailing divider unless last. The shimmer overlay
 	// sits on the inner padded box (not the outer wrapper) so the divider stays
 	// outside the `overflow: hidden` sweep — mirrors ToolCallCard :6100.
 	if (inRun) {
 		return (
-			<Box>
+			<Box {...quoteSource}>
 				<Box p="xs" className={shimmerClass} style={{ boxSizing: "border-box" }}>
 					{body}
 				</Box>
@@ -2497,6 +2661,7 @@ export function RenderToolCall({
 			// so it has to arrive and leave rather than travel). Marked rather than found by
 			// tag so the fade cannot silently retarget if the card's markup changes.
 			data-nf-card-surface
+			{...quoteSource}
 			withBorder={hasBorder}
 			radius="sm"
 			p="xs"
@@ -2593,7 +2758,7 @@ export function RenderToolCallGroup({
 	const { expanded, headerHeight, childCount, children, bodyLeft, contentWidth } = measured;
 	// Child colour + glyph follow the first child's category (same as chunk mode).
 	const firstChild = children[0];
-	const groupColor = firstChild ? CATEGORY_COLOR[firstChild.category] : "gray";
+	const groupColor = categoryColor(firstChild?.category);
 	const Icon =
 		icon ?? (firstChild ? categoryIcon(firstChild.category, firstChild.toolName) : IconTool);
 

@@ -1,4 +1,17 @@
 import { Database } from "bun:sqlite";
+import {
+	generatedModelHistoryTriggerContract,
+	hasModelHistoryBlockSchema,
+	hasModelHistoryRevisionSchema,
+	MODEL_HISTORY_REVISION_CONTRACT,
+	MODEL_HISTORY_REVISION_CONTRACT_V1,
+	MODEL_HISTORY_TRIGGER_TABLES,
+	modelHistoryReinstall,
+	modelHistoryTriggerSuffix,
+	modelHistoryTriggerTables,
+	renderModelHistoryRevisionSql,
+	splitGeneratedModelHistoryTriggers,
+} from "./lib/generated-model-history-triggers";
 
 interface SnapshotTable {
 	columns: Record<
@@ -30,6 +43,9 @@ interface SnapshotTable {
 }
 export interface ResourceMigrationSnapshot {
 	tables: Record<string, SnapshotTable>;
+	internal?: {
+		indexes?: Record<string, { columns?: Record<string, { isExpression?: boolean }> }>;
+	};
 }
 interface Token {
 	kind: "word" | "identifier" | "string" | "symbol";
@@ -232,7 +248,28 @@ function expressionSignature(source: string, table: string, columns: string[]): 
 	}
 	return JSON.stringify(normalized);
 }
-function snapshotDDL(name: string, table: SnapshotTable): string[] {
+/** Only the literal integer 1, optionally wrapped in balanced parentheses, is allowed.
+ * Do not accept other expressions even when they evaluate/normalize to the same value. */
+function constantOneIndexSignature(source: string): string {
+	const parsed = statementsOf(`${source};`);
+	if (
+		parsed.length !== 1 ||
+		parsed[0].tokens.some(
+			(token) =>
+				!(token.kind === "word" && token.value === "1") &&
+				!symbol(token, "(") &&
+				!symbol(token, ")"),
+		) ||
+		expressionSignature(source, "", []) !== expressionSignature("1", "", [])
+	)
+		throw new Error("Unsupported expression index");
+	return expressionSignature(source, "", []);
+}
+function snapshotDDL(
+	name: string,
+	table: SnapshotTable,
+	snapshot: ResourceMigrationSnapshot,
+): string[] {
 	const columns = Object.keys(table.columns);
 	const expression = (value: unknown) => {
 		const text = String(value);
@@ -276,10 +313,21 @@ function snapshotDDL(name: string, table: SnapshotTable): string[] {
 	}
 	return [
 		`CREATE TABLE ${quote(name)} (${definitions.join(",")});`,
-		...Object.values(table.indexes ?? {}).map(
-			(index) =>
-				`CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX ${quote(index.name)} ON ${quote(name)} (${index.columns.map(quote).join(",")})${index.where ? ` WHERE ${expression(index.where)}` : ""};`,
-		),
+		...Object.values(table.indexes ?? {}).map((index) => {
+			// Drizzle stores sql`1` as "1" in columns, without an expression flag.
+			// A real column of that name takes precedence; no other expressions are supported.
+			const terms = index.columns.map((column) => {
+				const isExpression =
+					snapshot.internal?.indexes?.[index.name]?.columns?.[column]?.isExpression;
+				if (isExpression !== true && columns.some((name) => key(name) === key(column)))
+					return quote(column);
+				if (isExpression === false) throw new Error("Unsupported snapshot index column");
+				if (index.columns.length !== 1) throw new Error("Unsupported snapshot index expression");
+				constantOneIndexSignature(column);
+				return column;
+			});
+			return `CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX ${quote(index.name)} ON ${quote(name)} (${terms.join(",")})${index.where ? ` WHERE ${expression(index.where)}` : ""};`;
+		}),
 	];
 }
 function tableSignature(db: Database, name: string): string {
@@ -424,12 +472,36 @@ function tableSignature(db: Database, name: string): string {
 				)
 				.all()
 				.filter((row) => row.key);
-			if (rows.some((row) => row.cid < 0)) throw new Error("Unsupported expression index");
+			let indexExpression: string | undefined;
+			if (rows.some((row) => row.cid < 0)) {
+				const offset = keyword(it[1], "UNIQUE") ? 3 : 2;
+				const close = (where < 0 ? it.length : where) - 1;
+				if (
+					rows.length !== 1 ||
+					rows[0].cid !== -2 ||
+					!sql ||
+					!keyword(it[0], "CREATE") ||
+					!keyword(it[offset - 1], "INDEX") ||
+					!keyword(it[offset + 1], "ON") ||
+					!symbol(it[offset + 3], "(") ||
+					!symbol(it[close], ")")
+				)
+					throw new Error("Unsupported expression index");
+				indexExpression = constantOneIndexSignature(sql.slice(it[offset + 3].end, it[close].start));
+			}
 			return [
 				index.origin === "c" ? key(index.name) : index.origin,
 				index.unique,
 				index.partial,
-				rows.map((row) => [row.name === null ? null : key(row.name), row.desc, row.coll]),
+				rows.map((row) => [
+					indexExpression === undefined
+						? row.name === null
+							? null
+							: key(row.name)
+						: ["expression", indexExpression],
+					row.desc,
+					row.coll,
+				]),
 				where < 0 ? null : expr(sql?.slice(it[where].end) ?? ""),
 			];
 		});
@@ -452,6 +524,80 @@ function tableSignature(db: Database, name: string): string {
 		autoincrement: tokens.some((t) => keyword(t, "AUTOINCREMENT")),
 	});
 }
+/** The machine-rendered model-history SQL around a migration's schema statements. */
+interface ModelHistoryParts {
+	prefix: string;
+	schemaSql: string;
+	suffix: string;
+	/** The contract `suffix` installs. */
+	contract?: string;
+	/** `prefix` + `suffix` are the versioned reinstall around a trigger-table rebuild. */
+	reinstall: boolean;
+}
+/** Byte-exact allowlist, not a grammar relaxation: anything else stays schema SQL, which the
+ * ordinary parser rejects (DROP/CREATE TRIGGER, altered bodies, extra statements). */
+function modelHistoryParts(
+	sql: string,
+	before: ResourceMigrationSnapshot,
+	after: ResourceMigrationSnapshot,
+): ModelHistoryParts {
+	const contract = generatedModelHistoryTriggerContract(before, after, "sqlite");
+	if (contract) {
+		const { schemaSql, triggerSql } = splitGeneratedModelHistoryTriggers(
+			sql,
+			modelHistoryTriggerSuffix("sqlite", contract),
+		);
+		return { prefix: "", schemaSql, suffix: triggerSql, contract, reinstall: false };
+	}
+	const reinstall = modelHistoryReinstall(before, after, "sqlite");
+	if (
+		reinstall &&
+		sql.length >= reinstall.prefix.length + reinstall.suffix.length &&
+		sql.startsWith(reinstall.prefix) &&
+		sql.endsWith(reinstall.suffix)
+	)
+		return {
+			prefix: reinstall.prefix,
+			schemaSql: sql.slice(reinstall.prefix.length, sql.length - reinstall.suffix.length),
+			suffix: reinstall.suffix,
+			contract: MODEL_HISTORY_REVISION_CONTRACT,
+			reinstall: true,
+		};
+	return { prefix: "", schemaSql: sql, suffix: "", reinstall: false };
+}
+/** Tables whose rebuild would drop, or strand, an installed contract's triggers. */
+function modelHistoryGuardedTables(before: ResourceMigrationSnapshot): readonly string[] {
+	if (!hasModelHistoryRevisionSchema(before, "sqlite")) return [];
+	return hasModelHistoryBlockSchema(before, "sqlite")
+		? MODEL_HISTORY_TRIGGER_TABLES
+		: modelHistoryTriggerTables(MODEL_HISTORY_REVISION_CONTRACT_V1);
+}
+function dropsGuardedTable(tokens: Token[], guarded: readonly string[]): boolean {
+	return (
+		keyword(tokens[0], "DROP") &&
+		keyword(tokens[1], "TABLE") &&
+		tokens.length === 3 &&
+		(tokens[2].kind === "identifier" || tokens[2].kind === "word") &&
+		guarded.includes(key(tokens[2].value))
+	);
+}
+/**
+ * The generator's half of the versioned reinstall: a fresh Drizzle batch that rebuilds a
+ * current-contract trigger table is wrapped in the canonical prefix + suffix. Anything else,
+ * including an already wrapped batch, is returned unchanged for the finalizer to judge.
+ */
+export function appendModelHistoryReinstall(
+	sql: string,
+	before: ResourceMigrationSnapshot,
+	after: ResourceMigrationSnapshot,
+): string {
+	const reinstall = modelHistoryReinstall(before, after, "sqlite");
+	if (!reinstall || modelHistoryParts(sql, before, after).reinstall) return sql;
+	const guarded = modelHistoryGuardedTables(before);
+	return statementsOf(sql).some(({ tokens }) => dropsGuardedTable(tokens, guarded))
+		? `${reinstall.prefix}${sql.trim()}${reinstall.suffix}`
+		: sql;
+}
 /** Execute only already-classified schema DDL in two private memory databases. Never run
  * INSERT, arbitrary SQL, ATTACH, user paths, or any user database. SQLite resolves column,
  * FK, PK and index semantics; CHECK/predicate equivalence remains deliberately conservative. */
@@ -459,15 +605,22 @@ function validateTargetDDL(
 	statements: Statement[],
 	before: ResourceMigrationSnapshot,
 	after: ResourceMigrationSnapshot,
+	modelHistory: ModelHistoryParts,
 ): void {
 	const actual = new Database(":memory:");
 	let expected: Database | undefined;
 	try {
 		expected = new Database(":memory:");
 		for (const [name, table] of Object.entries(before.tables))
-			for (const ddl of snapshotDDL(name, table)) actual.exec(ddl);
+			for (const ddl of snapshotDDL(name, table, before)) actual.exec(ddl);
 		for (const [name, table] of Object.entries(after.tables))
-			for (const ddl of snapshotDDL(name, table)) expected.exec(ddl);
+			for (const ddl of snapshotDDL(name, table, after)) expected.exec(ddl);
+		if (modelHistory.reinstall) {
+			// Replay where the contract is installed: SQLite refuses a rebuild's RENAME while a
+			// trigger still names the dropped table, so this proves the prefix clears them all.
+			actual.exec(renderModelHistoryRevisionSql("sqlite"));
+			actual.exec(modelHistory.prefix);
+		}
 		for (const statement of statements) {
 			const t = statement.tokens;
 			if (keyword(t[0], "PRAGMA") || keyword(t[0], "INSERT")) continue;
@@ -510,6 +663,37 @@ function validateTargetDDL(
 					`Target DDL differs from generated snapshot: ${name} (${differences.join(", ")})`,
 				);
 		}
+		if (modelHistory.suffix) {
+			// Only the byte-exact renderer suffix reaches this seam. Compile each event in
+			// private databases to reject unresolved trigger columns without running DML.
+			for (const db of [actual, expected]) {
+				db.exec(modelHistory.suffix);
+				const contract = modelHistory.contract;
+				for (const name of contract ? modelHistoryTriggerTables(contract) : []) {
+					const table = after.tables[name];
+					if (!table) throw new Error(`Missing generated trigger table ${name}`);
+					const columns = Object.keys(table.columns).filter(
+						(column) => !table.columns[column].generated,
+					);
+					for (const ddl of [
+						`INSERT INTO ${quote(name)} DEFAULT VALUES`,
+						`UPDATE ${quote(name)} SET ${columns.map((column) => `${quote(column)}=${quote(column)}`).join(", ")}`,
+						`DELETE FROM ${quote(name)}`,
+					])
+						db.query(`EXPLAIN ${ddl}`).all();
+				}
+			}
+			// The migrated catalog must equal a clean install: the runtime trusts the
+			// contract only on exact trigger text, and the migrator proves it the same way.
+			const triggers = (db: Database) =>
+				db
+					.query<{ name: string; tbl_name: string; sql: string }, []>(
+						"SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+					)
+					.all();
+			if (JSON.stringify(triggers(actual)) !== JSON.stringify(triggers(expected)))
+				throw new Error("Migrated model-history triggers differ from a clean install");
+		}
 	} finally {
 		expected?.close();
 		actual.close();
@@ -526,7 +710,12 @@ export function finalizeResourceMigration(
 	after: ResourceMigrationSnapshot,
 ): string {
 	if (Buffer.byteLength(sql) > 1024 * 1024) throw new Error("Migration exceeds generator budget");
-	const statements = statementsOf(sql);
+	const modelHistory = modelHistoryParts(sql, before, after);
+	// Token offsets below are positions in the schema SQL, never in the wrapped input.
+	const { schemaSql } = modelHistory;
+	const statements = statementsOf(schemaSql);
+	const guardedTables = modelHistoryGuardedTables(before);
+	let rebuildsTriggerTable = false;
 	const tables = new Map(
 		Object.entries(before.tables).map(([name, table]) => [
 			key(name),
@@ -636,7 +825,7 @@ export function finalizeResourceMigration(
 							end += 2;
 						else throw new Error("Unsupported added FK action");
 					}
-					rendered = `${sql.slice(t[0].start, t[refs.next - 1].end)} ON UPDATE ${fk.onUpdate ?? "no action"} ON DELETE ${fk.onDelete ?? "no action"};`;
+					rendered = `${schemaSql.slice(t[0].start, t[refs.next - 1].end)} ON UPDATE ${fk.onUpdate ?? "no action"} ON DELETE ${fk.onDelete ?? "no action"};`;
 				}
 			} else throw new Error("Unsupported ALTER TABLE SQL");
 		} else if (keyword(t[0], "CREATE") && keyword(t[1], "TABLE")) {
@@ -653,7 +842,16 @@ export function finalizeResourceMigration(
 				throw new Error("CREATE TABLE differs from generated snapshot");
 			tables.set(key(table), new Set(columns.map(key)));
 		} else if (keyword(t[0], "DROP") && keyword(t[1], "TABLE") && t.length === 3) {
-			if (!tables.delete(key(identifier(t[2])))) throw new Error("Unknown dropped table");
+			const name = key(identifier(t[2]));
+			if (dropsGuardedTable(t, guardedTables)) {
+				// Only inside the exact canonical reinstall wrapper (current contract only).
+				if (!modelHistory.reinstall)
+					throw new Error(
+						"Model-history trigger table rebuild requires a versioned reinstall migration",
+					);
+				rebuildsTriggerTable = true;
+			}
+			if (!tables.delete(name)) throw new Error("Unknown dropped table");
 		} else if (keyword(t[0], "INSERT")) {
 			if (!keyword(t[1], "INTO")) throw new Error("Unexpected generated copy expressions");
 			const target = identifier(t[2]);
@@ -708,7 +906,7 @@ export function finalizeResourceMigration(
 					throw new Error(`Unbackfilled new required column ${target}.${column}`);
 			}
 			if (!retained.length) throw new Error("Empty generated copy projection");
-			const text = (token: Token) => sql.slice(token.start, token.end);
+			const text = (token: Token) => schemaSql.slice(token.start, token.end);
 			rendered = `INSERT INTO ${text(t[2])}(${retained.map((column) => text(column.target)).join(", ")}) SELECT ${retained.map((column) => text(column.source)).join(", ")} FROM ${text(t[end + 1])};`;
 		} else if (
 			keyword(t[0], "CREATE") &&
@@ -723,14 +921,38 @@ export function finalizeResourceMigration(
 				t.at(-1)?.value === ";"
 			)
 				throw new Error("Unsupported CREATE INDEX SQL");
+			// During table rebuilds Drizzle quotes expressions as if they were columns.
+			// Repair only the exact single term explicitly marked as an expression in
+			// this target snapshot; receipt-less validation must still reject raw SQL.
+			const definition = snapshotFor(identifier(t[offset + 2]));
+			const index = Object.values(definition.indexes ?? {}).find(
+				(index) => key(index.name) === key(identifier(t[offset])),
+			);
+			const term = t[offset + 4];
+			if (
+				index?.columns.length === 1 &&
+				term?.kind === "identifier" &&
+				term.value === index.columns[0] &&
+				symbol(t[offset + 5], ")") &&
+				after.internal?.indexes?.[index.name]?.columns?.[term.value]?.isExpression === true
+			) {
+				constantOneIndexSignature(term.value);
+				rendered = `${schemaSql.slice(t[0].start, term.start)}1${schemaSql.slice(term.end, t.at(-1)?.end)};`;
+			}
 		} else if (keyword(t[0], "DROP") && keyword(t[1], "INDEX") && t.length === 3) identifier(t[2]);
 		else throw new Error(`Unsupported migration SQL: ${t[0]?.value}`);
 		output.push(rendered);
 	}
-	const finalized = `${["PRAGMA foreign_keys=OFF;", ...output, "PRAGMA foreign_keys=ON;"].join("\n--> statement-breakpoint\n")}\n`;
+	// One canonical form per schema change: a reinstall that rebuilds no trigger table is noise.
+	if (modelHistory.reinstall && !rebuildsTriggerTable)
+		throw new Error("Model-history reinstall without a trigger table rebuild");
+	const finalizedSchema = `${["PRAGMA foreign_keys=OFF;", ...output, "PRAGMA foreign_keys=ON;"].join("\n--> statement-breakpoint\n")}\n`;
+	const finalized = `${modelHistory.prefix}${
+		modelHistory.suffix ? `${finalizedSchema.trimEnd()}${modelHistory.suffix}` : finalizedSchema
+	}`;
 	if (Buffer.byteLength(finalized) > 1024 * 1024)
 		throw new Error("Finalized migration exceeds byte budget");
-	validateTargetDDL(statementsOf(finalized), before, after);
+	validateTargetDDL(statementsOf(finalizedSchema), before, after, modelHistory);
 	return finalized;
 }
 /** Existing history is never repaired implicitly. A missing generation receipt may be
@@ -743,7 +965,7 @@ export function assertResourceMigrationValidated(
 	const finalized = finalizeResourceMigration(sql, before, after);
 	const signature = (source: string) =>
 		JSON.stringify(
-			statementsOf(source).map(({ tokens }) =>
+			statementsOf(modelHistoryParts(source, before, after).schemaSql).map(({ tokens }) =>
 				tokens.map((token) => [
 					token.kind,
 					token.kind === "word" ? token.value.toUpperCase() : token.value,

@@ -43,7 +43,16 @@
  * for no benefit.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import type { ExecutorPlatform } from "@shared/remote-executor";
+import {
+	type ExecutorInstallTarget,
+	type ExecutorPlatform,
+	getExecutorPlatformInfo,
+	isExecutorPlatform,
+} from "@shared/remote-executor";
+import { helperSourceIdentity, normalizeHelperSource } from "../../shared/helper-distribution";
+import { ValidationError } from "./errors";
+import type { ExecutorArtifactBinding } from "./executor-binaries";
+import { captureHelperSource } from "./helper-distribution-runtime";
 import { logger } from "./logger";
 
 /**
@@ -82,18 +91,25 @@ export interface ExecutorTicketUse {
 	userAgent: string | null;
 }
 
+export interface ExecutorTicketScript {
+	body: string;
+	filename: string;
+	shell: "sh" | "powershell";
+}
+
+interface TicketVariant {
+	artifact: ExecutorArtifactBinding | null;
+	script: ExecutorTicketScript | null;
+}
+
 interface TicketRecord {
+	variants: Map<ExecutorPlatform, TicketVariant>;
 	/** Hex ticket value. Stored so lookups can compare in constant time. */
 	value: string;
-	platform: ExecutorPlatform;
 	deviceId: string | null;
 	deviceSlug: string | null;
 	/** False for prompt-mode scripts: such a ticket can never yield a token. */
 	allowTokenDelivery: boolean;
-	/** Pre-rendered script body, so the public endpoint never touches the DB. */
-	script: string | null;
-	scriptFilename: string | null;
-	scriptShell: "sh" | "powershell" | null;
 	expiresAt: number;
 	usesByPurpose: Record<ExecutorTicketPurpose, number>;
 	/** Set once the token has been handed out: the ticket is spent entirely. */
@@ -106,6 +122,9 @@ interface TicketRecord {
 const tickets = new Map<string, TicketRecord>();
 
 export interface IssueExecutorTicketOptions {
+	artifact?: ExecutorArtifactBinding;
+	/** Cancel only new issuance, never redemption of an already frozen ticket. */
+	signal?: AbortSignal;
 	deviceId?: string | null;
 	deviceSlug?: string | null;
 	/** Defaults to false: a ticket only yields a token when asked to. */
@@ -131,6 +150,7 @@ export type ExecutorTicketRejection =
 	| "purpose_exhausted";
 
 export interface ExecutorTicketRedemption {
+	artifact?: ExecutorArtifactBinding | null;
 	ok: boolean;
 	reason?: ExecutorTicketRejection;
 	deviceId?: string | null;
@@ -163,12 +183,107 @@ function pruneExpired(now: number): void {
 	}
 }
 
-/** Issue an enrollment ticket bound to one platform. */
+export type IssueExecutorGroupTicketOptions = Omit<
+	IssueExecutorTicketOptions,
+	"artifact" | "script"
+>;
+export type IssuedExecutorGroupTicket = Omit<IssuedExecutorTicket, "platform">;
+
+/** Issue one credential for the published variants of one installation target. */
+export function issueExecutorGroupTicket(
+	target: ExecutorInstallTarget,
+	artifacts: Partial<Record<ExecutorPlatform, ExecutorArtifactBinding>>,
+	options: IssueExecutorGroupTicketOptions = {},
+): IssuedExecutorGroupTicket {
+	options.signal?.throwIfAborted();
+	if (target !== "unix" && target !== "windows")
+		throw new ValidationError("Invalid executor install target");
+	const variants = new Map<ExecutorPlatform, TicketVariant>();
+	let identity: string | undefined;
+	for (const [key, artifact] of Object.entries(artifacts)) {
+		options.signal?.throwIfAborted();
+		if (
+			!isExecutorPlatform(key) ||
+			(getExecutorPlatformInfo(key).os === "windows") !== (target === "windows") ||
+			!artifact
+		) {
+			throw new ValidationError("Executor ticket artifact platform mismatch");
+		}
+		const binding = freezeTicketArtifact(key, artifact, options.signal);
+		const variantIdentity = JSON.stringify([
+			helperSourceIdentity(binding.source),
+			binding.version,
+			binding.tag,
+			binding.protocolVersion,
+		]);
+		identity ??= variantIdentity;
+		if (identity !== variantIdentity)
+			throw new ValidationError("Executor ticket artifacts must share source/version/tag/protocol");
+		variants.set(key, { artifact: binding, script: null });
+	}
+	if (!variants.size) throw new ValidationError("Executor ticket requires published artifacts");
+	return issueTicket(variants, options);
+}
+
+function freezeTicketArtifact(
+	platform: ExecutorPlatform,
+	artifact: ExecutorArtifactBinding,
+	signal?: AbortSignal,
+): ExecutorArtifactBinding {
+	signal?.throwIfAborted();
+	const snapshot = { ...artifact };
+	const binding = Object.freeze({
+		...snapshot,
+		source: Object.freeze(normalizeHelperSource(snapshot.source)),
+	});
+	if (binding.platform !== platform)
+		throw new ValidationError("Executor ticket artifact platform mismatch");
+	assertCurrentArtifact(binding, signal);
+	return binding;
+}
+
+function assertCurrentArtifact(artifact: ExecutorArtifactBinding, signal?: AbortSignal): void {
+	signal?.throwIfAborted();
+	if (helperSourceIdentity(artifact.source) !== helperSourceIdentity(captureHelperSource())) {
+		throw new ValidationError(
+			"Executor distribution source changed; generate a new install command",
+		);
+	}
+	signal?.throwIfAborted();
+}
+
+/** Compatibility adapter for callers that explicitly choose one platform. */
 export function issueExecutorTicket(
 	platform: ExecutorPlatform,
 	options: IssueExecutorTicketOptions = {},
 ): IssuedExecutorTicket {
+	options.signal?.throwIfAborted();
+	const artifact = options.artifact
+		? freezeTicketArtifact(platform, options.artifact, options.signal)
+		: null;
+	return {
+		...issueTicket(
+			new Map([[platform, { artifact, script: options.script ? { ...options.script } : null }]]),
+			options,
+		),
+		platform,
+	};
+}
+
+function issueTicket(
+	variants: Map<ExecutorPlatform, TicketVariant>,
+	options: IssueExecutorGroupTicketOptions,
+): IssuedExecutorGroupTicket {
 	const now = options.now ?? Date.now();
+	const deviceId = options.deviceId ?? null;
+	const deviceSlug = options.deviceSlug ?? null;
+	const allowTokenDelivery = options.allowTokenDelivery ?? false;
+	// Validate the entire snapshot again immediately before registering it. A later
+	// variant (or caller-owned getter) must not obsolete an earlier variant.
+	for (const variant of variants.values()) {
+		if (variant.artifact) assertCurrentArtifact(variant.artifact, options.signal);
+	}
+	options.signal?.throwIfAborted();
 	pruneExpired(now);
 	if (tickets.size >= MAX_LIVE_TICKETS) {
 		// Drop the oldest live ticket rather than refusing to issue: an operator
@@ -186,14 +301,11 @@ export function issueExecutorTicket(
 
 	const value = randomBytes(TICKET_BYTES).toString("hex");
 	const record: TicketRecord = {
+		variants,
 		value,
-		platform,
-		deviceId: options.deviceId ?? null,
-		deviceSlug: options.deviceSlug ?? null,
-		allowTokenDelivery: options.allowTokenDelivery ?? false,
-		script: options.script?.body ?? null,
-		scriptFilename: options.script?.filename ?? null,
-		scriptShell: options.script?.shell ?? null,
+		deviceId,
+		deviceSlug,
+		allowTokenDelivery,
 		expiresAt: now + EXECUTOR_TICKET_TTL_MS,
 		usesByPurpose: emptyUses(),
 		invalidated: false,
@@ -203,7 +315,6 @@ export function issueExecutorTicket(
 	tickets.set(value, record);
 	return {
 		ticket: value,
-		platform,
 		expiresAt: record.expiresAt,
 		allowTokenDelivery: record.allowTokenDelivery,
 	};
@@ -292,19 +403,19 @@ export function redeemExecutorTicket(
 	if (record.invalidated) {
 		return { ok: false, reason: "already_used", ...attribution };
 	}
+	const variant = record.variants.get(platform);
+	if (!variant) {
+		// Cross-target and unpublished platforms never consume the shared budget.
+		return { ok: false, reason: "platform_mismatch", ...attribution };
+	}
 	if (purpose === "token" && !record.allowTokenDelivery) {
 		return { ok: false, reason: "purpose_not_allowed", ...attribution };
 	}
-	if (purpose === "script" && !record.script) {
+	if (purpose === "script" && !variant.script?.body) {
 		return { ok: false, reason: "purpose_not_allowed", ...attribution };
 	}
 	if (record.usesByPurpose[purpose] >= PURPOSE_LIMITS[purpose]) {
 		return { ok: false, reason: "purpose_exhausted", ...attribution };
-	}
-	if (record.platform !== platform) {
-		// Do not consume: the ticket may still be used correctly, and a mismatch is
-		// more likely a copy/paste of the wrong script than an attack.
-		return { ok: false, reason: "platform_mismatch", ...attribution };
 	}
 
 	record.usesByPurpose[purpose] += 1;
@@ -320,16 +431,10 @@ export function redeemExecutorTicket(
 	});
 	return {
 		ok: true,
+		artifact: purpose === "binary" ? variant.artifact : null,
 		deviceId: record.deviceId,
 		deviceSlug: record.deviceSlug,
-		script:
-			purpose === "script" && record.script
-				? {
-						body: record.script,
-						filename: record.scriptFilename ?? "install-narrafork-executor",
-						shell: record.scriptShell ?? "sh",
-					}
-				: null,
+		script: purpose === "script" && variant.script ? { ...variant.script } : null,
 	};
 }
 
@@ -345,15 +450,29 @@ export function redeemExecutorTicket(
  * a value this module just issued, and the caller has nothing useful to do about a
  * ticket that expired in between.
  */
-export function attachExecutorTicketScript(
+export function attachExecutorTicketScript(ticket: string, script: ExecutorTicketScript): void {
+	const record = findRecord(ticket);
+	if (!record) return;
+	if (record.variants.size !== 1)
+		throw new ValidationError("Use platform-specific scripts for an executor group ticket");
+	const platform = record.variants.keys().next().value;
+	if (platform) attachExecutorTicketScripts(ticket, { [platform]: script });
+}
+
+/** Attach only scripts for the frozen, published variants; copy caller-owned input. */
+export function attachExecutorTicketScripts(
 	ticket: string,
-	script: { body: string; filename: string; shell: "sh" | "powershell" },
+	scripts: Partial<Record<ExecutorPlatform, ExecutorTicketScript>>,
 ): void {
 	const record = findRecord(ticket);
 	if (!record) return;
-	record.script = script.body;
-	record.scriptFilename = script.filename;
-	record.scriptShell = script.shell;
+	const pending: [TicketVariant, ExecutorTicketScript][] = [];
+	for (const [platform, script] of Object.entries(scripts)) {
+		const variant = isExecutorPlatform(platform) ? record.variants.get(platform) : undefined;
+		if (!variant || !script) throw new ValidationError("Executor ticket script platform mismatch");
+		pending.push([variant, { ...script }]);
+	}
+	for (const [variant, script] of pending) variant.script = Object.freeze(script);
 }
 
 /**

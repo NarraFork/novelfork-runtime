@@ -1,6 +1,14 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
+import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
+import {
+	MEDIA_MIME_TO_EXT,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+	type NativeMediaInput,
+} from "@shared/media-attachments";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -12,12 +20,7 @@ import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-inj
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
-import {
-	type ApiRequestHandle,
-	finishApiRequest,
-	shouldCollectRequestDump,
-	startApiRequest,
-} from "../api-request-tracker";
+import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import {
 	type BooleanOverride,
 	type DangerReflectionLevel,
@@ -25,23 +28,25 @@ import {
 	resolveBooleanOverride,
 } from "../boolean-override";
 import { matchContextComposition, validInputCharacters } from "../context-usage-snapshot";
-import { resolveKimiQuotaWait } from "../kimi-quota-wait";
 import { logger } from "../logger";
 import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { captureReferencePricingSnapshot } from "../model-pricing";
+import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
-import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import { getPrompt, getToolMessage, type Locale } from "../prompt-i18n";
+import { resolveProviderQuotaWait } from "../provider-quota-wait";
+import { createRequestRecording } from "../request-recorder";
 import {
 	consumeSearchExecutionTurn,
 	getSearchExecutionScope,
 	matchesSearchExecutionScope,
 	SearchExecutionBudgetExceededError,
 } from "../search/execution-scope";
-import { shouldUseNativeSearch, usesSideRequestNativeSearch } from "../search/native";
-import { hasUsableFunctionSearchChannelFor } from "../search/router";
+import { shouldUseNativeSearch } from "../search/native";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
+import { buildUsageDataFromSnapshot } from "../usage-tracking";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -57,17 +62,29 @@ import {
 	isRetryableError,
 } from "./error-handling";
 import { localPathSemantics } from "./execution/path-semantics";
+import { buildAdapterHistory, historyTail } from "./history-build";
 import { countInputCharacters } from "./input-characters";
-import {
-	buildMalformedCaptureRecord,
-	isMalformedRequestBodyError,
-	writeMalformedRequestDump,
-} from "./malformed-request-dump";
+import { LoopTranscript, type TranscriptImage } from "./loop-transcript";
+import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
+import { rememberModelTraceRequest } from "./modeltrace-request";
+import { assertNativeMediaPayload, splitNativeMediaReferences } from "./native-media";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
-import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
+import { type DbMessage, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectQuestionModelInput } from "./question-model-input";
+import {
+	bindPermissionRecovery,
+	isRecoveredHumanPermission,
+	type PersistedRecoveryGate,
+	recoveryReflection,
+} from "./recovery-gate";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
+import {
+	describeFirstTokenTimeout,
+	describeStreamIdleTimeout,
+	StreamProgress,
+} from "./stream-progress";
+import { interleaveWakeups, STREAM_WAKEUP, WakeSignal } from "./stream-wakeups";
 import {
 	groupToolExecutions,
 	isStrictSerialToolExecution,
@@ -77,6 +94,7 @@ import {
 import {
 	executeTool,
 	freezeToolExecution,
+	getOutlineSpecRejection,
 	getReflectionToolRejection,
 	preAdmitToolExecution,
 	releaseToolAdmissionState,
@@ -85,15 +103,15 @@ import {
 	type ToolExecResult,
 } from "./tool-executor";
 import { ToolInputStream } from "./tool-input-stream";
+import {
+	formatRequestTools,
+	resolveAdapterToolLoadingStrategy,
+	ToolEpochError,
+	type ToolLoadingStrategy,
+	usesToolLoading,
+} from "./tool-loading";
 import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
-import {
-	applyToolUseIdRemap,
-	collectToolUseIdsFromHistory,
-	remapToolResultIds,
-	reserveUniqueToolUseIds,
-} from "./tool-use-id-dedup";
-import { SHELL_TOOL_NAME } from "./tools/bash";
 import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
 import { replace as applyEditReplacement, findReplaceMatch } from "./tools/edit";
 import { readFileText } from "./tools/encoding";
@@ -108,6 +126,7 @@ import {
 	isExitPlanReflectionWaitingForUser,
 	markExitPlanReflectionStarted,
 } from "./tools/exit-plan-reflection";
+import { isOutlineTool } from "./tools/outline-names";
 import {
 	broadcastTaskReflectionProgress,
 	cleanupTaskReflection,
@@ -124,17 +143,16 @@ import type {
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
+	AgentInputPart,
+	AgentLoopHistory,
 	AgentToolUse,
 	ApiRequestDiagnostics,
 	ContentBlock,
 	PermissionResult,
 	ResolvedToolDefinition,
+	ToolDefinition,
 } from "./types";
-import {
-	PLAN_MODE_ALLOWED_TOOLS,
-	type ReasoningProviderMetadata,
-	TRANSIENT_RETRY_BASE_MS,
-} from "./types";
+import { type ReasoningProviderMetadata, TRANSIENT_RETRY_BASE_MS } from "./types";
 
 export { isRetryableError } from "./error-handling";
 
@@ -191,6 +209,11 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	// deferred question before the call completes; `withdraw` so a maintenance-only
 	// call is not rendered as an empty question.
 	AskUserQuestion: { short: ["async", "withdraw"], large: [] },
+	// `source` is UI markup the chat renders while it streams.
+	GenUI: {
+		short: [...GEN_UI_STREAM_FIELDS.short],
+		large: [...GEN_UI_STREAM_FIELDS.large],
+	},
 };
 
 interface StreamingToolAccumulator {
@@ -317,6 +340,32 @@ function classifyEmptyResponse(signals: EmptyResponseSignals): EmptyResponseKind
 	if (signals.stopReason) return "empty_response_stop_without_content";
 	if (signals.streamEvents === signals.contentlessEvents) return "empty_response_usage_only";
 	return "empty_response";
+}
+
+/** Stop reasons a provider gives for an ordinary finish, as opposed to a refusal or cutoff. */
+const QUIET_STOP_REASONS = new Set(["stop", "end_turn", "completed"]);
+
+/**
+ * A served request that ended without content and without a fault: the model chose to
+ * say nothing. After some tool rounds that is how a turn ends (see `handsOffWork`), so
+ * it is not an empty reply.
+ */
+function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): boolean {
+	if (kind === "empty_response_usage_only") return true;
+	return (
+		kind === "empty_response_stop_without_content" &&
+		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
+	);
+}
+
+/**
+ * A tool call that hands work or words to someone else — an agent, a background command,
+ * a message. Whatever comes next arrives later as its own input, so after a round with
+ * one the model may rightly have nothing to add yet.
+ */
+function handsOffWork(toolUse: AgentToolUse): boolean {
+	if (toolUse.name === "Send" || toolUse.name === "Agent") return true;
+	return isBashToolName(toolUse.name) && toolUse.input.run_in_background === true;
 }
 
 /**
@@ -498,6 +547,18 @@ function hasPersistableStreamContent(parsed: ParsedStreamEvent): boolean {
 }
 
 /**
+ * Whether this event starts a tool call the stream has not announced yet: the block boundary
+ * where live guidance may end a response without cutting text or reasoning. An event that also
+ * carries text/reasoning is never a cut point, so no model prose is dropped with it.
+ */
+function opensNewToolCall(parsed: ParsedStreamEvent, known: ReadonlyMap<string, unknown>): boolean {
+	if (parsed.text || parsed.reasoning || parsed.redactedThinking) return false;
+	const chunkId = parsed.toolUseChunk?.toolUseId;
+	if (chunkId && !known.has(chunkId)) return true;
+	return parsed.toolUses?.some((tu) => !known.has(tu.toolUseId)) ?? false;
+}
+
+/**
  * Any parsed provider event proves that the upstream response stream is alive.
  *
  * This is deliberately broader than isMeaningfulStreamEvent(): Anthropic's
@@ -522,6 +583,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"WebSearch",
 	"WebFetch",
 	"Await",
+	"Stop",
 	"ShareFile",
 	"ContextAsk",
 	"LearningGuide",
@@ -589,7 +651,7 @@ function isTaskStateMaintenanceToolUse(tu: AgentToolUse): boolean {
 
 export async function shouldInjectRelaxedPlanToolReminder(
 	tu: AgentToolUse,
-	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "chapterId" | "planFilePath">,
+	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "planFilePath">,
 ): Promise<boolean> {
 	if (!config.planMode || !config.relaxedPlan) return false;
 	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
@@ -608,12 +670,7 @@ export async function shouldInjectRelaxedPlanToolReminder(
 		try {
 			const workdir = typeof tu.input.workdir === "string" ? tu.input.workdir : undefined;
 			const shellCwd = workdir ? resolve(config.cwd, workdir) : config.cwd;
-			const analysis = await analyzeShellCommand(
-				command,
-				shellCwd,
-				detectShell().type,
-				!!config.chapterId,
-			);
+			const analysis = await analyzeShellCommand(command, shellCwd, detectShell().type);
 			return analysis.hasWriteOperation;
 		} catch (err) {
 			logger.debug("Failed to classify relaxed-plan shell tool use", {
@@ -636,61 +693,39 @@ function normalizeSilentToolCallThreshold(value: number | undefined): number {
 
 const ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS = 100;
 
-const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
-	"Execute",
-	"Agent",
-	// Await/Send coordinate with spawned agents. Executing them eagerly mid-stream would
-	// let a wait/message run before the group barrier observes the sibling Agent's
-	// registered/running state. Defer them to the ordered post-stream tool phase.
-	"Await",
-	"Send",
-	"Browser",
-	"Terminal",
-	"ShareFile",
-	"NarraForkAdmin",
-	// ScheduledTask mutations self-gate via ctx.requestPermission and can launch a
-	// narrator (run_now). Eager mid-stream execution would open an approval prompt —
-	// or dispatch an unattended run — before the assistant message that requested it
-	// is even complete.
-	"ScheduledTask",
-	"PluginInstall",
-	"McpAdmin",
-	"HookAdmin",
-	"ScheduledTaskAdmin",
-	"ForkNarrator",
-	"EnterPlanMode",
-	...DANGER_REFLECTION_TOOLS,
-	...EXIT_PLAN_REFLECTION_TOOLS,
-	...TASK_REFLECTION_TOOLS,
-]);
+/**
+ * Abort reason for a reflection request cut after the reflection already decided: the
+ * request did its job, so it ends as a completion rather than an aborted request.
+ */
+const REFLECTION_DECISION_SETTLED = new Error("Reflection decision settled");
+/** How long a self-decided reflection request may keep streaming before it is cut. */
+const REFLECTION_SELF_DECISION_LINGER_MS = 30_000;
 
+/**
+ * Whether a completed tool call may start while the provider is still streaming.
+ *
+ * Every tool may: a call whose input is complete is independent of anything the model
+ * writes after it (the model cannot condition a call on text it has not produced yet,
+ * and the result only reaches the model in the next request). What a tool needs from
+ * its surroundings is provided per call, not per response:
+ *
+ * - ordering — `selectStreamingToolExecutions` keeps provider order and the grouping
+ *   rules, and a later group starts only after earlier results were consumed;
+ * - its persisted row — execution is bound at `block_complete`, before any start;
+ * - per-call session state — prepared at the call's own persistence (EnterPlanMode),
+ *   never at the end of the response.
+ *
+ * Effects that must not happen while the response is still open are deferred by the
+ * effect itself (plan approval waits for the finalized message before restarting the
+ * pass), not by holding back the tool. The only call that cannot start is one whose
+ * arguments never formed valid input.
+ */
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
-	if (EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name)) return false;
-	// Ordinary Bash is ordered, not necessarily deferred until the response ends.
-	// Pipeline/plan transitions still need the complete assistant message.
-	if (isStrictSerial(tu) && tu.name !== SHELL_TOOL_NAME) return false;
-	// Virtual task writes can enter a reflection loop. Keep that decision after
-	// request finalization rather than reflecting against an incomplete response.
-	if (
-		(tu.name === "Write" || tu.name === "Edit") &&
-		typeof tu.input.file_path === "string" &&
-		tu.input.file_path.startsWith("spec://")
-	)
-		return false;
 	// A stopped but malformed argument stream is not executable input.
-	if ("_raw" in tu.input) return false;
-	// Reflection decision tools (TaskReflectConfirm/Revise, ExitPlanConfirm/Revise,
-	// DangerConfirm/Cancel, …) settle a pending decision whose resolution aborts the
-	// reflection loop's own AbortController. Executing them eagerly mid-stream aborts the
-	// reflection provider.chat() while it is still in flight, which records a spurious
-	// "Aborted" API request in usage history. Defer them to the post-stream tool phase so
-	// the reflection request records a clean success (via finishRequest) before the tool
-	// settles the decision and triggers the expected abort.
-	if (toolRegistry.get(tu.name)?.reflectionOnly === true) return false;
-	return true;
+	return !("_raw" in tu.input);
 }
 
-/** Whether a tool use should skip parallel grouping and early execution. */
+/** Whether a tool use forms its own serial group (an ordering barrier for later calls). */
 function isStrictSerial(tu: AgentToolUse): boolean {
 	return isStrictSerialToolExecution(tu);
 }
@@ -734,7 +769,7 @@ function stampReasoningSource(
 	return { ...metadata, signatureSource: source };
 }
 
-/** Convert the per-itemId reasoning map to the blocks array expected by pushAssistantTurn. */
+/** The reasoning blocks of the per-itemId map that carry text or a credential. */
 function collectReasoningBlocks(
 	map: Map<string, ReasoningBlockEntry>,
 ): ReasoningBlockEntry[] | undefined {
@@ -1010,7 +1045,12 @@ export function buildTaskReflectionPrompt(
 
 export interface ReflectionLoopRunOptions {
 	parentConfig: AgentConfig;
-	history: unknown[];
+	/**
+	 * The rows the parent's request was projected from (its transcript plus the input it
+	 * sent). The reflection's request is their projection plus `prompt`, so it starts with
+	 * exactly the bytes the parent sent and shares its cacheable prefix.
+	 */
+	rows: readonly DbMessage[];
 	prompt: string;
 	reflectionLoop: NonNullable<AgentConfig["reflectionLoop"]>;
 	abortController?: AbortController;
@@ -1026,15 +1066,6 @@ export interface ReflectionLoopRunOptions {
 	 * identity, so only the caller can address the right card.
 	 */
 	onProgress?: (snapshot: ProgressSnapshot) => void;
-	/**
-	 * Whether the nested loop should inject the parent's system prompt itself.
-	 *
-	 * Defaults to `false` whenever a non-empty parent history is inherited: that
-	 * history was already produced by the parent loop's own injection, so a second
-	 * injection duplicates the prompt and shifts the cacheable prefix. Callers that
-	 * pass a raw history with no system prompt of its own can set this to `true`.
-	 */
-	injectParentSystemPrompt?: boolean;
 }
 
 export interface ReflectionLoopObservation {
@@ -1180,16 +1211,7 @@ export function summarizeReflectionFailure(
 type ApiRequestEndEvent = Extract<AgentEvent, { type: "api_request_end" }>;
 
 function normalizeApiRequestUsage(usage: ApiRequestEndEvent["usage"]) {
-	if (!usage) return null;
-	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
-		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
-		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
-		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
-		reasoningTokens: usage.reasoningTokens ?? 0,
-	};
+	return buildUsageDataFromSnapshot(usage);
 }
 
 async function recordReflectionApiRequestEnd(
@@ -1219,8 +1241,6 @@ async function recordReflectionApiRequestEnd(
 			meterUsage: event.meterUsage ?? null,
 			meterUnit: event.meterUnit ?? null,
 			errorMessage: event.errorMessage ?? null,
-			rawDump: event.rawDump,
-			dumpSpillReuseToken: event.dumpSpillReuseToken,
 		});
 	} catch (error) {
 		logger.warn("Failed to record reflection API request", {
@@ -1272,9 +1292,9 @@ const requestToolSnapshots = new WeakMap<
 		provider: string;
 		model: string;
 		tools: unknown[];
+		toolLoadingStrategy: ToolLoadingStrategy;
 	}
 >();
-const inheritedPromptConfigs = new WeakSet<AgentConfig>();
 
 function buildReflectionCorrectionPrompt(config: AgentConfig): string {
 	const tools = config.reflectionLoop?.allowedTools.join(", ") ?? "";
@@ -1289,32 +1309,16 @@ export async function runReflectionLoop(
 ): Promise<ReflectionLoopObservation> {
 	const {
 		parentConfig,
-		history,
+		rows,
 		prompt,
 		reflectionLoop,
 		abortController = new AbortController(),
 		maxTurns = 2,
 		label = "reflection loop",
 		onProgress,
-		injectParentSystemPrompt,
 	} = options;
 	const allowedTools = new Set(reflectionLoop.allowedTools);
 	const progress = createThrottledProgressReporter(onProgress);
-	// The history handed to us is the parent agentLoop's own post-injection array:
-	// agentLoop calls injectSystemPrompt once before its turn loop, so a non-empty
-	// inherited history already carries the system prompt as its leading entry.
-	//
-	// Letting the nested loop inject again produced two copies — a stray
-	// `__SYSTEM__:` user block on Anthropic, doubled `instructions` on
-	// the duplicate lands at the very front, it shifted every following byte and
-	// destroyed the cacheable prefix this loop shares with the parent
-	// conversation. Prompt caching is a byte-exact prefix match, so a reflection
-	// on a 200k-token conversation re-billed the whole prefix at full price.
-	//
-	// `injectParentSystemPrompt` lets a caller that builds a raw history (rather
-	// than inheriting the parent's) opt back in.
-	const inheritsInjectedSystemPrompt =
-		injectParentSystemPrompt === undefined ? history.length > 0 : !injectParentSystemPrompt;
 	const pendingApiRequests = new Map<string, ApiRequestHandle>();
 	const observed: ReflectionLoopObservation = {
 		assistantMessages: 0,
@@ -1326,16 +1330,41 @@ export async function runReflectionLoop(
 		invalidStates: [],
 		retries: 0,
 	};
-	const onParentAbort = () => abortController.abort();
+	// The nested loop runs on its own signal. `abortController` belongs to the gate: it
+	// fires when the gate's decision settles, whoever made it. When this reflection made
+	// the decision itself — its decision tool ran mid-stream, while the provider was still
+	// streaming — cutting its request would record a spurious "Aborted" API request for a
+	// reflection that succeeded. Then the request is left to finish (shouldStop starts
+	// nothing after the decision) and is only cut, as a clean completion, if it lingers.
+	// A takeover by the user or the parent's abort still cuts it at once.
+	const loopAbort = new AbortController();
+	let selfDecisionInFlight = false;
+	let lingerTimer: ReturnType<typeof setTimeout> | undefined;
+	const onGateAbort = () => {
+		if (!selfDecisionInFlight) {
+			loopAbort.abort();
+			return;
+		}
+		lingerTimer ??= setTimeout(
+			() => loopAbort.abort(REFLECTION_DECISION_SETTLED),
+			REFLECTION_SELF_DECISION_LINGER_MS,
+		);
+	};
+	if (abortController.signal.aborted) onGateAbort();
+	else abortController.signal.addEventListener("abort", onGateAbort, { once: true });
+	const onParentAbort = () => {
+		abortController.abort();
+		loopAbort.abort();
+	};
 	if (parentConfig.signal.aborted) onParentAbort();
 	else parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
 	try {
 		const reflectionConfig: AgentConfig = {
 			...parentConfig,
-			signal: abortController.signal,
+			signal: loopAbort.signal,
 			maxTurns: Number.isFinite(maxTurns) ? Math.max(1, Math.min(2, Math.floor(maxTurns))) : 2,
 			reflectionLoop,
-			// Keep systemPrompt available to dynamic tool definitions; suppress only injection.
+			// The parent's system prompt is inherited: the projected request starts as the parent's did.
 			getRuntimeSettingsOverride: undefined,
 			getModelOverride: undefined,
 			// Auxiliary inputs cannot replace or pin the parent conversation's classification.
@@ -1349,6 +1378,10 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
+			// A reflection extends the parent's request rows in memory; it writes no rows of its own.
+			rebuildRequestHistory: undefined,
+			historyEndsWithToolResults: undefined,
+			shouldIdleOnReasoningOnly: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -1358,9 +1391,12 @@ export async function runReflectionLoop(
 			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: () => observed.decisionSucceeded === true,
+			shouldYieldToInput: undefined,
 			guidanceSignal: undefined,
 			urgentGuidanceSignal: undefined,
-			onToolExecutionInvoking: undefined,
+			onToolExecutionInvoking: (toolUse) => {
+				if (allowedTools.has(toolUse.name)) selfDecisionInFlight = true;
+			},
 			// Declaration filtering remains inherited; execution uses the gate's hard ceiling.
 			allowedTools: new Set(reflectionLoop.allowedTools),
 			disabledTools: undefined,
@@ -1375,16 +1411,18 @@ export async function runReflectionLoop(
 				};
 			},
 		};
-		if (inheritsInjectedSystemPrompt) inheritedPromptConfigs.add(reflectionConfig);
 		const snapshot = requestToolSnapshots.get(parentConfig);
 		if (snapshot) requestToolSnapshots.set(reflectionConfig, snapshot);
-		for await (const event of agentLoop(reflectionConfig, prompt, [...history])) {
+		// The parent's rows, projected the way the parent's request was (same adapter,
+		// tools and system prompt): the reflection's request extends those bytes.
+		for await (const event of agentLoop(reflectionConfig, prompt, { rows })) {
 			if (event.type === "api_request_start") {
 				pendingApiRequests.set(
 					event.requestId,
 					startApiRequest({
+						recordingRequestId: event.requestId,
 						narratorId: parentConfig.narratorId,
-						userId: parentConfig.userId,
+						userId: event.userId ?? null,
 						provider: event.provider,
 						model: event.model,
 						credentialId: event.credentialId,
@@ -1427,6 +1465,8 @@ export async function runReflectionLoop(
 				observed.toolCalls.push(event.toolName);
 			} else if (event.type === "tool_result") {
 				if (!event.isError && allowedTools.has(event.toolName)) observed.decisionSucceeded = true;
+				// A rejected decision settled nothing; a later takeover must cut at once.
+				if (event.isError && allowedTools.has(event.toolName)) selfDecisionInFlight = false;
 				observed.toolResults.push({
 					toolName: event.toolName,
 					isError: event.isError,
@@ -1463,7 +1503,7 @@ export async function runReflectionLoop(
 		}
 		if (
 			reflectionLoop.context.purpose === "permissionRuleRequest" &&
-			(abortController.signal.aborted || pendingApiRequests.size > 0)
+			(loopAbort.signal.aborted || pendingApiRequests.size > 0)
 		)
 			observed.errors.push(
 				"Permission rule reflection did not finish its provider request normally",
@@ -1481,14 +1521,16 @@ export async function runReflectionLoop(
 		return observed;
 	} finally {
 		progress.finish();
+		if (lingerTimer) clearTimeout(lingerTimer);
 		await recordUnfinishedReflectionApiRequests(pendingApiRequests, parentConfig, label);
 		parentConfig.signal.removeEventListener("abort", onParentAbort);
+		abortController.signal.removeEventListener("abort", onGateAbort);
 	}
 }
 
 async function runDangerReflectionLoop(
 	parentConfig: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	pause: DangerReflectionPermission,
 	toolUse: AgentToolUse,
 	reflectionAbort: AbortController,
@@ -1499,7 +1541,7 @@ async function runDangerReflectionLoop(
 	);
 	return runReflectionLoop({
 		parentConfig,
-		history,
+		rows,
 		prompt: buildDangerReflectionPrompt(pause, toolUse.name, pause.input, locale),
 		onProgress: (snapshot) => broadcastDangerReflectionProgress(pause.requestId, snapshot),
 		reflectionLoop: {
@@ -1525,7 +1567,7 @@ async function runDangerReflectionLoop(
 
 async function runExitPlanModeReflectionLoop(
 	parentConfig: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	requestId: string,
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
@@ -1534,7 +1576,7 @@ async function runExitPlanModeReflectionLoop(
 	const locale = (parentConfig.locale as Locale) ?? "en";
 	return runReflectionLoop({
 		parentConfig,
-		history,
+		rows,
 		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
 		onProgress: (snapshot) => void broadcastPlanReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
@@ -1556,7 +1598,7 @@ async function runExitPlanModeReflectionLoop(
 
 async function runTaskReflectionLoop(
 	parentConfig: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	requestId: string,
 	toolUse: AgentToolUse,
 	input: Record<string, unknown>,
@@ -1566,7 +1608,7 @@ async function runTaskReflectionLoop(
 	const locale = (parentConfig.locale as Locale) ?? "en";
 	return runReflectionLoop({
 		parentConfig,
-		history,
+		rows,
 		prompt: buildTaskReflectionPrompt(requestId, input, mutations, locale),
 		onProgress: (snapshot) => void broadcastTaskReflectionProgress(requestId, snapshot),
 		reflectionLoop: {
@@ -1653,7 +1695,7 @@ async function discardDangerReflectionRuntimeState(requestId: string): Promise<v
 
 export async function resolveDangerReflectionDecision(
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	pause: DangerReflectionPermission,
 	toolUse: AgentToolUse,
 ): Promise<PermissionResult> {
@@ -1672,13 +1714,7 @@ export async function resolveDangerReflectionDecision(
 	//
 	// Converting the rejection to a fulfilment keeps the fallback path reachable, which is what
 	// cancels the gate and converges the row. The plan and task gates already do exactly this.
-	const reflectionPromise = runDangerReflectionLoop(
-		config,
-		history,
-		pause,
-		toolUse,
-		reflectionAbort,
-	)
+	const reflectionPromise = runDangerReflectionLoop(config, rows, pause, toolUse, reflectionAbort)
 		.catch((err) => {
 			const crashMessage = extractErrorMessage(err);
 			logger.warn("Danger reflection loop ended unexpectedly", {
@@ -1804,8 +1840,9 @@ interface ExitPlanReflectionGateResult {
 
 export async function resolveExitPlanModeReflection(
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	toolUse: AgentToolUse,
+	recoveryGate?: PersistedRecoveryGate,
 ): Promise<ExitPlanReflectionGateResult> {
 	const locale = (config.locale as Locale) ?? "en";
 	const { loadPlanFileReadPolicy, resolveExitPlanModeInputWithBackend } = await import(
@@ -1830,7 +1867,31 @@ export async function resolveExitPlanModeReflection(
 		};
 	}
 
-	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const restoredReflection = recoveryReflection(recoveryGate);
+	if (
+		restoredReflection?.type === "plan_reflection" &&
+		restoredReflection.status === "awaiting_user"
+	) {
+		// A taken-over plan gate is no longer AI-owned. The caller must re-register
+		// the real ExitPlanMode permission under the original tool-call identity.
+		// Do not create a synthetic running gate or launch an auxiliary model request.
+		if (typeof toolUse.input.plan === "string" && toolUse.input.plan !== resolvedInput.input.plan) {
+			return {
+				decision: {
+					action: "revise",
+					feedback: "Plan changed while its approval was awaiting a user",
+				},
+				input: toolUse.input,
+			};
+		}
+		return {
+			decision: { action: "manual", reason: "Restored user-owned plan approval" },
+			input: resolvedInput.input,
+		};
+	}
+	const requestId =
+		restoredReflection?.requestId ??
+		`exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createExitPlanReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -1839,6 +1900,8 @@ export async function resolveExitPlanModeReflection(
 		toolUseId: toolUse.toolUseId,
 		toolName: toolUse.name,
 		inputJson: resolvedInput.input,
+		toolCallId: recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+		restoredStartedAt: restoredReflection?.startedAt,
 		abortController: reflectionAbort,
 	});
 	const onPreparationAbort = () => {
@@ -1852,7 +1915,7 @@ export async function resolveExitPlanModeReflection(
 	let failedCheckFeedback: string | undefined;
 	const reflectionPromise = runExitPlanModeReflectionLoop(
 		config,
-		history,
+		rows,
 		requestId,
 		toolUse,
 		resolvedInput.input,
@@ -2020,8 +2083,15 @@ export async function shouldRunExitPlanModeReflectionLive(
 	});
 }
 
-export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
-	return !config.reflectionLoop;
+/**
+ * taskReflection guards protected tasks in `spec://tasks.json`. It never runs in a reflection
+ * loop, nor in a session whose tasks live in the outline (plan §8 trade-off 3: outline sessions
+ * get no task reflection; their `spec://` is closed anyway).
+ */
+export function shouldRunTaskReflection(
+	config: Pick<AgentConfig, "reflectionLoop" | "taskBackend">,
+): boolean {
+	return !config.reflectionLoop && config.taskBackend !== "outline";
 }
 
 function normalizeEditText(text: string): string {
@@ -2178,9 +2248,11 @@ function appendTaskReflectionConfirmation(
 
 async function resolveTaskReflection(
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	toolUse: AgentToolUse,
 	candidateContent: string,
+	recoveryGate?: PersistedRecoveryGate,
+	onRestoredHumanWait?: () => void,
 ): Promise<{
 	decision: TaskReflectionDecision;
 	checkFailed?: boolean;
@@ -2194,9 +2266,22 @@ async function resolveTaskReflection(
 		filePath,
 		candidateContent,
 	);
-	if (analysis.protectedMutations.length === 0) return null;
-
-	const requestId = `task_reflect_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const restoredReflection = recoveryReflection(recoveryGate);
+	if (
+		restoredReflection?.type === "task_reflection" &&
+		restoredReflection.status === "awaiting_user"
+	) {
+		// User takeover freezes the question they were shown, even if the spec changed
+		// while the server was down. The actual spec write still revalidates on execution.
+		if (!Array.isArray(restoredReflection.mutations))
+			throw new Error("Invalid persisted task reflection");
+		analysis.protectedMutations = restoredReflection.mutations as ProtectedTaskMutation[];
+	}
+	if (analysis.protectedMutations.length === 0 && restoredReflection?.status !== "awaiting_user")
+		return null;
+	const requestId =
+		restoredReflection?.requestId ??
+		`task_reflect_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createTaskReflectionDecision(requestId, {
 		narratorId: config.narratorId,
@@ -2206,6 +2291,8 @@ async function resolveTaskReflection(
 		toolName: toolUse.name,
 		inputJson: input,
 		mutations: analysis.protectedMutations,
+		toolCallId: recoveryGate?.id ?? config.toolExecutionBindings?.get(toolUse)?.toolCallId,
+		restoredStartedAt: restoredReflection?.startedAt,
 		abortController: reflectionAbort,
 	});
 	const onPreparationAbort = () => {
@@ -2214,12 +2301,24 @@ async function resolveTaskReflection(
 	};
 	if (config.signal.aborted) onPreparationAbort();
 	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
+	if (restoredReflection?.status === "awaiting_user") {
+		const { takeOverTaskReflection } = await import("./tools/task-reflection");
+		await takeOverTaskReflection(requestId, "Restored user-owned task reflection");
+		onRestoredHumanWait?.();
+		try {
+			const decision = await decisionPromise;
+			return { decision, input, mutations: analysis.protectedMutations };
+		} finally {
+			config.signal.removeEventListener("abort", onPreparationAbort);
+			cleanupTaskReflection(requestId);
+		}
+	}
 	await markTaskReflectionStarted(requestId);
 	let reflectionDone = false;
 	let failedCheckFeedback: string | undefined;
 	const reflectionPromise = runTaskReflectionLoop(
 		config,
-		history,
+		rows,
 		requestId,
 		toolUse,
 		input,
@@ -2295,20 +2394,103 @@ async function resolveTaskReflection(
 interface ExecuteToolAfterReflectionsOptions {
 	admissionState?: ToolAdmissionState;
 	preAdmissionComplete?: boolean;
+	executeOptions?: Parameters<typeof executeTool>[2];
+	recoveryGate?: PersistedRecoveryGate;
+}
+
+/** Recovery/retry uses the same gates as the live loop, never the bare executor. */
+export async function executePersistedToolAfterReflections(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	rows: readonly DbMessage[],
+	options: Parameters<typeof executeTool>[2] & { recoveryGate?: PersistedRecoveryGate } = {},
+): Promise<ToolExecResult> {
+	if (options.recoveryGate?.executionStartedAt) {
+		return {
+			output: "Recovery refused: tool execution already started",
+			isError: true,
+			durationMs: 0,
+		};
+	}
+	if (options.recoveryGate && options.toolCallBinding?.toolCallId !== options.recoveryGate.id) {
+		return {
+			output: "Recovery refused: mismatched tool-call identity",
+			isError: true,
+			durationMs: 0,
+		};
+	}
+	// Pending gates must enter permission again, even if a caller supplied an old grant.
+	if (options.recoveryGate?.status === "pending") {
+		options = { ...options, preGrantedPermission: undefined };
+	}
+	const originalPermissionHandler = config.permissionHandler;
+	const recoveredConfig: AgentConfig = {
+		...config,
+		toolExecutionBindings: new WeakMap(),
+		permissionHandler: async (name, input, toolUseId, permissionOptions) => {
+			if (options.recoveryGate && permissionOptions) {
+				bindPermissionRecovery(permissionOptions, options.recoveryGate);
+			}
+			const result = await originalPermissionHandler(name, input, toolUseId, permissionOptions);
+			if (result.behavior !== "dangerReflection") return result;
+			if (recoveryReflection(options.recoveryGate)?.status === "awaiting_user") {
+				return result.decision;
+			}
+			return resolveDangerReflectionDecision(recoveredConfig, rows, result, {
+				name,
+				input: result.input,
+				toolUseId,
+			});
+		},
+	};
+	if (options.toolCallBinding) {
+		recoveredConfig.toolExecutionBindings?.set(tu, options.toolCallBinding);
+	}
+	if (options.preFrozenTarget) {
+		const deviceId = options.preFrozenTarget.deviceId;
+		if (
+			(deviceId === "local" && config.allowLocalExecution === false) ||
+			(deviceId !== "local" && !config.availableDevices?.some((device) => device.id === deviceId))
+		) {
+			return {
+				output: "Recovery refused: frozen device is no longer authorized",
+				isError: true,
+				durationMs: 0,
+			};
+		}
+		const { resolveBackend } = await import("./execution/registry");
+		recoveredConfig.executionTarget = options.preFrozenTarget;
+		recoveredConfig.executionBackend = resolveBackend({
+			requested: options.preFrozenTarget.deviceId,
+		});
+	}
+	return executeToolAfterReflections(tu, recoveredConfig, rows, (config.locale as Locale) ?? "en", {
+		executeOptions: options,
+		recoveryGate: options.recoveryGate,
+	});
 }
 
 async function executeToolAfterReflections(
 	tu: AgentToolUse,
 	config: AgentConfig,
-	history: unknown[],
+	rows: readonly DbMessage[],
 	locale: Locale,
 	options: ExecuteToolAfterReflectionsOptions = {},
 ): Promise<ToolExecResult> {
-	const admissionState = options.admissionState ?? {};
+	const admissionState = options.admissionState ?? {
+		toolCallBinding: options.executeOptions?.toolCallBinding,
+	};
 	const reflectionRejection = getReflectionToolRejection(tu, config);
 	if (reflectionRejection) {
 		releaseToolAdmissionState(admissionState);
 		return reflectionRejection;
+	}
+	// Before admission, permission and the reflections: an outline session has no `spec://`,
+	// so neither a permission prompt nor taskReflection may start for one.
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		releaseToolAdmissionState(admissionState);
+		return outlineSpecRejection;
 	}
 	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
 	let preAdmissionComplete = options.preAdmissionComplete === true;
@@ -2319,6 +2501,19 @@ async function executeToolAfterReflections(
 	let admissionHandedToExecutor = false;
 	try {
 		const freezeExecution = async (): Promise<void> => {
+			// Recovery already carries an immutable target. The executor revalidates it at
+			// final start; resolving it afresh here would change selectionSource before approval.
+			if (options.executeOptions?.preFrozenTarget) {
+				await config.runtimeAuthorizationGuard?.();
+				const frozen = options.executeOptions.preFrozenTarget;
+				if (
+					frozen.runtimeGeneration !== undefined &&
+					config.executionBackend?.runtimeGeneration !== frozen.runtimeGeneration
+				) {
+					throw new Error("Frozen device runtime generation changed before reflection");
+				}
+				return;
+			}
 			if (!preFrozenExecution) preFrozenExecution = await freezeToolExecution(tu, config);
 		};
 		if (tu.name === "ExitPlanMode") {
@@ -2341,6 +2536,7 @@ async function executeToolAfterReflections(
 		): Promise<ToolExecResult> => {
 			admissionHandedToExecutor = true;
 			const result = await executeTool(tu, config, {
+				...options.executeOptions,
 				...executeOptions,
 				admissionState,
 				preAdmissionComplete,
@@ -2353,7 +2549,12 @@ async function executeToolAfterReflections(
 
 		// Decision-time reload: the permission-menu "计划反思" switch must apply to a
 		// still-running pass, not only to the next AgentConfig snapshot.
-		if (tu.name === "ExitPlanMode" && (await shouldRunExitPlanModeReflectionLive(config))) {
+		if (
+			tu.name === "ExitPlanMode" &&
+			!isRecoveredHumanPermission(options.recoveryGate) &&
+			(recoveryReflection(options.recoveryGate)?.type === "plan_reflection" ||
+				(await shouldRunExitPlanModeReflectionLive(config)))
+		) {
 			const reflectionConfig = preFrozenExecution
 				? {
 						...config,
@@ -2361,7 +2562,12 @@ async function executeToolAfterReflections(
 						executionTarget: preFrozenExecution.target,
 					}
 				: config;
-			const reflected = await resolveExitPlanModeReflection(reflectionConfig, history, tu);
+			const reflected = await resolveExitPlanModeReflection(
+				reflectionConfig,
+				rows,
+				tu,
+				options.recoveryGate,
+			);
 			if (reflected.decision.action === "manual") {
 				tu.input = reflected.input;
 				// User manually took over the plan reflection; the loop falls back to the
@@ -2416,7 +2622,14 @@ async function executeToolAfterReflections(
 					// taskReflection persists permission-like status on the original row. Admission
 					// already passed; now freeze the deterministic spec target before reflection.
 					await freezeExecution();
-					const reflected = await resolveTaskReflection(config, history, tu, candidateContent);
+					const reflected = await resolveTaskReflection(
+						config,
+						rows,
+						tu,
+						candidateContent,
+						options.recoveryGate,
+						() => releaseToolAdmissionState(admissionState),
+					);
 					if (reflected) {
 						tu.input = reflected.input;
 						if (reflected.decision.action !== "confirm") {
@@ -2448,6 +2661,13 @@ async function executeToolAfterReflections(
 						}
 					}
 				} catch (err) {
+					if (recoveryReflection(options.recoveryGate)?.type === "task_reflection") {
+						return {
+							output: `Task reflection recovery failed: ${extractErrorMessage(err)}`,
+							isError: true,
+							durationMs: 0,
+						};
+					}
 					logger.debug("Skipping taskReflection preflight", {
 						toolUseId: tu.toolUseId,
 						error: err instanceof Error ? err.message : String(err),
@@ -2459,6 +2679,40 @@ async function executeToolAfterReflections(
 	} finally {
 		if (!admissionHandedToExecutor) releaseToolAdmissionState(admissionState);
 	}
+}
+
+/** Create per-execution durable media conversion with identity deduplication. */
+export function createDurableMediaReferences(config: Pick<AgentConfig, "narratorId" | "signal">) {
+	const savedMedia = new WeakMap<NativeMediaInput, Promise<MediaContentBlock>>();
+	return async (
+		inputs: readonly (MediaRef | NativeMediaInput)[] = [],
+	): Promise<MediaContentBlock[]> =>
+		Promise.all(
+			inputs.map(async (item) => {
+				if ("mediaId" in item) return mediaRefToContentBlock(item, config.narratorId);
+				let saved = savedMedia.get(item);
+				if (!saved) {
+					assertNativeMediaPayload(item);
+					config.signal.throwIfAborted();
+					const { saveUploadedMedia, deleteUploadedMedia } = await import("../media-uploads");
+					const filename = item.filename ?? `attachment${MEDIA_MIME_TO_EXT[item.mediaType] ?? ""}`;
+					saved = saveUploadedMedia(
+						config.narratorId,
+						new File([new Uint8Array(Buffer.from(item.base64, "base64"))], filename, {
+							type: item.mediaType,
+						}),
+					).then((ref) => {
+						if (config.signal.aborted) {
+							deleteUploadedMedia(config.narratorId, ref.mediaId);
+							config.signal.throwIfAborted();
+						}
+						return mediaRefToContentBlock(ref, config.narratorId);
+					});
+					savedMedia.set(item, saved);
+				}
+				return saved;
+			}),
+		);
 }
 
 /**
@@ -2474,9 +2728,9 @@ export function agentLoop(
 async function* agentLoopInMetadataSnapshot(
 	config: AgentConfig,
 	userText: string,
-	history: unknown[],
-	initialToolResults?: unknown[],
+	initialHistory: AgentLoopHistory = { rows: [] },
 	images?: Array<{ format: string; base64: string }>,
+	media?: readonly (MediaRef | NativeMediaInput)[],
 ): AsyncGenerator<AgentEvent> {
 	const guidanceSignal =
 		config.guidanceSignal && config.urgentGuidanceSignal
@@ -2507,19 +2761,39 @@ async function* agentLoopInMetadataSnapshot(
 	);
 	const locale = (config.locale as Locale) ?? "en";
 
+	// Durable refs are the transcript's authority. Direct low-level byte inputs are
+	// validated and persisted once, never copied into rows or diagnostic events.
+	const durableMediaReferences = createDurableMediaReferences(config);
+	async function withDurableToolMedia(result: ToolExecResult): Promise<ToolExecResult> {
+		if (!result.media?.length || result.mediaRefs?.length) return result;
+		return { ...result, mediaRefs: await durableMediaReferences(result.media) };
+	}
+
+	/** The conversation this loop's requests are projected from (`loop-transcript.ts`). */
+	const transcript = new LoopTranscript(initialHistory.rows);
+	/** The turn's input until the model has answered it; then it is a transcript row. */
+	let uncommittedInput: {
+		text: string;
+		images?: readonly TranscriptImage[];
+		media?: readonly MediaRef[];
+	} = { text: "" };
+	/**
+	 * The rows the current request is projected from: the transcript plus the turn's
+	 * input. A reflection gating one of its calls starts from exactly these.
+	 */
+	const requestRows = (): DbMessage[] =>
+		transcript.withInput(uncommittedInput.text, uncommittedInput.images, uncommittedInput.media);
+
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
 	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
 	const originalPermissionHandler = config.permissionHandler;
-	// A streamed tool may request reflection before the provider's current user
-	// turn has been appended to history. Supply that turn on a separate array.
-	let getPermissionHistory = (): unknown[] => history;
 	let permissionTail: Promise<void> = Promise.resolve();
 	config.permissionHandler = async (toolName, input, toolUseId, options) => {
 		const run = permissionTail.then(async () => {
 			const result = await originalPermissionHandler(toolName, input, toolUseId, options);
 			if (result.behavior !== "dangerReflection") return result;
 
-			return resolveDangerReflectionDecision(config, getPermissionHistory(), result, {
+			return resolveDangerReflectionDecision(config, requestRows(), result, {
 				toolUseId,
 				name: toolName,
 				input: result.input,
@@ -2532,51 +2806,39 @@ async function* agentLoopInMetadataSnapshot(
 		return run;
 	};
 
-	let allTools: ResolvedToolDefinition[] = (inheritedTools ? [] : toolRegistry.all())
-		.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
-		// Last line of defence before the wire. Providers validate the whole `tools`
-		// array and reject the entire request when one name breaks their alphabet
-		// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
-		// single malformed dynamic tool would otherwise make every turn fail. Names are
-		// minted sanitized upstream (MCP + plugin bridges); dropping the tool here keeps
-		// the session usable if a future source misses that, instead of rewriting the
-		// name behind the registry's back — a renamed tool could not be executed or
-		// matched against history.
-		.filter((t) => {
-			if (isValidToolName(t.name)) return true;
-			logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
-			return false;
-		})
-		.map((t) => ({
-			...t,
-			description: typeof t.description === "function" ? t.description(config) : t.description,
-			rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
-		}));
+	/** Materialize one candidate view; rebuilds never read a second registry snapshot. */
+	function materializeToolCandidates(
+		candidates: readonly ToolDefinition[],
+	): ResolvedToolDefinition[] {
+		const resolved = candidates
+			.filter((t) => t.name)
+			// Last line of defence before the wire. Providers validate the whole `tools`
+			// array and reject the entire request when one name breaks their alphabet
+			// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
+			// single malformed dynamic tool would otherwise make every turn fail. Names are
+			// minted sanitized upstream (MCP + plugin bridges); dropping the tool here keeps
+			// the session usable if a future source misses that, instead of rewriting the
+			// name behind the registry's back — a renamed tool could not be executed or
+			// matched against history.
+			.filter((t) => {
+				if (isValidToolName(t.name)) return true;
+				logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
+				return false;
+			});
 
-	// Keep the wire-level tool list identical for primary and reflection requests so
-	// provider prompt caches can share the same prefix. Reflection permissions remain
-	// narrow: the reflection loop's permissionHandler and executeTool checks enforce
-	// `reflectionLoop.allowedTools` when the model actually attempts a call.
-
-	// Apply toolFilter if provided (used by subagents to restrict available tools)
-	if (config.toolFilter) {
-		allTools = allTools.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		// A published declaration is immutable. Availability, device state and policy
+		// changes are prompt updates; execution still checks the live gates. Standalone
+		// callers without an epoch retain their initial declaration ceiling.
+		if (!config.toolLoading?.baseToolNames && config.toolFilter) {
+			return resolved.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		}
+		return resolved;
 	}
 
-	// Keep SwitchDevice available for a stale remote default so the model can
-	// recover by explicitly switching back to local. TransferFile still requires
-	// at least one online remote endpoint.
-	allTools = filterDeviceTools(allTools, config);
-
-	/**
-	 * Whether plan mode should currently blank out the forbidden tools' descriptions.
-	 *
-	 * Read live, not frozen: plan mode can be toggled MANUALLY while this pass runs, and
-	 * `config.planMode`/`relaxedPlan` are getters on the session's live state.
-	 */
-	function planModeDisablesTools(): boolean {
-		return !!config.planMode && !config.relaxedPlan;
-	}
+	// Only a standalone first request without host candidates materializes the registry.
+	let allTools = materializeToolCandidates(
+		inheritedTools ? [] : (config.toolCandidates ?? toolRegistry.all()),
+	);
 
 	function resolveToolsForProvider(
 		providerName: string,
@@ -2585,37 +2847,8 @@ async function* agentLoopInMetadataSnapshot(
 		let resolved = allTools;
 		// Inline native search (Codex): the provider declares its own search tool in
 		// the main request, so the function-style WebSearch is hidden entirely.
-		if (shouldUseNativeSearch(providerName, modelName)) {
+		if (!config.toolLoading?.baseToolNames && shouldUseNativeSearch(providerName, modelName)) {
 			resolved = resolved.filter((t) => t.name !== "WebSearch");
-		} else if (
-			// Hide WebSearch when every enabled channel would deterministically fail
-			// for THIS session's provider (the global isAvailable check can't see the
-			// session, so a native-only channel list would otherwise advertise a tool
-			// that always errors on non-opted providers).
-			resolved.some((t) => t.name === "WebSearch") &&
-			!(searchScope || config.runtimePolicy?.searchOnly
-				? (!searchScope || matchesSearchExecutionScope(providerName, modelName)) &&
-					usesSideRequestNativeSearch(providerName, modelName)
-				: hasUsableFunctionSearchChannelFor(providerName))
-		) {
-			resolved = resolved.filter((t) => t.name !== "WebSearch");
-		}
-
-		// In plan mode, override descriptions for forbidden tools so the model knows not to
-		// call them. Applied here rather than baked into `allTools` because a manual toggle
-		// can flip plan mode between turns, and `allTools` is built once per pass.
-		// Tool NAMES are preserved (required by some APIs for history consistency).
-		// When relaxedPlan is enabled, skip this — tools remain fully available.
-		if (planModeDisablesTools()) {
-			const disabledDesc = getToolMessage("planModeToolDisabled", locale);
-			resolved = resolved.map((t) =>
-				PLAN_MODE_ALLOWED_TOOLS.has(t.name)
-					? t
-					: {
-							...t,
-							description: disabledDesc,
-						},
-			);
 		}
 		return resolved;
 	}
@@ -2633,19 +2866,35 @@ async function* agentLoopInMetadataSnapshot(
 		}
 	}
 
-	let tools =
-		inheritedTools?.tools ??
-		provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
-	await reportToolsCharacters(tools);
 	/**
-	 * The plan-mode tool-description state `tools` was formatted with.
-	 *
-	 * Compared at each turn boundary so a manual toggle re-formats the tool array, while an
-	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
+	 * Format the request's tool array for the current adapter. Managed optional tools
+	 * follow the history's loading state and the adapter's tool loading strategy, so the
+	 * array stays fixed while tools are loaded inside the history.
 	 */
-	let toolsPlanModeDisabled = planModeDisablesTools();
-	let pendingToolResults: unknown[] = initialToolResults ?? [];
+	let toolLoadingStrategy: ToolLoadingStrategy =
+		inheritedTools?.toolLoadingStrategy ?? "replace_tools";
+	function formatRequestToolsForProvider(): unknown[] {
+		toolLoadingStrategy =
+			config.toolLoading?.strategy ??
+			(usesToolLoading(config.toolLoading)
+				? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
+				: "replace_tools");
+		return formatRequestTools(
+			(selected) => provider.formatTools(selected),
+			resolveToolsForProvider(effectiveProvider, effectiveModel),
+			config.toolLoading,
+			toolLoadingStrategy,
+		);
+	}
+
+	let tools = inheritedTools?.tools ?? formatRequestToolsForProvider();
+	await reportToolsCharacters(tools);
 	let turnIndex = 0;
+	/**
+	 * The last round ran tools after which an empty reply is a finish, not a fault: any
+	 * tool round of a bot (it answers through Send), or one that handed work off.
+	 */
+	let quietFinishAllowed = false;
 	let completedToolCount = config.initialCompletedToolCount ?? 0;
 	const silentToolCallThreshold = normalizeSilentToolCallThreshold(config.silentToolCallThreshold);
 	let silentToolCallCount = 0;
@@ -2658,6 +2907,9 @@ async function* agentLoopInMetadataSnapshot(
 	 * the execution-group loop). They could only ever hold the same ids.
 	 */
 	const processedToolUseIds = new Set<string>();
+	// Keep the first planning nudge, without repeating it after every tool/turn in
+	// this run. A new agentLoop invocation (e.g. the next user message) re-arms it.
+	let relaxedPlanReminderQueued = false;
 	const pipelineExitConfirmationAttachedStateIds = new Set<string>();
 	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
 	// across tool outputs). Prefer the session-provided shared set so point A (user message)
@@ -2676,37 +2928,88 @@ async function* agentLoopInMetadataSnapshot(
 	type LoopInjection = NonNullable<Parameters<NonNullable<typeof config.deliverInjectionRow>>[0]>;
 
 	const pendingLoopInjections: LoopInjection[] = [];
+	/**
+	 * Loop-control notices (turn nudge, broken call, continue). Unlike the advisory
+	 * reminders, the next request is wrong without them, so a host that cannot persist a
+	 * row (a reflection loop, a probe) still sends their text from memory.
+	 */
+	const requiredLoopInjections = new WeakSet<LoopInjection>();
 
 	function queueLoopInjection(injection: LoopInjection): void {
 		if (!injection.content.trim()) return;
 		pendingLoopInjections.push(injection);
 	}
 
-	/**
-	 * Persist the queued reminders and return the text for the current turn.
-	 *
-	 * A host without the hook gets "" and the reminders are dropped rather than falling
-	 * back to a side-car: delivering both ways is how the same words end up in the
-	 * conversation twice.
-	 */
-	async function flushLoopInjections(): Promise<string> {
-		if (pendingLoopInjections.length === 0) return "";
+	/** Queue a loop-control notice; persisted as its own row like every other reminder. */
+	function queueLoopNotice(source: string, params?: Record<string, string | number>): void {
+		const injection: LoopInjection = {
+			source,
+			...sideCarBodyWithText(source, { kind: "notice", ...(params ? { params } : {}) }, locale),
+		};
+		requiredLoopInjections.add(injection);
+		queueLoopInjection(injection);
+	}
+
+	/** Persist reminders once, retaining their source IDs until input is actually assembled. */
+	async function flushLoopInjections(): Promise<void> {
+		if (pendingLoopInjections.length === 0) return;
 		const queued = pendingLoopInjections.splice(0, pendingLoopInjections.length);
-		if (!config.deliverInjectionRow) return "";
-		const parts: string[] = [];
 		for (const injection of queued) {
-			try {
-				const text = await config.deliverInjectionRow(injection);
-				if (text?.trim()) parts.push(text);
-			} catch (err) {
-				logger.warn("Failed to deliver loop injection row", {
-					narratorId: config.narratorId,
-					source: injection.source,
-					error: String(err),
-				});
+			let delivered = false;
+			if (config.deliverInjectionRow) {
+				try {
+					const result = await config.deliverInjectionRow(injection);
+					const part = typeof result === "string" ? { text: result } : result;
+					if (part.text.trim()) {
+						pendingInputParts.push(part);
+						delivered = true;
+					}
+				} catch (err) {
+					logger.warn("Failed to deliver loop injection row", {
+						narratorId: config.narratorId,
+						source: injection.source,
+						error: String(err),
+					});
+				}
 			}
+			if (!delivered && requiredLoopInjections.has(injection))
+				pendingInputParts.push({ text: injection.content });
 		}
-		return parts.join("\n\n");
+	}
+
+	/**
+	 * The persisted form of one settled tool result.
+	 *
+	 * A broken call stores its sanitized input and the fixed broken-call result (the
+	 * model's history leaves it out); images travel with the event so the consumer can
+	 * save them, which is what lets a rebuilt request carry them too.
+	 */
+	function toolResultEvent(
+		tu: AgentToolUse,
+		result: ToolExecResult,
+		overrides: { durationMs?: number; metadata?: Record<string, unknown> } = {},
+	): Extract<AgentEvent, { type: "tool_result" }> {
+		const brokenInputOverride = result.broken
+			? sanitizeBrokenInput(tu.name, result.updatedInput ?? tu.input, locale)
+			: undefined;
+		return {
+			type: "tool_result",
+			toolCallBinding: executionBindings.get(tu),
+			toolUseId: tu.toolUseId,
+			toolName: tu.name,
+			input: result.updatedInput ?? tu.input,
+			output: result.broken ? getToolMessage("brokenToolCallResult", locale) : result.output,
+			isError: result.isError ?? false,
+			durationMs: overrides.durationMs ?? result.durationMs,
+			permissionStartedAt: result.permissionStartedAt,
+			executionStartedAt: result.executionStartedAt,
+			completedAt: result.completedAt,
+			brokenInputOverride,
+			updatedInput: brokenInputOverride ?? result.updatedInput,
+			metadata: overrides.metadata ?? result.metadata,
+			...(!result.broken && result.images?.length ? { images: result.images } : {}),
+			...(!result.broken && result.mediaRefs?.length ? { mediaRefs: result.mediaRefs } : {}),
+		};
 	}
 
 	/**
@@ -2769,7 +3072,14 @@ async function* agentLoopInMetadataSnapshot(
 		// toward the completed-tool cadence, which measures productive work.
 		if (result.broken || result.fatal) return;
 
-		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
+		if (
+			!relaxedPlanReminderQueued &&
+			(await shouldInjectRelaxedPlanToolReminder(tu, config)) &&
+			!relaxedPlanReminderQueued
+		) {
+			// Re-check after awaiting classification: parallel tool completions may
+			// reach this point together, but must still queue only one reminder.
+			relaxedPlanReminderQueued = true;
 			queueLoopInjection({
 				source: "relaxed_plan",
 				...sideCarBodyWithText(
@@ -2785,9 +3095,10 @@ async function* agentLoopInMetadataSnapshot(
 			});
 		}
 		// Point B: scan this tool's output for relevant knowledge and inject a reminder.
-		// Skip the knowledge tools themselves to avoid self-amplification.
+		// Skip the knowledge and outline tools themselves to avoid self-amplification.
 		if (
 			!tu.name.startsWith("Knowledge") &&
+			!isOutlineTool(tu.name) &&
 			typeof result.output === "string" &&
 			result.output.length > 0
 		) {
@@ -2811,6 +3122,7 @@ async function* agentLoopInMetadataSnapshot(
 							{
 								kind: "knowledge",
 								hits: scan.hits.map((hit) => ({
+									scope: hit.scope,
 									entryId: hit.entryId,
 									title: hit.title,
 									summary: hit.summary,
@@ -2852,39 +3164,95 @@ async function* agentLoopInMetadataSnapshot(
 	 * pass start: a row written mid-turn is invisible until the next pass, and a
 	 * finished background task should not have to wait that long to be mentioned.
 	 */
+	const pendingInputParts: AgentInputPart[] = [];
+	let replayedInjectionMessageIds = new Set<string>();
 	const pendingInputConsumptions: Array<() => void> = [];
-	async function collectAfterToolsInjectionText(): Promise<string> {
-		if (!config.getAfterToolsInjections) return "";
+	async function collectAfterToolsInjections(): Promise<void> {
+		if (!config.getAfterToolsInjections) return;
 		try {
 			const injection = await config.getAfterToolsInjections();
 			const text = (typeof injection === "string" ? injection : injection.text).trim();
-			if (text && typeof injection !== "string" && injection.onConsumed) {
+			if (!text) return;
+			const parts = typeof injection === "string" ? undefined : injection.parts;
+			// Legacy hosts return one opaque string. Never lose input if a host supplies
+			// incomplete provenance: without an exact partition it cannot be de-duplicated.
+			if (
+				parts &&
+				parts
+					.map((part) => part.text)
+					.join("\n\n")
+					.trim() === text
+			) {
+				pendingInputParts.push(...parts);
+			} else {
+				pendingInputParts.push({ text });
+			}
+			if (typeof injection !== "string" && injection.onConsumed) {
 				pendingInputConsumptions.push(injection.onConsumed);
 			}
-			return text;
 		} catch (err) {
 			logger.warn("Failed to collect after-tools injections", {
 				narratorId: config.narratorId,
 				error: String(err),
 			});
-			return "";
 		}
 	}
 
+	/** A built history with this loop's system prompt; the builder's array stays untouched. */
+	function withSystemPrompt(built: unknown[]): unknown[] {
+		const history = [...built];
+		if (config.systemPrompt)
+			provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+		return history;
+	}
+
+	/**
+	 * The host's history for the next request while it is current: the first request's
+	 * build, or a rebuild at a turn boundary. Without one, the request is the projection
+	 * of the transcript — the same builder over the same kind of rows.
+	 */
+	let hostHistory: unknown[] | null = initialHistory.built
+		? withSystemPrompt(initialHistory.built)
+		: null;
 	// Preserve the exact build identity for delivery receipts; the model history itself
 	// is copied/mutated by provider projections and must not be used as a global inbox.
-	let sourceInputHistory = history;
-	// Shallow-copy to avoid mutating the caller's array
-	history = [...history];
+	let sourceInputHistory: unknown[] = initialHistory.built ?? [];
 
-	// Inherited reflection history already contains this prompt.
-	if (config.systemPrompt && !inheritedPromptConfigs.has(config)) {
-		provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+	/** A request's history from rows, for the current adapter, model and tool layout. */
+	async function projectRows(rows: readonly DbMessage[]): Promise<unknown[]> {
+		const built = await buildAdapterHistory(
+			provider,
+			rows,
+			{ provider: effectiveProvider, model: effectiveModel },
+			{
+				narratorId: config.narratorId,
+				// Injected schemas are already notice text in host rows (`buildRuntimeHistory`).
+				...(usesToolLoading(config.toolLoading) && toolLoadingStrategy !== "custom_injection"
+					? { toolLoading: { state: config.toolLoading, strategy: toolLoadingStrategy } }
+					: {}),
+			},
+		);
+		if (built.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: built.mediaFallbackWarnings });
+		return withSystemPrompt(built.history);
 	}
 
 	// Extra content to prepend to the next turn's user message (e.g. broken-tool reminder).
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
+
+	function pendingInputText(parts: readonly AgentInputPart[]): string {
+		return parts
+			.filter((part) => !part.messageId || !replayedInjectionMessageIds.has(part.messageId))
+			.map((part) => part.text)
+			.join("\n\n")
+			.trim();
+	}
+
+	function combinePendingInput(base: string, parts: readonly AgentInputPart[]): string {
+		const text = pendingInputText(parts);
+		return text ? (base ? `${base}\n\n${text}` : text) : base;
+	}
 
 	// Retries for "reasoning-only" dead turns (model produced only reasoning, no text
 	// and no tool calls). Declared at function scope so the ceiling is shared across
@@ -2896,31 +3264,44 @@ async function* agentLoopInMetadataSnapshot(
 
 	let resetUpstreamSessionOnNextRequest = !!config.resetUpstreamSessionOnFirstRequest;
 
-	/**
-	 * Tool-use identifiers already present in the model-facing history.
-	 *
-	 * Providers that mint one id for every call (e.g. "call_go_0") produce a valid single
-	 * turn but an invalid history: after a few turns the replayed conversation carries the
-	 * same id many times and the API answers 400 "duplicate tool_use id". The DB rebuild
-	 * path fixes accumulated rows (see uniquifyDbMessageToolUseIds); this set guards the
-	 * turns appended in-memory during one run, which never go through a rebuild.
-	 *
-	 * Rebuilt on every history replacement so it always describes the live history.
-	 */
-	let historyToolUseIds = collectToolUseIdsFromHistory(history, initialToolResults);
+	/** Replacements applied so far; a turn that already got one needs no rebuild. */
+	let historyReplacements = 0;
 
-	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
-		resetUpstreamSessionOnNextRequest = true;
-		history = replacement.history;
+	function applyHistoryReplacement(
+		replacement: AgentHistoryReplacement,
+		options: { sameUpstreamSession?: boolean } = {},
+	) {
+		if (!inheritedTools && replacement.toolLoading && !replacement.toolCandidates) {
+			throw new Error("A tool-loading history replacement must include tool candidates");
+		}
+		historyReplacements++;
+		// A per-request rebuild continues the same conversation; only a replacement that
+		// changes what was already sent (compact, model switch) starts a new upstream session.
+		const epochChanged =
+			replacement.toolLoading?.epochMarkerId !== config.toolLoading?.epochMarkerId;
+		const sameSystemPrompt =
+			replacement.systemPrompt === undefined || replacement.systemPrompt === config.systemPrompt;
+		if (epochChanged || !sameSystemPrompt || options.sameUpstreamSession === false)
+			resetUpstreamSessionOnNextRequest = true;
+		// The builder's array is the receipt identity; the system prompt goes into a copy.
 		sourceInputHistory = replacement.history;
+		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
 		}
-		if (config.systemPrompt) {
-			provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+		hostHistory = withSystemPrompt(replacement.history);
+		transcript.replace(replacement.rows);
+		if (replacement.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: replacement.mediaFallbackWarnings });
+		// Only a loading-aware rebuild may replace the request's tool view. Candidates and
+		// loading state move together; even an unchanged layout may carry a new tool/schema.
+		if (!inheritedTools && replacement.toolLoading && replacement.toolCandidates) {
+			config.toolCandidates = replacement.toolCandidates;
+			allTools = materializeToolCandidates(replacement.toolCandidates);
+			config.toolLoading = replacement.toolLoading;
+			tools = formatRequestToolsForProvider();
+			void reportToolsCharacters(tools);
 		}
-		pendingToolResults = replacement.pendingToolResults;
-		historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 	}
 
 	async function hasPendingRuntimeSettingsOverride(): Promise<boolean> {
@@ -2959,63 +3340,11 @@ async function* agentLoopInMetadataSnapshot(
 
 		if (!newModel && !reasoningChanged) return null;
 
+		let newResolved: ReturnType<typeof resolveProviderAndModel> | undefined;
 		try {
-			let providerChanged = false;
-			let modelChanged = false;
-			if (newModel) {
-				const newResolved = resolveProviderAndModel(newModel);
-				providerChanged = newResolved.provider !== effectiveProvider;
-				modelChanged = newResolved.model !== effectiveModel;
-				provider = newResolved.adapter;
-				effectiveModel = newResolved.model;
-				effectiveProvider = newResolved.provider;
-				config.model = newResolved.model;
-				config.provider = newResolved.provider;
-				if (providerChanged || modelChanged) {
-					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
-					await reportToolsCharacters(tools);
-					// This re-format already applied the current plan-mode state; record it so the
-					// turn-boundary check does not immediately redo the same work.
-					toolsPlanModeDisabled = planModeDisablesTools();
-				}
-			}
-
-			if (hasReasoningOverride) {
-				config.reasoningEffort = nextReasoningEffort;
-			}
-
-			if (providerChanged || modelChanged) {
-				// Force history/tool-result rebuild so the next API call uses the new
-				// provider protocol even when this switch happens inside a retry loop.
-				const replacement = await config.onBeforeTurn?.(turnIndex, {
-					force: true,
-					cause: "model_switch",
-				});
-				if (replacement) {
-					applyHistoryReplacement(replacement);
-				} else if (config.systemPrompt && providerChanged) {
-					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
-				}
-			}
-
-			logger.info("Agent loop switched runtime settings before API call", {
-				narratorId: config.narratorId,
-				cause,
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort,
-				modelChanged,
-				providerChanged,
-				reasoningChanged,
-			});
-			return {
-				type: "model_switched",
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort ?? null,
-				cause,
-			};
+			if (newModel) newResolved = resolveProviderAndModel(newModel);
 		} catch (err) {
+			if (err instanceof ToolEpochError) throw err;
 			logger.warn("Failed to switch runtime settings during agent loop", {
 				narratorId: config.narratorId,
 				cause,
@@ -3025,6 +3354,55 @@ async function* agentLoopInMetadataSnapshot(
 			});
 			return null;
 		}
+
+		// Once the adapter or request state changes, preparation must succeed before
+		// dispatch. In particular, identity/storage failures cannot reuse the old
+		// prepared first attempt under a new model or provider.
+		let providerChanged = false;
+		let modelChanged = false;
+		if (newResolved) {
+			providerChanged = newResolved.provider !== effectiveProvider;
+			modelChanged = newResolved.model !== effectiveModel;
+			provider = newResolved.adapter;
+			effectiveModel = newResolved.model;
+			effectiveProvider = newResolved.provider;
+			config.model = newResolved.model;
+			config.provider = newResolved.provider;
+			if (providerChanged || modelChanged) {
+				tools = formatRequestToolsForProvider();
+				await reportToolsCharacters(tools);
+			}
+		}
+
+		if (hasReasoningOverride) config.reasoningEffort = nextReasoningEffort;
+
+		if (providerChanged || modelChanged) {
+			// Force history/tool-result rebuild even when switching inside a retry loop.
+			const replacement = await config.onBeforeTurn?.(turnIndex, {
+				force: true,
+				cause: "model_switch",
+			});
+			if (replacement) applyHistoryReplacement(replacement);
+			else hostHistory = null;
+		}
+
+		logger.info("Agent loop switched runtime settings before API call", {
+			narratorId: config.narratorId,
+			cause,
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort,
+			modelChanged,
+			providerChanged,
+			reasoningChanged,
+		});
+		return {
+			type: "model_switched",
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort ?? null,
+			cause,
+		};
 	}
 
 	turnLoop: while (turnIndex < maxTurns) {
@@ -3035,23 +3413,19 @@ async function* agentLoopInMetadataSnapshot(
 		if (guidanceSignal?.aborted) {
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
-			config.shouldStop?.();
-			const isFirstTurn = turnIndex === 0;
-			provider.pushUserTurn(
-				history,
-				isFirstTurn ? userText : nextTurnContent,
-				effectiveModel,
-				isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-				isFirstTurn ? images : undefined,
-			);
+			config.shouldYieldToInput?.();
 			yield { type: "turn_complete", turnIndex };
 			return;
 		}
 		// A reflection sub-loop runs inside the parent's tool admission, so it must not be
 		// parked behind the update gate — see beginNarratorResponseActivity for the deadlock.
-		const responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
+		let responseActivity = await beginNarratorResponseActivity(config.narratorId, config.signal, {
 			isReflection: !!config.reflectionLoop,
 		});
+		// The transport ending is not the final attempt verdict: empty/malformed tool
+		// responses are classified afterwards. Keep the unfinished handle for that verdict,
+		// while this turn's outer finally covers consumer return and unexpected exits.
+		let activeRequestDump: ApiRequestDumpCollector | undefined;
 		try {
 			// Delivery is de-duplicated only within one model turn. If persistence failed,
 			// the still-pending state may be attached again on the next turn.
@@ -3060,6 +3434,9 @@ async function* agentLoopInMetadataSnapshot(
 			const isFirstTurn = turnIndex === 0;
 
 			if (!isFirstTurn) {
+				// The host's history described the previous request; the transcript has moved on.
+				hostHistory = null;
+				const replacementsBefore = historyReplacements;
 				const switchEvent = await applyPendingRuntimeSettings("turn");
 				if (switchEvent) {
 					yield switchEvent;
@@ -3070,40 +3447,53 @@ async function* agentLoopInMetadataSnapshot(
 						applyHistoryReplacement(replacement);
 					}
 				}
-
-				// A manual plan-mode toggle landed between turns: re-format the tool array so
-				// the forbidden tools carry (or drop) the disabled description. Checked after
-				// onBeforeTurn because a model switch there already re-formatted the tools.
-				const planModeDisabledNow = planModeDisablesTools();
-				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
-					toolsPlanModeDisabled = planModeDisabledNow;
-					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
-					await reportToolsCharacters(tools);
-					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
-						narratorId: config.narratorId,
-						planModeDisablesTools: planModeDisabledNow,
-					});
+				// Every later request is the projection of the persisted rows, exactly what a
+				// rebuild of this conversation sends. A failed rebuild projects the transcript.
+				if (config.rebuildRequestHistory && historyReplacements === replacementsBefore) {
+					try {
+						const replacement = await config.rebuildRequestHistory();
+						// A new system prompt (a compact landed) changes what was already sent.
+						applyHistoryReplacement(replacement, {
+							sameUpstreamSession:
+								replacement.systemPrompt === undefined ||
+								replacement.systemPrompt === config.systemPrompt,
+						});
+					} catch (error) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						// Storage failed at a prefix boundary, or the old view is no longer current.
+						// Reusing that transcript would disguise changed definitions as the old epoch.
+						if (error instanceof ToolEpochError || config.toolLoading) throw error;
+						logger.warn("Request history rebuild failed; projecting the loop's transcript", {
+							narratorId: config.narratorId,
+							turnIndex,
+							error: String(error),
+						});
+					}
 				}
 			}
 
-			const content = isFirstTurn ? userText : nextTurnContent;
+			const baseContent = isFirstTurn ? userText : nextTurnContent;
+			const currentInputParts = pendingInputParts.splice(0);
+			let content = combinePendingInput(baseContent, currentInputParts);
 			nextTurnContent = ""; // consume once
-			getPermissionHistory = () => {
-				const reflectionHistory = [...history];
-				provider.pushUserTurn(
-					reflectionHistory,
-					content,
-					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-					isFirstTurn ? images : undefined,
+			const turnImages = isFirstTurn ? images : undefined;
+			const turnMedia = isFirstTurn ? await durableMediaReferences(media) : undefined;
+			uncommittedInput = { text: content, images: turnImages, media: turnMedia };
+			/** The model answered the turn's input: from now on it is part of the conversation. */
+			const commitInput = () => {
+				transcript.appendInput(
+					uncommittedInput.text,
+					uncommittedInput.images,
+					uncommittedInput.media,
 				);
-				return reflectionHistory;
+				uncommittedInput = { text: "" };
 			};
 
 			// Call provider and collect the response
 			let assistantText = "";
-			/** Provider-native content block index for the text block (for interleaved ordering). */
-			let textOutputIndex: number | undefined;
 			/**
 			 * Reasoning blocks accumulated during streaming, keyed by itemId.
 			 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
@@ -3218,24 +3608,34 @@ async function* agentLoopInMetadataSnapshot(
 			 */
 			let gracefulStopRequested = false;
 			/**
-			 * Consume a pending soft-stop request at most once per turn.
+			 * Consume a pending host stop request at most once per turn.
 			 *
 			 * Every boundary asks through here, so the grant is spent exactly once no
 			 * matter which phase observes it first. Asking again after a grant would
 			 * return the *next* request's answer (usually false) and silently resurrect
-			 * the turn the caller already agreed to end.
+			 * the turn the caller already agreed to end. A host stop skips the calls that
+			 * have not started yet.
 			 */
 			const observeSoftStopForTurn = (): boolean => {
-				if (!gracefulStopRequested && guidanceSignal?.aborted) {
-					// Consume the host's one-shot flag too, so the next pass is not stopped again.
-					config.shouldStop?.();
-					gracefulStopRequested = true;
-				}
 				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 				return gracefulStopRequested;
 			};
+			/** Same one-shot contract for queued user input, which never skips a call. */
+			let inputStopRequested = false;
+			const observeInputStopForTurn = (): boolean => {
+				if (!inputStopRequested && guidanceSignal?.aborted) {
+					// Consume the host's one-shot flag too, so the next pass is not stopped again.
+					config.shouldYieldToInput?.();
+					inputStopRequested = true;
+				}
+				if (!inputStopRequested && config.shouldYieldToInput?.()) inputStopRequested = true;
+				return inputStopRequested;
+			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
+			// Raised when a started tool settles, so the stream consumer can publish its
+			// result (and release successors) while the provider stream is idle.
+			const toolSettledWake = new WakeSignal();
 			// Synchronously queryable map of settled early-exec results (populated via .then())
 			const settledResults = new Map<string, ToolExecResult>();
 			// Only fully persisted AND announced calls are candidates. A preceding input
@@ -3245,52 +3645,33 @@ async function* agentLoopInMetadataSnapshot(
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
-				const preparationAbort = new AbortController();
-				const onGuidance = () =>
-					preparationAbort.abort(new Error("Stopped for immediate guidance"));
-				const removeGuidance = () => guidanceSignal?.removeEventListener("abort", onGuidance);
-				if (guidanceSignal?.aborted) onGuidance();
-				else guidanceSignal?.addEventListener("abort", onGuidance, { once: true });
-				const preparationSignal = AbortSignal.any([toolSignal, preparationAbort.signal]);
+				// Queued guidance never cancels a produced call, not even while it waits for
+				// permission: only the run's own signal and urgent input cancel preparation.
 				const invocationConfig = new Proxy(toolConfig, {
 					get(target, key, receiver) {
-						if (key === "signal") return preparationSignal;
 						if (key === "permissionHandler") {
 							return ((name, input, id, options) =>
 								target.permissionHandler(name, input, id, {
 									...options,
-									signal: preparationSignal,
+									signal: toolSignal,
 								})) satisfies AgentConfig["permissionHandler"];
-						}
-						if (key === "onToolExecutionInvoking") {
-							return (tool: AgentToolUse) => {
-								// No await between this synchronous boundary and tool.execute.
-								preparationSignal.throwIfAborted();
-								removeGuidance();
-								target.onToolExecutionInvoking?.(tool);
-							};
 						}
 						return Reflect.get(target, key, receiver);
 					},
 				});
 				const execution = settleToolExecutionResult(
-					executeToolAfterReflections(tu, invocationConfig, history, locale),
-				)
-					.then((result) =>
-						preparationAbort.signal.aborted
-							? {
-									...result,
-									output: getToolMessage("skippedForSoftStop", locale),
-									isError: true,
-									metadata: { ...result.metadata, skippedForSoftStop: true },
-								}
-							: result,
-					)
-					.finally(removeGuidance);
+					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale).then(
+						withDurableToolMedia,
+					),
+				);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
 					settledResults.set(tu.toolUseId, result);
-					pumpStreamingTools();
+					// Successors wait for this result to be consumed, not merely settled (see
+					// pumpStreamingTools). Wake the stream consumer so it publishes the result
+					// now instead of at the provider's next event, which may be long after the
+					// model stopped producing output.
+					toolSettledWake.notify();
 				});
 				return execution;
 			};
@@ -3329,7 +3710,12 @@ async function* agentLoopInMetadataSnapshot(
 							tool,
 							ready: streamReadyTools.has(identity.toolUseId),
 							started: earlyExecMap.has(identity.toolUseId),
-							settled: result !== undefined,
+							// The barrier is the CONSUMED result, not the settled promise. Some
+							// effects are applied by the event consumer when it processes the
+							// tool_result (plan-mode commit, plan exit, reflection decisions);
+							// a later group must observe them, exactly as the post-stream phase
+							// does by yielding each group's results before starting the next.
+							settled: yieldedToolResults.has(identity.toolUseId),
 							fatal: result?.fatal,
 							allowed: tool !== undefined && shouldEagerExecuteTool(tool),
 						};
@@ -3456,29 +3842,26 @@ async function* agentLoopInMetadataSnapshot(
 			let lastStopReason: string | undefined;
 			const namelessToolUseIds = new Set<string>();
 
-			function earlyToolResultEvent(
-				tu: AgentToolUse,
-				settled: ToolExecResult,
-			): Extract<AgentEvent, { type: "tool_result" }> {
-				const brokenOverride = settled.broken
-					? sanitizeBrokenInput(tu.name, settled.updatedInput ?? tu.input, locale)
-					: undefined;
-				return {
-					type: "tool_result",
-					toolCallBinding: executionBindings.get(tu),
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					input: settled.updatedInput ?? tu.input,
-					output: settled.broken ? getToolMessage("brokenToolCallResult", locale) : settled.output,
-					isError: settled.isError ?? false,
-					durationMs: settled.durationMs,
-					permissionStartedAt: settled.permissionStartedAt,
-					executionStartedAt: settled.executionStartedAt,
-					completedAt: settled.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride ?? settled.updatedInput,
-					metadata: settled.metadata,
-				};
+			/**
+			 * Publish settled-but-unpublished results in call order while the stream is open.
+			 * Returns the first fatal result, after publishing it; the caller ends the request.
+			 */
+			async function* drainSettledStreamingToolResults(): AsyncGenerator<
+				AgentEvent,
+				ToolExecResult | undefined
+			> {
+				for (const tu of toolUses) {
+					const settled = settledResults.get(tu.toolUseId);
+					if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
+					yieldedToolResults.add(tu.toolUseId);
+					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
+					if (settled.updatedInput && tu.name !== "AskUserQuestion")
+						tu.input = settled.updatedInput;
+					await processToolResultInjections(tu, settled);
+					yield toolResultEvent(tu, settled);
+					if (settled.fatal) return settled;
+				}
+				return undefined;
 			}
 
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
@@ -3487,9 +3870,10 @@ async function* agentLoopInMetadataSnapshot(
 					if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
 					yieldedToolResults.add(tu.toolUseId);
 					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
-					if (settled.updatedInput) tu.input = settled.updatedInput;
+					if (settled.updatedInput && tu.name !== "AskUserQuestion")
+						tu.input = settled.updatedInput;
 					await processToolResultInjections(tu, settled);
-					yield earlyToolResultEvent(tu, settled);
+					yield toolResultEvent(tu, settled);
 				}
 			}
 
@@ -3510,7 +3894,7 @@ async function* agentLoopInMetadataSnapshot(
 					// final result alive without holding up interruption or emitting into
 					// a stream that may already belong to the narrator's next run.
 					void execution
-						.then((settled) => persist(earlyToolResultEvent(tu, settled)))
+						.then((settled) => persist(toolResultEvent(tu, settled)))
 						.catch((error) => {
 							logger.error("Failed to persist detached tool result", {
 								narratorId: config.narratorId,
@@ -3563,7 +3947,7 @@ async function* agentLoopInMetadataSnapshot(
 				for (const tu of toolUses) {
 					if (earlyExecMap.has(tu.toolUseId) || yieldedToolResults.has(tu.toolUseId)) continue;
 					yieldedToolResults.add(tu.toolUseId);
-					yield earlyToolResultEvent(tu, {
+					yield toolResultEvent(tu, {
 						output: locale === "zh-CN" ? "工具执行已取消。" : "Tool execution cancelled.",
 						isError: true,
 						durationMs: 0,
@@ -3635,19 +4019,6 @@ async function* agentLoopInMetadataSnapshot(
 			let requestDiagnostics: ApiRequestDiagnostics | undefined;
 			let requestDump: ApiRequestDumpCollector | undefined;
 			/**
-			 * Set when leaked XML tool calls are detected this turn (recovered or unrecovered),
-			 * forcing the raw dump to persist regardless of the errors-only setting so the SSE
-			 * data is downloadable for debugging.
-			 */
-			let forceDumpPersist = false;
-			/**
-			 * Fallback dump used when the upstream rejected the request body as malformed and
-			 * no dump collector was active for this attempt (dumping disabled and the provider
-			 * does not leak XML tool calls). With a collector present the capture is attached
-			 * to the real dump instead — see {@link captureMalformedRequest}.
-			 */
-			let malformedRequestRecord: unknown;
-			/**
 			 * Attempts already spent replaying an upstream "malformed request body" rejection.
 			 *
 			 * Kept separate from `chatRetryCount` because this rejection is not a transient
@@ -3659,30 +4030,9 @@ async function* agentLoopInMetadataSnapshot(
 			 * would only delay a hard error while re-sending the whole history each time.
 			 */
 			let malformedRetryCount = 0;
-			/**
-			 * Path of the dump file written for this turn's first malformed rejection, if any.
-			 *
-			 * The replays re-send an identical body, so one file is the whole evidence there is;
-			 * later attempts reuse this path instead of writing near-duplicates. `null` records
-			 * "the write was attempted and failed", which must not be retried either — the
-			 * capture record has a distinct note for that case and re-attempting would just
-			 * produce the same failure. See {@link captureMalformedRequest}.
-			 */
-			let malformedDumpPath: string | null | undefined;
-			/**
-			 * Turn-scoped key letting every attempt of THIS rejection share one spilled dump file.
-			 *
-			 * `malformedDumpPath` already keeps the malformed-dump directory to one file per turn,
-			 * but each attempt also persists its own force-saved `api_requests` row, and those
-			 * dumps spill to a SECOND directory (`request-dumps`) that had no such guard: three
-			 * attempts produced three near-identical multi-MB files, pruning unrelated
-			 * captures out of the newest-N window to store the same request three times. The
-			 * token is what tells the tracker these rows describe one request; each row still
-			 * gets a pointer, so no attempt looks like a failure without evidence.
-			 */
-			let malformedSpillReuseToken: string | undefined;
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
+			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
@@ -3714,60 +4064,19 @@ async function* agentLoopInMetadataSnapshot(
 			/**
 			 * Special case: the upstream rejected the request body as malformed
 			 * (`REQUEST_BODY_INVALID` / "Improperly formed request.") without saying which
-			 * field was wrong. Force-save the exact request that produced it to a dedicated
-			 * file so the root cause survives every retry path, and ANNOTATE the dump with a
-			 * pointer to that file plus a structural summary.
-			 *
-			 * The annotation must never replace the dump. A user opening a dump is asking what
-			 * was sent; handing back only a summary and a server-side path is the one outcome
-			 * the dump exists to prevent. Row size is bounded downstream by spilling the whole
-			 * dump to a file (see `api-request-dump-store`), not by dropping the request here.
+			 * field was wrong. Pin this attempt's recording so the exact request survives the
+			 * ring window, and attach a bounded structural summary that usually points at the
+			 * offender. Replays re-send the identical body; each attempt is its own recording.
 			 */
-			const captureMalformedRequest = async (errorMessage?: string): Promise<void> => {
-				const snapshot = requestDump?.snapshot();
-				// Write the file only for this turn's FIRST rejection. The replays re-send a
-				// byte-identical body, so a second file would be a near-duplicate of several MB,
-				// and at 3 attempts per turn they would evict unrelated captures through the
-				// newest-N pruning — losing other evidence to keep three copies of one.
-				//
-				// The capture record itself is still rebuilt every attempt: each attempt inserts
-				// its own `api_requests` row, and a row without the annotation would look like an
-				// ordinary failure with no pointer to the evidence.
-				if (malformedDumpPath === undefined) {
-					malformedDumpPath = await writeMalformedRequestDump({
-						narratorId: config.narratorId,
-						requestId,
-						provider: effectiveProvider,
-						model: effectiveModel,
-						errorMessage,
-						diagnostics: requestDiagnostics,
-						dump: snapshot,
-					});
-				}
-				const filePath = malformedDumpPath;
-				const captureRecord = buildMalformedCaptureRecord({
-					narratorId: config.narratorId,
-					requestId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					errorMessage,
-					diagnostics: requestDiagnostics,
-					dump: snapshot,
-					filePath,
+			const captureMalformedRequest = (): void => {
+				if (!requestDump) return;
+				const summary = summarizeRequestBody(requestDump.lastRequestBody());
+				requestDump.frame({
+					direction: "request",
+					type: "malformed_request_summary",
+					metadata: { reason: "malformed_request_body", ...(summary ? { summary } : {}) },
 				});
-				if (requestDump) {
-					requestDump.setCapture(captureRecord.capture);
-				} else {
-					// No collector ran for this attempt, so there is no dump to annotate and the
-					// capture record is all the evidence there is.
-					malformedRequestRecord = captureRecord;
-				}
-				forceDumpPersist = true;
-				// Established on the FIRST rejection of this turn and reused by its replays, so
-				// their identical dumps share one spill file. Keyed on the first attempt's
-				// requestId: unique per turn without needing another id source, and stable across
-				// the replays because it is only assigned once.
-				malformedSpillReuseToken ??= `malformed:${requestId}`;
+				requestDump.pin("malformed");
 			};
 
 			function getEstimatedUpstreamPromptTokens(): number | undefined {
@@ -3779,8 +4088,23 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+				// A failed/no-op settings switch can reach teardown twice for one attempt.
+				// Do not re-emit its end or erase the durable association added by the consumer.
+				if (requestFinished) return;
+				requestFinished = true;
 				streamExecutionOpen = false;
-				if (!requestStarted) return;
+				// An OpenCode Go request just spent (or was refused) allowance: schedule a
+				// throttled background `/usage` refresh so the status bar catches up.
+				// Fire-and-forget; a no-op for every other provider.
+				noteOpencodeUsageActivity(effectiveProvider);
+				if (!requestStarted) {
+					requestDump?.finish({
+						error: errorMessage,
+						status: errorMessage ? "error" : "completed",
+					});
+					if (activeRequestDump === requestDump) activeRequestDump = undefined;
+					return;
+				}
 				// Retract the live tool cards this request published but never completed.
 				//
 				// This sits in the request teardown rather than at each retry site because
@@ -3795,15 +4119,34 @@ async function* agentLoopInMetadataSnapshot(
 				// accumulator, so only genuinely truncated ids are ever named.
 				yield* retractStreamingToolCards();
 				yield* flushRequestStart();
-				const diagnostics = requestDiagnostics
-					? normalizeApiRequestDiagnostics({
-							...requestDiagnostics,
-							provider: requestDiagnostics.provider ?? effectiveProvider,
-							model: requestDiagnostics.model ?? effectiveModel,
-							message: requestDiagnostics.message ?? errorMessage,
-						})
-					: undefined;
-				requestDump?.setDiagnostics(diagnostics);
+				// Keep the diagnostic object's identity: lastRetryDiagnostics and deferred
+				// resumable errors can still refer to this attempt after the next one starts.
+				// The consumer enriches this SAME object with the durable API row ID at end.
+				const normalizedDiagnostics =
+					requestDiagnostics || errorMessage
+						? normalizeApiRequestDiagnostics({
+								...requestDiagnostics,
+								provider: requestDiagnostics?.provider ?? effectiveProvider,
+								model: requestDiagnostics?.model ?? effectiveModel,
+								message: requestDiagnostics?.message ?? errorMessage,
+								recordingRequestId: requestId,
+								// Never accept a provider-supplied local database association.
+								apiRequestId: undefined,
+							})
+						: undefined;
+				if (normalizedDiagnostics) {
+					if (requestDiagnostics) {
+						for (const field of Object.keys(requestDiagnostics)) {
+							Reflect.deleteProperty(requestDiagnostics, field);
+						}
+						Object.assign(requestDiagnostics, normalizedDiagnostics);
+					} else requestDiagnostics = normalizedDiagnostics;
+				}
+				const diagnostics = requestDiagnostics;
+				// Start is lazy. Let the consumer create/bind its durable API row, and
+				// attach bounded diagnostics, before automatic errors-only saving fires.
+				requestDump?.finish({ error: errorMessage, status: errorMessage ? "error" : "completed" });
+				if (activeRequestDump === requestDump) activeRequestDump = undefined;
 				if (!contextSnapshot) {
 					const window = getModelContextWindow(effectiveModel, effectiveProvider);
 					if (window && inputCharacters) {
@@ -3841,13 +4184,8 @@ async function* agentLoopInMetadataSnapshot(
 					contextPercent: requestContextPercent,
 					meterUsage: requestMeterUsage,
 					meterUnit: requestMeterUnit,
-					// The dump wins whenever one exists: `malformedRequestRecord` is only set on
-					// the no-collector path, where it is the sole record of the rejection.
-					rawDump: requestDump?.snapshot() ?? malformedRequestRecord,
 					errorMessage,
 					diagnostics,
-					forceDumpPersist,
-					dumpSpillReuseToken: malformedSpillReuseToken,
 				};
 			}
 
@@ -3858,9 +4196,11 @@ async function* agentLoopInMetadataSnapshot(
 			// Stateful providers (responses/codex) cannot retry here because the
 			// server already consumed the request.
 			const maxConfiguredRetries = config.maxTransientRetries ?? 0;
+			// Watchdog timeouts must use the same retry owner as other transport errors:
+			// stateful providers replay in the outer runtime, stateless providers retry
+			// here. Giving both layers a full budget multiplies the configured limit.
 			const getMaxChatRetries = () =>
 				usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
-			const maxFirstTokenRetries = maxConfiguredRetries;
 			const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 			const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
 			let chatRetryCount = 0;
@@ -3878,10 +4218,9 @@ async function* agentLoopInMetadataSnapshot(
 			/**
 			 * Whether this attempt has produced any client-visible, persistable
 			 * content so far (text/tool calls/reasoning/web search/image
-			 * generation). Used both by the empty-response guard below and by the
-			 * resumable-error path: a "resumable" error is only meaningful when
-			 * there is actually partial output to continue from — otherwise it
-			 * degrades to an ordinary retryable/non-retryable error.
+			 * generation). Used by the empty-response guard below and by
+			 * canReplayMalformedRequest; the resumable strategy classification
+			 * inspects the same accumulators directly.
 			 */
 			/**
 			 * Names of tool calls the model had STARTED writing arguments for when the
@@ -3946,10 +4285,11 @@ async function* agentLoopInMetadataSnapshot(
 
 			/**
 			 * Pick the recovery strategy for a resumable interruption (a transient
-			 * upstream failure that hit AFTER partial output was already produced,
-			 * e.g. the NUG gateway reporting `diagnostics.resumable`).
+			 * upstream failure reported via `diagnostics.resumable`).
 			 *
-			 * The right recovery depends on what the partial output actually is:
+			 * Recovery is NEVER an in-place replay of the identical request: the pass
+			 * ends and the caller assembles the next request from the LATEST state.
+			 * What that means depends on what the partial output actually is:
 			 * - `tool_continuation`: at least one complete tool call landed. Highest
 			 *   priority because tool calls may already have side effects; the model
 			 *   must see their results. The turn finishes normally (tools execute,
@@ -3965,18 +4305,22 @@ async function* agentLoopInMetadataSnapshot(
 			 *   truncation until the retry budget dies. Finish the turn through the
 			 *   normal path instead, where the orphaned-tool detector injects the
 			 *   skeleton-first reminder and the model can switch to smaller calls.
-			 * - `reasoning_only_retry`: only reasoning exists. Nothing client-facing was
-			 *   committed and no side effect occurred, so the safest recovery is to DROP
-			 *   the partial reasoning and re-send the identical request in place. Keeping
-			 *   truncated reasoning would pollute the history and degrade the continuation.
-			 * - `none`: nothing to resume from; fall through to ordinary
-			 *   retryable/terminal error handling.
+			 * - `reasoning_only`: only reasoning exists. The truncated thought must not
+			 *   enter history (for stateful providers an incomplete reasoning item is
+			 *   not even replayable upstream), so it is discarded and the pass ends;
+			 *   the continuation request is then assembled from the latest state,
+			 *   which no longer contains it.
+			 * - `none`: nothing landed locally at all (the gateway's "forwarded"
+			 *   notion is broader than ours — lifecycle frames count there but leave
+			 *   nothing persistable here). Still hand off for a continuation pass:
+			 *   the reassembled request carries the latest state, and the alternative
+			 *   is dying on a transient transport fault.
 			 */
 			const classifyResumeStrategy = ():
 				| "tool_continuation"
 				| "text_continuation"
 				| "truncated_tool_input"
-				| "reasoning_only_retry"
+				| "reasoning_only"
 				| "none" => {
 				if (toolUses.length > 0) return "tool_continuation";
 				if (
@@ -3989,33 +4333,9 @@ async function* agentLoopInMetadataSnapshot(
 				// Ranked above reasoning: a model that thinks and THEN gets cut off writing
 				// a tool call must be told to write smaller calls, not asked to try again.
 				if (orphanedToolInputNames().length > 0) return "truncated_tool_input";
-				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only_retry";
+				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only";
 				return "none";
 			};
-
-			/**
-			 * Whether a "resumable" failure can simply be replayed in place because
-			 * nothing landed on our side.
-			 *
-			 * A gateway sets `resumable` once it has forwarded client-visible SSE
-			 * payload — that is why it simultaneously refuses a wholesale retry
-			 * (`retryable: false`): replaying could duplicate visible output or tool
-			 * side effects. But its notion of "client-visible" is broader than ours:
-			 * queue notices, a `toolUseChunk` carrying only an id, and other non-content
-			 * events count as forwarded upstream while leaving nothing persistable here.
-			 *
-			 * When that happens the turn is stuck between both recovery paths: there is
-			 * nothing to continue from (so no continuation prompt makes sense) and the
-			 * error is flagged non-retryable (so the turn dies as a hard failure) even
-			 * though the local state is indistinguishable from "the request never
-			 * produced anything". Since no visible content and no tool side effect
-			 * exists locally, replaying the identical request is safe and is the only
-			 * recovery that does not surface a hard failure for a transient transport
-			 * fault. The replay reuses the ordinary transient-retry budget and backoff,
-			 * so this cannot loop unbounded.
-			 */
-			const canReplayResumableInPlace = (resumable: boolean): boolean =>
-				resumable && !hasAnyPersistableOutput() && !hasStartedEarlyToolExecution();
 
 			/**
 			 * Replays granted to an upstream "malformed request body" rejection.
@@ -4049,6 +4369,54 @@ async function* agentLoopInMetadataSnapshot(
 				!usesStatefulModel(effectiveProvider, effectiveModel) &&
 				!hasAnyPersistableOutput() &&
 				!hasStartedEarlyToolExecution();
+
+			/**
+			 * Suspend the turn on a plan-quota refusal that resets on a known clock
+			 * (Kimi coding plan, OpenCode Go) instead of failing or replaying it.
+			 *
+			 * Shared by both refusal paths — a thrown HTTP error and an in-stream
+			 * `invalidState` event — so they cannot drift. A wall whose reset is beyond
+			 * the wait budget (or unknown) is forwarded too, without `resumeAt`: the
+			 * caller then reports it with the recovery time, because "spent, returns at
+			 * T" is actionable and an opaque 403/429 is not.
+			 *
+			 * @returns true when the suspension was emitted and the pass must end.
+			 */
+			async function* tryQuotaSuspension(message: string): AsyncGenerator<AgentEvent, boolean> {
+				const quota = await resolveProviderQuotaWait(
+					effectiveProvider,
+					message,
+					requestDiagnostics,
+				);
+				if (quota.kind === "none") return false;
+				const decided = quota.kind === "wait" ? quota.wait : quota.refusal;
+				logger.info("Provider quota refusal resolved", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					quotaProvider: decided.quotaProvider,
+					bucket: decided.bucket,
+					decision: quota.kind,
+					resetAt: decided.resetAt,
+				});
+				yield* outputContent.flush();
+				yield* finishRequest(message);
+				yield {
+					type: "model_unavailable",
+					message,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					providerId: decided.providerId,
+					providerPrefix: decided.providerPrefix,
+					waitKind: "quota",
+					quotaProvider: decided.quotaProvider,
+					quotaBucket: decided.bucket,
+					resumeAt: quota.kind === "wait" ? quota.wait.resumeAt : undefined,
+					quotaResetAt: decided.resetAt,
+					diagnostics: requestDiagnostics,
+				};
+				return true;
+			}
 
 			/**
 			 * What the caller must do after {@link runMalformedReplay} finishes.
@@ -4192,6 +4560,7 @@ async function* agentLoopInMetadataSnapshot(
 			// Settle every completed call through the normal permission/serial execution path
 			// before handing the interruption back to the caller's bounded retry budget.
 			let pendingResumableError: Extract<AgentEvent, { type: "resumable_error" }> | undefined;
+			let prefixPreparedForAttempt = true;
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -4206,8 +4575,8 @@ async function* agentLoopInMetadataSnapshot(
 				// dispatch), so this is safe.
 				assistantText = "";
 				outputContent.reset();
-				textOutputIndex = undefined;
 				reasoningBlockMap.clear();
+				redactedThinkingBlocks.length = 0;
 				toolUses.length = 0;
 				toolOrderIdentities.clear();
 				nextToolArrivalOrder = 0;
@@ -4217,10 +4586,6 @@ async function* agentLoopInMetadataSnapshot(
 				settledResults.clear();
 				streamReadyTools.clear();
 				streamExecutionOpen = false;
-				// Leak-detection dump flag is per successful attempt; clear stale state so a
-				// retry that no longer leaks does not force-persist the previous attempt's dump.
-				forceDumpPersist = false;
-				malformedRequestRecord = undefined;
 				yieldedToolResults.clear();
 				brokenToolUseIds.clear();
 				toolUseAccum.clear();
@@ -4241,11 +4606,27 @@ async function* agentLoopInMetadataSnapshot(
 				// misleading "empty response" message.  It is cleared below when
 				// the attempt produces meaningful content.
 
+				const replacementsBeforeRetry = historyReplacements;
 				const retrySwitchEvent = await applyPendingRuntimeSettings("retry");
 				if (retrySwitchEvent) {
 					yield retrySwitchEvent;
 					resetRetryStateAfterModelSwitch();
 				}
+				// A retry is another provider request. Reconcile current context before
+				// sending it too, unless a model switch already rebuilt the same boundary.
+				if (
+					!prefixPreparedForAttempt &&
+					config.toolLoading?.baseToolNames &&
+					config.rebuildRequestHistory &&
+					historyReplacements === replacementsBeforeRetry
+				) {
+					applyHistoryReplacement(await config.rebuildRequestHistory());
+				}
+				prefixPreparedForAttempt = false;
+				// Reflection and legacy configurations may have no prefix/history hook.
+				// Every attempt still needs durable identity before dispatch. Keep this
+				// outside transport retry handling: a failed admission is not an API error.
+				await config.beforeProviderRequest?.();
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the
@@ -4253,6 +4634,7 @@ async function* agentLoopInMetadataSnapshot(
 				requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 				requestStartTime = 0;
 				requestStarted = false;
+				requestFinished = false;
 				requestStartPending = false;
 				requestTtftMs = undefined;
 				requestUsage = undefined;
@@ -4266,28 +4648,47 @@ async function* agentLoopInMetadataSnapshot(
 				requestMeterUnit = undefined;
 				requestDiagnostics = undefined;
 
-				// Collection decision is live (not session-start): saving dump settings must
-				// affect the next provider.chat() in this already-running narrator without
-				// interrupt/restart. Also force-enabled when the provider may leak XML tool
-				// calls so leaked-tool diagnostics always have a bounded raw dump.
-				// Providers write bodyText/events through the *WithLimit helpers, so collection
-				// stays bounded even when force-enabled here.
-				requestDump = shouldCollectRequestDump(provider.mayLeakXmlToolCalls)
-					? new ApiRequestDumpCollector({
-							provider: effectiveProvider,
-							model: effectiveModel,
-						})
-					: undefined;
+				// Recording settings are read live (not at session start): saving them affects
+				// the next provider.chat() in this already-running narrator without restart.
+				activeRequestDump?.finish({
+					status: "interrupted",
+					error: "Attempt replaced before final response classification",
+				});
+				activeRequestDump = undefined;
+				const recording = createRequestRecording({
+					requestId,
+					narratorId: config.narratorId,
+					userId: requestUserId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					kind: config.reflectionLoop ? "reflection" : "narrator",
+				});
+				requestDump = recording ? new ApiRequestDumpCollector(recording) : undefined;
+				activeRequestDump = requestDump;
 
 				const attemptAbort = new AbortController();
+				let updateReasoningInterrupted = false;
+				const updateReasoningStop = new Error("Reasoning paused for graceful restart");
 				const guidanceStop = new Error("Stopped for immediate guidance");
+				// Live guidance must not truncate output the user is reading. Until this attempt
+				// has streamed content, cancelling loses nothing; afterwards the response is cut
+				// only where a new tool call starts, so every text/reasoning block before it is
+				// complete. Urgent guidance keeps cancelling immediately.
+				let attemptStreamedContent = false;
+				const guidanceCutsNow = () =>
+					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
+				// Calls already complete keep their eager start; the turn ends after its tools.
 				const onGuidanceAbort = () => {
-					observeSoftStopForTurn();
-					streamExecutionOpen = false;
-					attemptAbort.abort(guidanceStop);
+					observeInputStopForTurn();
+					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
+				// Urgent guidance can follow live guidance whose combined signal already fired.
+				const onUrgentGuidanceAbort = () => attemptAbort.abort(guidanceStop);
 				if (guidanceSignal?.aborted) onGuidanceAbort();
 				else guidanceSignal?.addEventListener("abort", onGuidanceAbort, { once: true });
+				config.urgentGuidanceSignal?.addEventListener("abort", onUrgentGuidanceAbort, {
+					once: true,
+				});
 				const configuredToolLimit = config.maxToolCallsPerResponse ?? 32;
 				const toolCallLimit = Number.isFinite(configuredToolLimit)
 					? Math.min(128, Math.max(1, Math.floor(configuredToolLimit)))
@@ -4321,14 +4722,42 @@ async function* agentLoopInMetadataSnapshot(
 				let providerActivitySeen = false;
 				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
 				let streamIdleTimer: ReturnType<typeof setTimeout> | undefined;
-				const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
-					firstTokenTimeoutMs / 1000,
-				)}s without upstream activity`;
+				// Bytes and SSE heartbeats only explain *where* an attempt stalled; they never
+				// cancel or extend the event-based timers below.
+				const streamProgress = new StreamProgress();
+				let firstTokenTimeoutMessage = describeFirstTokenTimeout(
+					effectiveProvider,
+					firstTokenTimeoutMs,
+					undefined,
+				);
 				const streamIdleTimeoutMs =
 					firstTokenTimeoutMs > 0 ? Math.max(firstTokenTimeoutMs * 5, 300_000) : 0;
-				const streamIdleTimeoutMessage = `${effectiveProvider}: Stream idle timeout after ${Math.round(
-					streamIdleTimeoutMs / 1000,
-				)}s without a parsed stream event`;
+				let streamIdleTimeoutMessage = describeStreamIdleTimeout(
+					effectiveProvider,
+					streamIdleTimeoutMs,
+					undefined,
+				);
+				const logStreamTimeout = (reason: string, message: string) => {
+					logger.warn("Provider stream timeout", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						reason,
+						message,
+						stallPhase: streamProgress.stallPhase(),
+						...streamProgress.snapshot(),
+					});
+				};
+				const streamTimeoutDiagnostics = () => {
+					const snapshot = streamProgress.snapshot();
+					return {
+						...(snapshot.statusCode !== undefined ? { statusCode: snapshot.statusCode } : {}),
+						...(streamProgress.stallPhase() && !providerActivitySeen
+							? { cause: streamProgress.stallPhase() }
+							: {}),
+					};
+				};
 				const clearFirstTokenTimer = () => {
 					if (firstTokenTimer) {
 						clearTimeout(firstTokenTimer);
@@ -4347,11 +4776,18 @@ async function* agentLoopInMetadataSnapshot(
 					streamIdleTimer = setTimeout(() => {
 						if (config.signal.aborted) return;
 						streamIdleTimeoutTriggered = true;
+						streamIdleTimeoutMessage = describeStreamIdleTimeout(
+							effectiveProvider,
+							streamIdleTimeoutMs,
+							streamProgress,
+						);
+						logStreamTimeout("stream_idle_timeout", streamIdleTimeoutMessage);
 						attemptAbort.abort(new Error(streamIdleTimeoutMessage));
 					}, streamIdleTimeoutMs);
 				};
 				const markProviderActivity = () => {
 					providerActivitySeen = true;
+					streamProgress.markEvent();
 					clearFirstTokenTimer();
 					armStreamIdleTimer();
 				};
@@ -4367,6 +4803,12 @@ async function* agentLoopInMetadataSnapshot(
 					firstTokenTimer = setTimeout(() => {
 						if (config.signal.aborted || providerActivitySeen || sawMeaningfulResponse) return;
 						firstTokenTimeoutTriggered = true;
+						firstTokenTimeoutMessage = describeFirstTokenTimeout(
+							effectiveProvider,
+							firstTokenTimeoutMs,
+							streamProgress,
+						);
+						logStreamTimeout("first_token_timeout", firstTokenTimeoutMessage);
 						attemptAbort.abort(new Error(firstTokenTimeoutMessage));
 					}, firstTokenTimeoutMs);
 				};
@@ -4379,14 +4821,49 @@ async function* agentLoopInMetadataSnapshot(
 					config.signal.addEventListener("abort", onParentAbort, { once: true });
 				}
 
+				responseActivity.setReasoningAbort(() => {
+					updateReasoningInterrupted = true;
+					attemptAbort.abort(updateReasoningStop);
+				});
 				try {
+					if (updateReasoningInterrupted) throw updateReasoningStop;
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
 					if (config.runtimeAuthorizationGuard) await config.runtimeAuthorizationGuard();
+					// A retry may switch providers and rebuild again. Re-project from the
+					// original fragments, not a previously filtered string, so both newly
+					// replayed and newly lifted-out rows are represented exactly once.
+					content = combinePendingInput(baseContent, currentInputParts);
+					uncommittedInput = { text: content, images: turnImages, media: turnMedia };
+					// A host-built history carries prior rows, so separate current media rides
+					// beside it. Otherwise the single row projection handles all media, including
+					// tool results. Re-split the original refs on EVERY attempt/model switch.
+					let requestContent = hostHistory ? content : "";
+					let requestMedia: NativeMediaInput[] | undefined;
+					if (hostHistory && turnMedia?.length) {
+						const projected = splitNativeMediaReferences(
+							turnMedia,
+							effectiveModel,
+							provider,
+							config.narratorId,
+						);
+						if (projected.warnings.length)
+							config.onEvent?.({ type: "media_fallback", warnings: projected.warnings });
+						if (projected.fallbackText)
+							requestContent = [requestContent, projected.fallbackText]
+								.filter(Boolean)
+								.join("\n\n");
+						if (projected.nativeRefs.length) {
+							const { mediaToBase64 } = await import("../media-uploads");
+							requestMedia = await Promise.all(
+								projected.nativeRefs.map((ref) => mediaToBase64(ref, config.narratorId)),
+							);
+						}
+					}
 					const questionInput = projectQuestionModelInput(
-						history,
-						content,
-						pendingToolResults,
+						hostHistory ?? (await projectRows(requestRows())),
+						requestContent,
+						[],
 						config.getQuestionModelReceipts?.() ?? [],
 					);
 					// This is adoption by the recipient loop, not persistence, wake admission,
@@ -4417,6 +4894,7 @@ async function* agentLoopInMetadataSnapshot(
 						provider: effectiveProvider,
 						model: effectiveModel,
 						tools,
+						toolLoadingStrategy,
 					});
 					const toolSnapshot = requestToolSnapshots.get(config);
 					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
@@ -4434,22 +4912,34 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						consumeSearchExecutionTurn();
 					}
-					const stream = provider.chat({
+					const requestParams: import("./provider").ChatParams = {
 						conversationId: config.conversationId,
-						content,
+						content: requestContent,
 						model: effectiveModel,
 						cwd: config.cwd,
 						history: questionInput.history,
 						tools,
-						toolResults: questionInput.toolResults,
+						toolResults: [],
+						toolLoadingStrategy,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
 						reasoningEffort: config.reasoningEffort,
 						serviceTier: config.serviceTier,
 						metadata: config.metadata,
 						requestDump,
+						streamProgress,
 						resetUpstreamSession,
-						onRequestStart: markRequestStarted,
+						onRequestStart: (info) => {
+							if (!config.reflectionLoop) {
+								rememberModelTraceRequest(
+									config.narratorId,
+									provider,
+									requestParams,
+									effectiveProvider,
+								);
+							}
+							markRequestStarted(info);
+						},
 						onInputCharacters: async (counts) => {
 							inputCharacters = validInputCharacters(counts);
 							try {
@@ -4464,12 +4954,48 @@ async function* agentLoopInMetadataSnapshot(
 								inputComposition = null;
 							}
 						},
-						...(isFirstTurn && images?.length ? { images } : {}),
-					});
+						...(hostHistory && turnImages?.length ? { images: turnImages } : {}),
+						...(requestMedia?.length ? { media: requestMedia } : {}),
+					};
+					const stream = provider.chat(requestParams);
 
 					streamExecutionOpen = true;
-					for await (const parsed of stream) {
-						if (guidanceSignal?.aborted) throw guidanceStop;
+					for await (const streamItem of interleaveWakeups(stream, toolSettledWake)) {
+						if (streamItem === STREAM_WAKEUP) {
+							// A started tool settled while the provider was idle: publish it and
+							// release the calls queued behind it. Not provider activity.
+							if (updateReasoningInterrupted) throw updateReasoningStop;
+							throwIfUserAborted();
+							const fatal = yield* drainSettledStreamingToolResults();
+							if (fatal) {
+								yield* finishRequest(fatal.output);
+								yield { type: "error", message: fatal.output };
+								return;
+							}
+							pumpStreamingTools();
+							continue;
+						}
+						const parsed = streamItem;
+						if (updateReasoningInterrupted) throw updateReasoningStop;
+						// Once visible text or a tool starts, drain the whole response safely.
+						if (
+							parsed.text ||
+							parsed.toolUseChunk ||
+							parsed.toolUses?.length ||
+							parsed.webSearch ||
+							parsed.imageGeneration
+						) {
+							responseActivity.setReasoningAbort(null);
+						}
+						if (
+							guidanceSignal?.aborted &&
+							(guidanceCutsNow() || opensNewToolCall(parsed, toolOrderIdentities))
+						) {
+							attemptAbort.abort(guidanceStop);
+							throw guidanceStop;
+						}
+						if (parsed.redactedThinking || hasPersistableStreamContent(parsed))
+							attemptStreamedContent = true;
 						throwIfUserAborted();
 						// Stop dispatch before yielding/awaiting error publication. A finishing
 						// tool must not release more queued work while failure handling runs.
@@ -4635,9 +5161,6 @@ async function* agentLoopInMetadataSnapshot(
 							yield* outputContent.begin("text", textLane);
 							assistantText += parsed.text;
 							if (parsed.text.trim()) silentToolCallCount = 0;
-							if (parsed.textOutputIndex != null) {
-								textOutputIndex = parsed.textOutputIndex;
-							}
 							// Deltas are forwarded verbatim. Stripping happens once at finalize,
 							// and the read side projects historical rows anyway — a second,
 							// incremental parser here only created two ways to disagree.
@@ -4734,6 +5257,7 @@ async function* agentLoopInMetadataSnapshot(
 								// If this tool was also being streamed via toolUseChunk, remove it
 								// from the accumulator so it isn't flagged as orphaned.
 								// This happens with some providers (e.g. NUG) that send both a
+								// streaming tool-use event and a non-streaming toolUse/toolUses for
 								// the same call — especially for tools with empty parameters.
 								const wasStreaming = toolUseAccum.has(tu.toolUseId);
 								if (wasStreaming) {
@@ -4946,46 +5470,18 @@ async function* agentLoopInMetadataSnapshot(
 										};
 										throwIfUserAborted();
 										streamReadyTools.add(id);
-										pumpStreamingTools();
 
-										// Drain any tool results that settled during streaming.
-										// This lets fast tools (Read, Glob, etc.) report completion
+										// Publish results that settled during streaming first: a call
+										// queued behind them may start only once they are consumed.
+										// This also lets fast tools (Read, Glob, etc.) report completion
 										// before the model finishes outputting subsequent tool calls.
-										for (const prevTu of toolUses) {
-											const sr = settledResults.get(prevTu.toolUseId);
-											if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
-											yieldedToolResults.add(prevTu.toolUseId);
-											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
-											if (sr.updatedInput) prevTu.input = sr.updatedInput;
-											const brokenOverride = sr.broken
-												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
-												: undefined;
-											await processToolResultInjections(prevTu, sr);
-											const baseOutput = sr.broken
-												? getToolMessage("brokenToolCallResult", locale)
-												: sr.output;
-											yield {
-												type: "tool_result",
-												toolCallBinding: executionBindings.get(prevTu),
-												toolUseId: prevTu.toolUseId,
-												toolName: prevTu.name,
-												input: sr.updatedInput ?? prevTu.input,
-												output: baseOutput,
-												isError: sr.isError ?? false,
-												durationMs: sr.durationMs,
-												permissionStartedAt: sr.permissionStartedAt,
-												executionStartedAt: sr.executionStartedAt,
-												completedAt: sr.completedAt,
-												brokenInputOverride: brokenOverride,
-												updatedInput: brokenOverride ?? sr.updatedInput,
-												metadata: sr.metadata,
-											};
-											if (sr.fatal) {
-												yield* finishRequest(sr.output);
-												yield { type: "error", message: sr.output };
-												return;
-											}
+										const fatal = yield* drainSettledStreamingToolResults();
+										if (fatal) {
+											yield* finishRequest(fatal.output);
+											yield { type: "error", message: fatal.output };
+											return;
 										}
+										pumpStreamingTools();
 									}
 								}
 							}
@@ -5082,20 +5578,37 @@ async function* agentLoopInMetadataSnapshot(
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
 							};
 						}
-						// Convert OpenAI/Anthropic usage to context_usage percentage
-						if (parsed.usage && parsed.usage.promptTokens != null) {
+						// Billing updates can be output-only; occupancy still requires a real prompt.
+						if (parsed.usage) {
 							receivedUsage = true;
 							const previousUsage = requestUsage as ApiRequestEndEvent["usage"];
+							const zeroPlaceholder =
+								parsed.usage.promptTokens === 0 &&
+								parsed.usage.completionTokens === 0 &&
+								[
+									parsed.usage.inputTokens,
+									parsed.usage.reasoningTokens,
+									parsed.usage.cachedInputTokens,
+									parsed.usage.cacheCreationInputTokens,
+									parsed.usage.cacheCreation5mTokens,
+									parsed.usage.cacheCreation1hTokens,
+								].every((count) => count == null || count === 0);
 							// Merge partial counters without letting prompt/input placeholders
-							// erase known counts. Output and cache counters update independently.
+							// erase known counts. A nonempty fully cached prompt legitimately has
+							// zero ordinary input. Output and cache counters update independently.
 							requestUsage = {
-								promptTokens: parsed.usage.promptTokens || previousUsage?.promptTokens || 0,
+								promptTokens:
+									parsed.usage.promptTokens === 0 && previousUsage?.promptTokens
+										? previousUsage.promptTokens
+										: (parsed.usage.promptTokens ?? previousUsage?.promptTokens),
 								inputTokens:
-									parsed.usage.inputTokens === 0 && previousUsage?.inputTokens
+									parsed.usage.promptTokens === 0 &&
+									parsed.usage.inputTokens === 0 &&
+									previousUsage?.inputTokens
 										? previousUsage.inputTokens
 										: (parsed.usage.inputTokens ?? previousUsage?.inputTokens),
 								completionTokens:
-									parsed.usage.completionTokens === 0 && previousUsage?.completionTokens
+									zeroPlaceholder && previousUsage?.completionTokens
 										? previousUsage.completionTokens
 										: (parsed.usage.completionTokens ?? previousUsage?.completionTokens),
 								reasoningTokens: parsed.usage.reasoningTokens ?? previousUsage?.reasoningTokens,
@@ -5118,6 +5631,7 @@ async function* agentLoopInMetadataSnapshot(
 							// causes the UI to briefly flash "0%" before showing the real value.
 							if (
 								contextWindow &&
+								parsed.usage.promptTokens != null &&
 								parsed.usage.promptTokens > 0 &&
 								upstreamContextPercent === undefined
 							) {
@@ -5238,6 +5752,8 @@ async function* agentLoopInMetadataSnapshot(
 							const message = String(parsed.invalidState.message ?? "Unknown provider error");
 							requestDiagnostics = normalizeApiRequestDiagnostics({
 								...parsed.invalidState.diagnostics,
+								recordingRequestId: undefined,
+								apiRequestId: undefined,
 								source: parsed.invalidState.diagnostics?.source ?? "provider",
 								phase: parsed.invalidState.diagnostics?.phase ?? "invalid_state",
 								reason,
@@ -5251,7 +5767,7 @@ async function* agentLoopInMetadataSnapshot(
 							if (
 								isMalformedRequestBodyError({ reason, message, diagnostics: requestDiagnostics })
 							) {
-								await captureMalformedRequest(message);
+								captureMalformedRequest();
 								// Almost always an upstream hiccup that clears on its own, so replay the
 								// identical request a couple of times before surfacing a hard failure.
 								if (canReplayMalformedRequest()) {
@@ -5316,91 +5832,25 @@ async function* agentLoopInMetadataSnapshot(
 							}
 							// Guard first, so a turn that already ran tools does not pay for a
 							// usage lookup it could never act on.
-							if (!hasStartedEarlyToolExecution()) {
-								// Kimi coding-plan allowance used up (403 "usage limit"). Unlike
-								// the NUG case above this is NOT unknowable: the window's reset
-								// instant is published, so the caller waits on the clock rather
-								// than on a poller.
-								//
-								// A wall whose reset is beyond the wait budget is forwarded too
-								// (`quotaResetAt` without `resumeAt`): the caller then reports it
-								// WITH the recovery time, because "spent, returns at T" is
-								// actionable and an opaque 403 is not.
-								const kimiQuota = await resolveKimiQuotaWait(
-									effectiveProvider,
-									`${message}\n${requestDiagnostics?.responseSnippet ?? ""}`,
-								);
-								if (kimiQuota.kind !== "none") {
-									const { providerId, providerPrefix, resetAt } =
-										kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
-									yield* outputContent.flush();
-									yield* finishRequest(message);
-									yield {
-										type: "model_unavailable",
-										message,
-										provider: effectiveProvider,
-										model: effectiveModel,
-										providerId,
-										providerPrefix,
-										waitKind: "quota",
-										resumeAt: kimiQuota.kind === "wait" ? kimiQuota.wait.resumeAt : undefined,
-										quotaResetAt: resetAt,
-										diagnostics: requestDiagnostics,
-									};
-									return;
-								}
+							//
+							// Plan allowance used up (Kimi 403 "usage limit", OpenCode Go 429
+							// GoUsageLimitError) or an OpenCode rate limit naming a long wait.
+							// Unlike the NUG case above this is NOT unknowable: the reset instant
+							// is published, so the caller waits on the clock rather than on a
+							// poller. See `tryQuotaSuspension`.
+							if (!hasStartedEarlyToolExecution() && (yield* tryQuotaSuspension(message))) {
+								return;
 							}
-							// Resumable but nothing landed locally: the gateway counted some
-							// non-content event as forwarded payload, so it refuses a wholesale
-							// retry, yet we have no visible output and no tool side effect to
-							// resume from. Replay the identical request instead of dying on a
-							// transient transport fault. See canReplayResumableInPlace.
-							if (canReplayResumableInPlace(classification.resumable)) {
-								if (
-									(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-									!config.signal.aborted
-								) {
-									chatRetryCount++;
-									lastRetryErrorMessage = message;
-									lastRetryDiagnostics = requestDiagnostics;
-									const delayMs = Math.min(
-										TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-										backoffCeil,
-									);
-									logger.warn("Resumable stream interruption with no local output, replaying", {
-										narratorId: config.narratorId,
-										provider: effectiveProvider,
-										model: effectiveModel,
-										requestId,
-										reason,
-										attempt: chatRetryCount,
-										maxRetries: getMaxChatRetries(),
-									});
-									yield {
-										type: "retrying",
-										message,
-										attempt: chatRetryCount,
-										maxRetries: getMaxChatRetries(),
-										delayMs,
-										diagnostics: requestDiagnostics,
-									};
-									yield* abandonAttemptForReplay(message);
-									await abortableSleep(delayMs, config.signal);
-									if (config.signal.aborted) {
-										yield { type: "error", message: "Aborted" };
-										return;
-									}
-									continue chatRetryLoop;
-								}
-								// Replay budget spent (or a stateful provider that cannot replay):
-								// fall through to the ordinary terminal handling below.
-							}
-							// Resumable: a transient failure occurred after client-visible partial
-							// output was already produced this attempt (NUG/gateway told us so via
-							// diagnostics.resumable). Retrying the whole request wholesale could
-							// repeat visible output, so recover according to what the partial output
-							// actually is (see classifyResumeStrategy).
-							if (classification.resumable && hasAnyPersistableOutput()) {
+							// Resumable: a transient failure the gateway flagged as safe to
+							// continue from (diagnostics.resumable). Recovery is NEVER an
+							// in-place replay of the identical request — the pass ends here and
+							// the caller assembles the next request from the LATEST state (per
+							// classifyResumeStrategy). This also covers "nothing landed
+							// locally": the gateway's notion of forwarded payload is broader
+							// than ours (lifecycle frames count there but persist nothing
+							// here), and a freshly assembled continuation request is the only
+							// recovery that cannot duplicate visible output.
+							if (classification.resumable) {
 								const strategy = classifyResumeStrategy();
 								if (strategy === "tool_continuation") {
 									// A complete tool call landed before the stream broke. Finish the
@@ -5451,48 +5901,25 @@ async function* agentLoopInMetadataSnapshot(
 									};
 									break;
 								}
-								if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
-									// Only reasoning was produced. Drop it and re-send the identical
-									// request instead of continuing from a truncated thought.
-									if (
-										(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-										!config.signal.aborted
-									) {
-										chatRetryCount++;
-										lastRetryErrorMessage = message;
-										lastRetryDiagnostics = requestDiagnostics;
-										const delayMs = Math.min(
-											TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-											backoffCeil,
-										);
-										logger.warn("Resumable stream interruption with reasoning only, retrying", {
-											narratorId: config.narratorId,
-											provider: effectiveProvider,
-											model: effectiveModel,
-											requestId,
-											reason,
-											attempt: chatRetryCount,
-											maxRetries: getMaxChatRetries(),
-										});
-										yield* discardReasoningOnlyPartialOutput();
-										yield {
-											type: "retrying",
-											message,
-											attempt: chatRetryCount,
-											maxRetries: getMaxChatRetries(),
-											delayMs,
-											diagnostics: requestDiagnostics,
-										};
-										yield* abandonAttemptForReplay(message);
-										await abortableSleep(delayMs, config.signal);
-										if (config.signal.aborted) {
-											yield { type: "error", message: "Aborted" };
-											return;
-										}
-										continue chatRetryLoop;
-									}
-									// Retry budget spent (or a stateful provider that cannot replay the
-									// request): fall back to a textual continuation rather than failing.
+								if (strategy === "reasoning_only") {
+									// Only truncated reasoning was produced. Drop it so the
+									// half-written thought never enters history (for stateful
+									// providers an incomplete reasoning item is not even
+									// replayable upstream), then hand off below: the
+									// continuation pass reassembles the request without it.
+									logger.warn("Resumable stream interruption with reasoning only, discarding", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										requestId,
+										reason,
+									});
+									yield* discardReasoningOnlyPartialOutput();
+									// Reasoning lane blocks persist as they stream, so memory-only
+									// cleanup is not enough: retract whatever this attempt already
+									// wrote, or the continuation pass would rebuild history WITH
+									// the truncated thought we just discarded.
+									yield* discardAttemptPersistence();
 								}
 								yield* outputContent.flush();
 								yield* finishRequest(message);
@@ -5505,9 +5932,9 @@ async function* agentLoopInMetadataSnapshot(
 								// again while the result it already produced is lost.
 								//
 								// Widened from `hasStartedEarlyToolExecution()`: a tool whose input closed
-								// but which was deferred (strict-serial, or an eager-disabled tool such as
-								// Bash/Write/Edit) has no entry in `earlyExecMap`, yet replaying it is just
-								// as lossy.
+								// but which has not started yet (queued behind an earlier call, or held by
+								// a soft stop) has no entry in `earlyExecMap`, yet replaying it is just as
+								// lossy.
 								if (hasIrreplaceableProgress()) {
 									logger.warn("Retryable provider stream error after tool progress landed", {
 										narratorId: config.narratorId,
@@ -5518,8 +5945,8 @@ async function* agentLoopInMetadataSnapshot(
 										startedToolCount: earlyExecMap.size,
 										settledToolCount: settledResults.size,
 									});
-									// Draining eager calls alone strands completed deferred calls (Browser,
-									// strict-serial tools). Execute them normally, but never start another
+									// Draining started calls alone strands completed calls that are still
+									// queued. Execute them normally, but never start another
 									// provider turn here: the caller owns the interruption retry budget.
 									pendingResumableError = {
 										type: "resumable_error",
@@ -5598,6 +6025,7 @@ async function* agentLoopInMetadataSnapshot(
 						}
 					}
 					streamExecutionOpen = false;
+					if (updateReasoningInterrupted) throw updateReasoningStop;
 					throwIfUserAborted();
 					yield* flushRequestStart();
 				} catch (err) {
@@ -5629,12 +6057,33 @@ async function* agentLoopInMetadataSnapshot(
 						// executor finishes cleanup; the detached callback preserves the exact result.
 						// Even on abort, yield block_complete for accumulated content so it can be persisted
 						yield* outputContent.flush();
+						// A reflection that already decided was only cut for lingering: its
+						// request succeeded and is recorded as such.
+						if (config.reflectionLoop && config.signal.reason === REFLECTION_DECISION_SETTLED) {
+							yield* finishRequest();
+							yield { type: "done" };
+							return;
+						}
 						yield* finishRequest("Aborted");
 						yield { type: "error", message: "Aborted" };
 						return;
 					}
+					if (updateReasoningInterrupted) {
+						// Request-local abort: preserve the narrator/user input and retry budget.
+						// Consume cleanup before opening the durable checkpoint fence.
+						clearFirstTokenTimer();
+						clearStreamIdleTimer();
+						yield* abandonAttemptForReplay(updateReasoningStop.message);
+						responseActivity.release();
+						responseActivity = await beginNarratorResponseActivity(
+							config.narratorId,
+							config.signal,
+							{ isReflection: !!config.reflectionLoop },
+						);
+						continue;
+					}
 					if (guidanceSignal?.aborted) {
-						observeSoftStopForTurn();
+						observeInputStopForTurn();
 						// Guidance is not a transport fault. Finalize this partial turn below,
 						// without replay/retry or cancelling tools whose bodies already began.
 						break;
@@ -5647,9 +6096,10 @@ async function* agentLoopInMetadataSnapshot(
 							message: firstTokenTimeoutMessage,
 							provider: effectiveProvider,
 							model: effectiveModel,
+							...streamTimeoutDiagnostics(),
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -5665,14 +6115,14 @@ async function* agentLoopInMetadataSnapshot(
 								model: effectiveModel,
 								requestId,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								firstTokenTimeoutMs,
 							});
 							yield {
 								type: "retrying",
 								message: firstTokenTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -5710,9 +6160,10 @@ async function* agentLoopInMetadataSnapshot(
 							message: streamIdleTimeoutMessage,
 							provider: effectiveProvider,
 							model: effectiveModel,
+							...streamTimeoutDiagnostics(),
 						});
 						if (
-							(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 							!config.signal.aborted
 						) {
 							chatRetryCount++;
@@ -5726,7 +6177,7 @@ async function* agentLoopInMetadataSnapshot(
 								type: "retrying",
 								message: streamIdleTimeoutMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxFirstTokenRetries,
+								maxRetries: getMaxChatRetries(),
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
@@ -5808,14 +6259,23 @@ async function* agentLoopInMetadataSnapshot(
 					}
 					requestDiagnostics = normalizeApiRequestDiagnostics({
 						...diagnosticsFromError(err),
+						recordingRequestId: undefined,
+						apiRequestId: undefined,
 						message: msg,
 						provider: effectiveProvider,
 						model: effectiveModel,
 					});
+					// TokenDance recovery requires human action: no automatic repair, replay or failover.
+					if (requestDiagnostics?.tokendanceRecoveryAction) {
+						yield* outputContent.flush();
+						yield* finishRequest(msg);
+						yield { type: "error", message: msg, diagnostics: requestDiagnostics };
+						return;
+					}
 					// Opaque upstream "malformed request body" rejection: capture the exact
 					// request before any retry/classification path can discard it.
 					if (isMalformedRequestBodyError(err)) {
-						await captureMalformedRequest(msg);
+						captureMalformedRequest();
 						// Same reasoning as the stream-event path: replay a bounded number of times,
 						// since this rejection is overwhelmingly an upstream hiccup. Placed before the
 						// payment/availability checks because those cannot apply to this error, and
@@ -5840,7 +6300,7 @@ async function* agentLoopInMetadataSnapshot(
 							balance: paymentRequired.balance,
 							required: paymentRequired.required,
 							resumeAction:
-								hasStartedEarlyToolExecution() || (initialToolResults?.length ?? 0) > 0
+								hasStartedEarlyToolExecution() || !!config.historyEndsWithToolResults
 									? "continue"
 									: "retry",
 						};
@@ -5873,41 +6333,16 @@ async function* agentLoopInMetadataSnapshot(
 						};
 						return;
 					}
-					// Kimi coding-plan allowance used up (403 "usage limit"). Same suspend-
-					// and-replay contract as the NUG branch above, but the reset instant is
-					// published, so the caller waits on the clock rather than on a poller.
-					// Mirrors the invalidState branch earlier in this loop.
-					{
-						// Kimi coding-plan allowance used up (403 "usage limit"). Same
-						// contract as the NUG branch above, but the reset instant is
-						// published, so the caller waits on the clock rather than on a
-						// poller — or, when the reset is beyond the wait budget, reports the
-						// wall with that instant attached (`quotaResetAt` without `resumeAt`).
-						// Mirrors the invalidState branch earlier in this loop.
-						const kimiQuota = await resolveKimiQuotaWait(
-							effectiveProvider,
-							`${msg}\n${requestDiagnostics?.responseSnippet ?? ""}`,
-						);
-						if (kimiQuota.kind !== "none") {
-							const { providerId, providerPrefix, resetAt } =
-								kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
-							yield* outputContent.flush();
-							yield* finishRequest(msg);
-							yield {
-								type: "model_unavailable",
-								message: msg,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								providerId,
-								providerPrefix,
-								waitKind: "quota",
-								resumeAt: kimiQuota.kind === "wait" ? kimiQuota.wait.resumeAt : undefined,
-								quotaResetAt: resetAt,
-								diagnostics: requestDiagnostics,
-							};
-							return;
-						}
-					}
+					// Plan allowance used up (Kimi 403 "usage limit", OpenCode Go 429
+					// GoUsageLimitError) or an OpenCode rate limit naming a long wait. Same
+					// suspend-and-replay contract as the NUG branch above, but the reset instant
+					// is published, so the caller waits on the clock rather than on a poller —
+					// or, when the reset is beyond the wait budget, reports the wall with that
+					// instant attached (`quotaResetAt` without `resumeAt`). Checked BEFORE the
+					// generic retry classification: a quota 429 must never burn the transient
+					// retry budget re-uploading the whole history. Mirrors the invalidState
+					// branch earlier in this loop.
+					if (yield* tryQuotaSuspension(msg)) return;
 					// Detect upstream API context length exceeded (HTTP 400)
 					if (
 						err &&
@@ -5929,52 +6364,12 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "context_length_exceeded", message: msg };
 						return;
 					}
-					// Resumable but nothing landed locally — replay the identical request
-					// rather than failing the turn. See canReplayResumableInPlace and the
-					// matching invalidState branch above.
-					if (canReplayResumableInPlace(isResumableError(err))) {
-						if (
-							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-							!config.signal.aborted
-						) {
-							chatRetryCount++;
-							lastRetryErrorMessage = msg;
-							lastRetryDiagnostics = requestDiagnostics;
-							const delayMs = Math.min(
-								TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-								backoffCeil,
-							);
-							logger.warn("Resumable stream interruption with no local output, replaying", {
-								narratorId: config.narratorId,
-								provider: effectiveProvider,
-								model: effectiveModel,
-								requestId,
-								attempt: chatRetryCount,
-								maxRetries: getMaxChatRetries(),
-							});
-							yield {
-								type: "retrying",
-								message: msg,
-								attempt: chatRetryCount,
-								maxRetries: getMaxChatRetries(),
-								delayMs,
-								diagnostics: requestDiagnostics,
-							};
-							yield* abandonAttemptForReplay(msg);
-							await abortableSleep(delayMs, config.signal);
-							if (config.signal.aborted) {
-								yield { type: "error", message: "Aborted" };
-								return;
-							}
-							continue; // retry provider.chat() with the identical request
-						}
-						// Replay budget spent (or a stateful provider that cannot replay):
-						// fall through to the ordinary handling below.
-					}
-					// Resumable: a transient failure occurred after client-visible partial
-					// output was already produced this attempt. See the matching invalidState
-					// branch above for the full rationale and the per-strategy recovery.
-					if (isResumableError(err) && hasAnyPersistableOutput()) {
+					// Resumable: a transient failure the gateway flagged as safe to
+					// continue from. Never replay the request in place — the pass ends
+					// here and the caller assembles the next request from the latest
+					// state. See the matching invalidState branch above for the full
+					// rationale and the per-strategy recovery.
+					if (isResumableError(err)) {
 						const strategy = classifyResumeStrategy();
 						if (strategy === "tool_continuation") {
 							logger.warn("Resumable stream interruption after a complete tool call", {
@@ -6016,45 +6411,23 @@ async function* agentLoopInMetadataSnapshot(
 							};
 							break;
 						}
-						if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
-							if (
-								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
-								!config.signal.aborted
-							) {
-								chatRetryCount++;
-								lastRetryErrorMessage = msg;
-								lastRetryDiagnostics = requestDiagnostics;
-								const delayMs = Math.min(
-									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
-									backoffCeil,
-								);
-								logger.warn("Resumable stream interruption with reasoning only, retrying", {
-									narratorId: config.narratorId,
-									provider: effectiveProvider,
-									model: effectiveModel,
-									requestId,
-									attempt: chatRetryCount,
-									maxRetries: getMaxChatRetries(),
-								});
-								yield* discardReasoningOnlyPartialOutput();
-								yield {
-									type: "retrying",
-									message: msg,
-									attempt: chatRetryCount,
-									maxRetries: getMaxChatRetries(),
-									delayMs,
-									diagnostics: requestDiagnostics,
-								};
-								yield* abandonAttemptForReplay(msg);
-								await abortableSleep(delayMs, config.signal);
-								if (config.signal.aborted) {
-									yield { type: "error", message: "Aborted" };
-									return;
-								}
-								continue; // retry provider.chat() with the identical request
-							}
-							// Retry budget spent (or a stateful provider that cannot replay the
-							// request): fall back to a textual continuation rather than failing.
+						if (strategy === "reasoning_only") {
+							// Only truncated reasoning was produced. Drop it so the
+							// half-written thought never enters history, then hand off
+							// below: the continuation pass reassembles the request
+							// without it.
+							logger.warn("Resumable stream interruption with reasoning only, discarding", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+							});
+							yield* discardReasoningOnlyPartialOutput();
+							// Reasoning lane blocks persist as they stream, so memory-only
+							// cleanup is not enough: retract whatever this attempt already
+							// wrote, or the continuation pass would rebuild history WITH
+							// the truncated thought we just discarded.
+							yield* discardAttemptPersistence();
 						}
 						yield* outputContent.flush();
 						yield* finishRequest(msg);
@@ -6141,16 +6514,20 @@ async function* agentLoopInMetadataSnapshot(
 					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;
 				} finally {
+					responseActivity.setReasoningAbort(null);
+					// Close transport resources here, but do not seal recording until the
+					// post-stream empty/tool-response checks have determined this attempt's result.
 					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					clearStreamIdleTimer();
 					config.signal.removeEventListener("abort", onParentAbort);
 					guidanceSignal?.removeEventListener("abort", onGuidanceAbort);
+					config.urgentGuidanceSignal?.removeEventListener("abort", onUrgentGuidanceAbort);
 					startFirstTokenTimerForAttempt = undefined;
 				}
 
 				if (guidanceSignal?.aborted) {
-					observeSoftStopForTurn();
+					observeInputStopForTurn();
 					break;
 				}
 				if (firstTokenTimeoutTriggered) {
@@ -6161,9 +6538,10 @@ async function* agentLoopInMetadataSnapshot(
 						message: firstTokenTimeoutMessage,
 						provider: effectiveProvider,
 						model: effectiveModel,
+						...streamTimeoutDiagnostics(),
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6177,7 +6555,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: firstTokenTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
@@ -6216,9 +6594,10 @@ async function* agentLoopInMetadataSnapshot(
 						message: streamIdleTimeoutMessage,
 						provider: effectiveProvider,
 						model: effectiveModel,
+						...streamTimeoutDiagnostics(),
 					});
 					if (
-						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -6232,7 +6611,7 @@ async function* agentLoopInMetadataSnapshot(
 							type: "retrying",
 							message: streamIdleTimeoutMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxFirstTokenRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
@@ -6314,15 +6693,10 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "done" };
 						return;
 					}
-					provider.pushUserTurn(
-						history,
-						content,
-						effectiveModel,
-						isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-					);
-					pendingToolResults = [];
+					commitInput();
 					nextTurnContent = buildReflectionCorrectionPrompt(config);
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					continue turnLoop;
 				}
@@ -6371,6 +6745,16 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
+					if (
+						quietFinishAllowed &&
+						requestStarted &&
+						!lastRetryErrorMessage &&
+						isQuietFinish(emptyKind, emptySignals)
+					) {
+						yield* finishRequest();
+						yield { type: "done" };
+						return;
+					}
 					const emptyEvidence = emptyResponseEvidence(emptySignals);
 					const emptyResponseText = emptyResponseMessageFor(emptyKind, emptySignals);
 					const buildEmptyDiagnostics = (message: string) =>
@@ -6388,6 +6772,7 @@ async function* agentLoopInMetadataSnapshot(
 						const message =
 							`${effectiveProvider}: Provider finished without starting an API request. ` +
 							"This indicates the request was not assembled or dispatched; check provider setup and local request-building errors.";
+						yield* finishRequest(message);
 						logger.warn("Provider produced no events before starting a request", {
 							narratorId: config.narratorId,
 							provider: effectiveProvider,
@@ -6603,6 +6988,17 @@ async function* agentLoopInMetadataSnapshot(
 						return;
 					}
 
+					// Keep the ordinary cleanup above, but do not retry or compact a model
+					// that has nothing to say while waiting for a background result / Send.
+					if (await config.shouldIdleOnReasoningOnly?.()) {
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield { type: "done", reason: "reasoning_only_idle" };
+						return;
+					}
+
 					// Explicit upstream occupancy wins, including zero. Otherwise prefer
 					// positive measured usage, then the caller's last known occupancy.
 					const callerContextUsagePercentage = config.getContextUsagePercentage?.();
@@ -6688,6 +7084,9 @@ async function* agentLoopInMetadataSnapshot(
 							reason: "reasoning_only_exhausted",
 							message,
 							diagnostics: normalizeApiRequestDiagnostics({
+								// This attempt has already ended. Preserve its exact recorder/API
+								// association while refining the terminal exhaustion evidence.
+								...requestDiagnostics,
 								source: "agent",
 								phase: "response",
 								reason: "reasoning_only_exhausted",
@@ -6711,7 +7110,6 @@ async function* agentLoopInMetadataSnapshot(
 						attempt: reasoningOnlyRetries,
 						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
 						isFirstTurn,
-						pendingToolResults: pendingToolResults.length,
 						contextUsagePercentage,
 						compacted: !!compactReplacement,
 					});
@@ -6735,13 +7133,12 @@ async function* agentLoopInMetadataSnapshot(
 					// The dead turn itself is discarded entirely — nothing is pushed to
 					// history, so no content:null assistant message can be created.
 					//
-					// If the request that produced the dead turn still has pending input
-					// that has NOT been committed to history yet — i.e. the first-turn user
-					// message, a mid-loop user nudge (non-empty `content`), or tool results
-					// (`pendingToolResults`) — then the previous block is a user/tool block.
-					// Re-send the exact same request by retrying the chat() call in place
-					// (same turn: history, content and toolResults are all unchanged).
-					if (isFirstTurn || content.length > 0 || pendingToolResults.length > 0) {
+					// If the request that produced the dead turn ends with input the model has
+					// not answered — the first-turn user message, a mid-loop nudge (non-empty
+					// `content`), tool results or a notice row at the end of the conversation —
+					// then the previous block is a user/tool block. Re-send the exact same
+					// request by retrying the chat() call in place (same turn, same rows).
+					if (isFirstTurn || content.length > 0 || historyTail(transcript.rows).input) {
 						continue;
 					}
 
@@ -6749,8 +7146,10 @@ async function* agentLoopInMetadataSnapshot(
 					// there is no pending input to re-send. Open a fresh turn that nudges
 					// the model to continue, so the loop can make progress.
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
-					nextTurnContent = getToolMessage("userContinue", locale);
+					queueLoopNotice("continue_prompt");
+					await flushLoopInjections();
 					continue turnLoop;
 				}
 
@@ -6764,7 +7163,7 @@ async function* agentLoopInMetadataSnapshot(
 
 			// ── Finalize citations for this turn's assistant text ──
 			// Runs once, here, so the SAME cleaned text feeds token estimation, the
-			// `assistant_message` event, persistence and `pushAssistantTurn`. If the
+			// `assistant_message` event, persistence and the transcript. If the
 			// raw text were used for the model history, the next turn would see the
 			// internal markers and happily reproduce them.
 			const finalizedText = outputContent.finalizeText();
@@ -6784,30 +7183,6 @@ async function* agentLoopInMetadataSnapshot(
 			// from identities recorded at tool start before persistence, execution grouping,
 			// and model-facing tool results consume the completed calls.
 			sortToolUsesByOutputOrder();
-
-			// Reserve this turn's tool_use identifiers against the ones already in history,
-			// and coerce them into the character set every channel accepts.
-			// Providers that mint a single id for every call (e.g. "call_go_0") would otherwise
-			// make the replayed history carry the same id in several assistant messages, which
-			// the API rejects with 400 "duplicate tool_use id"; ids like "Bash:0" are accepted
-			// by Anthropic but rejected outright by NUG's strict gateway, which would break the
-			// session the moment it is switched there. Only the model-facing history is
-			// rewritten — the tool_use objects below keep the provider's original id, so
-			// persistence, the UI, and permission/approval flows are unaffected.
-			const turnToolUseIdRemap = reserveUniqueToolUseIds(toolUses, historyToolUseIds);
-			if (turnToolUseIdRemap.size > 0) {
-				logger.warn("Rewrote unusable tool_use IDs for model history", {
-					narratorId: config.narratorId,
-					provider: effectiveProvider,
-					model: effectiveModel,
-					requestId,
-					renamedCount: turnToolUseIdRemap.size,
-					originalIds: [...turnToolUseIdRemap.keys()].slice(0, 10),
-				});
-			}
-			/** Tool uses with history-safe ids, for provider.pushAssistantTurn. */
-			const toHistoryToolUses = (list: AgentToolUse[]): AgentToolUse[] =>
-				applyToolUseIdRemap(list, turnToolUseIdRemap);
 
 			// No fabricated billing counters: occupancy estimates live only in contextSnapshot.
 
@@ -6850,28 +7225,9 @@ async function* agentLoopInMetadataSnapshot(
 				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
 				yieldedToolResults.add(tu.toolUseId);
 				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
-				if (sr.updatedInput) tu.input = sr.updatedInput;
-				const brokenOverride = sr.broken
-					? sanitizeBrokenInput(tu.name, tu.input, locale)
-					: undefined;
+				if (sr.updatedInput && tu.name !== "AskUserQuestion") tu.input = sr.updatedInput;
 				await processToolResultInjections(tu, sr);
-				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
-				yield {
-					type: "tool_result",
-					toolCallBinding: executionBindings.get(tu),
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					input: sr.updatedInput ?? tu.input,
-					output: baseOutput,
-					isError: sr.isError ?? false,
-					durationMs: sr.durationMs,
-					permissionStartedAt: sr.permissionStartedAt,
-					executionStartedAt: sr.executionStartedAt,
-					completedAt: sr.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride ?? sr.updatedInput,
-					metadata: sr.metadata,
-				};
+				yield toolResultEvent(tu, sr);
 				if (sr.fatal) {
 					yield { type: "error", message: sr.output };
 					return;
@@ -6889,13 +7245,6 @@ async function* agentLoopInMetadataSnapshot(
 				!collectCompletedImageGenerations(imageGenAccum)
 			) {
 				responseActivity.release();
-				provider.pushUserTurn(
-					history,
-					isFirstTurn ? userText : content,
-					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-					isFirstTurn ? images : undefined,
-				);
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
@@ -6904,6 +7253,7 @@ async function* agentLoopInMetadataSnapshot(
 			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
 			yield {
 				type: "assistant_message",
+				outputCompleted: !pendingResumableError,
 				onToolPersisted: (toolUseId, binding) => {
 					const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
 					if (tu) bindExecution(tu, binding);
@@ -6918,99 +7268,49 @@ async function* agentLoopInMetadataSnapshot(
 			// Tool execution may remain paused behind phase two without holding the response fence.
 			responseActivity.release();
 
-			if (guidanceSignal?.aborted) {
-				observeSoftStopForTurn();
+			// Guidance ends the turn here only when nothing remains to run, or when urgent
+			// input has already cancelled tool IO. Otherwise every produced call executes
+			// below and the step boundary ends the turn: a complete call is never skipped.
+			if (
+				guidanceSignal?.aborted &&
+				(toolUses.length === 0 || config.urgentGuidanceSignal?.aborted === true)
+			) {
+				observeInputStopForTurn();
 				yield* drainStartedEarlyToolResults();
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
 				// Still-running detached calls retain their real pending rows. Do not fabricate
-				// skipped results or replay their incomplete pairs into model-facing history.
+				// results or replay their incomplete pairs into model-facing history.
 				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
-				const guidanceResults: unknown[] = [];
 				for (const tu of guidanceTools) {
-					const result = settledResults.get(tu.toolUseId) ?? {
-						output: getToolMessage("skippedForSoftStop", locale),
-						isError: true,
-						durationMs: 0,
-						completedAt: Date.now(),
-						metadata: { skippedForSoftStop: true },
-					};
-					if (!yieldedToolResults.has(tu.toolUseId)) {
-						yieldedToolResults.add(tu.toolUseId);
-						yield earlyToolResultEvent(tu, result);
-					}
-					guidanceResults.push(
-						provider.formatToolResult(
-							turnToolUseIdRemap.get(tu.toolUseId) ?? tu.toolUseId,
-							result.output,
-							result.isError ?? false,
-							result.images,
-							tu.name,
-						),
+					if (yieldedToolResults.has(tu.toolUseId)) continue;
+					yieldedToolResults.add(tu.toolUseId);
+					yield toolResultEvent(
+						tu,
+						settledResults.get(tu.toolUseId) ?? {
+							output: getToolMessage("cancelledForInterrupt", locale),
+							isError: true,
+							durationMs: 0,
+							completedAt: Date.now(),
+							metadata: { cancelledForInterrupt: true },
+						},
 					);
 				}
-				provider.pushUserTurn(
-					history,
-					isFirstTurn ? userText : content,
-					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-					isFirstTurn ? images : undefined,
-				);
-				if (
-					assistantText ||
-					guidanceTools.length > 0 ||
-					collectReasoningBlocks(reasoningBlockMap)
-				) {
-					provider.pushAssistantTurn(
-						history,
-						assistantText,
-						toHistoryToolUses(guidanceTools),
-						collectReasoningBlocks(reasoningBlockMap),
-						collectCompletedWebSearches(webSearchAccum),
-						messageId,
-						collectCompletedImageGenerations(imageGenAccum),
-						textOutputIndex,
-						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(guidanceTools)),
-					);
-				}
-				if (guidanceResults.length > 0)
-					provider.pushUserTurn(history, "", effectiveModel, guidanceResults);
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
 
 			if (hasOrphanedToolUses) {
-				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-					toolNames: orphanedToolNames.join(", "),
-				});
+				queueLoopNotice("broken_call", { toolNames: orphanedToolNames.join(", ") });
 				if (toolUses.length === 0) {
-					if (isFirstTurn) {
-						provider.pushUserTurn(
-							history,
-							userText,
-							effectiveModel,
-							initialToolResults ?? [],
-							images,
-						);
-					} else if (pendingToolResults.length > 0) {
-						provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
-					}
-					provider.pushAssistantTurn(
-						history,
-						assistantText,
-						[],
-						collectReasoningBlocks(reasoningBlockMap),
-						collectCompletedWebSearches(webSearchAccum),
-						messageId,
-						collectCompletedImageGenerations(imageGenAccum),
-						textOutputIndex,
-						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(toolUses)),
-					);
+					commitInput();
+					transcript.appendStep(orderedAssistantContent([]));
+					// No tools ran, so the boundary below is skipped: deliver the notice here.
+					await flushLoopInjections();
 					yield { type: "turn_complete", turnIndex };
+					quietFinishAllowed = false;
 					turnIndex++;
 					continue;
 				}
@@ -7028,16 +7328,11 @@ async function* agentLoopInMetadataSnapshot(
 					parseDangerReflectionTextFallback(assistantText)
 				)
 			) {
-				provider.pushUserTurn(
-					history,
-					isFirstTurn ? userText : content,
-					effectiveModel,
-					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
-				);
-				provider.pushAssistantTurn(history, assistantText, []);
-				pendingToolResults = [];
+				commitInput();
+				if (assistantText) transcript.appendStep([{ type: "text", text: assistantText }]);
 				nextTurnContent = buildReflectionCorrectionPrompt(config);
 				yield { type: "turn_complete", turnIndex };
+				quietFinishAllowed = false;
 				turnIndex++;
 				continue;
 			}
@@ -7048,30 +7343,20 @@ async function* agentLoopInMetadataSnapshot(
 				return;
 			}
 
-			// Push the current user turn into history for the next turn.
-			// This must happen AFTER the API call (not before), because
-			// chat() references the history array directly.
-			if (isFirstTurn) {
-				provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
-			} else if (pendingToolResults.length > 0) {
-				provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
-			}
+			// The model answered this turn's input, so it joins the transcript now; a
+			// permission resolving after the stream reads it there, not a second time.
+			commitInput();
 
-			// The current input now lives in history; pending permissions must not
-			// append it a second time when they resolve after stream completion.
-			getPermissionHistory = () => history;
-
-			// Execute each tool call
-			pendingToolResults = [];
-			// Nudge threshold: append a wrap-up reminder when ≥80% of maxTurns used
+			// Execute each tool call. Their results join the transcript with the step, in
+			// call order, once the step's tools have run.
+			const stepResults = new Map<string, ToolExecResult>();
+			// Nudge threshold: a wrap-up notice after this step's results when ≥80% of
+			// maxTurns is used. Its own row, after the results, not inside the last one.
 			const nudgeThreshold = Math.floor(maxTurns * 0.8);
 			const shouldNudge = turnIndex >= nudgeThreshold;
-			const nudgeText = shouldNudge
-				? getToolMessageWithParams("turnNudge", locale, {
-						turnIndex: turnIndex + 1,
-						maxTurns,
-					})
-				: "";
+			const queueTurnNudge = () => {
+				if (shouldNudge) queueLoopNotice("turn_nudge", { turnIndex: turnIndex + 1, maxTurns });
+			};
 
 			// Preserve provider order while grouping consecutive parallel-safe calls.
 			// The same grouping function is used by planned-update recovery.
@@ -7115,33 +7400,19 @@ async function* agentLoopInMetadataSnapshot(
 						yield* drainEarlyToolResultsAfterAbort();
 						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 						else {
-							observeSoftStopForTurn();
+							observeInputStopForTurn();
 							yield { type: "turn_complete", turnIndex };
 						}
 						return;
 					}
 					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 					// When the permission handler redirected the input (e.g. the plan file),
-					// update the in-memory tool_use so pushAssistantTurn writes the correct
-					// input into history — otherwise the model sees the original (wrong) path.
-					if (result.updatedInput) tu.input = result.updatedInput;
+					// update the in-memory tool_use so the transcript's step carries the input
+					// the call ran with — otherwise the model sees the original (wrong) path.
+					if (result.updatedInput && tu.name !== "AskUserQuestion") tu.input = result.updatedInput;
 					await processToolResultInjections(tu, result);
-					const isLastTool = toolIndex === toolUses.length - 1;
-					// The turn nudge is still appended inline: it is about THIS being the last
-					// tool of a nearly-exhausted turn, so it has to travel with that result
-					// rather than wait for a boundary the loop may not reach.
-					const outputForModel =
-						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
-
-					pendingToolResults.push(
-						provider.formatToolResult(
-							tu.toolUseId,
-							outputForModel,
-							result.isError ?? false,
-							result.images,
-							tu.name,
-						),
-					);
+					if (toolIndex === toolUses.length - 1) queueTurnNudge();
+					stepResults.set(tu.toolUseId, result);
 
 					if (yieldedToolResults.has(tu.toolUseId)) {
 						// Already yielded during streaming — just accumulate timing
@@ -7162,34 +7433,13 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						prevToolsExecMs += result.durationMs;
 
-						// For broken tool calls, sanitize the persisted input and output
-						// so the DB shows a clean message instead of truncated garbage.
-						const brokenInputOverride = result.broken
-							? sanitizeBrokenInput(tu.name, tu.input, locale)
-							: undefined;
-
 						yieldedToolResults.add(tu.toolUseId);
-						yield {
-							type: "tool_result",
-							toolCallBinding: executionBindings.get(tu),
-							toolUseId: tu.toolUseId,
-							toolName: tu.name,
-							input: result.updatedInput ?? tu.input,
-							output: result.broken
-								? getToolMessage("brokenToolCallResult", locale)
-								: result.output,
-							isError: result.isError ?? false,
+						yield toolResultEvent(tu, result, {
 							durationMs,
-							permissionStartedAt: result.permissionStartedAt,
-							executionStartedAt: result.executionStartedAt,
-							completedAt: result.completedAt,
-							brokenInputOverride,
-							updatedInput: brokenInputOverride ?? result.updatedInput,
-							metadata:
-								durationMs !== result.durationMs
-									? { ...result.metadata, execDurationMs: result.durationMs }
-									: result.metadata,
-						};
+							...(durationMs !== result.durationMs
+								? { metadata: { ...result.metadata, execDurationMs: result.durationMs } }
+								: {}),
+						});
 						toolIndex++;
 
 						if (result.fatal) {
@@ -7234,7 +7484,6 @@ async function* agentLoopInMetadataSnapshot(
 					const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
 
 					const settled = new Array<ToolExecResult | undefined>(group.length);
-					const formattedResults = new Array<unknown>(group.length);
 					const groupStartToolIndex = toolIndex;
 					let remaining = new Set(indexed);
 					let hasFatal = false;
@@ -7246,7 +7495,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7260,38 +7509,18 @@ async function* agentLoopInMetadataSnapshot(
 						const tu = group[i];
 						const effectiveResult = result;
 						if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
-						if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
+						if (effectiveResult.updatedInput && tu.name !== "AskUserQuestion")
+							tu.input = effectiveResult.updatedInput;
 						await processToolResultInjections(tu, effectiveResult);
 
 						// Persist and broadcast every completed result immediately in completion order.
-						// Model-facing formatting still happens below in the original call order.
+						// The transcript keeps call order: results settle into the step's calls.
 						if (!yieldedToolResults.has(tu.toolUseId)) {
 							// Mark before yielding. The consumer may abort while handling this
 							// event; an abort drain at the next group boundary must not replay
 							// a result that was already delivered to persistence/UI.
 							yieldedToolResults.add(tu.toolUseId);
-							const brokenInputOverride = effectiveResult.broken
-								? sanitizeBrokenInput(tu.name, tu.input, locale)
-								: undefined;
-
-							yield {
-								type: "tool_result",
-								toolCallBinding: executionBindings.get(tu),
-								toolUseId: tu.toolUseId,
-								toolName: tu.name,
-								input: effectiveResult.updatedInput ?? tu.input,
-								output: effectiveResult.broken
-									? getToolMessage("brokenToolCallResult", locale)
-									: effectiveResult.output,
-								isError: effectiveResult.isError ?? false,
-								durationMs: effectiveResult.durationMs,
-								permissionStartedAt: effectiveResult.permissionStartedAt,
-								executionStartedAt: effectiveResult.executionStartedAt,
-								completedAt: effectiveResult.completedAt,
-								brokenInputOverride,
-								updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
-								metadata: effectiveResult.metadata,
-							};
+							yield toolResultEvent(tu, effectiveResult);
 						}
 						if (effectiveResult.durationMs > maxParallelMs)
 							maxParallelMs = effectiveResult.durationMs;
@@ -7300,24 +7529,11 @@ async function* agentLoopInMetadataSnapshot(
 					}
 
 					for (let i = 0; i < group.length; i++) {
-						const tu = group[i];
 						const effectiveResult = settled[i];
 						if (!effectiveResult) continue;
-						const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
-						const outputForModel =
-							isLastTool && shouldNudge
-								? effectiveResult.output + nudgeText
-								: effectiveResult.output;
-						formattedResults[i] = provider.formatToolResult(
-							tu.toolUseId,
-							outputForModel,
-							effectiveResult.isError ?? false,
-							effectiveResult.images,
-							tu.name,
-						);
+						if (groupStartToolIndex + i === toolUses.length - 1) queueTurnNudge();
+						stepResults.set(group[i].toolUseId, effectiveResult);
 					}
-
-					pendingToolResults.push(...formattedResults);
 					toolIndex += group.length;
 					prevToolsExecMs += maxParallelMs;
 
@@ -7329,24 +7545,16 @@ async function* agentLoopInMetadataSnapshot(
 					}
 				}
 
-				// Check after every serial tool and complete parallel-safe group. Once a soft
+				// Check after every serial tool and complete parallel-safe group. Once a host
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
+				// Queued user input is not a host stop; it waits for the step boundary below.
 				if (observeSoftStopForTurn()) {
-					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
+					const skippedOutput = getToolMessage("skippedForPassEnd", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
 						const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
 						if (!earlyPromise) {
-							pendingToolResults.push(
-								provider.formatToolResult(
-									remainingTool.toolUseId,
-									skippedOutput,
-									true,
-									undefined,
-									remainingTool.name,
-								),
-							);
 							if (!yieldedToolResults.has(remainingTool.toolUseId)) {
 								yieldedToolResults.add(remainingTool.toolUseId);
 								yield {
@@ -7359,7 +7567,7 @@ async function* agentLoopInMetadataSnapshot(
 									isError: true,
 									durationMs: 0,
 									completedAt: Date.now(),
-									metadata: { skippedForSoftStop: true },
+									metadata: { skippedForPassEnd: true },
 								};
 							}
 							continue;
@@ -7370,47 +7578,19 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
 						}
 						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
-						if (result.updatedInput) remainingTool.input = result.updatedInput;
+						if (result.updatedInput && remainingTool.name !== "AskUserQuestion")
+							remainingTool.input = result.updatedInput;
 						await processToolResultInjections(remainingTool, result);
-						pendingToolResults.push(
-							provider.formatToolResult(
-								remainingTool.toolUseId,
-								result.output,
-								result.isError ?? false,
-								result.images,
-								remainingTool.name,
-							),
-						);
 
 						if (!yieldedToolResults.has(remainingTool.toolUseId)) {
 							yieldedToolResults.add(remainingTool.toolUseId);
-							const brokenInputOverride = result.broken
-								? sanitizeBrokenInput(remainingTool.name, remainingTool.input, locale)
-								: undefined;
-							yield {
-								type: "tool_result",
-								toolCallBinding: executionBindings.get(remainingTool),
-								toolUseId: remainingTool.toolUseId,
-								toolName: remainingTool.name,
-								input: result.updatedInput ?? remainingTool.input,
-								output: result.broken
-									? getToolMessage("brokenToolCallResult", locale)
-									: result.output,
-								isError: result.isError ?? false,
-								durationMs: result.durationMs,
-								permissionStartedAt: result.permissionStartedAt,
-								executionStartedAt: result.executionStartedAt,
-								completedAt: result.completedAt,
-								brokenInputOverride,
-								updatedInput: brokenInputOverride ?? result.updatedInput,
-								metadata: result.metadata,
-							};
+							yield toolResultEvent(remainingTool, result);
 						}
 						if (result.fatal && !fatalOutput) fatalOutput = result.output;
 					}
@@ -7419,98 +7599,45 @@ async function* agentLoopInMetadataSnapshot(
 						yield { type: "error", message: fatalOutput };
 						return;
 					}
-					provider.pushAssistantTurn(
-						history,
-						assistantText,
-						toHistoryToolUses(toolUses),
-						collectReasoningBlocks(reasoningBlockMap),
-						collectCompletedWebSearches(webSearchAccum),
-						messageId,
-						collectCompletedImageGenerations(imageGenAccum),
-						textOutputIndex,
-						redactedThinkingBlocks,
-						orderedAssistantContent(toHistoryToolUses(toolUses)),
-					);
 					yield { type: "turn_complete", turnIndex };
 					return;
 				}
 			}
 
-			// Strip broken tool calls from the history sent to the model.
-			// The UI already has the full picture (tool_result events were yielded above),
-			// but the model should not see the broken tool_use + tool_result pair —
-			// they waste context and cause retry loops.
-			if (brokenToolUseIds.size > 0) {
-				const cleanToolUses = toolUses.filter((tu) => !brokenToolUseIds.has(tu.toolUseId));
-				// Broken calls are filtered by the ORIGINAL ids: pendingToolResults were
-				// formatted from tu.toolUseId and are only renamed further below.
-				pendingToolResults = pendingToolResults.filter((tr) => {
-					const toolUseId =
-						(tr as { toolUseId?: string }).toolUseId ??
-						(tr as { tool_use_id?: string }).tool_use_id ??
-						(tr as { call_id?: string }).call_id ??
-						(tr as { tool_call_id?: string }).tool_call_id;
-					return !toolUseId || !brokenToolUseIds.has(toolUseId);
+			// The step joins the transcript as the host stores it: every call with its result,
+			// a broken one marked so that every projection leaves it out.
+			transcript.appendStep(orderedAssistantContent(toolUses));
+			for (const tu of toolUses) {
+				const result = stepResults.get(tu.toolUseId);
+				if (!result) continue;
+				transcript.settleTool(tu.toolUseId, {
+					output: result.output,
+					isError: result.isError,
+					images: result.images,
+					mediaRefs: result.mediaRefs,
+					broken: brokenToolUseIds.has(tu.toolUseId),
 				});
-				provider.pushAssistantTurn(
-					history,
-					assistantText,
-					toHistoryToolUses(cleanToolUses),
-					collectReasoningBlocks(reasoningBlockMap),
-					collectCompletedWebSearches(webSearchAccum),
-					messageId,
-					collectCompletedImageGenerations(imageGenAccum),
-					textOutputIndex,
-					redactedThinkingBlocks,
-					orderedAssistantContent(toHistoryToolUses(cleanToolUses)),
-				);
-
-				// Inject a user-side reminder so the model knows what happened and
-				// switches strategy instead of blindly retrying the same large write.
+			}
+			if (brokenToolUseIds.size > 0) {
+				// A notice row tells the model what happened, so it switches strategy instead
+				// of blindly retrying the same large write.
 				const brokenNames = toolUses
 					.filter((tu) => brokenToolUseIds.has(tu.toolUseId))
 					.map((tu) => tu.name);
-				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-					toolNames: brokenNames.join(", "),
-				});
-			} else {
-				// Append assistant message to history for next turn
-				provider.pushAssistantTurn(
-					history,
-					assistantText,
-					toHistoryToolUses(toolUses),
-					collectReasoningBlocks(reasoningBlockMap),
-					collectCompletedWebSearches(webSearchAccum),
-					messageId,
-					collectCompletedImageGenerations(imageGenAccum),
-					textOutputIndex,
-					redactedThinkingBlocks,
-					orderedAssistantContent(toHistoryToolUses(toolUses)),
-				);
+				queueLoopNotice("broken_call", { toolNames: brokenNames.join(", ") });
 			}
 
-			// The assistant turn now carries the renamed ids, so the paired tool results
-			// sent with the next request must be renamed too — otherwise the API sees a
-			// tool_use with no matching result (and an orphaned result for the old id).
-			remapToolResultIds(pendingToolResults, turnToolUseIdRemap);
+			// Persisted rows contribute pending input, not another persistence event.
+			// Keep their identities until the actual request: a compact/model switch
+			// may already replay some of them before this input is sent.
+			// Loop reminders precede host-drained notifications, preserving arrival order.
+			await flushLoopInjections();
+			await collectAfterToolsInjections();
 
-			// Producers that persist their own message row contribute text only — see
-			// `collectAfterToolsInjectionText` on why nothing is yielded for them.
-			// Loop-raised reminders are flushed first so they read in the order they were
-			// raised, before anything the host drained at this same boundary.
-			for (const injectionText of [
-				await flushLoopInjections(),
-				await collectAfterToolsInjectionText(),
-			]) {
-				if (!injectionText) continue;
-				nextTurnContent = nextTurnContent
-					? `${nextTurnContent}\n\n${injectionText}`
-					: injectionText;
-			}
-
-			// Close the small race between the final group boundary and the next provider
-			// request: direct user feedback may arrive while after-tools injections are drained.
-			if (observeSoftStopForTurn()) {
+			// Every call of the step has run: queued user input takes the next turn. This also
+			// closes the race with feedback arriving while after-tools injections are drained.
+			const hostStop = observeSoftStopForTurn();
+			if (observeInputStopForTurn() || hostStop) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
@@ -7525,8 +7652,19 @@ async function* agentLoopInMetadataSnapshot(
 			}
 
 			yield { type: "turn_complete", turnIndex };
+			quietFinishAllowed = !!config.bot || toolUses.some(handsOffWork);
 			turnIndex++;
+		} catch (error) {
+			activeRequestDump?.finish({ status: "error", error: extractErrorMessage(error) });
+			activeRequestDump = undefined;
+			throw error;
 		} finally {
+			activeRequestDump?.finish({
+				status: config.signal.aborted ? "cancelled" : "interrupted",
+				error: config.signal.aborted
+					? String(config.signal.reason ?? "Aborted")
+					: "Attempt exited before final response classification",
+			});
 			responseActivity.release();
 		}
 	}

@@ -1,4 +1,5 @@
 import { createWriteStream, existsSync, statSync } from "node:fs";
+import { opendir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, relative, resolve } from "node:path";
 import { z } from "zod/v4";
 import {
@@ -6,7 +7,13 @@ import {
 	isShareText,
 	SHARE_HTML_MAX_BYTES,
 } from "../../../../shared/share-preview";
+import {
+	isPrivateRequestRecordingPath,
+	isSecretPlatformPath,
+	SECRET_PATH_REFUSAL,
+} from "../../fs-secret-paths";
 import { generateShortId } from "../../id";
+import { logger } from "../../logger";
 import { settings } from "../../settings";
 import { createShare, getMaxShareSizeBytes, getShareDir } from "../../shares";
 import { safeSpawn } from "../../spawn";
@@ -184,6 +191,57 @@ async function zipViaArchiver(
 	});
 }
 
+/** Validate before copying or invoking an archiver: the resulting share loses source identity.
+ * ZIP can follow nested symlinks, so checking only the selected root would leak private recordings.
+ * Walk only names/metadata, asynchronously, with count/depth/time bounds and cancellation. */
+async function assertRecordingShareSource(fullPath: string, deadline: AbortSignal): Promise<void> {
+	// A credential file (settings.json, narrafork.db*) or a private protocol directory
+	// must never be packaged into a share link, in any permission mode. `isSecretPlatformPath`
+	// subsumes the private-recording check and also covers the credential files; the
+	// ancestor-aware recording check is kept so sharing a PARENT of a private root is refused.
+	if (isSecretPlatformPath(fullPath) || isPrivateRequestRecordingPath(fullPath, undefined, true))
+		throw new Error(SECRET_PATH_REFUSAL);
+	if (!existsSync(fullPath)) return; // Preserve the existing missing-source response.
+	const pending = [{ path: fullPath, depth: 0 }];
+	const visited = new Set<string>();
+	let scanned = 0;
+	while (pending.length) {
+		deadline.throwIfAborted();
+		const current = pending.pop();
+		if (!current) break;
+		if (current.depth > 64) throw new Error("Share source privacy scan exceeds depth limit");
+		const physical = await realpath(current.path);
+		deadline.throwIfAborted();
+		if (isSecretPlatformPath(physical) || isPrivateRequestRecordingPath(physical, undefined, true))
+			throw new Error(SECRET_PATH_REFUSAL);
+		if (visited.has(physical)) continue;
+		visited.add(physical);
+		const info = await stat(physical);
+		deadline.throwIfAborted();
+		if (!info.isDirectory()) continue;
+		const directory = await opendir(physical);
+		for await (const entry of directory) {
+			deadline.throwIfAborted();
+			if (++scanned > 20_000) throw new Error("Share source privacy scan exceeds entry limit");
+			const path = resolve(physical, entry.name);
+			if (entry.isSymbolicLink()) {
+				// Reject before dereferencing, even for a link to a parent of the private roots.
+				if (isSecretPlatformPath(path) || isPrivateRequestRecordingPath(path, undefined, true))
+					throw new Error(SECRET_PATH_REFUSAL);
+				pending.push({ path, depth: current.depth + 1 });
+			} else if (entry.isDirectory()) {
+				// A credential file sitting directly in a shared directory would be archived
+				// by the time the walk reaches it; refuse it up front.
+				if (isSecretPlatformPath(path)) throw new Error(SECRET_PATH_REFUSAL);
+				pending.push({ path, depth: current.depth + 1 });
+			} else if (isSecretPlatformPath(path)) {
+				throw new Error(SECRET_PATH_REFUSAL);
+			}
+		}
+	}
+	deadline.throwIfAborted();
+}
+
 export const shareFileTool: ToolDefinition = {
 	name: "ShareFile",
 	description:
@@ -231,6 +289,26 @@ export const shareFileTool: ToolDefinition = {
 		};
 
 		const isMulti = Array.isArray(inputPath);
+		const sources = isMulti ? inputPath : [inputPath];
+		if (sources.length > 128)
+			return { output: "Share source privacy scan exceeds source count limit", isError: true };
+		const started = performance.now();
+		const timeout = AbortSignal.timeout(5_000);
+		const deadline = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout;
+		try {
+			for (const path of sources) {
+				await assertRecordingShareSource(resolve(ctx.cwd, path), deadline);
+			}
+		} catch (error) {
+			return {
+				output: error instanceof Error ? error.message : "Share source privacy check failed",
+				isError: true,
+			};
+		} finally {
+			const elapsedMs = performance.now() - started;
+			if (elapsedMs > 250)
+				logger.warn("Slow share source privacy scan", { elapsedMs, sourceCount: sources.length });
+		}
 
 		// ── Multi-file mode: zip packaging ──────────────────────────────────
 		if (isMulti) {

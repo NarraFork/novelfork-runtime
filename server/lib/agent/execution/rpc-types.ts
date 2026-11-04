@@ -27,8 +27,20 @@ export const FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE = FEATURE_FS_WRITE_ATOMIC_RES
 export const FEATURE_GLOB_BOUNDED_V1 = "glob.bounded.v1";
 /** Reads check cancellation between chunks and revalidate identity/size after reading. */
 export const FEATURE_FS_READ_BOUNDED_V1 = "fs.read.bounded.v1";
+/** Bounded positional reads; older executors must never silently return the prefix. */
+export const FEATURE_FS_READ_OFFSET_V1 = "fs.read.offset.v1";
 /** Serialized content check + replacement; does not exclude external filesystem writers. */
 export const FEATURE_FS_CONDITIONAL_WRITE_V1 = "fs.write.conditional.v1";
+export const FEATURE_EDITOR_RAW_READ_V1 = "editor.raw-read.v1";
+export const FEATURE_EDITOR_DURABLE_WRITE_V1 = "editor.durable-write.v1";
+/** Editor RPC selected by the authorized backend; no local helper bootstrap. */
+export interface EditorRpc {
+	call<T>(method: string, params: object, signal?: AbortSignal): Promise<T>;
+}
+/** Non-recursive exclusive mkdir with canonical path verification (legacy capability). */
+export const FEATURE_FS_MKDIR_EXCLUSIVE_V1 = "fs.mkdir.exclusive.v1";
+/** Exclusive mkdir/write bind canonical parent handles, preventing parent-link replacement races. */
+export const FEATURE_FS_CREATE_BOUND_PARENT_V1 = "fs.create.bound-parent.v1";
 
 // ── Handshake ────────────────────────────────────────────────────────────────
 
@@ -119,12 +131,23 @@ export interface DeviceHelloAckFrame {
 
 export type RpcMethod =
 	| "system.ping"
+	| "editor.capabilities"
+	| "editor.stage.open"
+	| "editor.stage.append"
+	| "editor.stage.seal"
+	| "editor.stage.abort"
+	| "editor.apply"
+	| "editor.query"
+	| "editor.read.open"
+	| "editor.read.chunk"
+	| "editor.read.close"
 	| "fs.stat"
 	| "fs.read"
 	| "fs.write"
 	| "fs.writeConditional"
 	| "fs.remove"
 	| "fs.mkdirp"
+	| "fs.mkdirExclusive"
 	| "fs.list"
 	| "fs.exists"
 	| "glob"
@@ -212,6 +235,12 @@ export interface FsStatParams {
 	path: string;
 }
 export interface FsStatResult {
+	/** editorIdentity:true only; actual permission bits, null for absence. */
+	mode?: number | null;
+	/** Present only with editorIdentity:true and editor.raw-read.v1. */
+	canonicalRoot?: string;
+	rootIdentity?: string;
+	runtimeEpoch?: string;
 	exists: boolean;
 	isDirectory: boolean;
 	isFile: boolean;
@@ -260,6 +289,9 @@ export interface FsWriteParams {
 	dataB64: string;
 	/** Canonical create/existing path returned by fs.stat and approved by policy. */
 	expectedResolvedPath?: string;
+	/** Requires fs.mkdir.exclusive.v1 plus fs.create.bound-parent.v1; no implicit mkdirp. */
+	exclusive?: boolean;
+	timeoutMs?: number;
 }
 
 export interface FsRemoveParams {

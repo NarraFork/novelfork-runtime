@@ -1,18 +1,19 @@
-import { ActionIcon, Group, NumberInput, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Group, Text, Tooltip } from "@mantine/core";
 import { IconEye, IconEyeOff, IconPlayerPlay } from "@tabler/icons-react";
 import React from "react";
 import { useTranslation } from "react-i18next";
+import { ContextWindowField } from "./ContextWindowField";
 
 export interface ModelRowProps {
 	modelValue: string;
 	modelLabel: string;
 	isHidden: boolean;
 	onToggleHidden: () => void;
-	contextWindow?: number;
-	onContextWindowChange: (size: number | null) => void;
 	onTestModel?: () => void;
 	/** Set to false to hide the context window input (e.g. Codex). */
 	showContextWindow?: boolean;
+	/** Provider-specific controls rendered at the end of the row (e.g. protocol picker). */
+	extra?: React.ReactNode;
 }
 
 export const ModelRow = React.memo(function ModelRow({
@@ -20,10 +21,9 @@ export const ModelRow = React.memo(function ModelRow({
 	modelLabel,
 	isHidden,
 	onToggleHidden,
-	contextWindow,
-	onContextWindowChange,
 	onTestModel,
 	showContextWindow = true,
+	extra,
 }: ModelRowProps) {
 	const { t } = useTranslation("settings");
 
@@ -35,18 +35,8 @@ export const ModelRow = React.memo(function ModelRow({
 			<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 120 }}>
 				{modelLabel}
 			</Text>
-			{showContextWindow && (
-				<NumberInput
-					placeholder={t("contextWindowPlaceholder")}
-					value={contextWindow || ""}
-					onChange={(v) => onContextWindowChange(typeof v === "number" ? v : null)}
-					min={1}
-					step={1000}
-					suffix={` ${t("contextWindowSuffix")}`}
-					w={180}
-					size="xs"
-				/>
-			)}
+			{extra}
+			{showContextWindow && <ContextWindowField modelValue={modelValue} />}
 			{onTestModel && (
 				<Tooltip label={t("modelTestBtn")}>
 					<ActionIcon variant="subtle" color="teal" onClick={onTestModel}>

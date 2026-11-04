@@ -6,12 +6,12 @@ import {
 	Card,
 	Code,
 	Group,
-	Loader,
 	Modal,
 	PasswordInput,
 	Progress,
 	SegmentedControl,
 	SimpleGrid,
+	Skeleton,
 	Stack,
 	Text,
 	TextInput,
@@ -43,6 +43,23 @@ export const Route = createFileRoute("/projects/")({
 	component: ProjectListPage,
 });
 
+function ProjectGridSkeleton() {
+	return (
+		<SimpleGrid
+			cols={{ base: 1, sm: 2, lg: 3 }}
+			aria-busy="true"
+			data-testid="project-list-skeleton"
+		>
+			{["first", "second", "third"].map((key) => (
+				<Card key={key} padding="lg" radius="md" withBorder>
+					<Skeleton height={22} width="62%" />
+					<Skeleton height={14} mt="md" width="88%" />
+				</Card>
+			))}
+		</SimpleGrid>
+	);
+}
+
 function ProjectListPage() {
 	const { data: projects, isLoading } = useProjects();
 	// Only probed when the list is empty: it exists purely to tell "no projects yet"
@@ -54,7 +71,6 @@ function ProjectListPage() {
 	const [name, setName] = useState("");
 	const [nameError, setNameError] = useState("");
 	const [repoMode, setRepoMode] = useState<string>("existing");
-	const [flowMode, setFlowMode] = useState<string>("classic");
 	const [repoPath, setRepoPath] = useState("");
 	const [repoPathError, setRepoPathError] = useState("");
 	const [cloneUrl, setCloneUrl] = useState("");
@@ -93,7 +109,6 @@ function ProjectListPage() {
 		setName("");
 		setNameError("");
 		setRepoMode("existing");
-		setFlowMode("classic");
 		setRepoPath("");
 		setRepoPathError("");
 		setCloneUrl("");
@@ -110,25 +125,6 @@ function ProjectListPage() {
 			close();
 			resetForm();
 		}
-	};
-
-	// Detect "not a git repo" error from existing mode — offer to init instead
-	const isNotGitRepoError = createProject.error?.message?.includes("not a git repository") ?? false;
-
-	const handleInitAndCreate = () => {
-		createProject.reset();
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const data: Record<string, any> = {
-			name: name.trim(),
-			repoMode: "init",
-			gitPath: repoPath.trim() || undefined,
-		};
-		createProject.mutate(data, {
-			onSuccess: () => {
-				close();
-				resetForm();
-			},
-		});
 	};
 
 	const handleCreate = () => {
@@ -156,7 +152,6 @@ function ProjectListPage() {
 		const data: Record<string, any> = {
 			name: name.trim(),
 			repoMode,
-			flowMode,
 			gitPath: repoPath.trim() || undefined,
 		};
 
@@ -201,8 +196,6 @@ function ProjectListPage() {
 	// Unified error from either mutation
 	const mutationError = createProjectStream.error ?? createProject.error;
 
-	if (isLoading) return <Loader />;
-
 	return (
 		<Stack>
 			<Group justify="space-between">
@@ -210,7 +203,9 @@ function ProjectListPage() {
 				<Button onClick={guardedOpen}>{t("newProject")}</Button>
 			</Group>
 
-			{!projects?.length ? (
+			{isLoading ? (
+				<ProjectGridSkeleton />
+			) : !projects?.length ? (
 				// Two different empty states: telling a user who simply has not been added to
 				// any project to "create one" sends them down the wrong path.
 				<Text c="dimmed">
@@ -318,30 +313,6 @@ function ProjectListPage() {
 									: t("repoModeCloneDesc")}
 						</Text>
 					</div>
-					<div>
-						<Text size="sm" fw={500} mb={4}>
-							{t("flowMode", "Flow Mode")}
-						</Text>
-						{/* Ruler stays selectable so nothing that already uses it becomes
-						    unreachable, but it is deprecated: labelled as such here, and the
-						    hint only appears once it is actually picked so the common path
-						    stays quiet. The view is switchable after creation either way. */}
-						<SegmentedControl
-							fullWidth
-							value={flowMode}
-							onChange={setFlowMode}
-							data={[
-								{ value: "classic", label: t("flowModeClassic", "NarraFlow") },
-								{ value: "ruler", label: t("flowModeRulerDeprecated", "Ruler (deprecated)") },
-							]}
-							disabled={isCloning}
-						/>
-						{flowMode === "ruler" && (
-							<Text size="xs" c="yellow" mt={4}>
-								{t("flowModeRulerDeprecatedHint")}
-							</Text>
-						)}
-					</div>
 					{repoMode === "clone" && (
 						<>
 							<TextInput
@@ -432,20 +403,7 @@ function ProjectListPage() {
 							</Stack>
 						</Alert>
 					)}
-					{isNotGitRepoError && (
-						<Alert icon={<IconAlertCircle size={16} />} title={t("notGitRepoTitle")} color="yellow">
-							<Text size="sm">{t("notGitRepoMessage", { path: repoPath.trim() })}</Text>
-							<Button
-								size="xs"
-								mt="sm"
-								onClick={handleInitAndCreate}
-								loading={createProject.isPending}
-							>
-								{t("notGitRepoInitAndCreate")}
-							</Button>
-						</Alert>
-					)}
-					{mutationError && !isNotGitRepoError && !createProjectStream.needsAuth && (
+					{mutationError && !createProjectStream.needsAuth && (
 						<Alert icon={<IconAlertCircle size={16} />} color="red">
 							<Text size="sm">{mutationError.message}</Text>
 						</Alert>

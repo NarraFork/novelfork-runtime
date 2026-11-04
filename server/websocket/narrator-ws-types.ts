@@ -8,6 +8,7 @@ import type {
 	BackgroundTaskListDelta,
 	BackgroundTaskProgressFrame,
 } from "@shared/background-task-list";
+import type { NativeMediaFallbackWarning } from "@shared/media-attachments";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
@@ -19,6 +20,7 @@ import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
+import type { ModelContextWindowSource } from "../lib/settings";
 import type { GitStatusSummary } from "../services/git-service";
 import type { BufferMessageSummary } from "../services/narrator-buffer";
 
@@ -38,6 +40,16 @@ export interface NarratorListStateSnapshotItem {
 	status: string;
 	substatus?: string[];
 	turnStartedAt?: string;
+	activeBackgroundTaskCount?: number;
+	activeBackgroundWorkCount?: number;
+	activeBackgroundServiceCount?: number;
+	/**
+	 * Present when this snapshot shows a done-state (idle + unread) whose
+	 * wake-capable background work is still running (bash tasks / subagents —
+	 * never transfers or services). The client marks unread but suppresses the
+	 * sound/PWA notification, mirroring the live status_change flag.
+	 */
+	backgroundWorkActive?: boolean;
 }
 
 /** Reflection gate families that report live progress. */
@@ -46,6 +58,15 @@ export type ReflectionProgressKind =
 	| "plan_reflection"
 	| "task_reflection"
 	| "question_reflection";
+
+/** One row of an activity card's recent-tool list (`activity` subscriptions). */
+export interface NarratorActivityToolCall {
+	toolUseId: string;
+	toolName: string;
+	status: string;
+	createdAt: string | null;
+	inputSummary?: SubagentToolInputSummary;
+}
 
 export interface NarratorListStateSnapshotMessage {
 	type: "list_state_snapshot";
@@ -61,8 +82,11 @@ export interface RecentTabsSnapshotMessage {
 // Server → Client messages
 export type NarratorServerMessage =
 	| import("@shared/workspace-context").WorkspaceContextChangedEvent
+	| import("@shared/workspace-events").WorkspaceChangedEvent
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
 	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
+	| import("@shared/editor-file-events").EditorFileServerMessage
+	| import("@shared/outline-page-events").OutlinePageServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
@@ -278,8 +302,23 @@ export type NarratorServerMessage =
 			status: string;
 			substatus?: string[];
 			turnStartedAt?: string;
+			/**
+			 * Present on the done-transition (idle + unread) when background work
+			 * whose completion wakes the narrator (bash tasks / subagents — never
+			 * transfers or services) is still running: the client still marks the
+			 * narrator unread but suppresses the sound/PWA notification. Mirrors
+			 * the flag on the `narrator:attention` bus event.
+			 */
+			backgroundWorkActive?: boolean;
 	  }
 	| { type: "substatus_change"; narratorId: string; substatus: string[] }
+	/** Initial state of an `activity` subscription: the narrator's latest tool calls. */
+	| {
+			type: "activity_snapshot";
+			narratorId: string;
+			toolCalls: NarratorActivityToolCall[];
+			subscriptionRequestId?: string;
+	  }
 	| {
 			type: "payment_required";
 			narratorId: string;
@@ -303,6 +342,10 @@ export type NarratorServerMessage =
 			nugModelId?: string;
 			/** `credentials` when omitted. `quota` waits carry `resumeAt`. */
 			waitKind?: "credentials" | "quota";
+			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+			quotaProvider?: "kimi" | "opencode";
+			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
+			quotaBucket?: string;
 			/** Epoch ms the blocked window resets at. `quota` waits only. */
 			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
@@ -318,6 +361,8 @@ export type NarratorServerMessage =
 			model: string;
 			nugModelId?: string;
 			waitKind?: "credentials" | "quota";
+			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+			quotaProvider?: "kimi" | "opencode";
 	  }
 	| {
 			type: "queued_new_narrator_created";
@@ -372,6 +417,12 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseId: string;
 			subagentNarratorId: string;
+			/**
+			 * The session's display name when the resolver held the narrator row.
+			 * Lets the running card headline the title without waiting for the
+			 * tool's returned metadata.
+			 */
+			subagentTitle?: string;
 			parentToolUseId?: string;
 	  }
 	/** Navigation receipts only: queued deliveryMessageIds may not yet exist in the DB. */
@@ -404,6 +455,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;
+			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
+			blockId?: string;
 			subagentNarratorId?: string;
 			toolName?: string;
 			status: string;
@@ -438,6 +491,8 @@ export type NarratorServerMessage =
 	// inline a narrower shape that had already drifted (missing imageCount/creator),
 	// so clients could not see attachments the server was in fact sending.
 	| { type: "buffer_set"; narratorId: string; messages: BufferMessageSummary[] }
+	/** Queued agent messages changed; clients refetch the bounded projection. */
+	| { type: "agent_inbox_changed"; narratorId: string }
 	| {
 			type: "buffer_consumed";
 			narratorId: string;
@@ -468,6 +523,7 @@ export type NarratorServerMessage =
 	| { type: "custom_traits_changed"; narratorId: string; traits: string[]; customTraits: unknown }
 	| {
 			type: "draft_changed";
+			hasComposerDocument?: boolean;
 			narratorId: string;
 			hasDraft: boolean;
 			text: string;
@@ -519,6 +575,12 @@ export type NarratorServerMessage =
 			retryCount?: number;
 			/** Message of the error that triggered the retry (paired with retryCount). */
 			retryError?: string;
+			/**
+			 * Where the summary model's context window came from. `fallback` means
+			 * nothing user/catalog/provider configured a window, so packing used the
+			 * tier default — worth telling the user when compact fails or stalls.
+			 */
+			contextWindowSource?: ModelContextWindowSource;
 	  }
 	| {
 			type: "compact_done";
@@ -542,6 +604,8 @@ export type NarratorServerMessage =
 			mode?: "blocking" | "background";
 			/** Why the compact failed (also persisted on the failed marker message). */
 			error?: string;
+			/** Provenance of the summary model's context window (see compact_progress). */
+			contextWindowSource?: ModelContextWindowSource;
 			/** COW compact retry replacement identity, when this is a retry. */
 			oldMessageId?: string;
 			replacedMessageId?: string;
@@ -635,6 +699,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;
+			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
+			blockId?: string;
 			subagentNarratorId?: string;
 			toolName: string;
 			input?: unknown;
@@ -760,11 +826,8 @@ export type NarratorServerMessage =
 	| {
 			type: "git_status";
 			narratorId: string;
-			chapterId: string;
 			toolUseId: string;
 			status: GitStatusSummary;
-			commitsAhead?: number;
-			baseBranch?: string;
 			linesAdded?: number;
 			linesRemoved?: number;
 	  }
@@ -776,18 +839,16 @@ export type NarratorServerMessage =
 			 * Paths are worktree-RELATIVE: the client knows its own root, and absolute
 			 * paths would disclose the host's directory layout to every subscriber.
 			 *
-			 * Only emitted while the native watcher is running
-			 * (`NARRAFORK_ENABLE_NATIVE_WATCHER=1`); the default polling fallback observes
-			 * no paths. A receiver must therefore treat this as an accelerator over its own
-			 * on-demand fetching, never as its only route to a fresh view.
+			 * Emitted after a tool call changes files; edits from outside the tool path
+			 * are not reported. A receiver must therefore treat this as an accelerator over
+			 * its own on-demand fetching, never as its only route to a fresh view.
 			 *
-			 * `truncated` says more changed than `changes` lists — the batch hit the
-			 * watcher's per-window cap. The list is then a sample, not the set, and the
-			 * receiver must invalidate broadly instead of applying it literally.
+			 * `truncated` says more changed than `changes` lists — the call hit the
+			 * per-broadcast cap. The list is then a sample, not the set, and the receiver
+			 * must invalidate broadly instead of applying it literally.
 			 */
 			type: "workspace_paths_changed";
 			narratorId: string;
-			chapterId: string;
 			toolUseId: string;
 			changes: readonly { path: string; kind: "added" | "updated" | "deleted" }[];
 			truncated: boolean;
@@ -801,11 +862,26 @@ export type NarratorServerMessage =
 			cursor?: CatchUpCursor;
 			messageVersion?: number;
 	  }
+	/** Catch-up in protocol v2: the rows as envelopes + blocks, children included. */
+	| {
+			type: "catch_up";
+			narratorId: string;
+			protocol: 2;
+			messages: unknown[];
+			blocks: unknown[];
+			/** Rows sent as v1 `orphanChildren`: children whose parent row is not included. */
+			orphanMessageIds: string[];
+			subagentActivities: unknown[];
+			cursor?: CatchUpCursor;
+			messageVersion?: number;
+	  }
 	| { type: "error"; message: string }
 	| {
 			type: "warning";
 			narratorId: string;
 			message: string;
+			warningCode?: "native_media_fallback";
+			mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 			retryCount?: number;
 			maxRetries?: number;
 			delayMs?: number;
@@ -814,14 +890,15 @@ export type NarratorServerMessage =
 	| {
 			/**
 			 * Non-persisted diagnostic for leaked XML tool calls. The frontend
-			 * uses it to mark stream-captured tool calls and to prompt downloading the raw SSE
-			 * dump when capture failed. `apiRequestId` points at the persisted api_requests row
-			 * for the leaked-tool-dump download endpoint.
+			 * uses it to mark stream-captured tool calls and to prompt downloading the request
+			 * evidence when capture failed. `recordingRequestId` locates the recording (pinned
+			 * with reason "leak"); `apiRequestId` is the persisted api_requests row.
 			 */
 			type: "leaked_tool_call_notice";
 			narratorId: string;
 			phase: "stream_captured" | "recovered" | "unrecovered";
 			apiRequestId: string;
+			recordingRequestId: string;
 			toolUseIds?: string[];
 			toolNames?: string[];
 			snippet?: string;
@@ -833,24 +910,6 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseId: string;
 			timeoutMs: number;
-	  }
-	| { type: "commits_updated"; narratorId: string; chapterId: string; newCount: number }
-	/**
-	 * Background commit sync failed, so the commit list and Git panel are serving
-	 * cached rows. The client already had the handler for this (a warning toast plus
-	 * a refetch of the chapter's git state); nothing on the server ever sent it, so
-	 * a failed sync silently kept showing stale data.
-	 */
-	| {
-			type: "commit_sync_error";
-			narratorId: string;
-			chapterId: string;
-			code: string;
-			error: string;
-			/** Cached rows are still being served, so this is a degradation, not a stop. */
-			fallback: boolean;
-			/** Raised by a watcher tick rather than by something the user just asked for. */
-			backgroundSync: boolean;
 	  }
 	| {
 			type: "presence_update";
@@ -877,6 +936,8 @@ export type NarratorServerMessage =
 			type: "background_task_count_changed";
 			narratorId: string;
 			activeBackgroundTaskCount: number;
+			activeBackgroundWorkCount?: number;
+			activeBackgroundServiceCount?: number;
 	  }
 	| {
 			type: "browser_session_count";
@@ -887,12 +948,6 @@ export type NarratorServerMessage =
 			type: "browser_session_visual_change";
 			narratorId: string;
 			sessionId: string;
-	  }
-	| {
-			type: "container_status_changed";
-			narratorId: string;
-			chapterId: string;
-			containerStatus: string | null;
 	  }
 	| {
 			type: "quota_balance";
@@ -1042,6 +1097,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			subagentNarratorId: string;
 			message: string;
+			warningCode?: "native_media_fallback";
+			mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 			retryCount?: number;
 			maxRetries?: number;
 			delayMs?: number;
@@ -1056,6 +1113,8 @@ export type NarratorServerMessage =
 			model: string;
 			nugModelId?: string;
 			waitKind?: "credentials" | "quota";
+			quotaProvider?: "kimi" | "opencode";
+			quotaBucket?: string;
 			resumeAt?: number;
 			diagnostics?: ApiRequestDiagnostics;
 	  }
@@ -1067,6 +1126,7 @@ export type NarratorServerMessage =
 			model: string;
 			nugModelId?: string;
 			waitKind?: "credentials" | "quota";
+			quotaProvider?: "kimi" | "opencode";
 	  }
 	| {
 			type: "subagent_conclusion_updated";
@@ -1079,6 +1139,56 @@ export type NarratorServerMessage =
 			durationMs?: number;
 	  }
 	| { type: "sync_ok"; narratorId: string; version: number }
+	// ── Message protocol v2 (docs/BLOCK_STORAGE-DESIGN.md §8.2) ─────────────────
+	// The only message protocol (P3d): `narrator-block-protocol.ts` maps the row-shaped
+	// frames the emitters build onto these for every connection.
+	/**
+	 * Message rows as envelopes + blocks: what `message`, `user_message` and
+	 * `message_updated` carry in v1, named by `cause`. An envelope lists its blocks in
+	 * order; a block it no longer lists is gone.
+	 */
+	| {
+			type: "message_upserted";
+			narratorId: string;
+			cause: "message" | "user_message" | "message_updated";
+			messages: unknown[];
+			blocks: unknown[];
+			oldMessageId?: string;
+			replacedMessageId?: string;
+			messageId?: string;
+			newMessageId?: string;
+			replacementMessageId?: string;
+	  }
+	/** A streaming item opened: its block id before the block has a row (§5.2). */
+	| {
+			type: "block_opened";
+			narratorId: string;
+			blockId: string;
+			kind: "output" | "reasoning" | "tool";
+			/** The element's own identity: `${attempt}:${order}`, or a tool's call id. */
+			elementId: string;
+			/** Known once the step's envelope exists; null while it is not written yet. */
+			messageId: string | null;
+			wireId?: string;
+			outputIndex?: number;
+			subagentToolUseId?: string;
+			subagentNarratorId?: string;
+	  }
+	/** Text streamed into an open output or reasoning block. */
+	| {
+			type: "block_delta";
+			narratorId: string;
+			blockId: string;
+			kind: "output" | "reasoning";
+			elementId: string;
+			text: string;
+			revision?: number;
+			textOffset?: number;
+			outputIndex?: number;
+			fileReferenceContext?: unknown;
+			subagentToolUseId?: string;
+			subagentNarratorId?: string;
+	  }
 	/**
 	 * A subscribe request was refused because the connection's user may not read
 	 * that narrator (or it does not exist — deliberately indistinguishable, matching

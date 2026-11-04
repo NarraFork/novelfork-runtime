@@ -145,7 +145,7 @@ func TestProtectedReadRechecksCanonicalIdentityAfterReading(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows may deny renaming an open file")
 	}
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	path := filepath.Join(root, "file.txt")
 	if err := os.WriteFile(path, []byte("original"), 0600); err != nil {
 		t.Fatal(err)
@@ -170,8 +170,36 @@ func TestProtectedReadRechecksCanonicalIdentityAfterReading(t *testing.T) {
 	}
 }
 
+func TestBoundedOffsetRead(t *testing.T) {
+	root := canonicalFixturePath(t, t.TempDir())
+	path := filepath.Join(root, "range.txt")
+	if err := os.WriteFile(path, []byte("0123456789"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h := New(NewPathGuard([]string{root}), 4096)
+	for _, tc := range []struct {
+		offset    float64
+		expected  string
+		truncated bool
+	}{{3, "3456", true}, {8, "89", false}, {10, "", false}} {
+		result, err := h.FsReadContext(context.Background(), map[string]any{"path": path, "expectedResolvedPath": path, "maxBytes": float64(4), "offset": tc.offset})
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := result.(map[string]any)
+		if payload["dataB64"] != base64.StdEncoding.EncodeToString([]byte(tc.expected)) || payload["truncated"] != tc.truncated || payload["totalSize"] != int64(10) {
+			t.Fatalf("incorrect page: %#v", payload)
+		}
+	}
+	for _, invalid := range []float64{-1, 1.5} {
+		if _, err := h.FsReadContext(context.Background(), map[string]any{"path": path, "offset": invalid}); err == nil {
+			t.Fatal("invalid offset accepted")
+		}
+	}
+}
+
 func TestProtectedReadPreservesResultShapeAndHonorsDeadline(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	path := filepath.Join(root, "file.txt")
 	if err := os.WriteFile(path, []byte("saved"), 0600); err != nil {
 		t.Fatal(err)

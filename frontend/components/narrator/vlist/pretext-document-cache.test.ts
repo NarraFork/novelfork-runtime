@@ -8,22 +8,24 @@
 
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { createPretextDocumentCache } from "./pretext-document-cache";
 import type { PretextDocumentInput } from "./pretext-document-loader";
 
 function message(seq: number): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text: `message ${seq}` }],
-		contentText: `message ${seq}`,
-		toolCalls: [],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: `message ${seq}`,
+			toolCalls: [],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text: `message ${seq}` }],
+	) as TreeMessage;
 }
 
 function input(
@@ -71,9 +73,21 @@ describe("createPretextDocumentCache", () => {
 		expect(cache.peek("n1")).toBeNull();
 	});
 
-	it("refuses a zero messageVersion (never-committed document)", () => {
+	it("accepts a real non-empty loaded window at server version zero", () => {
 		const cache = createPretextDocumentCache();
-		cache.write({ narratorId: "n1", input: input([1], { messageVersion: 0 }) });
+		const zero = input([1, 2], { messageVersion: 0 });
+		cache.write({ narratorId: "n1", input: zero });
+		expect(cache.peek("n1")).toBe(zero);
+	});
+
+	it("rejects empty and invalid-version snapshots without leaving stale data behind", () => {
+		const cache = createPretextDocumentCache();
+		for (const version of [-1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+			cache.write({ narratorId: "n1", input: input([1, 2]) });
+			cache.write({ narratorId: "n1", input: input([1], { messageVersion: version }) });
+			expect(cache.peek("n1")).toBeNull();
+		}
+		cache.write({ narratorId: "n1", input: input([], { messageVersion: 0 }) });
 		expect(cache.peek("n1")).toBeNull();
 	});
 

@@ -2,6 +2,7 @@ import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { DataDirectorySecurityCheckButton } from "../../components/DataDirectorySecurityAlert";
 import { ServerSystemSection } from "../../components/settings/ServerSystemSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 
@@ -23,6 +24,7 @@ function SettingsServerPage() {
 	return (
 		<Stack>
 			<Title order={3}>{t("serverAndSystemSection")}</Title>
+			<DataDirectorySecurityCheckButton />
 			<ServerSystemSection
 				port={is.port}
 				setPort={is.setPort}
@@ -36,6 +38,8 @@ function SettingsServerPage() {
 				handlePwaUpdate={handlePwaUpdate}
 				tlsEnabled={is.tlsEnabled}
 				setTlsEnabled={is.setTlsEnabled}
+				tlsAutoReissue={is.tlsAutoReissue}
+				setTlsAutoReissue={is.setTlsAutoReissue}
 				tlsCertFile={is.tlsCertFile}
 				setTlsCertFile={is.setTlsCertFile}
 				tlsKeyFile={is.tlsKeyFile}
@@ -44,6 +48,11 @@ function SettingsServerPage() {
 				setTlsPassphrase={is.setTlsPassphrase}
 				tlsCaFile={is.tlsCaFile}
 				setTlsCaFile={is.setTlsCaFile}
+				updateSource={is.updateSource}
+				setUpdateSource={is.setUpdateSource}
+				updateGithubRepository={is.updateGithubRepository}
+				setUpdateGithubRepository={is.setUpdateGithubRepository}
+				savedUpdateSettings={is.settings?.update}
 				updateServerUrl={is.updateServerUrl}
 				setUpdateServerUrl={is.setUpdateServerUrl}
 				updateChannel={is.updateChannel}

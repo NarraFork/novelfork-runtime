@@ -1,52 +1,36 @@
 import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
-import { lstat, opendir, readdir, realpath, rm, stat } from "node:fs/promises";
+import { lstat, readdir, rm, rmdir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import {
+	STORAGE_CATEGORY_KEYS,
+	STORAGE_CATEGORY_PROGRESS_MESSAGE,
+	type StorageCategoryKey,
+} from "@shared/storage-categories";
 import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapters,
-	chatAttachments,
-	chatRooms,
-	narratorMessages,
-	narrators,
-	projects,
-} from "../db/schema";
-import { localBackend } from "../lib/agent/execution/registry";
-import { MALFORMED_REQUEST_DUMP_DIR } from "../lib/agent/malformed-request-dump";
-import { REQUEST_DUMP_SPILL_DIR } from "../lib/api-request-dump-store";
+import { chatAttachments, chatRooms, narratorMessages, narrators, projects } from "../db/schema";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
 	getChatAttachmentsDir,
 	listStoredChatAttachmentNames,
 } from "../lib/chat-attachments";
+import {
+	DirectoryMeasureAbortedError,
+	measureDirectoriesOffThread,
+} from "../lib/fs-scan-worker/client";
 import { logger } from "../lib/logger";
 import { getNarraforkHome, getNarraforkPath } from "../lib/narrafork-home";
+import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "../lib/request-recorder";
 import { safeSpawn } from "../lib/spawn";
-import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
-import { dropRecentlyAttributed } from "./file-attribution-service";
-import { dropStatus } from "./git-status-cache";
-import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
-import { readWorktreeReceiptProtection } from "./narrator-worktree-journal";
-import {
-	isRegisteredNarratorWorktree,
-	readLegacyNarratorWorktreeProtection,
-} from "./narrator-worktree-resources";
-import { parseWorktreePorcelain } from "./narrator-worktree-service";
+import { contentJsonHasImageBlocks, getUploadsDir, isWithinDir } from "../lib/uploads";
+import { blockReadsEnabled, imageEnvelopeOwners } from "./narrator-block-scans";
 import {
 	DatabaseStorageScanCancelledError,
 	DatabaseStorageUnsupportedError,
 } from "./storage/database-storage-port";
 import { databaseStoragePort } from "./storage/store";
-import { withWorkspaceRepositoryLock } from "./workspace-context-service";
-import {
-	captureLifecycleContextPath,
-	confirmLifecyclePathRemoved,
-	isResourceProtectionError,
-	revalidateLifecycleTarget,
-	withProtectionReservation,
-} from "./worktree-lifecycle-guard";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -86,13 +70,13 @@ const NARRAFORK_DIR = getNarraforkHome();
 const SHARES_DIR = resolve(NARRAFORK_DIR, "shares");
 const TREE_SNAPSHOTS_DIR = resolve(NARRAFORK_DIR, "tree-snapshots");
 /**
- * Git-ignored files a dormant chapter parked outside its worktree.
+ * Git-ignored files dormant chapters parked outside their worktrees, before chapters
+ * were removed.
  *
  * Accounted for here because it is the one data area holding content git refuses to
  * track — `.env` files, local credentials — and nothing else in the storage view would
- * ever mention it. A chapter's own terminal transitions now discard its archive, but
- * directories created before that was true have no owner at all, which is what the
- * sweep below collects.
+ * ever mention it. Nothing owns these archives any more, and nothing deletes them: the
+ * user decides what to keep.
  *
  * Resolved per call rather than into a module constant, unlike the paths above.
  * `getNarraforkHome` reads `NARRAFORK_HOME` on every call precisely so an override can
@@ -124,29 +108,6 @@ export function invalidateStorageCache(): void {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/**
- * Entry budget for one {@link measureDirSize} call.
- *
- * Derived from the largest thing this scan realistically walks: a checked-out
- * worktree of a big monorepo with `node_modules` present is on the order of a few
- * hundred thousand files. 2,000,000 leaves an order of magnitude of headroom above
- * that while still bounding a pathological or hostile tree — at ~2 syscalls per
- * entry this is seconds of async I/O, not an unbounded walk. Every category shares
- * the constant because they are all measured by the same function.
- */
-const DIR_SCAN_MAX_ENTRIES = 2_000_000;
-
-/**
- * Depth budget for one {@link measureDirSize} call.
- *
- * Real trees measured here (uploads/<narrator>/, shares/<id>/, bare snapshot repos,
- * git worktrees) are well under 30 levels; 64 is generous for deliberately nested
- * source trees while keeping recursion far from any stack limit. Symlinks are not
- * followed, so this is a guard against genuinely deep directories rather than
- * against link cycles.
- */
-const DIR_SCAN_MAX_DEPTH = 64;
-
 export interface DirSizeResult {
 	sizeBytes: number;
 	/** Entries actually visited (files + directories), for observability. */
@@ -160,60 +121,36 @@ export interface DirSizeResult {
 	truncated: boolean;
 }
 
-/**
- * Recursively sum file sizes in a directory (async to avoid blocking the event loop).
- *
- * Bounded on three axes and never follows symlinks:
- *  - `lstat` is used instead of `stat`, and only real directories are recursed into,
- *    so a self-referential or mutually-referential directory link (which `readdir`'s
- *    Dirent reports as a directory when it resolves to one) cannot spin forever;
- *  - symlinked files are skipped rather than counted, because their bytes belong to
- *    the target and would otherwise be double counted;
- *  - entry count and depth are capped, and hitting either sets `truncated` instead of
- *    quietly returning a smaller number.
- */
-async function measureDirSize(dirPath: string): Promise<DirSizeResult> {
-	if (!existsSync(dirPath)) return { sizeBytes: 0, entriesScanned: 0, truncated: false };
-	let sizeBytes = 0;
-	let entriesScanned = 0;
-	let truncated = false;
+export interface CategoryScanOptions {
+	signal?: AbortSignal;
+	onProgress?: (progress: { done: number; total: number | null }) => void;
+}
 
-	const walk = async (current: string, depth: number): Promise<void> => {
-		if (truncated) return;
-		if (depth > DIR_SCAN_MAX_DEPTH) {
-			truncated = true;
-			return;
-		}
-		let entries: Dirent[];
-		try {
-			entries = await readdir(current, { withFileTypes: true });
-		} catch {
-			// directory not readable
-			return;
-		}
-		for (const entry of entries) {
-			if (truncated) return;
-			if (entriesScanned >= DIR_SCAN_MAX_ENTRIES) {
-				truncated = true;
-				return;
-			}
-			entriesScanned++;
-			const full = resolve(current, entry.name);
-			try {
-				// lstat, not stat: a symlink must be identified as a link even when it
-				// points at a directory, otherwise a link cycle recurses without end.
-				const info = await lstat(full);
-				if (info.isSymbolicLink()) continue;
-				if (info.isDirectory()) await walk(full, depth + 1);
-				else if (info.isFile()) sizeBytes += info.size;
-			} catch {
-				// skip inaccessible entries
-			}
-		}
+function directoryProgress(
+	onProgress: CategoryScanOptions["onProgress"],
+): ((progress: { entriesScanned: number; sizeBytes: number }) => void) | undefined {
+	if (!onProgress) return undefined;
+	return (progress) => {
+		onProgress({ done: progress.entriesScanned, total: null });
 	};
+}
 
-	await walk(dirPath, 0);
-	return { sizeBytes, entriesScanned, truncated };
+/**
+ * Recursively sum file sizes in one directory.
+ *
+ * The walk itself runs in a filesystem worker. Symlinks are not followed, and
+ * entry count and depth are capped; hitting either sets `truncated`.
+ */
+async function measureDirSize(
+	dirPath: string,
+	options: CategoryScanOptions = {},
+): Promise<DirSizeResult> {
+	if (!existsSync(dirPath)) return { sizeBytes: 0, entriesScanned: 0, truncated: false };
+	const [measured] = await measureDirectoriesOffThread([dirPath], {
+		signal: options.signal,
+		onProgress: directoryProgress(options.onProgress),
+	});
+	return measured ?? { sizeBytes: 0, entriesScanned: 0, truncated: false };
 }
 
 /**
@@ -242,6 +179,29 @@ export function buildReferencedUploadOwnerIds(
 		ownerIds.add(row.narratorId);
 	}
 	return ownerIds;
+}
+
+/**
+ * Narrators whose upload dir must stay: every existing narrator, and the owner of any
+ * message with an image block. With block reads, block-format messages answer from their
+ * `input_image` asset rows (the same `{type: "image", imageId}` elements
+ * `contentJsonHasImageBlocks` looks for) instead of a substring scan of every message.
+ */
+export function referencedUploadOwnerIds(narratorIds: Iterable<string>): Set<string> {
+	if (blockReadsEnabled()) {
+		const { owners, unindexed } = imageEnvelopeOwners();
+		return buildReferencedUploadOwnerIds([...narratorIds, ...owners], unindexed);
+	}
+	// Only messages that contain an image block can pin an upload dir. Pre-filter
+	// with a substring match on content_json (a superset of contentJsonHasImageBlocks,
+	// which requires the literal `"type":"image"`) so we avoid loading every
+	// message's content_json into memory. The exact check below stays authoritative.
+	const uploadMessageOwners = db
+		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
+		.from(narratorMessages)
+		.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`)
+		.all();
+	return buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
 }
 
 // ── Scan functions (each returns one category) ─────────────────────────────
@@ -316,7 +276,9 @@ async function scanDatabase(
  * would inflate a figure whose cleanup button can never reclaim them. Their
  * size still ships in `details` so the omission stays visible instead of silent.
  */
-export async function scanUploads(): Promise<StorageCategoryResult> {
+export async function scanUploads(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
 	const uploadsDir = getUploadsDir();
 	let narratorBytes = 0;
 	let narratorCount = 0;
@@ -327,7 +289,7 @@ export async function scanUploads(): Promise<StorageCategoryResult> {
 		for (const entry of entries) {
 			const fullPath = resolve(uploadsDir, entry.name);
 			if (entry.isDirectory()) {
-				const measured = await measureDirSize(fullPath);
+				const measured = await measureDirSize(fullPath, options);
 				truncated ||= measured.truncated;
 				if (entry.name === "avatars") {
 					avatarBytes = measured.sizeBytes;
@@ -368,9 +330,11 @@ export async function scanUploads(): Promise<StorageCategoryResult> {
  * and different reclamation rules (a room vs. a narrator), so a combined figure
  * could not tell an operator which cleanup button would actually free it.
  */
-async function scanChatAttachments(): Promise<StorageCategoryResult> {
+async function scanChatAttachments(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
 	const dir = getChatAttachmentsDir();
-	const measured = await measureDirSize(dir);
+	const measured = await measureDirSize(dir, options);
 	let roomCount = 0;
 	try {
 		const entries = await readdir(dir, { withFileTypes: true });
@@ -386,45 +350,23 @@ async function scanChatAttachments(): Promise<StorageCategoryResult> {
 	};
 }
 
-/**
- * Spilled API request dumps (`~/.narrafork/request-dumps` and the malformed-request
- * captures next to them).
- *
- * A dump too large for its database row is written here so "download" can return the
- * complete request; that makes the directory grow with debugging activity rather than with
- * user data, so it needs to be visible in the breakdown. Both directories are self-pruning
- * (newest N kept) and safe to delete — deleting only costs the ability to download older
- * dumps in full.
- */
-async function scanRequestDumps(): Promise<StorageCategoryResult> {
-	const dirs = [
-		resolve(NARRAFORK_DIR, REQUEST_DUMP_SPILL_DIR),
-		resolve(NARRAFORK_DIR, MALFORMED_REQUEST_DUMP_DIR),
-	];
-	let sizeBytes = 0;
-	let truncated = false;
-	let fileCount = 0;
-	for (const dir of dirs) {
-		const measured = await measureDirSize(dir);
-		sizeBytes += measured.sizeBytes;
-		if (measured.truncated) truncated = true;
-		try {
-			const entries = await readdir(dir, { withFileTypes: true });
-			fileCount += entries.filter((e) => e.isFile()).length;
-		} catch {
-			// dir may not exist yet
-		}
-	}
+/** Saved bundles have their own category and are never reclaimed by rolling-buffer cleanup. */
+export async function scanRequestRecordings(
+	saved = false,
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
+	const directory = saved ? REQUEST_RECORDING_SAVED_DIR : REQUEST_RECORDING_DIR;
+	const measured = await measureDirSize(resolve(NARRAFORK_DIR, directory), options);
 	return {
-		key: "requestDumps",
-		sizeBytes,
-		...(truncated ? { truncated: true } : {}),
-		details: { fileCount },
+		key: saved ? "savedRequestRecordings" : "requestRecordings",
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
+		details: { retention: saved ? "manual" : "rolling" },
 	};
 }
 
-async function scanShares(): Promise<StorageCategoryResult> {
-	const measured = await measureDirSize(SHARES_DIR);
+async function scanShares(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
+	const measured = await measureDirSize(SHARES_DIR, options);
 	let fileCount = 0;
 	try {
 		const entries = await readdir(SHARES_DIR, { withFileTypes: true });
@@ -446,8 +388,10 @@ async function scanShares(): Promise<StorageCategoryResult> {
  * These grow with every recorded tool boundary, so they need to be visible in the
  * storage breakdown rather than accumulating unaccounted for.
  */
-async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
-	const measured = await measureDirSize(TREE_SNAPSHOTS_DIR);
+async function scanTreeSnapshots(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
+	const measured = await measureDirSize(TREE_SNAPSHOTS_DIR, options);
 	let repoCount = 0;
 	try {
 		const entries = await readdir(TREE_SNAPSHOTS_DIR, { withFileTypes: true });
@@ -467,30 +411,21 @@ async function scanTreeSnapshots(): Promise<StorageCategoryResult> {
  * Ignored-file archives left by dormant chapters (`~/.narrafork/dormant-ignored`).
  *
  * Reported separately from the snapshot repositories because the contents are the
- * user's untracked secrets rather than derived data, so "how much is here and is any of
- * it orphaned" is a question worth being able to answer.
+ * user's untracked secrets rather than derived data. Chapters are gone, so every
+ * archive is unowned.
  */
-async function scanDormantIgnored(): Promise<StorageCategoryResult> {
+async function scanDormantIgnored(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
 	const dir = dormantIgnoredDir();
-	const measured = await measureDirSize(dir);
+	const measured = await measureDirSize(dir, options);
 	let archiveCount = 0;
 	let orphanCount = 0;
 	try {
 		const entries = await readdir(dir, { withFileTypes: true });
 		const dirs = entries.filter((e) => e.isDirectory());
 		archiveCount = dirs.length;
-		if (dirs.length > 0) {
-			// One bounded query rather than a lookup per directory: the id set is
-			// human-scale (one entry per chapter that has ever gone dormant).
-			const liveChapterIds = new Set(
-				db
-					.select({ id: chapters.id })
-					.from(chapters)
-					.all()
-					.map((row) => row.id),
-			);
-			orphanCount = dirs.filter((dir) => !liveChapterIds.has(dir.name)).length;
-		}
+		orphanCount = dirs.length;
 	} catch {
 		// dir may not exist yet
 	}
@@ -502,7 +437,7 @@ async function scanDormantIgnored(): Promise<StorageCategoryResult> {
 	};
 }
 
-async function scanWorktrees(): Promise<StorageCategoryResult> {
+async function scanWorktrees(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
 	let totalSize = 0;
 	let worktreeCount = 0;
 	let truncated = false;
@@ -518,7 +453,7 @@ async function scanWorktrees(): Promise<StorageCategoryResult> {
 			if (!proj.gitPath) continue;
 			const wtDir = resolve(proj.gitPath, ".worktrees");
 			if (!existsSync(wtDir)) continue;
-			const measured = await measureDirSize(wtDir);
+			const measured = await measureDirSize(wtDir, options);
 			truncated ||= measured.truncated;
 			const projSize = measured.sizeBytes;
 			let projWtCount = 0;
@@ -550,11 +485,12 @@ async function scanWorktrees(): Promise<StorageCategoryResult> {
 	};
 }
 
-async function scanContainers(): Promise<StorageCategoryResult> {
+async function scanContainers(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
 	try {
 		const result = await safeSpawn({
 			cmd: ["podman", "system", "df", "--format", "json"],
 			timeout: 15_000,
+			signal: options.signal,
 		});
 		if (result.exitCode !== 0) {
 			return { key: "containers", sizeBytes: 0, details: { available: false } };
@@ -680,129 +616,267 @@ function throwIfAborted(signal?: AbortSignal): void {
 	if (signal?.aborted) throw new StorageScanAbortedError();
 }
 
-export async function* scanStorage(
-	options: { signal?: AbortSignal } = {},
-): AsyncGenerator<
-	| { type: "progress"; message: string; detail?: { done: number; total: number } }
-	| { type: "category"; data: StorageCategoryResult },
-	StorageScanResult
-> {
-	const { signal } = options;
-	const categories: StorageCategoryResult[] = [];
+function rethrowScanFailure(error: unknown): never {
+	if (error instanceof StorageScanAbortedError) throw error;
+	if (error instanceof DirectoryMeasureAbortedError) throw new StorageScanAbortedError();
+	throw error;
+}
 
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_database" };
-	// The database scan measures ~116 tables and is by far the longest step, so stream table-level
-	// progress instead of leaving the UI on one static message for seconds. Progress is produced by
-	// a callback while we await the scan, so pump it through a queue and yield as it arrives.
-	const dbProgress = createProgressPump(signal);
-	const dbScan = scanDatabase(dbProgress.push, signal).finally(dbProgress.close);
-	// Attached now so an abort-driven rejection is never an unhandled rejection, even if the code
-	// below stops awaiting `dbScan` (for example because the consumer abandons the generator).
-	dbScan.catch(() => {});
-	for await (const progress of dbProgress.drain()) {
-		yield {
-			type: "progress",
-			message: "scanning_database",
-			detail: { done: progress.done, total: progress.total },
-		};
-	}
-	if (signal?.aborted) {
-		// The pump was closed by the abort, so `dbScan` may still be running. Do not await it: the
-		// worker tasks are already cancelled and the caller is gone.
-		throw new StorageScanAbortedError();
-	}
-	const dbResult = await dbScan;
-	categories.push(dbResult);
-	yield { type: "category", data: dbResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_uploads" };
-	const uploadsResult = await scanUploads();
-	categories.push(uploadsResult);
-	yield { type: "category", data: uploadsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_chat_attachments" };
-	const chatAttachmentsResult = await scanChatAttachments();
-	categories.push(chatAttachmentsResult);
-	yield { type: "category", data: chatAttachmentsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_shares" };
-	const sharesResult = await scanShares();
-	categories.push(sharesResult);
-	yield { type: "category", data: sharesResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_request_dumps" };
-	const requestDumpsResult = await scanRequestDumps();
-	categories.push(requestDumpsResult);
-	yield { type: "category", data: requestDumpsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_worktrees" };
-	const worktreesResult = await scanWorktrees();
-	categories.push(worktreesResult);
-	yield { type: "category", data: worktreesResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_tree_snapshots" };
-	const treeSnapshotsResult = await scanTreeSnapshots();
-	categories.push(treeSnapshotsResult);
-	yield { type: "category", data: treeSnapshotsResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_dormant_ignored" };
-	const dormantIgnoredResult = await scanDormantIgnored();
-	categories.push(dormantIgnoredResult);
-	yield { type: "category", data: dormantIgnoredResult };
-
-	throwIfAborted(signal);
-	yield { type: "progress", message: "scanning_containers" };
-	const containersResult = await scanContainers();
-	categories.push(containersResult);
-	yield { type: "category", data: containersResult };
-
-	throwIfAborted(signal);
-
+export function assembleStorageScanResult(categories: StorageCategoryResult[]): StorageScanResult {
 	const truncated = categories.some((c) => c.truncated === true);
 	// An unmeasurable category contributes nothing to the total AND makes the total a lower bound.
 	// Adding its placeholder zero would be arithmetically harmless and semantically wrong: the sum
 	// would read as complete while a whole category was missing from it.
 	const unavailable = categories.filter((c) => c.unavailable);
-	const result: StorageScanResult = {
+	return {
 		categories,
 		totalBytes: categories.filter((c) => !c.unavailable).reduce((sum, c) => sum + c.sizeBytes, 0),
 		...(truncated || unavailable.length > 0 ? { truncated: true } : {}),
 		scannedAt: Date.now(),
 	};
+}
+
+/** Merge one finished category into the shared cache. Other categories stay put. */
+export function rememberStorageCategory(category: StorageCategoryResult): StorageScanResult {
+	const previous =
+		cachedResult && Date.now() - cachedResult.scannedAt <= CACHE_TTL_MS
+			? cachedResult.categories
+			: [];
+	const merged = new Map(previous.map((entry) => [entry.key, entry]));
+	merged.set(category.key, category);
+	const ordered = STORAGE_CATEGORY_KEYS.map((key) => merged.get(key)).filter(
+		(entry): entry is StorageCategoryResult => Boolean(entry),
+	);
+	for (const entry of merged.values()) {
+		if (!ordered.some((existing) => existing.key === entry.key)) ordered.push(entry);
+	}
+	const result = assembleStorageScanResult(ordered);
+	cachedResult = result;
+	return result;
+}
+
+/**
+ * Measure one category.
+ *
+ * Categories do not wait on each other. Directory walks run in filesystem workers;
+ * the database measurement keeps its own read-worker path. `await Promise.resolve()`
+ * lets every category reach its first real wait before any of them does synchronous
+ * sqlite on the way into the database scan.
+ */
+export async function scanStorageCategory(
+	key: StorageCategoryKey,
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
+	await Promise.resolve();
+	throwIfAborted(options.signal);
+	// The database step still has synchronous sqlite before its first internal await.
+	// Yielding a turn lets sibling directory workers spawn first when a full scan
+	// starts every category together.
+	if (key === "database") {
+		await new Promise<void>((resolve) => {
+			setTimeout(resolve, 0);
+		});
+		throwIfAborted(options.signal);
+	}
+	try {
+		switch (key) {
+			case "database":
+				return await scanDatabase((progress) => {
+					options.onProgress?.({ done: progress.done, total: progress.total });
+				}, options.signal);
+			case "uploads":
+				return await scanUploads(options);
+			case "chatAttachments":
+				return await scanChatAttachments(options);
+			case "shares":
+				return await scanShares(options);
+			case "worktrees":
+				return await scanWorktrees(options);
+			case "treeSnapshots":
+				return await scanTreeSnapshots(options);
+			case "requestRecordings":
+				return await scanRequestRecordings(false, options);
+			case "savedRequestRecordings":
+				return await scanRequestRecordings(true, options);
+			case "dormantIgnored":
+				return await scanDormantIgnored(options);
+			case "containers":
+				return await scanContainers(options);
+		}
+	} catch (error) {
+		rethrowScanFailure(error);
+	}
+}
+
+type StorageScanEvent =
+	| {
+			type: "progress";
+			message: string;
+			detail?: { done: number; total: number | null };
+	  }
+	| { type: "category"; data: StorageCategoryResult }
+	| { type: "error"; error: unknown }
+	| { type: "done" };
+
+/**
+ * Scan every category at once.
+ *
+ * Completion order is whatever finishes first. The returned category list is
+ * still the stable display order. A failure in one category aborts the rest and
+ * rejects the generator, matching the previous all-or-nothing contract.
+ */
+export async function* scanStorage(
+	options: { signal?: AbortSignal } = {},
+): AsyncGenerator<
+	| { type: "progress"; message: string; detail?: { done: number; total: number | null } }
+	| { type: "category"; data: StorageCategoryResult },
+	StorageScanResult
+> {
+	const callerSignal = options.signal;
+	throwIfAborted(callerSignal);
+	const linked = new AbortController();
+	if (callerSignal) {
+		if (callerSignal.aborted) linked.abort();
+		else callerSignal.addEventListener("abort", () => linked.abort(), { once: true });
+	}
+
+	const finished: StorageCategoryResult[] = [];
+	const queue: StorageScanEvent[] = [];
+	let notify: (() => void) | null = null;
+	let remaining = STORAGE_CATEGORY_KEYS.length;
+	let failure: unknown = null;
+
+	const push = (event: StorageScanEvent) => {
+		queue.push(event);
+		const resume = notify;
+		notify = null;
+		resume?.();
+	};
+
+	for (const key of STORAGE_CATEGORY_KEYS) {
+		void (async () => {
+			try {
+				push({ type: "progress", message: STORAGE_CATEGORY_PROGRESS_MESSAGE[key] });
+				const result = await scanStorageCategory(key, {
+					signal: linked.signal,
+					onProgress: (detail) => {
+						push({
+							type: "progress",
+							message: STORAGE_CATEGORY_PROGRESS_MESSAGE[key],
+							detail,
+						});
+					},
+				});
+				finished.push(result);
+				push({ type: "category", data: result });
+			} catch (error) {
+				if (!failure) {
+					failure = error;
+					linked.abort();
+					push({ type: "error", error });
+				}
+			} finally {
+				remaining--;
+				if (remaining === 0) push({ type: "done" });
+			}
+		})();
+	}
+
+	while (true) {
+		if (queue.length === 0) {
+			await new Promise<void>((resolve) => {
+				notify = resolve;
+			});
+			continue;
+		}
+		const event = queue.shift();
+		if (!event || event.type === "done") break;
+		if (event.type === "error") rethrowScanFailure(event.error);
+		yield event;
+	}
+	if (failure) rethrowScanFailure(failure);
+
+	const ordered = STORAGE_CATEGORY_KEYS.map((key) =>
+		finished.find((entry) => entry.key === key),
+	).filter((entry): entry is StorageCategoryResult => Boolean(entry));
+	const result = assembleStorageScanResult(ordered);
 	cachedResult = result;
 	return result;
 }
 
 // ── Cleanup functions ──────────────────────────────────────────────────────
 
+export async function removeUploadDirectoryWithoutMedia(
+	narratorId: string,
+	measureBytes = true,
+): Promise<{ removed: number; freedBytes: number }> {
+	const root = getUploadsDir();
+	const dirPath = resolve(root, narratorId);
+	if (!isWithinDir(root, dirPath)) return { removed: 0, freedBytes: 0 };
+
+	// Existing media, including a symlink or an empty directory, preserves the
+	// entire owner directory. References can survive in forks and tool results.
+	try {
+		await lstat(resolve(dirPath, "media"));
+		return { removed: 0, freedBytes: 0 };
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+
+	// Never recursively remove the owner root: media can be created at any time.
+	let children: Dirent[];
+	try {
+		children = await readdir(dirPath, { withFileTypes: true });
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, freedBytes: 0 };
+		throw err;
+	}
+	let freedBytes = 0;
+	for (const child of children) {
+		// Case-insensitive filesystems can report an existing MEDIA spelling.
+		if (child.name.toLowerCase() === "media") continue;
+		const childPath = resolve(dirPath, child.name);
+		try {
+			const size = !measureBytes
+				? 0
+				: child.isDirectory()
+					? await dirSize(childPath)
+					: child.isFile()
+						? (await lstat(childPath)).size
+						: 0;
+			await rm(childPath, { recursive: true, force: true });
+			freedBytes += size;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		}
+	}
+	try {
+		await rmdir(dirPath);
+		return { removed: 1, freedBytes };
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code !== "ENOTEMPTY" && code !== "EEXIST" && code !== "ENOENT") throw err;
+		return { removed: 0, freedBytes };
+	}
+}
+
 export async function cleanupOrphanedUploads(): Promise<{ removed: number; freedBytes: number }> {
 	const uploadsDir = getUploadsDir();
 	if (!existsSync(uploadsDir)) return { removed: 0, freedBytes: 0 };
 
-	const entries = await readdir(uploadsDir, { withFileTypes: true });
+	let entries: Dirent[];
+	try {
+		entries = await readdir(uploadsDir, { withFileTypes: true });
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { removed: 0, freedBytes: 0 };
+		throw err;
+	}
 	const narratorIds = db
 		.select({ id: narrators.id })
 		.from(narrators)
 		.all()
 		.map((n) => n.id);
-	// Only messages that contain an image block can pin an upload dir. Pre-filter
-	// with a substring match on content_json (a superset of contentJsonHasImageBlocks,
-	// which requires the literal `"type":"image"`) so we avoid loading every
-	// message's content_json into memory. The exact check below stays authoritative.
-	const uploadMessageOwners = db
-		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`)
-		.all();
-	const preservedOwnerIds = buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
+	const preservedOwnerIds = referencedUploadOwnerIds(narratorIds);
 
 	let removed = 0;
 	let freedBytes = 0;
@@ -810,12 +884,15 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 	for (const entry of entries) {
 		if (!entry.isDirectory() || entry.name === "avatars") continue;
 		if (!preservedOwnerIds.has(entry.name)) {
-			const dirPath = resolve(uploadsDir, entry.name);
-			const size = await dirSize(dirPath);
-			await rm(dirPath, { recursive: true, force: true });
-			removed++;
-			freedBytes += size;
-			logger.info("Removed orphaned upload dir", { narratorId: entry.name, size });
+			const result = await removeUploadDirectoryWithoutMedia(entry.name);
+			removed += result.removed;
+			freedBytes += result.freedBytes;
+			if (result.removed) {
+				logger.info("Removed orphaned upload dir", {
+					narratorId: entry.name,
+					size: result.freedBytes,
+				});
+			}
 		}
 	}
 
@@ -944,69 +1021,6 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 	return { removed, freedBytes };
 }
 
-/**
- * Remove ignored-file archives whose chapter no longer exists.
- *
- * The archive is written when a chapter goes dormant and consumed when it wakes, so its
- * lifetime is bounded by a chapter that can still do both. Chapter deletion, project
- * deletion and batch cleanup now discard it directly, but directories created before
- * that was true have no owner and no expiry — and what they hold is precisely the files
- * git refuses to track, i.e. the user's plaintext credentials sitting under
- * `~/.narrafork` indefinitely.
- *
- * Keyed on the chapter row existing at all rather than on its status: a dormant chapter
- * still needs its archive, and any status can still be woken or deleted, so the row
- * disappearing is the only signal that nothing will ever read it again.
- */
-export async function cleanupOrphanedIgnoredArchives(): Promise<{
-	removed: number;
-	freedBytes: number;
-}> {
-	const baseDir = dormantIgnoredDir();
-	if (!existsSync(baseDir)) return { removed: 0, freedBytes: 0 };
-
-	let removed = 0;
-	let freedBytes = 0;
-	try {
-		const entries = await readdir(baseDir, { withFileTypes: true });
-		const liveChapterIds = new Set(
-			db
-				.select({ id: chapters.id })
-				.from(chapters)
-				.all()
-				.map((row) => row.id),
-		);
-		for (const entry of entries) {
-			if (!entry.isDirectory()) continue;
-			if (liveChapterIds.has(entry.name)) continue;
-			const dirPath = resolve(baseDir, entry.name);
-			// Per directory, not around the loop: one unreadable or permission-denied
-			// archive must not stop the sweep, because everything after it would then stay
-			// on disk indefinitely while the caller was told the clean-up ran.
-			try {
-				const size = await dirSize(dirPath);
-				await rm(dirPath, { recursive: true, force: true });
-				removed++;
-				freedBytes += size;
-				logger.info("Removed an ignored-file archive with no chapter", {
-					chapterId: entry.name,
-					size,
-				});
-			} catch (err) {
-				logger.warn("Could not remove an orphaned ignored-file archive", {
-					chapterId: entry.name,
-					error: String(err),
-				});
-			}
-		}
-	} catch (err) {
-		logger.error("Failed to clean up orphaned ignored-file archives", { error: String(err) });
-	}
-
-	cachedResult = null;
-	return { removed, freedBytes };
-}
-
 export async function cleanupAllShares(): Promise<{ removed: number; freedBytes: number }> {
 	if (!existsSync(SHARES_DIR)) return { removed: 0, freedBytes: 0 };
 
@@ -1027,226 +1041,18 @@ export async function cleanupAllShares(): Promise<{ removed: number; freedBytes:
 	return { removed, freedBytes };
 }
 
-export async function cleanupOrphanedWorktrees(): Promise<{
+/**
+ * Repack the tree-snapshot repositories. Each captured state writes loose objects, so
+ * without this they grow with every tool call.
+ *
+ * Worktree directories under `<project>/.worktrees` are never removed here: those left
+ * by removed chapters have no owner record, and deleting one would lose whatever it
+ * still holds.
+ */
+export async function repackTreeSnapshots(): Promise<{
 	removed: number;
 	freedBytes: number;
 }> {
-	let removed = 0;
-	let freedBytes = 0;
-
-	try {
-		// Caps bound work, not ownership: unvisited projects are simply left untouched.
-		const allProjects = db
-			.select({ id: projects.id, gitPath: projects.gitPath })
-			.from(projects)
-			.orderBy(projects.id)
-			.limit(64)
-			.all();
-		const deadline = performance.now() + 30_000;
-		const gitEnv = {
-			...process.env,
-			GIT_DIR: undefined,
-			GIT_COMMON_DIR: undefined,
-			GIT_WORK_TREE: undefined,
-			GIT_INDEX_FILE: undefined,
-		};
-		for (const proj of allProjects) {
-			if (!proj.gitPath || performance.now() > deadline) continue;
-			const probe = await probeLocalGitWorkspace(proj.gitPath);
-			if (
-				probe.state !== "ready" ||
-				!probe.rootPath ||
-				!probe.repositoryPath ||
-				!localBackend.paths.equals(probe.rootPath, await realpath(proj.gitPath))
-			)
-				continue;
-			const wtDir = resolve(proj.gitPath, ".worktrees");
-			try {
-				// Same identity/lock as narrator creation, including the pre-registration window.
-				await withWorkspaceRepositoryLock(
-					gitWorkspaceIdentity(localBackend, probe.repositoryPath),
-					async () => {
-						const parent = await lstat(wtDir).catch(() => null);
-						if (
-							!parent?.isDirectory() ||
-							parent.isSymbolicLink() ||
-							(await realpath(wtDir)) !== wtDir
-						)
-							return;
-						const receipts = await readWorktreeReceiptProtection(
-							getNarraforkPath("worktree-requests"),
-						);
-						if (!receipts.complete) return;
-						const legacy = await readLegacyNarratorWorktreeProtection(deadline);
-						if (!legacy.complete) return;
-						// Never treat a capped porcelain prefix as proof that a worktree is absent.
-						const list = await safeSpawn({
-							cmd: [
-								"git",
-								"--no-optional-locks",
-								"-C",
-								proj.gitPath ?? "",
-								"worktree",
-								"list",
-								"--porcelain",
-								"-z",
-							],
-							timeout: 5000,
-							maxOutputBytes: 128 * 1024,
-							env: gitEnv,
-						});
-						if (list.exitCode !== 0 || list.stdoutTruncated || list.stderrTruncated) return;
-						const registered = parseWorktreePorcelain(list.stdout);
-						if (registered.truncated) return;
-						const candidates: string[] = [];
-						let count = 0;
-						for await (const entry of await opendir(wtDir)) {
-							if (++count > 512 || performance.now() > deadline) return;
-							if (entry.isDirectory()) candidates.push(resolve(wtDir, entry.name));
-						}
-						for (const fullPath of candidates) {
-							if (performance.now() > deadline) break;
-							// ALL resource states survive narrator deletion. Errors (e.g. an unmigrated
-							// registry) abort the repo sweep, rather than making ownership disappear.
-							if (
-								isRegisteredNarratorWorktree(fullPath) ||
-								[...receipts.paths].some((path) => localBackend.paths.contains(fullPath, path))
-							)
-								continue;
-							const chapter = db
-								.select({ id: chapters.id })
-								.from(chapters)
-								.where(eq(chapters.worktreePath, fullPath))
-								.limit(1)
-								.get();
-							if (chapter) continue;
-							// Legacy switched sessions may predate receipts/registry. Protect ancestor
-							// directories too, e.g. a narrator running in a worktree subdirectory.
-							const cwdOwner = legacy.owners.find(
-								(owner) =>
-									owner.deviceId === "local" && localBackend.paths.contains(fullPath, owner.path),
-							);
-							// A cleanup inspection must never select/adopt an owner or write inventory.
-							if (cwdOwner) continue;
-							const entry = registered.entries.find((item) =>
-								localBackend.paths.equals(item.path, fullPath),
-							);
-							const leaf = localBackend.paths.basename(fullPath);
-							// Only the old, positively identifiable chapter convention is eligible.
-							// Unknown directories, ordinary narrators and unverifiable Git state fail closed.
-							if (
-								!entry ||
-								entry.locked ||
-								entry.prunable ||
-								!/^[a-z0-9-]+-[A-Za-z0-9_-]{6}$/.test(leaf) ||
-								entry.branch !== `refs/heads/chapter/${leaf}`
-							)
-								continue;
-							if (
-								db
-									.select({ id: chapters.id })
-									.from(chapters)
-									.where(eq(chapters.branch, `chapter/${leaf}`))
-									.limit(1)
-									.get()
-							)
-								continue;
-							if ((await realpath(fullPath)) !== fullPath) continue;
-							const identity = await probeLocalGitWorkspace(fullPath);
-							if (
-								identity.state !== "ready" ||
-								!identity.rootPath ||
-								!identity.repositoryPath ||
-								!localBackend.paths.equals(identity.rootPath, fullPath) ||
-								!localBackend.paths.equals(identity.repositoryPath, probe.repositoryPath ?? "")
-							)
-								continue;
-							const clean = await safeSpawn({
-								cmd: [
-									"git",
-									"--no-optional-locks",
-									"-C",
-									fullPath,
-									"status",
-									"--porcelain=v1",
-									"-z",
-									"--untracked-files=all",
-									"--ignored",
-								],
-								timeout: 5000,
-								maxOutputBytes: 128 * 1024,
-							});
-							if (
-								clean.exitCode !== 0 ||
-								clean.stdoutTruncated ||
-								clean.stderrTruncated ||
-								clean.stdout !== ""
-							)
-								continue;
-							try {
-								await withProtectionReservation(
-									[{ path: fullPath }],
-									"orphan worktree cleanup",
-									async () => {
-										const size = await dirSize(await revalidateLifecycleTarget(fullPath));
-										const frozenRepository = await captureLifecycleContextPath(proj.gitPath ?? "");
-										const frozenPath = await revalidateLifecycleTarget(fullPath);
-										// No --force and no rm fallback. Git must prove this clean registered
-										// chapter worktree is removable; a late dirty write makes remove fail.
-										const deletion = await safeSpawn({
-											cmd: ["git", "-C", frozenRepository, "worktree", "remove", "--", frozenPath],
-											timeout: 10_000,
-											maxOutputBytes: 32 * 1024,
-											env: gitEnv,
-										});
-										if (deletion.exitCode !== 0) return;
-										await confirmLifecyclePathRemoved(frozenPath);
-										await worktreeTreeSnapshot.destroy(fullPath);
-										dropStatus(fullPath);
-										dropRecentlyAttributed(fullPath);
-										removed++;
-										freedBytes += size;
-										logger.info("Removed verified clean orphaned chapter worktree", {
-											path: fullPath,
-											size,
-										});
-									},
-								);
-							} catch (error) {
-								if (!isResourceProtectionError(error)) throw error;
-								logger.warn("Kept protected or unverifiable orphan worktree", {
-									path: fullPath,
-									error: String(error),
-								});
-							}
-						}
-					},
-				);
-			} catch (err) {
-				logger.warn("Skipped unverifiable or busy worktree repository during cleanup", {
-					projectId: proj.id,
-					error: String(err),
-				});
-			}
-		}
-	} catch (err) {
-		logger.error("Failed to cleanup orphaned worktrees", { error: String(err) });
-	}
-
-	// Ignored-file archives are swept on the same trigger: they are the same class of
-	// leftover (per-chapter state outside the repository, orphaned when a chapter row
-	// goes), and a user reclaiming space has no reason to run two separate actions.
-	try {
-		const archives = await cleanupOrphanedIgnoredArchives();
-		removed += archives.removed;
-		freedBytes += archives.freedBytes;
-	} catch (err) {
-		logger.warn("Failed to sweep orphaned ignored-file archives", { error: String(err) });
-	}
-
-	// Repack the surviving snapshot repos. Each captured state writes loose objects,
-	// so without this they grow with every tool call. Runs after the orphan sweep so
-	// removed repos are not repacked first.
 	try {
 		await worktreeTreeSnapshot.gcAll();
 	} catch (err) {
@@ -1254,7 +1060,7 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 	}
 
 	cachedResult = null;
-	return { removed, freedBytes };
+	return { removed: 0, freedBytes: 0 };
 }
 
 export async function pruneContainerImages(): Promise<{ success: boolean; output: string }> {
@@ -1277,8 +1083,7 @@ export const storageService = {
 	scanStorage,
 	cleanupOrphanedUploads,
 	cleanupOrphanedChatAttachments,
-	cleanupOrphanedIgnoredArchives,
 	cleanupAllShares,
-	cleanupOrphanedWorktrees,
+	repackTreeSnapshots,
 	pruneContainerImages,
 };

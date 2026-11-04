@@ -97,8 +97,8 @@ export const askUserQuestionTool: ToolDefinition = {
 						},
 						options: {
 							description:
-								"The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
-							minItems: 2,
+								"The available choices for this question. Use an empty array for free-form input, or provide 2-4 options for a choice question. Put all choices inside this question's options array, not as separate questions. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically.",
+							minItems: 0,
 							maxItems: 4,
 							type: "array",
 							items: {
@@ -133,34 +133,6 @@ export const askUserQuestionTool: ToolDefinition = {
 						},
 					},
 					required: ["header", "options"],
-					additionalProperties: false,
-				},
-			},
-			answers: {
-				description:
-					"User answers collected by the permission component, keyed by the question header (uniquified when titles collide)",
-				type: "object",
-				propertyNames: { type: "string" },
-				additionalProperties: { type: "string" },
-			},
-			annotations: {
-				description:
-					"Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question header.",
-				type: "object",
-				propertyNames: { type: "string" },
-				additionalProperties: {
-					type: "object",
-					properties: {
-						preview: {
-							description:
-								"The preview content of the selected option, if the question used previews.",
-							type: "string",
-						},
-						notes: {
-							description: "Free-text notes the user added to their selection.",
-							type: "string",
-						},
-					},
 					additionalProperties: false,
 				},
 			},

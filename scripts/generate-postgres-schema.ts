@@ -80,6 +80,8 @@ export type Column = {
 export type Index = {
 	name: string;
 	columns: string[];
+	/** A single literal expression, never a column or a usable FK uniqueness target. */
+	expression?: "1";
 	unique: boolean;
 	predicate?: string;
 	/**
@@ -108,6 +110,23 @@ export class UnsupportedSchemaError extends Error {
 	}
 }
 
+/** SQLite integer byte totals are 64-bit; the default 5 GiB quota exceeds PostgreSQL int4. */
+const PG_BYTE_TOTAL_COLUMNS: ReadonlySet<string> = new Set([
+	"file_change_storage_budgets.used_bytes",
+	"file_change_storage_budgets.reserved_bytes",
+	"file_change_storage_budgets.quota_bytes",
+]);
+/**
+ * Unix-seconds integer columns. SQLite integers are 64-bit, but PostgreSQL `integer` is
+ * int4 and overflows in January 2038 — and a session's expiry already reaches a week
+ * past "now". PostgreSQL stores them as `bigint`.
+ */
+const PG_UNIX_SECONDS_COLUMNS: ReadonlySet<string> = new Set([
+	"auth_sessions.session_start",
+	"auth_sessions.created_at",
+	"auth_sessions.expires_at",
+	"auth_sessions.revoked_at",
+]);
 /**
  * PostgreSQL-only identity columns: capabilities PostgreSQL needs that SQLite provides
  * implicitly, so the SQLite schema deliberately does not declare them.
@@ -305,10 +324,17 @@ export function generatePostgresSchema(
 			);
 		}
 		// SQL is deliberately a small language here. Unknown SQLite functions cannot silently leak into PG.
-		const functions = [...sql.matchAll(/\b([a-z_]\w*)\s*\(/gi)].map((m) => m[1].toLowerCase());
-		for (const fn of functions)
-			if (!["coalesce", "in", "or", "and", "when", "not", "octet_length"].includes(fn))
+		for (const match of sql.matchAll(/\b([a-z_]\w*)\s*\(/gi)) {
+			const fn = match[1].toLowerCase();
+			if (fn === "length") {
+				// Both backends count characters in text (JSON mode is also stored as text).
+				// Byte budgets were handled above; do not admit arbitrary length arguments.
+				const argument = sql.slice(match.index).match(/^length\s*\(\s*"(\w+)"\s*\)/i);
+				if (!argument || !table.columns.some((c) => c.name === argument[1] && c.kind === "text"))
+					fail(object, "unsupported length argument: expected a text column");
+			} else if (!["coalesce", "in", "or", "and", "when", "not", "octet_length"].includes(fn))
 				fail(object, `unsupported SQL function ${fn}`);
+		}
 		return sql.trim().replace(/\s+/g, " ");
 	};
 	const pending: {
@@ -380,6 +406,14 @@ export function generatePostgresSchema(
 							primary: false,
 							unique: false,
 						};
+						if (
+							c.kind === "integer" &&
+							c.mode !== "boolean" &&
+							(PG_BYTE_TOTAL_COLUMNS.has(`${table.name}.${c.name}`) ||
+								PG_UNIX_SECONDS_COLUMNS.has(`${table.name}.${c.name}`))
+						) {
+							c.pgType = "bigint";
+						}
 						for (const method of methods) {
 							const name = callName(method);
 							const [arg, second] = method.arguments;
@@ -474,9 +508,22 @@ export function generatePostgresSchema(
 							unique: kind === "uniqueIndex",
 						};
 						for (const method of methods) {
-							if (callName(method) === "on" && !i.columns.length)
-								i.columns = columnList(method.arguments, object);
-							else if (
+							if (callName(method) === "on" && !i.columns.length && !i.expression) {
+								const node = method.arguments[0];
+								if (node && ts.isTaggedTemplateExpression(node)) {
+									if (
+										method.arguments.length !== 1 ||
+										text(node.tag) !== "sql" ||
+										!ts.isNoSubstitutionTemplateLiteral(node.template)
+									)
+										fail(object, "unsupported index expression");
+									let value = node.template.text.trim();
+									while (value.startsWith("(") && value.endsWith(")"))
+										value = value.slice(1, -1).trim();
+									if (value !== "1") fail(object, "unsupported index expression");
+									i.expression = "1";
+								} else i.columns = columnList(method.arguments, object);
+							} else if (
 								callName(method) === "where" &&
 								!i.predicate &&
 								method.arguments.length === 1
@@ -484,7 +531,7 @@ export function generatePostgresSchema(
 								i.predicate = sqlExpression(method.arguments[0], table, alias, object);
 							else fail(object, `unsupported index method ${callName(method)}`);
 						}
-						if (!i.columns.length || base.arguments.length !== 1)
+						if ((!i.columns.length && !i.expression) || base.arguments.length !== 1)
 							fail(object, "invalid index definition");
 						table.indexes.push(i);
 					} else if (kind === "check") {
@@ -678,6 +725,7 @@ export function generatePostgresSchema(
 			const covering = table.indexes.find(
 				(index) =>
 					index.unique &&
+					!index.expression &&
 					!index.predicate &&
 					index.columns.length === 1 &&
 					columnName(table, index.columns[0]) === column,
@@ -760,7 +808,7 @@ export function generatePostgresSchema(
 				...table.indexes.map((i) =>
 					i.emitAsUniqueConstraint
 						? `unique(${q(i.name)}).on(${i.columns.map((c) => `table.${c}`).join(", ")})`
-						: `${i.unique ? "uniqueIndex" : "index"}(${q(i.name)}).on(${i.columns.map((c) => `table.${c}`).join(", ")})${i.predicate ? `.where(sql.raw(${q(i.predicate)}))` : ""}`,
+						: `${i.unique ? "uniqueIndex" : "index"}(${q(i.name)}).on(${i.expression ? 'sql.raw("(1)")' : i.columns.map((c) => `table.${c}`).join(", ")})${i.predicate ? `.where(sql.raw(${q(i.predicate)}))` : ""}`,
 				),
 				...table.checkDefinitions.map((c) => `check(${q(c.name)}, sql.raw(${q(c.expression)}))`),
 				// Column references whose automatic name would be truncated are emitted here so

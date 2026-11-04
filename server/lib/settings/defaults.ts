@@ -2,14 +2,19 @@
  * Default settings values and per-field documentation.
  * Extracted from the monolithic settings/index.ts.
  */
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
+import {
+	DEFAULT_RECORDING_REQUEST_BYTES,
+	DEFAULT_RECORDING_RESPONSE_BYTES,
+} from "@shared/request-recording";
 import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
 import { DEFAULT_DISK_SAFETY } from "../disk-safety-config";
 import type { FieldDoc, NarraForkSettings } from "./types";
+import { DEFAULT_UPDATE_SETTINGS } from "./update-source";
 
 export const DEFAULTS: NarraForkSettings = {
+	tokendance: { apiKey: "", disabled: false, generation: 0 },
+	speech: { enabled: false, providers: [] },
 	diskSafety: { ...DEFAULT_DISK_SAFETY },
 	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
@@ -18,7 +23,9 @@ export const DEFAULTS: NarraForkSettings = {
 	// (see the `database` field comment in types.ts).
 	database: { backend: "sqlite" },
 	paths: {
-		defaultProjectDir: resolve(homedir(), "projects"),
+		// Unset until the user picks an existing directory (setup wizard / settings).
+		// Never guessed: `~/projects` does not exist on most machines.
+		defaultProjectDir: "",
 		// Empty by default, and that is the safe zero value: with no entry here the
 		// in-browser editor can only write inside a narrator's own worktree.
 		extraWritableDirs: [] as string[],
@@ -33,6 +40,15 @@ export const DEFAULTS: NarraForkSettings = {
 		packMaxUncompressedMb: 500,
 		packActivateRequiresPermission: true,
 	},
+	outline: {
+		enabled: false,
+	},
+	requestEvidence: {
+		ringEnabled: true,
+		ringRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
+		ringResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
+		autoPin: "off",
+	},
 	plugins: {
 		enabled: true,
 	},
@@ -43,7 +59,9 @@ export const DEFAULTS: NarraForkSettings = {
 		// instead of the real cause ("no default model configured"). The setup
 		// wizard makes selecting one a hard gate before anything can run.
 		defaultModel: "",
-		defaultPermissionMode: "acceptEdits",
+		// 全部允许：新建叙述者默认不逐条审批工具调用，改为依赖危险反思档位
+		// （dangerReflectionLevel = standard）在真正高风险操作上暂停。
+		defaultPermissionMode: "bypassPermissions",
 		notificationPolicy: { allowSend: false },
 		defaultNarratorVisibility: "auto",
 		defaultNarratorWriteAudience: "auto",
@@ -76,14 +94,6 @@ export const DEFAULTS: NarraForkSettings = {
 		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
-		requestDumpEnabled: false,
-		requestDumpErrorsOnly: false,
-		// 32MB. Enabling dumping is an explicit, warned, high-risk opt-in made to capture
-		// a specific failure, so the ceiling must be high enough that a real request —
-		// full conversation history, replayed tool output, inline images — survives intact.
-		// The old 1MB default silently truncated almost every request worth dumping.
-		requestDumpMaxSize: 32 * 1024 * 1024,
-		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		planModeAllowInlinePlan: true,
@@ -115,21 +125,13 @@ export const DEFAULTS: NarraForkSettings = {
 		queueDuringCompaction: true,
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
-	chapters: {
-		maxActiveWorktrees: 10,
-		maxActiveContainers: 5,
-		worktreeSizeWarningMb: 500,
-		autoSaveOnDormant: true,
-		dormantAfterMinutes: 0,
+	workspace: {
 		treeSnapshotsEnabled: true,
 	},
-	containers: {
-		portRangeStart: 10000,
-		portRangeEnd: 20000,
-		proxy: {
-			enabled: false,
-			port: 7780,
-		},
+	narratorBlocks: {
+		write: true,
+		read: true,
+		compactJson: false,
 	},
 	editor: {
 		type: "vscode",
@@ -189,13 +191,7 @@ export const DEFAULTS: NarraForkSettings = {
 		defaultTimeoutMs: 60_000,
 		maxOutputChars: 24_000,
 	},
-	update: {
-		serverUrl: "https://narrafork-update.b.domexie.cn",
-		product: "narrafork",
-		channel: "stable",
-		checkIntervalMinutes: 60,
-		autoDownload: false,
-	},
+	update: { ...DEFAULT_UPDATE_SETTINGS },
 	vnet: {
 		enabled: true,
 		allowAnonymousRelay: false,
@@ -231,6 +227,30 @@ export const DEFAULTS: NarraForkSettings = {
  * Kept alongside DEFAULTS so changes stay in sync.
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
+	"speech.enabled": { desc: "启用独立语音识别与合成 API。", type: "boolean" },
+	"speech.providers": { desc: "独立语音提供商及 ASR/TTS 协议配置。", type: "array" },
+	customApiProviders: {
+		desc: "通过自定义供应商面板维护的结构化 API 供应商配置。密钥由对应面板管理，不作为普通文本设置展示。",
+		type: "array",
+	},
+	openaiProviders: {
+		desc: "通过 OpenAI 兼容供应商面板维护的结构化配置，包括模型、协议和连接设置。",
+		type: "array",
+	},
+	anthropicProviders: {
+		desc: "通过 Anthropic 兼容供应商面板维护的结构化配置。",
+		type: "array",
+	},
+	geminiProviders: {
+		desc: "通过 Gemini 供应商面板维护的结构化配置。",
+		type: "array",
+	},
+	"tokendance.apiKey": {
+		desc: "TokenDance 后端专用凭证，仅通过平台授权写入，不在设置 API 返回。",
+		type: "string",
+	},
+	"tokendance.disabled": { desc: "暂停 TokenDance 模型使用但保留连接。", type: "boolean" },
+	"tokendance.generation": { desc: "TokenDance 连接版本，用于取消旧代请求。", type: "number" },
 	"diskSafety.mode": {
 		desc: "磁盘安全策略：enforce 拒绝危险写入；warn 仅提示；off 关闭。管理员可临时覆盖，普通工具权限不会绕过。",
 		type: "string",
@@ -270,7 +290,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 	},
 	"server.host": {
-		desc: '服务器监听地址。"localhost" 仅本机访问，"0.0.0.0" 允许局域网访问。重启后生效。',
+		desc: '服务器监听地址。"localhost" 仅本机访问，"auto-lan" 每次启动自动取第一个局域网 IP，失败回退本机；"0.0.0.0" 监听所有 IPv4 网卡。重启后生效。',
 		type: "string",
 	},
 	"server.openBrowser": {
@@ -284,6 +304,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"server.tls.enabled": {
 		desc: "是否启用 HTTPS。启用后需要配置 certFile 和 keyFile。",
+		type: "boolean",
+	},
+	"server.tls.autoReissue": {
+		desc: "启动时，本机 IP 变化则自动重新签发内置证书，保留原 CA。默认开启。",
 		type: "boolean",
 	},
 	"server.tls.certFile": {
@@ -331,7 +355,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── paths ───────────────────────────────────────────────────────────
 	"paths.defaultProjectDir": {
-		desc: "默认项目目录。新建项目时的默认父目录。",
+		desc: "默认项目目录：未指定目录时新会话的工作目录，也是新建项目时的默认父目录。必须是已存在的目录；为空表示未设置，此时需要用户手动选择目录。",
 		type: "string",
 	},
 	"paths.extraWritableDirs": {
@@ -373,7 +397,30 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 
+	// ── outline ─────────────────────────────────────────────────────────
+	"outline.enabled": {
+		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示；现有的 spec:// 和知识库不受影响。",
+		type: "boolean",
+		valid: "true / false，默认 false",
+	},
+
 	// ── plugins ─────────────────────────────────────────────────────────
+	"requestEvidence.ringEnabled": {
+		desc: "循环录制近期模型/API 请求与响应（请求证据），默认开启。使用 /save_dump 或报错卡片、使用历史固定证据，不打断会话。设置立即生效。",
+		type: "boolean",
+	},
+	"requestEvidence.ringRequestBytes": {
+		desc: "循环窗口请求侧容量（字节），默认 16MiB，范围 0 或 1KiB..512MiB。0 关闭该侧循环录制，不影响 autoPin=all。",
+		type: "number",
+	},
+	"requestEvidence.ringResponseBytes": {
+		desc: "循环窗口响应侧容量（字节），默认 128MiB，范围 0 或 1KiB..2GiB。0 关闭该侧循环录制，不影响 autoPin=all。",
+		type: "number",
+	},
+	"requestEvidence.autoPin": {
+		desc: '自动固定策略："off" 只在手动保存时固定；"errors" 请求报错结束时自动固定；"all" 每个请求从开始就固定（不受循环容量限制，可能占用大量磁盘）。单份固定保存有 512MiB 安全上限。',
+		type: '"off" | "errors" | "all"',
+	},
 	"plugins.enabled": {
 		desc: "是否启用插件子系统（默认启用）。环境变量 NF_PLUGINS_ENABLED / NARRAFORK_PLUGINS_ENABLED 若设置则优先，可作为应急关闭开关。",
 		type: "boolean",
@@ -565,22 +612,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "启用后 Bash 工具通过 login shell 加载最新环境变量，而非继承服务器进程环境。适用于服务器启动后修改了 shell 配置的场景。",
 		type: "boolean",
 	},
-	"agent.requestDumpEnabled": {
-		desc: "启用后为每次模型/API 请求持久化原始请求与响应 dump，可在管理员请求历史中查看完整原始数据。保存后对当前会话的后续请求立即生效，无需重启叙述者。",
-		type: "boolean",
-	},
-	"agent.requestDumpErrorsOnly": {
-		desc: "启用后仅为报错的模型/API 请求持久化原始请求与响应 dump，成功请求不会保存 dump。保存后同样对后续请求立即生效。",
-		type: "boolean",
-	},
-	"agent.requestDumpMaxSize": {
-		desc: "单条 raw dump 落库的最大字节数。默认 32MB (33554432)。设为 -1 表示不限制。超出时优先丢弃 SSE 事件、再按剩余预算截断请求/响应体，并标记 bodyTextTruncated，不会整包丢弃请求体。",
-		type: "number",
-	},
-	"agent.modelContextWindows": {
-		desc: '按模型覆盖上下文窗口大小（tokens）。键为完整模型值 "provider:modelId"，值为 token 数。优先级最高。',
-		type: "Record<string, number>",
-	},
 	"agent.translateReasoning": {
 		desc: "启用后，每个 reasoning/thinking 块完成后自动通过 translationModel 翻译成用户语言（非英文时）。",
 		type: "boolean",
@@ -632,7 +663,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "always / blockStop / protectedOnly / off，默认 protectedOnly",
 	},
 	"agent.maxTransientRetries": {
-		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态提供商（Responses/Codex）会在外层重建历史后重试。",
+		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态供应商（Responses/Codex）会在外层重建历史后重试。",
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
 	},
@@ -753,53 +784,28 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 true",
 	},
 
-	// ── chapters ────────────────────────────────────────────────────────
-	"chapters.maxActiveWorktrees": {
-		desc: "最大活跃 worktree 数量。超出时自动将最不活跃的章节休眠。≤0 禁用自动休眠。",
-		type: "number",
-		valid: "≥1, 默认 10",
-	},
-	"chapters.maxActiveContainers": {
-		desc: "最大活跃容器数量。超出时新容器创建会被拒绝。",
-		type: "number",
-		valid: "≥0, 默认 5",
-	},
-	"chapters.worktreeSizeWarningMb": {
-		desc: "Worktree 大小警告阈值(MB)。超出时向用户发出警告。0 表示禁用警告。",
-		type: "number",
-		valid: "≥0, 默认 500",
-	},
-	"chapters.autoSaveOnDormant": {
-		desc: "章节休眠时是否自动 git commit 保存未提交的更改。",
-		type: "boolean",
-	},
-	"chapters.dormantAfterMinutes": {
-		desc: "章节不活跃多少分钟后自动休眠。0 表示禁用自动休眠（仅在超出 maxActiveWorktrees 时休眠）。",
-		type: "number",
-		valid: "≥0, 默认 0 (禁用)",
-	},
-	"chapters.treeSnapshotsEnabled": {
-		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。结构性快照（fork/merge/restore）不受影响。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
+	// ── workspace ───────────────────────────────────────────────────────
+	"workspace.treeSnapshotsEnabled": {
+		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},
 
-	// ── containers ──────────────────────────────────────────────────────
-	"containers.portRangeStart": {
-		desc: "容器端口分配范围起始值。",
-		type: "number",
-	},
-	"containers.portRangeEnd": {
-		desc: "容器端口分配范围结束值。",
-		type: "number",
-	},
-	"containers.proxy.enabled": {
-		desc: "是否启用容器代理服务。代理将 Host 头匹配的请求路由到对应容器。",
+	// ── narratorBlocks ──────────────────────────────────────────────────
+	"narratorBlocks.write": {
+		desc: "新消息是否以原生块存储（narrator_blocks 表），同时写入兼容的 content_json。关闭后新消息回到只写 content_json 的旧格式；已是块格式的消息仍按块维护。默认 true。",
 		type: "boolean",
+		valid: "true / false，默认 true",
 	},
-	"containers.proxy.port": {
-		desc: "容器代理服务监听端口。",
-		type: "number",
+	"narratorBlocks.read": {
+		desc: "读取方（模型历史、消息页、External API、导出）是否从块表读取块格式消息的正文。关闭后全部回到读取 content_json，与块表并存期间两者内容一致。默认 true。",
+		type: "boolean",
+		valid: "true / false，默认 true",
+	},
+	"narratorBlocks.compactJson": {
+		desc: "新写入的块格式消息是否只把正文存在块表里（content_json 写 []，body_rows_only 置 1），省去重复的兼容投影。只在 SQLite 且 write、read 都开启时生效。关闭后新消息恢复写完整的 content_json；已是只存块的消息保持不变，需要回退时先在存储页运行「恢复副本」。默认 false。",
+		type: "boolean",
+		valid: "true / false，默认 false",
 	},
 
 	// ── editor ──────────────────────────────────────────────────────────
@@ -881,7 +887,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string[]",
 	},
 	"routines.toolModes": {
-		desc: '工具类例程的三段式模式表，键为例程 ID（如 "terminal"、"browser"）。"manual" 仅可通过 /load 临时加载；"auto" 预留给未来的 toolsearch 机制，当前行为等同 manual；"resident" 每个新会话默认加载。未列出的例程按 enabledRoutines/disabledRoutines 推导。',
+		desc: '工具类例程的三段式模式表，键为例程 ID（如 "terminal"、"browser"）。"manual" 仅可通过 /load 临时加载；"auto" 通过 ToolSearch 按需发现并加载，不预加载；"resident" 每个新会话默认加载。未列出的例程按 enabledRoutines/disabledRoutines 推导。',
 		type: "Record<string, string>",
 		valid: '"manual" | "auto" | "resident"',
 	},
@@ -961,8 +967,28 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── update ──────────────────────────────────────────────────────────
+	"update.proxy.mode": {
+		desc: "软件更新、版本说明及 rg/zstd/远程执行器清单与二进制请求的代理策略。缺省或 default 继承全局 proxy；不改变更新来源或 TLS 校验。",
+		type: "string",
+		valid: '"default" | "direct" | "system" | "custom"',
+	},
+	"update.proxy.url": {
+		desc: "更新代理地址，仅 custom 模式必填。支持 HTTP/HTTPS，host:port 自动补 http://；不支持 SOCKS。",
+		type: "string",
+		valid: "有效 HTTP/HTTPS URL，最长 500 字符",
+	},
+	"update.source": {
+		desc: '更新来源。默认 "github" 使用 GitHub Release；"update-server" 使用自定义更新服务器。',
+		type: "string",
+		valid: '"github" | "update-server"',
+	},
+	"update.githubRepository": {
+		desc: "GitHub 更新仓库，格式为 owner/repo，默认使用构建仓库。切换来源时保留。",
+		type: "string",
+		valid: "owner 最长 39 字符，repo 最长 100 字符；不接受 URL 或 .. 路径",
+	},
 	"update.serverUrl": {
-		desc: "更新服务器 URL。",
+		desc: "自定义更新服务器 URL，仅 update-server 来源使用；切换来源时保留。",
 		type: "string",
 	},
 	"update.product": {
@@ -994,8 +1020,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 };
 
-// Development-time completeness check: warn if SETTING_DOCS misses any DEFAULTS leaf
-if (process.env.NODE_ENV !== "production") {
+// Generated authentication material is intentionally not an editable/documented setting.
+// Keep this exception exact: new authentication fields must still receive documentation.
+const INTERNAL_SETTING_DOC_PATHS = new Set(["auth.jwtSecret"]);
+
+export function getMissingSettingDocPaths(
+	defaults: Record<string, unknown> = DEFAULTS as unknown as Record<string, unknown>,
+	docs: Record<string, FieldDoc> = SETTING_DOCS,
+): string[] {
 	function collectLeafPaths(obj: Record<string, unknown>, prefix = ""): string[] {
 		const paths: string[] = [];
 		for (const key of Object.keys(obj)) {
@@ -1014,9 +1046,14 @@ if (process.env.NODE_ENV !== "production") {
 		}
 		return paths;
 	}
-	const defaultLeaves = collectLeafPaths(DEFAULTS as unknown as Record<string, unknown>);
-	const docKeys = new Set(Object.keys(SETTING_DOCS));
-	const missing = defaultLeaves.filter((p) => !docKeys.has(p));
+	return collectLeafPaths(defaults).filter(
+		(path) => !INTERNAL_SETTING_DOC_PATHS.has(path) && !Object.hasOwn(docs, path),
+	);
+}
+
+// Report genuine documentation gaps without warning about generated secret material.
+if (process.env.NODE_ENV !== "production") {
+	const missing = getMissingSettingDocPaths();
 	if (missing.length > 0) {
 		console.warn(`[settings] SETTING_DOCS missing entries for: ${missing.join(", ")}`);
 	}

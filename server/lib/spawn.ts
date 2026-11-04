@@ -25,6 +25,7 @@ export interface SafeSpawnResult {
 	exitCode: number;
 	stdoutTruncated?: boolean;
 	stderrTruncated?: boolean;
+	terminationReason?: "timeout" | "abort" | "watchdog" | "output-limit" | "consumer";
 }
 
 /** Watchdog check interval in milliseconds. */
@@ -82,6 +83,12 @@ export interface SafeSpawnOptions {
 	 * Set to 0 to keep no output, or Infinity to explicitly allow unbounded capture.
 	 */
 	maxOutputBytes?: number;
+	/** Opt-in raw stdout streaming: retain no stdout and stop at the byte budget.
+	 * Return false to finish intentionally (distinct from timeout/cancellation).
+	 */
+	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined };
+	/** Independent stderr capture budget; defaults to maxOutputBytes. */
+	maxStderrBytes?: number;
 	/**
 	 * Best-effort cleanup of child processes spawned by the command. Useful for
 	 * startup hooks that may launch long-running dev servers via a shell.
@@ -104,15 +111,25 @@ function isPidAlive(pid: number): boolean {
 	}
 }
 
-function getChildPids(pid: number): number[] {
+/*
+ * Killing a process tree spawns helpers (`pgrep`, `taskkill`), and it happens on cancellation
+ * paths: a client switching narrators aborts that narrator's Git requests, each holding a few Git
+ * processes. These helpers must never be `spawnSync` — a synchronous `taskkill` held the event
+ * loop for about half a second per process, so one switch stalled every request and socket for
+ * seconds. They never reject.
+ */
+
+async function getChildPids(pid: number): Promise<number[]> {
 	if (process.platform === "win32") return [];
 	try {
-		const result = Bun.spawnSync(["pgrep", "-P", String(pid)], {
+		const pgrep = Bun.spawn(["pgrep", "-P", String(pid)], {
+			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "ignore",
+			windowsHide: true,
 		});
-		if (result.exitCode !== 0) return [];
-		const text = new TextDecoder().decode(result.stdout);
+		const [text, exitCode] = await Promise.all([new Response(pgrep.stdout).text(), pgrep.exited]);
+		if (exitCode !== 0) return [];
 		return text
 			.split(/\s+/)
 			.map((part) => Number.parseInt(part, 10))
@@ -122,14 +139,30 @@ function getChildPids(pid: number): number[] {
 	}
 }
 
-function killUnixProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
-	for (const childPid of getChildPids(pid)) {
-		killUnixProcessTree(childPid, signal);
+/** Descendants before their parent: once a parent is gone, `pgrep -P` cannot find its children. */
+async function killUnixProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+	for (const childPid of await getChildPids(pid)) {
+		await killUnixProcessTree(childPid, signal);
 	}
 	try {
 		process.kill(pid, signal);
 	} catch {
 		// already gone or not permitted; best effort only
+	}
+}
+
+/** `taskkill /T /F` on `pid`; resolves when taskkill has exited, within 5s. */
+export async function killWindowsProcessTree(pid: number): Promise<void> {
+	try {
+		clearInheritableHandlesBeforeSpawn();
+		const taskkill = Bun.spawn(["taskkill", "/T", "/F", "/PID", String(pid)], {
+			stdio: ["ignore", "ignore", "ignore"],
+			timeout: 5000,
+			windowsHide: true,
+		});
+		await taskkill.exited;
+	} catch {
+		// best effort — the process may already be gone
 	}
 }
 
@@ -151,6 +184,8 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			env: opts.env,
 			stdout: "pipe",
 			stderr: "pipe",
+			// Windows 上不隐藏会让每个子进程弹出控制台窗口（GUI 模式运行的服务尤其明显）。
+			windowsHide: true,
 		});
 	} catch (err) {
 		// ENOENT means the executable was not found in PATH (e.g. git not installed)
@@ -165,31 +200,31 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 	}
 
 	let killed = false;
+	let terminationReason: SafeSpawnResult["terminationReason"];
 	let hardTimer: ReturnType<typeof setTimeout> | undefined;
 	let watchdogTimer: ReturnType<typeof setInterval> | undefined;
+	/** The tree kill in flight; safeSpawn settles only after it, as it did when it was synchronous. */
+	let treeKill: Promise<void> | undefined;
 
-	const kill = () => {
-		if (killed) return;
-		killed = true;
-		if (opts.killProcessTree && process.platform !== "win32" && proc.pid) {
-			killUnixProcessTree(proc.pid);
-		}
+	const killRoot = () => {
 		try {
 			proc.kill();
 		} catch {
 			/* already gone */
 		}
+	};
+	const kill = (reason: SafeSpawnResult["terminationReason"]) => {
+		if (killed) return;
+		killed = true;
+		terminationReason = reason;
+		if (opts.killProcessTree && process.platform !== "win32" && proc.pid) {
+			treeKill = killUnixProcessTree(proc.pid).then(killRoot);
+			return;
+		}
+		killRoot();
 		// Windows: proc.kill() 只终止主进程，不会杀子进程树。
 		// taskkill /T /F 确保整个进程树被清理（如 sh.exe → git.exe 链）。
-		if (process.platform === "win32" && proc.pid) {
-			try {
-				Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
-					stdio: ["ignore", "ignore", "ignore"],
-				});
-			} catch {
-				/* best effort */
-			}
-		}
+		if (process.platform === "win32" && proc.pid) treeKill = killWindowsProcessTree(proc.pid);
 	};
 
 	// --- Hard timeout (unconditional kill) ---
@@ -199,15 +234,15 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 				cmd: opts.cmd.join(" "),
 				timeout: opts.timeout,
 			});
-			kill();
+			kill("timeout");
 		}, opts.timeout);
 	}
 
 	// --- External abort ---
-	const abortHandler = () => kill();
+	const abortHandler = () => kill("abort");
 	if (opts.signal) {
 		if (opts.signal.aborted) {
-			kill();
+			kill("abort");
 		} else {
 			opts.signal.addEventListener("abort", abortHandler, { once: true });
 		}
@@ -248,7 +283,7 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 					pidAlive,
 					tick,
 				});
-				kill();
+				kill("watchdog");
 				return;
 			}
 
@@ -267,8 +302,22 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 		// 而 await proc.exited 又在等子进程退出 → 死锁。
 		const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 		const [stdout, stderr] = await Promise.all([
-			drainStream(proc.stdout as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
-			drainStream(proc.stderr as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
+			opts.stdoutStream
+				? consumeStdout(
+						proc.stdout as ReadableStream<Uint8Array>,
+						opts.stdoutStream,
+						kill,
+						(bytes) => {
+							currentOutputLength += bytes;
+						},
+					)
+				: drainStream(proc.stdout as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
+			drainStream(
+				proc.stderr as ReadableStream<Uint8Array>,
+				trackOutput,
+				opts.maxStderrBytes ?? maxOutputBytes,
+				opts.maxStderrBytes == null,
+			),
 		]);
 		const exitCode = await proc.exited;
 
@@ -278,19 +327,58 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			exitCode,
 			stdoutTruncated: stdout.truncated,
 			stderrTruncated: stderr.truncated,
+			...(opts.stdoutStream ? { terminationReason } : {}),
 		};
+	} catch (error) {
+		if (opts.stdoutStream) {
+			kill("consumer");
+			await proc.exited;
+		}
+		throw error;
 	} finally {
 		if (hardTimer != null) clearTimeout(hardTimer);
 		if (watchdogTimer != null) clearInterval(watchdogTimer);
 		opts.signal?.removeEventListener("abort", abortHandler);
+		await treeKill;
 	}
 }
 
-/**
- * Default watchdog policy:
- *   - PID dead + no recent output → kill (process leaked / zombie)
- *   - Otherwise → renew
- */
+/** Consume raw stdout without retaining it; intentional stops kill and close the pipe. */
+async function consumeStdout(
+	stream: ReadableStream<Uint8Array>,
+	options: NonNullable<SafeSpawnOptions["stdoutStream"]>,
+	stop: (reason: SafeSpawnResult["terminationReason"]) => void,
+	track: (bytes: number) => void,
+): Promise<{ text: string; truncated: boolean }> {
+	const reader = stream.getReader();
+	let bytes = 0;
+	let truncated = false;
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			track(value.byteLength);
+			const chunk = value.subarray(0, Math.max(0, options.maxBytes - bytes));
+			bytes += chunk.byteLength;
+			if (chunk.byteLength && options.onChunk(chunk) === false) {
+				stop("consumer");
+				truncated = true;
+				break;
+			}
+			if (bytes >= options.maxBytes) {
+				stop("output-limit");
+				truncated = true;
+				break;
+			}
+		}
+		if (truncated) await reader.cancel();
+	} finally {
+		reader.releaseLock();
+	}
+	return { text: "", truncated };
+}
+
+/** Kill a dead process with no output; otherwise renew the watchdog. */
 function defaultWatchdog(info: WatchdogInfo): "kill" | "renew" {
 	if (!info.pidAlive && !info.hadOutput) return "kill";
 	return "renew";
@@ -305,6 +393,7 @@ async function drainStream(
 	stream: ReadableStream<Uint8Array>,
 	onChunk: (text: string) => void,
 	maxBytes: number,
+	includeTruncationMarker = true,
 ): Promise<{ text: string; truncated: boolean }> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
@@ -332,7 +421,8 @@ async function drainStream(
 			}
 			if (cutLen > 0) chunks.push(text.slice(0, cutLen));
 		}
-		chunks.push("\n\n[safeSpawn output truncated — exceeded capture limit]");
+		if (includeTruncationMarker)
+			chunks.push("\n\n[safeSpawn output truncated — exceeded capture limit]");
 		truncated = true;
 	};
 	try {

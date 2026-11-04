@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { setUploadsDirForTests } from "../../uploads";
 import { AnthropicProvider } from "../anthropic-provider";
 import type { DbMessage } from "../provider";
@@ -108,7 +109,36 @@ describe("anthropic history image replay", () => {
 		expect(images[0].source?.media_type).toBe("image/png");
 	});
 
-	test("keeps the turn's text alongside the image", async () => {
+	test("interleaves images at their placeholders, even when one is missing", async () => {
+		registerTestImage("narr-1", "img-b");
+
+		const { history } = await provider().buildHistory(
+			withTail([
+				userMessage({
+					id: "past",
+					contentJson: [
+						{ type: "image", imageId: "img-missing", mediaType: "image/png" },
+						{ type: "image", imageId: "img-b", mediaType: "image/png" },
+						{ type: "text", text: "看[image #1: a.png]和[image #2: b.png]有何不同" },
+					],
+				}),
+				{ ...userMessage({ id: "reply", role: "assistant", contentText: "ok" }) },
+			]),
+			"anthro:claude-sonnet-4.5",
+			"narr-1",
+		);
+
+		const turn = (history as Array<{ content: unknown }>).find((message) =>
+			Array.isArray(message.content),
+		);
+		expect(
+			(turn?.content as Array<{ type: string; text?: string }>).map((part) =>
+				part.type === "text" ? part.text : part.type,
+			),
+		).toEqual(["看[image #1: a.png]和[image #2: b.png]", "image", "有何不同"]);
+	});
+
+	test("keeps the turn's text alongside the image, in the live turn's order", async () => {
 		registerTestImage("narr-1", "img-a");
 
 		const { history } = await provider().buildHistory(
@@ -128,8 +158,9 @@ describe("anthropic history image replay", () => {
 
 		const first = history[0] as { role: string; content: Array<{ type: string; text?: string }> };
 		expect(first.role).toBe("user");
-		expect(first.content[0]).toEqual({ type: "text", text: "look at this" });
-		expect(first.content[1].type).toBe("image");
+		// The live turn sent unplaced images ahead of the text; replay must not reorder it.
+		expect(first.content[0].type).toBe("image");
+		expect(first.content[1]).toEqual({ type: "text", text: "look at this" });
 	});
 
 	test("resolves against the uploading narrator when it differs from the owner", async () => {
@@ -285,5 +316,82 @@ describe("anthropic history image replay", () => {
 		);
 
 		expect(imagePartsOf(history)).toHaveLength(2);
+	});
+});
+
+describe("tool result image replay", () => {
+	test("rebuilds the images a tool returned inside its result", async () => {
+		registerTestImage("n1", "shot1");
+		const assistant: DbMessage = {
+			id: "assistant-1",
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} }],
+			contentText: null,
+			parentToolUseId: null,
+			messageUuid: null,
+			toolCalls: [
+				{
+					toolUseId: "toolu_shot",
+					toolName: "Screenshot",
+					inputJson: {},
+					outputJson: encodeToolOutput("captured", {
+						images: [{ imageId: "shot1", mediaType: "image/png", uploadNarratorId: "n1" }],
+					}),
+					status: "success",
+				},
+			],
+		};
+		const { history } = await provider().buildHistory(
+			[userMessage({ contentText: "take one" }), assistant],
+			"anthro:claude-sonnet-4.5",
+			"n1",
+		);
+		expect(history.at(-1)).toEqual({
+			role: "user",
+			content: [
+				{
+					type: "tool_result",
+					tool_use_id: "toolu_shot",
+					content: [
+						{
+							type: "image",
+							source: { type: "base64", media_type: "image/png", data: SAMPLE_PNG_BASE64 },
+						},
+						{ type: "text", text: "captured" },
+					],
+				},
+			],
+		});
+	});
+
+	test("a missing tool image leaves the result text", async () => {
+		const assistant: DbMessage = {
+			id: "assistant-1",
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} }],
+			contentText: null,
+			parentToolUseId: null,
+			messageUuid: null,
+			toolCalls: [
+				{
+					toolUseId: "toolu_shot",
+					toolName: "Screenshot",
+					inputJson: {},
+					outputJson: encodeToolOutput("captured", {
+						images: [{ imageId: "gone", mediaType: "image/png", uploadNarratorId: "n1" }],
+					}),
+					status: "success",
+				},
+			],
+		};
+		const { history } = await provider().buildHistory(
+			[userMessage({ contentText: "take one" }), assistant],
+			"anthro:claude-sonnet-4.5",
+			"n1",
+		);
+		expect(history.at(-1)).toEqual({
+			role: "user",
+			content: [{ type: "tool_result", tool_use_id: "toolu_shot", content: "captured" }],
+		});
 	});
 });

@@ -11,6 +11,8 @@ import type { SubagentActivitySummary } from "../../../lib/api";
 import type { ExecutionTargetIdentity } from "../../../lib/api/types";
 
 export interface ToolCallData {
+	/** Message owner, independent from the panel receiving file navigation. */
+	fileNarratorId?: string;
 	id?: string;
 	toolName: string;
 	toolUseId?: string;
@@ -71,10 +73,17 @@ export interface ToolCallData {
 	 * A wait in flight has no output, so `metadata.subagentId` and the
 	 * `<subagent_id>` tag do not exist yet — this is the only source that lets the
 	 * card open the child's session before the wait returns. Kept out of `_metadata`
-	 * on purpose (it would render an extra `subagent:` row and change measured
-	 * height); see `AWAIT_AGENT_RESOLVED_FIELD` on the server.
+	 * for provenance (it is server-derived, not tool-reported); the adapter bridges
+	 * it into the classifier, where it feeds the card's one identity row — its
+	 * mid-wait arrival intentionally grows the card by that row.
 	 */
 	_awaitAgentNarratorId?: string;
+	/**
+	 * Display title of the awaited child session, shipped alongside
+	 * `_awaitAgentNarratorId`. Cosmetic only: the card headlines it while running,
+	 * and `metadata.targetTitle` takes over once the tool returns.
+	 */
+	_awaitAgentTitle?: string;
 	/** Accepted/queued delivery receipts, independent of the eventual tool result. */
 	_sendDeliveryTargets?: import("@shared/communication-tool").SendDeliveryTarget[];
 	_sendDeliveryTargetCount?: number;

@@ -8,6 +8,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { modelInputContainsText } from "../lib/agent/question-model-input";
 import type { ToolCallBinding } from "../lib/agent/types";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -484,10 +485,23 @@ async function persistConsumptionPostgres(
 	return true;
 }
 // to exist by the time a request starts. Weak keys cannot retain completed conversations.
-const historyConsumptions = new WeakMap<
+const historyConsumptions = new WeakMap<unknown[], AgentMessageConsumption[]>();
+
+// Provenance outlives receipt consumption, but never the builder's history identity.
+const lastMailboxModelInputs = new WeakMap<
 	unknown[],
-	Array<AgentMessageConsumption & { currentInputText?: string }>
+	{ text: string; length: number; tail: unknown }
 >();
+
+/** Whether this exact built input ends in a structured agent mailbox source row. */
+export function isLastModelInputMailbox(history: unknown[], currentContent: string): boolean {
+	const input = lastMailboxModelInputs.get(history);
+	if (!input || history.length !== input.length || history.at(-1) !== input.tail) return false;
+	const current = currentContent.trim();
+	// Some adapters retain a sys-only mailbox in history instead of extracting it
+	// as current content. Confirm its actual bytes are present in that exact packet.
+	return current === input.text || (!current && modelInputContainsText(history, input.text));
+}
 
 /** Register candidates only. Loading/compacting/preparing history is NOT consumption. */
 export async function trackAgentMessageHistory(
@@ -501,20 +515,33 @@ export async function trackAgentMessageHistory(
 		injectionConsumedAt?: Date | string | null;
 		contentJson: unknown;
 	}[],
-	trailingUserText?: string,
 ): Promise<void> {
-	const deliveries: Array<AgentMessageConsumption & { currentInputText?: string }> = [];
+	const deliveries: AgentMessageConsumption[] = [];
 	const modelMessages = messages.filter(
 		(message) =>
 			!message.parentToolUseId &&
 			(message.role === "user" || message.role === "assistant" || message.role === "sys"),
 	);
-	// Builders pop the final user row (after any extracted sys tail). It only counts
-	// if this request really carries that row as current input, not a different prompt.
-	let lastNonSystem = modelMessages.length - 1;
-	while (trailingUserText && modelMessages[lastNonSystem]?.role === "sys") lastNonSystem--;
-	const poppedUser =
-		modelMessages[lastNonSystem]?.role === "user" ? modelMessages[lastNonSystem] : undefined;
+	// The built history carries every row, the trailing input included, so a row in
+	// `messages` is in the model input as long as the caller sends this history.
+	lastMailboxModelInputs.delete(history);
+	const lastSource = modelMessages.at(-1);
+	if (
+		(lastSource?.role === "user" || lastSource?.role === "sys") &&
+		Array.isArray(lastSource.contentJson) &&
+		lastSource.contentJson.some(
+			(block) => block?.type === "system_injection" && block.body?.kind === "messages",
+		)
+	) {
+		// Unlike consumption candidates, source provenance includes already-adopted rows.
+		const expectedInput = modelTextFromContentBlocks(lastSource.contentJson).trim();
+		if (expectedInput)
+			lastMailboxModelInputs.set(history, {
+				text: expectedInput,
+				length: history.length,
+				tail: history.at(-1),
+			});
+	}
 	for (const message of modelMessages) {
 		// Shared fork refs and child subtrees must never acknowledge another recipient.
 		if (message.narratorId !== narratorId || message.injectionConsumedAt) continue;
@@ -525,8 +552,6 @@ export async function trackAgentMessageHistory(
 		if (!injectionBlocks.length) continue;
 		const modelText = modelTextFromContentBlocks(message.contentJson).trim();
 		if (!modelText) continue;
-		const requiresCurrentInput =
-			message === poppedUser || (message.role === "sys" && !!trailingUserText?.includes(modelText));
 		for (const block of injectionBlocks) {
 			if (!Array.isArray(block.body.items)) continue;
 			for (const item of block.body.items) {
@@ -548,7 +573,6 @@ export async function trackAgentMessageHistory(
 					Number.isSafeInteger(item.fromToolCallBinding?.attempt)
 						? { senderToolCallBinding: { ...item.fromToolCallBinding } }
 						: {}),
-					...(requiresCurrentInput ? { currentInputText: modelText } : {}),
 				});
 			}
 		}
@@ -609,8 +633,6 @@ export async function trackAgentMessageHistory(
 				if (!message || !Array.isArray(message.contentJson)) continue;
 				const text = modelTextFromContentBlocks(message.contentJson).trim();
 				if (!text) continue;
-				const requiresInput =
-					message === poppedUser || (message.role === "sys" && !!trailingUserText?.includes(text));
 				deliveries.push({
 					recipientNarratorId: narratorId,
 					recipientMessageId: row.messageId,
@@ -621,7 +643,6 @@ export async function trackAgentMessageHistory(
 					senderNarratorId: "",
 					fromToolUseId: "",
 					mailboxOnly: true,
-					...(requiresInput ? { currentInputText: text } : {}),
 				});
 			}
 		}
@@ -636,15 +657,11 @@ export async function trackAgentMessageHistory(
 }
 
 /** Called exclusively by the execution loop after adopting this history as model input. */
-export function consumeAgentMessageHistory(history: unknown[], content: string): void {
+export function consumeAgentMessageHistory(history: unknown[]): void {
 	const deliveries = historyConsumptions.get(history);
 	historyConsumptions.delete(history);
-	for (const { currentInputText, ...delivery } of deliveries ?? []) {
-		// Identity comes from the exact structured envelope, never from matching words.
-		// This only verifies that a builder-extracted row was not dropped by its caller.
-		if (currentInputText && !content.includes(currentInputText)) continue;
-		void markAgentMessageConsumed(delivery);
-	}
+	// Identity comes from the exact structured envelope, never from matching words.
+	for (const delivery of deliveries ?? []) void markAgentMessageConsumed(delivery);
 }
 
 export function consumeAgentMessageDelivery(delivery: AgentMessageDelivery): void {

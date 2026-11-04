@@ -4,12 +4,17 @@
  */
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
-import type { ModelCard } from "@shared/model-card";
+import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import type { RecordingSettings } from "@shared/request-recording";
+import type { SpeechSettings } from "@shared/speech";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
+import type { TokenDanceCatalogModel } from "@shared/tokendance";
+import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { DiskSafetySettings } from "../disk-safety-config";
 import type { ModelCatalogSettings } from "../model-catalog";
+import type { LegacyModelCard } from "../model-catalog/legacy-v1";
 import type { PermissionMode } from "../permission-modes";
 import type { UserAgentMode } from "../user-agent";
 
@@ -24,12 +29,22 @@ export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
 export type AutoContinuationMode = "always" | "blockStop" | "protectedOnly" | "off";
 
 export type CustomApiProtocol =
-	| "anthropic-official"
-	| "anthropic-compatible"
-	| "codex-native"
-	| "responses-compatible"
+	| "anthropic-messages"
+	| "openai-responses"
 	| "completions-compatible"
 	| "gemini-compatible";
+
+/**
+ * Legacy protocol values accepted from persisted settings and older clients.
+ * normalizeCustomApiProvider migrates them to the current values:
+ *   codex-native / responses-compatible   → openai-responses
+ *   anthropic-official / anthropic-compatible → anthropic-messages
+ */
+export type LegacyCustomApiProtocol =
+	| "codex-native"
+	| "responses-compatible"
+	| "anthropic-official"
+	| "anthropic-compatible";
 
 export interface CustomApiProviderConfig {
 	/** Unique short ID shared across protocol switches. */
@@ -265,6 +280,10 @@ export interface GeminiProviderConfig {
 	 * Must be unique across all providers.
 	 */
 	prefix: string;
+	/** Outbound client fingerprint, including operator-supplied header overrides. */
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
 	/** Google Generative Language API key (sent as x-goog-api-key). */
 	apiKey: string;
 	/** API base URL, e.g. "https://generativelanguage.googleapis.com/v1beta". */
@@ -368,7 +387,9 @@ export interface McpServerConfig {
 	url?: string;
 	/** sse/streamable-http: custom request headers. */
 	headers?: Record<string, string>;
-	/** Whether this server is enabled. */
+	/** Authoritative loading policy; absent only on legacy input. */
+	mode?: McpLoadingMode;
+	/** Compatibility projection of mode !== disabled. */
 	enabled: boolean;
 	/** Default permission behavior for all tools from this server. When unset, follows the narrator's permission mode. */
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
@@ -378,6 +399,8 @@ export interface McpServerConfig {
 
 export interface TlsConfig {
 	enabled: boolean;
+	/** Reissue built-in certificates on startup when SANs change. Defaults to true. */
+	autoReissue?: boolean;
 	/** Path to PEM-formatted TLS certificate file. */
 	certFile: string;
 	/** Path to PEM-formatted TLS private key file. */
@@ -483,7 +506,28 @@ export interface OidcProviderConfig {
 	enabled?: boolean;
 }
 
+/** 逐模型可选的协议；`agent.modelProtocols` 与 `agent.modelProtocolOverrides` 的值域。 */
+export type ModelProtocol =
+	| "anthropic-messages"
+	| "openai-responses"
+	| "completions-compatible"
+	| "gemini-compatible";
+
+export interface TokenDanceSettings {
+	apiKey: string;
+	disabled: boolean;
+	generation: number;
+	/** Bounded last successful catalog; available after service restart. */
+	models?: TokenDanceCatalogModel[];
+	/** Initial fixed model collection was applied; manual visibility choices now win. */
+	modelCollectionInitialized?: boolean;
+}
+
 export interface NarraForkSettings {
+	/** Independent ASR/TTS providers; absent legacy configurations remain disabled. */
+	speech?: SpeechSettings;
+	/** Backend-only singleton credentials; never return this object to clients. */
+	tokendance?: TokenDanceSettings;
 	/** Tool-triggered local filesystem safety; absent older settings use safe defaults. */
 	diskSafety?: DiskSafetySettings;
 	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */
@@ -511,6 +555,7 @@ export interface NarraForkSettings {
 	};
 	server: {
 		port: number;
+		/** "auto-lan" resolves the first LAN IP on each start, with localhost fallback. */
 		host: string;
 		/** Browser launch behaviour on server start: "off" | "browser" | "app" */
 		openBrowser: "off" | "browser" | "app";
@@ -593,7 +638,20 @@ export interface NarraForkSettings {
 		/** Whether PackActivate requires explicit user permission (it changes the narrator's dir access). */
 		packActivateRequiresPermission: boolean;
 	};
+	/** Block outlines (spaces, pages, timeline, mind map). */
+	outline: {
+		/**
+		 * Master switch, off by default while the feature is built: when off the outline agent
+		 * tools are not offered, its routes answer 404 and navigation hides it. When on, root
+		 * sessions created from then on keep their tasks in the outline (`narrators.task_backend`
+		 * `outline`); existing sessions keep Dynamic Spec. Turned off again, every session reads
+		 * as a spec session until it is back on (`services/task-source`).
+		 */
+		enabled: boolean;
+	};
 	/** Plugin subsystem settings. */
+	/** Request evidence (ring recording + auto-pin); read live for each provider request. */
+	requestEvidence: RecordingSettings;
 	plugins: {
 		/**
 		 * Whether the plugin subsystem is enabled. Defaults to true. The
@@ -606,7 +664,7 @@ export interface NarraForkSettings {
 	agent: {
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;
-		/** Creation default only; auto keeps chapter/project and standalone/private behavior. */
+		/** Creation default only; auto makes project-page sessions project-visible, others private. */
 		defaultNarratorVisibility: "auto" | "private" | "public";
 		/** Creation default only; narrowed to visibility, auto uses its widest legal audience. */
 		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
@@ -621,6 +679,13 @@ export interface NarraForkSettings {
 		promptOptimizeContextMaxMessages?: number;
 		customModels: ModelOption[];
 		hiddenModels: string[];
+		/** 逐模型的协议覆盖，键为带前缀的完整模型 ID；缺省即跟随该 provider 的默认协议。 */
+		modelProtocols?: Record<string, ModelProtocol>;
+		/**
+		 * 「编辑此连接覆盖」里按模型单独保存的协议，优先级高于 `modelProtocols`。
+		 * 键同样是带前缀的完整模型 ID；删除键即恢复继承 provider 层写的协议。
+		 */
+		modelProtocolOverrides?: Record<string, ModelProtocol>;
 		maxTurns: number;
 		subagentModels: {
 			explore: string;
@@ -645,25 +710,11 @@ export interface NarraForkSettings {
 		 */
 		legacyEncoding: boolean;
 		/**
-		 * Per-model context window overrides (tokens).
-		 * Key is the full model value ("provider:modelId"), value is the context window size.
-		 * Takes highest priority in getModelContextWindow().
+		 * Pre-catalog model card deltas. Read once, when a settings file without
+		 * `modelCatalog` is first loaded, and archived in `modelCatalog.legacyArchive`;
+		 * nothing reads them afterwards.
 		 */
-		modelContextWindows: Record<string, number>;
-		/**
-		 * Model cards — per-model metadata templates (context window, max
-		 * completion tokens, reasoning tiers, official USD prices).
-		 *
-		 * Stores only the DIFFERENCE from NarraFork's builtin cards: an entry
-		 * carries its `modelKey` plus the fields the user changed, and a card
-		 * matching its builtin is not stored. So untouched fields track builtin
-		 * updates across releases while edited fields stay pinned.
-		 *
-		 * Distinct from `modelContextWindows`, which stays higher priority: a card
-		 * describes a *class* of model ids (via aliases and prefixes), whereas that
-		 * map force-overrides one exact `provider:model` value.
-		 */
-		modelCards?: ModelCard[];
+		modelCards?: LegacyModelCard[];
 		/** Versioned public metadata overlays; never stores the public catalog itself. */
 		modelCatalog?: ModelCatalogSettings;
 		/** Translate reasoning/thinking blocks via translationModel after each block completes. */
@@ -713,12 +764,6 @@ export interface NarraForkSettings {
 		reasoningEffortBlocklist?: Array<{ pattern: string; enabled?: boolean }>;
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
-		/** Persist raw request/response dumps for each provider call into usage history. */
-		requestDumpEnabled: boolean;
-		/** When request dumps are enabled, only persist raw dumps for failed provider calls. */
-		requestDumpErrorsOnly: boolean;
-		/** Maximum size (bytes) for raw dump body text. Default 1MB. Set to -1 for unlimited. */
-		requestDumpMaxSize: number;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
 		/** Maximum tool calls per model response (integer 1–128). Exceeding it aborts the narrator, not a session-wide cumulative limit. */
@@ -845,29 +890,40 @@ export interface NarraForkSettings {
 		 */
 		queueDuringCompaction?: boolean;
 	};
-	chapters: {
-		maxActiveWorktrees: number;
-		maxActiveContainers: number;
-		worktreeSizeWarningMb: number;
-		autoSaveOnDormant: boolean;
-		dormantAfterMinutes: number;
+	workspace: {
 		/**
 		 * Whether tool calls / external edits capture content-addressed whole-tree
 		 * snapshots of the workspace (the precise rollback boundary). When off, the
 		 * snapshot scan never runs on the tool path and rollback degrades to per-file
-		 * replay of recorded Write/Edit inputs. Structural captures (fork/merge/restore)
-		 * are unaffected. Default true; hot-path captures also degrade automatically
-		 * when a worktree proves too large to scan within the capture budget.
+		 * replay of recorded Write/Edit inputs. Default true; hot-path captures also
+		 * degrade automatically when a worktree proves too large to scan within the
+		 * capture budget. Stored as `chapters.treeSnapshotsEnabled` before chapters
+		 * were removed; migrated on load.
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
-	containers: {
-		portRangeStart: number;
-		portRangeEnd: number;
-		proxy: {
-			enabled: boolean;
-			port: number;
-		};
+	/** Block storage rollout switches (docs/BLOCK_STORAGE-DESIGN.md §10.6). */
+	narratorBlocks: {
+		/**
+		 * Whether new envelopes are stored as blocks (`body_format = 2`), with the
+		 * compatible `content_json` derived alongside. Off: new envelopes use the legacy
+		 * format; envelopes already stored as blocks keep being maintained as blocks.
+		 */
+		write: boolean;
+		/**
+		 * Whether readers (model history, display pages, External API, exports) read a
+		 * block-format envelope's body from its block rows. Off: everything reads
+		 * `content_json`, which holds the same content while both are written.
+		 */
+		read: boolean;
+		/**
+		 * Whether a block-format envelope written from now on keeps its body only in its
+		 * block rows: `content_json` holds `[]` and `body_rows_only` is set (P3b). Takes
+		 * effect only on SQLite with `write` and `read` on. Off: new envelopes keep the
+		 * complete `content_json` projection; envelopes already rows-only stay so until the
+		 * restore job writes their projection back.
+		 */
+		compactJson: boolean;
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";
@@ -976,11 +1032,19 @@ export interface NarraForkSettings {
 	nugProviders?: NUGProviderConfig[];
 	/** Google Gemini API providers — native generativelanguage.googleapis.com protocol. */
 	geminiProviders?: GeminiProviderConfig[];
+	/** Command Code（commandcode.ai）接入配置；凭据复用 CLI 的 ~/.commandcode/auth.json。 */
+	commandCode?: CommandCodeProviderSettings;
 	/** External MCP server configurations. */
 	mcpServers?: McpServerConfig[];
-	/** Delta update configuration. */
+	/** Update source and download configuration. */
 	update?: {
-		/** Update server URL. */
+		/** Updates, release notes and helper downloads. Absent/default inherits the global proxy. */
+		proxy?: ProxyOverride;
+		/** Update source. Optional for legacy settings and mocks; defaults to GitHub. */
+		source?: "github" | "update-server";
+		/** GitHub repository slug (owner/repo), not a URL. */
+		githubRepository?: string;
+		/** Update server URL, retained when switching to GitHub. */
 		serverUrl: string;
 		/** Product ID for multi-product update servers. */
 		product: string;

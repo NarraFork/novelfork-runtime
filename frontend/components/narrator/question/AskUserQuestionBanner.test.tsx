@@ -35,14 +35,20 @@ import {
 	type GlobalQuestion,
 } from "./GlobalQuestionInbox";
 
-const { buildAsyncQuestionNode } = await import("../vlist/vlist-permission-bridge");
+const { buildAsyncQuestionNode, usePermissionSlots } = await import(
+	"../vlist/vlist-permission-bridge"
+);
+const { buildToolMetaIndex } = await import("../vlist/vlist-tool-meta");
+
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import type { AsyncQuestionSlot, NarratorMsg } from "../narrator-panel-types";
+import type { VListItem } from "../vlist/vlist-pipeline";
 
 const questions = [{ id: "notes", header: "Notes?", options: [] }];
 const deferredQuestion: GlobalQuestion = {
 	id: "async-record-id",
 	narratorId: "n1",
 	narratorTitle: "Session",
-	chapterId: null,
 	toolCallId: "original-permission-id",
 	toolUseId: "tool-use-id",
 	questions,
@@ -66,7 +72,6 @@ function attentionItem(question: GlobalQuestion): HumanAttentionItem {
 		narratorTitle: question.narratorTitle,
 		parentNarratorId: null,
 		rootNarratorId: null,
-		chapterId: question.chapterId,
 		createdAt: question.createdAt,
 		blocking: question.awaited === true,
 		canAct: true,
@@ -186,6 +191,77 @@ function button(label: string) {
 	expect(found).toBeDefined();
 	return found as HTMLButtonElement;
 }
+
+test("live Await question hosts one directly submittable menu using tool-call input", async () => {
+	const detail = spyOn(api, "getAsyncQuestionDetail").mockResolvedValue({
+		question: deferredQuestion,
+		supplements: [],
+		nextCursor: null,
+		canAct: true,
+	});
+	const answer = spyOn(api, "answerAsyncQuestion").mockResolvedValue({
+		ok: true,
+		question: { ...deferredQuestion, status: "answered" },
+	});
+	writeSession("ask-draft", deferredQuestion.toolCallId, draft);
+	const tools = buildToolMetaIndex([
+		rowWithElements(
+			{
+				seq: 9,
+				toolCalls: [
+					{
+						toolUseId: "wait",
+						toolName: "Await",
+						status: "running",
+						inputJson: { type: "question", id: deferredQuestion.id },
+					},
+				],
+			},
+			[{ type: "tool_use", id: "wait", name: "Await", input: {} }],
+		) as unknown as NarratorMsg,
+	]);
+	const asyncQuestions = new Map([
+		[
+			deferredQuestion.toolUseId as string,
+			{
+				id: deferredQuestion.id,
+				question: deferredQuestion,
+				questions,
+				onSubmit: () => {},
+				onDismiss: () => {},
+			} satisfies AsyncQuestionSlot,
+		],
+	]);
+	const renderItems = [deferredQuestion.toolUseId, "wait"].map((id) => ({
+		spec: { kind: "tool-call", key: `tool-${id}` },
+	})) as VListItem[];
+	function Harness() {
+		const slots = usePermissionSlots({ renderItems, tools, asyncQuestions });
+		return (
+			<>
+				<div data-ask>{slots.get(`tool-${deferredQuestion.toolUseId}`)}</div>
+				<div data-await>{slots.get("tool-wait")}</div>
+			</>
+		);
+	}
+	try {
+		await render(<Harness />);
+		for (let n = 0; n < 3; n++)
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+		expect(container.querySelector("[data-ask] textarea")).toBeNull();
+		expect(container.querySelector("[data-await] textarea")).not.toBeNull();
+		expect(container.querySelectorAll("textarea")).toHaveLength(1);
+		await act(async () => button("submitAnswer").click());
+		expect(answer).toHaveBeenCalledWith("n1", deferredQuestion.id, {
+			answers: { notes: "Keep this unfinished answer" },
+		});
+	} finally {
+		detail.mockRestore();
+		answer.mockRestore();
+	}
+});
 
 test("async read-only detail maps colliding headers by canonical question ID", async () => {
 	const detail = spyOn(api, "getAsyncQuestionDetail").mockResolvedValue({
@@ -374,15 +450,15 @@ test("fork answer event stays frozen after original actor supplements, even when
 		const spec = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "inherited-answer",
-					role: "user",
-					origin: "user",
-					narratorId: "original",
-					contentJson: [
-						{ type: "system_injection", source: "async_question_answer", body: snapshot },
-					],
-				},
+				msg: rowWithElements(
+					{
+						id: "inherited-answer",
+						role: "user",
+						origin: "user",
+						narratorId: "original",
+					},
+					[{ type: "system_injection", source: "async_question_answer", body: snapshot }],
+				),
 			},
 			{ lod: 5 },
 		)[0];
@@ -486,15 +562,15 @@ test("the original actor's answer event still opens live details and can submit 
 		const spec = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "own-answer",
-					role: "user",
-					origin: "user",
-					narratorId: "n1",
-					contentJson: [
-						{ type: "system_injection", source: "async_question_answer", body: snapshot },
-					],
-				},
+				msg: rowWithElements(
+					{
+						id: "own-answer",
+						role: "user",
+						origin: "user",
+						narratorId: "n1",
+					},
+					[{ type: "system_injection", source: "async_question_answer", body: snapshot }],
+				),
 			},
 			{ lod: 5 },
 		)[0];

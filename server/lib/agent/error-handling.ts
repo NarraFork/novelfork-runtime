@@ -3,13 +3,23 @@ import {
 	isPolicyViolationCode,
 } from "@shared/agent-protocol/policy-violation";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
+import { parseTokenDanceRecoveryAction } from "@shared/tokendance";
 import {
 	isTransientTlsHandshakeError,
 	TRANSIENT_TLS_HANDSHAKE_CODE,
 } from "../net/tls-transport-error";
 import { settings } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
+import { diagnosticsFromError } from "./error-diagnostics";
 import type { ApiRequestDiagnostics } from "./types";
+
+function needsTokenDanceRecovery(err: unknown): boolean {
+	const diagnostics = diagnosticsFromError(err);
+	return (
+		diagnostics?.provider === "tokendance" &&
+		!!parseTokenDanceRecoveryAction(diagnostics.tokendanceRecoveryAction)
+	);
+}
 
 /**
  * Hard cap on retry attempts for auxiliary (non-primary) AI calls — summaries,
@@ -418,10 +428,24 @@ function isContentFilterMessage(message: string): boolean {
 export function classifyInvalidState(
 	reason: string,
 	message?: string,
-	diagnostics?: Pick<ApiRequestDiagnostics, "statusCode" | "retryable" | "resumable">,
+	diagnostics?: Pick<
+		ApiRequestDiagnostics,
+		"statusCode" | "retryable" | "resumable" | "provider" | "tokendanceRecoveryAction"
+	>,
 	customRetryRules = settings.agent.customRetryRules,
 	providerRetryable?: boolean,
 ): InvalidStateClassification {
+	if (
+		diagnostics?.provider === "tokendance" &&
+		parseTokenDanceRecoveryAction(diagnostics.tokendanceRecoveryAction)
+	) {
+		return {
+			category: "non_retryable",
+			retryable: false,
+			resumable: false,
+			statusCode: diagnostics.statusCode,
+		};
+	}
 	const normalizedReason = reason.toLowerCase().trim();
 	const normalizedMessage = message?.toLowerCase() ?? "";
 	const statusCode = inferInvalidStateStatus(reason, diagnostics);
@@ -733,7 +757,7 @@ export function getPaymentRequiredErrorInfo(err: unknown): PaymentRequiredErrorI
 export function isResumableError(err: unknown): boolean {
 	// A policy violation vetoes resumability the same way it vetoes retryability:
 	// continuing from partial output would replay the violating prompt context.
-	if (extractPolicyViolationCode(err)) return false;
+	if (needsTokenDanceRecovery(err) || extractPolicyViolationCode(err)) return false;
 	if (err instanceof ProviderInvalidStateError) return err.resumable;
 	if (!err || typeof err !== "object") return false;
 	const obj = err as Record<string, unknown>;
@@ -840,10 +864,12 @@ export function isModelUnavailableError(err: unknown): boolean {
  * Phrases an endpoint uses to say "you may not turn reasoning off".
  *
  * Observed: `Anthropic API error 400: Reasoning is mandatory for this endpoint
- * and cannot be disabled.` Some gateways only serve reasoning-enabled traffic,
- * so an explicit `thinking: {type:"disabled"}` / `reasoning_effort: "none"` is a
- * hard 400 there — including on auxiliary calls (titles, summaries) which
- * deliberately ask for no reasoning to stay cheap.
+ * and cannot be disabled.`, and from Claude models that only accept adaptive
+ * thinking: `claude-opus-5-5 requires adaptive thinking; omit thinking or use
+ * thinking.type=adaptive and output_config.effort`. Some gateways only serve
+ * reasoning-enabled traffic, so an explicit `thinking: {type:"disabled"}` /
+ * `reasoning_effort: "none"` is a hard 400 there — including on auxiliary calls
+ * (titles, summaries) which deliberately ask for no reasoning to stay cheap.
  *
  * Kept to explicit "mandatory / cannot be disabled" wording. A looser rule (any
  * 400 mentioning reasoning) would also swallow genuine parameter errors, and the
@@ -862,6 +888,7 @@ const REASONING_MANDATORY_PATTERNS = [
 	"cannot disable thinking",
 	"reasoning is required for this",
 	"thinking is required for this",
+	"requires adaptive thinking",
 ];
 
 /** Collect human-readable provider text from an error graph (bounded depth). */
@@ -910,7 +937,7 @@ export function isRetryableError(
 	// content itself, so auto-retry is force-disabled here — ahead of EVERY other
 	// heuristic, including user-authored custom retry rules: replaying the prompt
 	// against the same or another account is how upstream bans propagate.
-	if (extractPolicyViolationCode(err)) return false;
+	if (needsTokenDanceRecovery(err) || extractPolicyViolationCode(err)) return false;
 	// Stream stale timeout is always retryable
 	if (err instanceof StreamStaleError) return true;
 	if (err instanceof ProviderInvalidStateError) return err.retryable;

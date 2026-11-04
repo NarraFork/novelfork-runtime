@@ -1,59 +1,4 @@
 import type { ReferenceCostSummary } from "../lib/usage-cost";
-/**
- * Pointer left on the dump when the complete copy was written to a file.
- *
- * Mirrors `RawDumpSpillPointer` in `server/lib/api-request-dump-store.ts`, minus the
- * absolute `filePath` — `redactSpillPointerPaths` replaces it with `fileName` before the
- * dump leaves the server, because the path carries the host's OS account name.
- *
- * Every field is optional: the pointer is read out of a stored JSON blob that may predate
- * the current shape, and a missing field must degrade to "say less", never to a crash.
- */
-export interface UsageHistoryRawDumpSpill {
-	schema?: string;
-	/**
-	 * True when the inline dump is only the head of a larger file.
-	 *
-	 * This is the whole reason the pointer is exposed: without surfacing it the UI presents
-	 * a truncated body as if it were the entire request.
-	 */
-	inlineTruncated?: boolean;
-	/**
-	 * True when the FILE itself had to shed parts to fit the server's per-file ceiling.
-	 *
-	 * Categorically different from `inlineTruncated`, which is always true on a pointer and
-	 * only says the row is a head that a download completes. This one says no complete copy
-	 * exists anywhere — downloading gets less than what was sent — so the UI must state that
-	 * outright rather than let a file that looks whole imply otherwise.
-	 */
-	truncated?: boolean;
-	/** Serialized byte size of the complete dump before shedding, when `truncated`. */
-	originalBytes?: number;
-	/** Byte size of the dump actually stored on disk. */
-	bytes?: number;
-	/** Spill file basename — what correlates a downloaded dump with a server log line. */
-	fileName?: string;
-	note?: string;
-}
-
-export interface UsageHistoryRawDump {
-	provider?: string;
-	model?: string;
-	spill?: UsageHistoryRawDumpSpill | null;
-	request?: {
-		transport?: string;
-		url?: string;
-		headers?: Record<string, string>;
-		body?: unknown;
-	};
-	response?: {
-		status?: number;
-		headers?: Record<string, string>;
-		bodyText?: string;
-		events?: unknown[];
-		error?: string;
-	};
-}
 
 export interface UsageHistoryRecord extends ReferenceCostSummary {
 	id: string;
@@ -83,14 +28,23 @@ export interface UsageHistoryRecord extends ReferenceCostSummary {
 	createdAt: string;
 	errorMessage?: string | null;
 	narratorTitle?: string | null;
-	chapterTitle?: string | null;
-	chapterId?: string | null;
 	projectId?: string | null;
-	hasRawDump?: boolean;
-	rawDump?: UsageHistoryRawDump | null;
+	/** Bounded diagnostics summary exists; list rows never carry its content. */
+	hasDiagnostics?: boolean;
+	/** Detail endpoint only. */
+	diagnostics?: unknown | null;
+	/** Loop attempt id in the narrator's request recorder, when one was recorded. */
+	recordingRequestId?: string | null;
 }
 
-export interface UsageHistoryStats extends ReferenceCostSummary {
+interface CacheHitRateStats {
+	/** Only requests with cachedInputTokens > 0 participate; ratio is 0–1 or null. */
+	cacheHitRate: number | null;
+	cacheHitRateReadTokens: number;
+	cacheHitRateInputTokens: number;
+}
+
+export interface UsageHistoryStats extends ReferenceCostSummary, CacheHitRateStats {
 	totalRequests: number;
 	totalInputTokens: number;
 	totalOutputTokens: number;
@@ -107,7 +61,7 @@ export interface UsageHistoryStats extends ReferenceCostSummary {
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
 
-export interface UsageHistoryTimeSeriesPoint extends ReferenceCostSummary {
+export interface UsageHistoryTimeSeriesPoint extends ReferenceCostSummary, CacheHitRateStats {
 	timestamp: string;
 	requestCount: number;
 	totalInputTokens: number;
@@ -143,7 +97,6 @@ export interface UsageHistoryFilters {
 	/** '__unattributed__' selects requests without known ownership. */
 	userId?: string;
 	narratorId?: string;
-	chapterId?: string;
 	projectId?: string;
 	provider?: string;
 	/** Exact credential id — narrows history to one account in a provider pool. */
@@ -249,11 +202,14 @@ export type UsageBreakdownMetric =
 	| "cost"
 	| "inputTokens"
 	| "outputTokens"
+	| "cachedInputTokens"
+	| "cacheCreationTokens"
+	| "cacheHitRate"
 	| "reasoningTokens";
 
 export interface UsageBreakdownEntry {
 	label: string;
-	value: number;
+	value: number | null;
 	percentage: number;
 	count: number;
 }
@@ -262,7 +218,7 @@ export interface UsageBreakdownResponse {
 	dimension: UsageBreakdownDimension;
 	metric: UsageBreakdownMetric;
 	entries: UsageBreakdownEntry[];
-	total: number;
+	total: number | null;
 }
 
 export interface UsageStackedTimeSeriesResponse {
@@ -272,7 +228,7 @@ export interface UsageStackedTimeSeriesResponse {
 	series: Array<{
 		label: string;
 		color: string;
-		data: Array<{ timestamp: string; value: number }>;
+		data: Array<{ timestamp: string; value: number | null }>;
 	}>;
 	timestamps: string[];
 	truncated: boolean;

@@ -26,6 +26,7 @@
  * titles) flow through the adapter instead, where they are measured.
  */
 
+import { dangerCopyLabels } from "@shared/danger-copy";
 import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
@@ -87,6 +88,9 @@ export interface VListTimingLabels {
 	completed: string;
 	total: string;
 	permissionWait: string;
+	streaming?: string;
+	wait?: string;
+	executionSpan?: string;
 	execution: string;
 	startedAt: string;
 	timeoutSeconds: string;
@@ -185,6 +189,8 @@ export interface VListRenderLabels {
 		backgroundBadge: string;
 		/** "Taken over by user" badge on a card whose child the user is driving. */
 		takenOverBadge: string;
+		/** Live output counter badge: `{count}` chars written so far. */
+		liveOutputChars: string;
 		followParent: string;
 		followTooltip: string;
 		/** `{parentModel}` / `{pool}` are substituted by the card. */
@@ -200,6 +206,7 @@ export interface VListRenderLabels {
 		/** Marker for a file a revert here will not restore (changed in another worktree). */
 		outsideWorkspace: string;
 		fileChangeLegacy: string;
+		fileChangeLegacyBadge: string;
 		fileChangeWindow: string;
 		unknownDevice: string;
 		unknownWorkspace: string;
@@ -316,8 +323,6 @@ export function useVListLabels(): VListLabels {
 			reviewVerdict_request_changes: t("reviewVerdict_request_changes"),
 			reviewVerdict_comment_only: t("reviewVerdict_comment_only"),
 			reviewFeedbackRevisedBadge: t("reviewFeedbackRevisedBadge"),
-			reviewFeedbackApply: t("reviewFeedbackApply"),
-			reviewFeedbackApplied: t("reviewFeedbackApplied"),
 			// ── message-origin attribution ──────────────────────────────────────────
 			// The origin_notice heading is composed during adaptation (it is a
 			// measured row), so these belong to the adapter labels.
@@ -361,6 +366,8 @@ export function useVListLabels(): VListLabels {
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
 			workspaceCreate: t("workspaceCreate"),
+			workspaceAttach: t("workspaceAttach"),
+			workspaceOperation: t("workspaceOperation"),
 			workspaceList: t("workspaceList"),
 			workspaceSwitch: t("workspaceSwitch"),
 			workspaceDevice: t("workspaceDevice"),
@@ -389,6 +396,27 @@ export function useVListLabels(): VListLabels {
 			communicationReceiptLegacy: t("communicationReceiptLegacy"),
 			communicationReceiptUnavailable: t("communicationReceiptUnavailable"),
 			communicationReceiptError: t("communicationReceiptError"),
+			// Fixed sentences a communication result reports by code (`warningCodes`), plus
+			// the narrator status words the send warning interpolates: these are the
+			// `status_*` entries this namespace already carries (the mention popover reads
+			// the same ones, so a status word is never translated twice).
+			communicationWarning_broadcastWorkingOnly: t("communicationWarning_broadcastWorkingOnly"),
+			communicationWarning_broadcastCancelled: t("communicationWarning_broadcastCancelled"),
+			// The status word is resolved at paint time (same literal-placeholder trick as
+			// COUNT_PLACEHOLDER), so the adapter substitutes `{status}` with the target's
+			// own `status_*` translation instead of a second copy of the wording.
+			communicationWarning_sendTargetNotWorking: t("communicationWarning_sendTargetNotWorking", {
+				status: "{status}",
+			}),
+			status_idle: t("status_idle"),
+			status_waiting: t("status_waiting"),
+			status_archived: t("status_archived"),
+			contextAskOutputChars: t("contextAskOutputChars", { count: COUNT_PLACEHOLDER }),
+			contextAskQuestions: t("contextAskQuestions", { count: COUNT_PLACEHOLDER }),
+			contextAskStatusSummary: t("contextAskStatusSummary"),
+			// Generic live output counter ("123 chars") for any running tool whose
+			// streamed output is a bare cumulative count (Agent / Await today).
+			liveOutputChars: t("liveOutputChars", { count: COUNT_PLACEHOLDER }),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
 			specProtectedBadge: t("specProtectedBadge"),
@@ -408,6 +436,8 @@ export function useVListLabels(): VListLabels {
 			// Also an adapter label, and for the same reason: it shares the fix's
 			// conditional button row, so the card's height depends on it existing.
 			testCurrentModel: t("testCurrentModel"),
+			viewErrorRequest: t("errorRequest.view"),
+			downloadErrorDump: t("errorRequest.download"),
 			specViewTasks: t("specGoalViewTasks"),
 			specClearTasks: t("specForkClearTasks"),
 			specResetTasks: t("specForkResetSpec"),
@@ -443,6 +473,9 @@ export function useVListLabels(): VListLabels {
 			subagentRecoveryResolvedWait: t("subagentRecoveryResolvedWait", {
 				count: COUNT_PLACEHOLDER,
 			}),
+			// The close button's aria-label + tooltip. Not measured, but it travels
+			// with the card payload so the render layer stays i18n-free.
+			subagentRecoveryDismiss: t("subagentRecoveryDismiss"),
 			// ── reflection notice titles (MEASURED, so they belong here) ─────────────
 			// Keys are `${kind}Reflection${Status}`, built by the adapter from
 			// reflectionTitleKeyPrefix/Suffix. The title wraps at narrow widths and
@@ -450,6 +483,20 @@ export function useVListLabels(): VListLabels {
 			// through the adapter rather than the render layer.
 			...reflectionTitleLabels(t),
 			reflectionNextSteps: t("reflectionNextSteps", { nextSteps: "{nextSteps}" }),
+			// System reflection reasons that are not status restatements (see
+			// shared/pretext-layout/reflection-reason.ts). The summary wraps, so these
+			// are measured adapter labels rather than render-layer strings.
+			reflectionReasonNarratorAborted: t("reflectionReasonNarratorAborted"),
+			reflectionReasonDangerCancelledByUser: t("reflectionReasonDangerCancelledByUser"),
+			reflectionReasonDangerCancelledByLoop: t("reflectionReasonDangerCancelledByLoop"),
+			reflectionReasonDangerInterrupted: t("reflectionReasonDangerInterrupted"),
+			reflectionReasonDangerAlreadyResolved: t("reflectionReasonDangerAlreadyResolved"),
+			reflectionReasonTaskApprovedByUser: t("reflectionReasonTaskApprovedByUser"),
+			reflectionReasonTaskRejectedByUser: t("reflectionReasonTaskRejectedByUser"),
+			reflectionReasonTaskDeclinedNextSteps: t("reflectionReasonTaskDeclinedNextSteps"),
+			// Danger assessment copy. Generated matrix, same contract as the
+			// reflection titles above — a dropped key still fails the coverage guard.
+			...dangerCopyLabels(t),
 			// ── side-car footnotes (one per system injection) ──────────────────────
 			// All of these are MEASURED text — the source name sits in the header row and
 			// the body lines are wrapped by the measure pass — so they flow through the
@@ -462,10 +509,21 @@ export function useVListLabels(): VListLabels {
 			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
 			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan", { planFile: "{planFile}" }),
 			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
+			noticeTurnNudge: t("sidecar.body.noticeTurnNudge", {
+				turnIndex: "{turnIndex}",
+				maxTurns: "{maxTurns}",
+			}),
+			noticeBrokenCall: t("sidecar.body.noticeBrokenCall", { toolNames: "{toolNames}" }),
+			noticeContinue: t("sidecar.body.noticeContinue"),
+			noticeWorkspaceChanged: t("sidecar.body.noticeWorkspaceChanged"),
 			tasksCurrent: t("sidecar.body.tasksCurrent", { n: "{n}" }),
 			tasksEmptyNever: t("sidecar.body.tasksEmptyNever"),
 			tasksEmptyDone: t("sidecar.body.tasksEmptyDone"),
 			tasksTooMany: t("sidecar.body.tasksTooMany", { n: "{n}" }),
+			outlineTasksCurrent: t("sidecar.body.outlineTasksCurrent", { n: "{n}" }),
+			outlineTasksEmptyNever: t("sidecar.body.outlineTasksEmptyNever"),
+			outlineTasksEmptyDone: t("sidecar.body.outlineTasksEmptyDone"),
+			outlineTaskHumanCreated: t("sidecar.body.outlineTaskHumanCreated"),
 			taskRoleDoing: t("sidecar.body.taskRoleDoing"),
 			taskRoleNext: t("sidecar.body.taskRoleNext"),
 			taskRoleTodo: t("sidecar.body.taskRoleTodo"),
@@ -496,7 +554,15 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
+			sidecarSourceOutlineTurnEnd: t("sidecar.sources.outline_task_turn_end"),
+			contextViewsUpdated: t("sidecar.contextViews.updated", { parts: "{parts}" }),
+			contextViewOutlineTasks: t("sidecar.contextViews.outlineTasks"),
+			contextViewOutlineBehavior: t("sidecar.contextViews.outlineBehavior"),
 			sidecarSourceTutorialLesson: t("sidecar.sources.tutorial_lesson"),
+			sidecarSourceTurnNudge: t("sidecar.sources.turn_nudge"),
+			sidecarSourceBrokenCall: t("sidecar.sources.broken_call"),
+			sidecarSourceContinuePrompt: t("sidecar.sources.continue_prompt"),
+			sidecarSourceWorkspaceChanged: t("sidecar.sources.workspace_changed"),
 		}),
 		[t, tCommon],
 	);
@@ -524,6 +590,11 @@ export function useVListLabels(): VListLabels {
 			completed: t("toolCallInspector.timing.completed"),
 			total: t("toolCallInspector.timing.total", { duration: DURATION_PLACEHOLDER }),
 			permissionWait: t("toolCallInspector.timing.permissionWait", {
+				duration: DURATION_PLACEHOLDER,
+			}),
+			streaming: t("toolCallInspector.timing.streaming", { duration: DURATION_PLACEHOLDER }),
+			wait: t("toolCallInspector.timing.wait", { duration: DURATION_PLACEHOLDER }),
+			executionSpan: t("toolCallInspector.timing.executionSpan", {
 				duration: DURATION_PLACEHOLDER,
 			}),
 			execution: t("toolCallInspector.timing.execution", { duration: DURATION_PLACEHOLDER }),
@@ -589,8 +660,11 @@ export function useVListLabels(): VListLabels {
 					error: t("toolSectionError"),
 				},
 				download: tCommon("download"),
-				copy: tCommon("copy"),
-				copied: tCommon("copied"),
+				// The share card's OWN words, not the generic "copy"/"copied": the button
+				// hands over a link, and the chunked card has always said so. This is the
+				// exact key pair it used, so the wording survives the renderer swap.
+				copy: t("shareFile.copyLink"),
+				copied: t("shareFile.linkCopied"),
 				terminate: t("terminateProcess"),
 				// `{count}` stays literal: the render layer substitutes the per-body
 				// hidden row count — same trick as COUNT_PLACEHOLDER above.
@@ -646,6 +720,9 @@ export function useVListLabels(): VListLabels {
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
 				takenOverBadge: t("subagentTakenOver"),
+				// Same wording as the adapter-level live counter; one locale key serves
+				// both the header badge and the folded-row summary.
+				liveOutputChars: t("liveOutputChars", { count: "{count}" }),
 				followParent: t("followParent"),
 				followTooltip: t("inheritance.followTooltip"),
 				// Placeholders stay literal so the card can substitute per-badge values.
@@ -659,6 +736,7 @@ export function useVListLabels(): VListLabels {
 				shellTouched: t("subagentShellTouched"),
 				outsideWorkspace: t("subagentOutsideWorkspace"),
 				fileChangeLegacy: t("subagentFileChangesLegacy"),
+				fileChangeLegacyBadge: t("subagentFileChangesLegacyBadge"),
 				fileChangeWindow: t("subagentFileChangesWindow"),
 				unknownDevice: t("subagentFileChangesUnknownDevice"),
 				unknownWorkspace: t("subagentFileChangesUnknownWorkspace"),

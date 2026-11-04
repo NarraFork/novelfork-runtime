@@ -9,15 +9,77 @@ import type { FileReference, FileReferenceContext } from "@shared/file-reference
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
+import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
+import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
+export type {
+	ProviderBalanceAmount,
+	ProviderBalanceData,
+	ProviderBalanceSnapshot,
+	ProviderBalanceStatus,
+} from "@shared/provider-balance";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type ChangelogEntry = {
 	version: string;
 	date: string;
 } & LocalizedValue<string>;
+
+/**
+ * One OpenCode Go plan window (5-hour rolling / weekly / monthly) as cached by
+ * the server. `percent` is how much of the window is already USED; the status bar
+ * converts it to the "remaining" convention the other quota indicators use.
+ */
+export interface OpencodeUsageWindow {
+	status: "ok" | "rate-limited" | null;
+	percent: number | null;
+	/** ISO timestamp when the window refills. The windows are not calendar periods. */
+	resetsAt: string | null;
+	/** Absolute amounts in the plan's units, only when upstream reported both. */
+	used?: number | null;
+	limit?: number | null;
+}
+
+/**
+ * Per-provider OpenCode Go usage cache entry.
+ *
+ * `GET /api/opencode/usages` is readable by any signed-in user, but the upstream error text
+ * is not: it describes the deployment's own provider account rather than the requesting
+ * user's allowance, so the server sends `error` only to admins and everyone else gets
+ * `hasError`. Both fields are optional here because a given response carries exactly one of
+ * them — read them through `opencodeUsageFailed()` rather than testing `error` directly, or a
+ * non-admin's failed fetch reads as a successful one whose numbers are merely stale.
+ */
+export interface OpencodeUsageCache {
+	rolling: OpencodeUsageWindow | null;
+	weekly: OpencodeUsageWindow | null;
+	monthly: OpencodeUsageWindow | null;
+	/** Pay-as-you-go fallback balance, when upstream reports one. */
+	balance?: number | null;
+	generation: string;
+	fetchedAt: number;
+	/** Admin-only: the upstream failure text. Absent for non-admins. */
+	error?: string | null;
+	/** Non-admin substitute for `error`: that it failed, without saying how. */
+	hasError?: boolean;
+}
+
+/** Per-provider official DeepSeek balance; errors are redacted for non-admins. */
+export interface DeepSeekBalanceCache {
+	generation: string;
+	isAvailable: boolean | null;
+	balanceInfos: Array<{
+		currency: string;
+		totalBalance: string;
+		grantedBalance: string;
+		toppedUpBalance: string;
+	}>;
+	fetchedAt: number;
+	error?: string | null;
+	hasError?: boolean;
+}
 
 /** One Kimi usage window (5-hour / weekly / monthly) as cached by the server. */
 export interface KimiUsageWindow {
@@ -145,40 +207,105 @@ export interface LearningSearchResponse {
 	results: LearningDocSummary[];
 }
 
-export interface SearchFallback {
-	feature?: string;
-	entity?: string;
+/** Sections of the global search page, in display order. */
+export type SearchSectionName = "sessions" | "knowledge";
+
+/** One page of a search section. */
+export interface SearchSectionPage<T> {
+	items: T[];
+	/** Matches in the section's candidate window. */
+	total: number;
+	/** The window filled up, so there may be more than `total`. */
+	totalIsLowerBound: boolean;
+	nextCursor: string | null;
+	/** The search limited itself to this many recent days (a query of only short terms). */
+	recentDays?: number;
+}
+
+/** A message hit listed under its session. */
+export interface SessionSearchHit {
+	id: string;
+	snippet: string;
+	messageRole?: string;
+	createdAt?: string;
+	blockId?: string;
+	/** Set when the hit is in a tool call: the jump then lands on that tool's row. */
+	toolUseId?: string;
+	toolName?: string;
+}
+
+/** A session (narrator) matching by its title, its messages, or both. */
+export interface SessionSearchResult {
+	type: "session";
+	id: string;
+	title?: string;
+	narratorType?: string;
+	subagentType?: string;
+	status?: string;
+	projectId?: string;
+	projectName?: string;
+	lastActivityAt?: string;
+	titleMatch: boolean;
+	hitCount: number;
+	hits: SessionSearchHit[];
+	score: number;
+}
+
+/** A knowledge entry hit. */
+export interface EntitySearchResult {
+	type: "knowledge";
+	id: string;
+	title?: string;
+	snippet: string;
+	projectName?: string;
+	collectionName?: string;
+	tags?: string[];
+	status?: string;
+	createdAt?: string;
+	updatedAt?: string;
+}
+
+export interface SearchSectionsResponse {
+	sections: {
+		sessions?: SearchSectionPage<SessionSearchResult>;
+		knowledge?: SearchSectionPage<EntitySearchResult>;
+	};
+}
+
+export interface SessionHitsResponse {
+	hits: SessionSearchHit[];
+	nextCursor: string | null;
+}
+
+/** Query, sort, scope and filters every global-search request carries. */
+export interface SearchRequest {
+	q: string;
+	sort?: "relevance" | "time";
+	/** Content added to the default scope: subagents, system, tools, archived. */
+	include?: readonly string[];
+	projectId?: string;
+	/** Inclusive ISO bounds. */
 	from?: string;
 	to?: string;
-	reason?: string;
-	error?: string;
-	message?: string;
-	code?: string;
-	[key: string]: unknown;
-}
-
-export interface SearchMetadata {
-	degraded?: boolean;
-	fallbacks?: SearchFallback[];
-	mode?: string;
-	ftsReady?: boolean | null;
-	shortQuery?: boolean;
-	requestedEntities?: string[];
-	[key: string]: unknown;
-}
-
-export interface SearchResponse {
-	results: ApiEntity[];
-	degraded?: boolean;
-	fallbacks?: SearchFallback[];
-	searchMetadata?: SearchMetadata;
+	/** Only the viewer's own sessions. */
+	mine?: boolean;
+	/** Search all of history even for a query of only short terms. */
+	fullHistory?: boolean;
+	cursor?: string;
+	/** 1-based page of a single section, in place of `cursor`. */
+	page?: number;
+	limit?: number;
 }
 
 export interface StorageCategoryResult {
 	key: string;
 	sizeBytes: number;
+	truncated?: boolean;
+	unavailable?: { backend: string; reason: string };
 	details?: Record<string, unknown>;
 }
+
+export type { StorageCategoryKey };
 
 export interface StorageScanResult {
 	categories: StorageCategoryResult[];
@@ -192,11 +319,23 @@ export interface StorageScanResult {
  */
 export type StorageScanJobStatus = "idle" | "running" | "complete" | "error" | "cancelled";
 
+export interface StorageCategoryJobState {
+	key: StorageCategoryKey;
+	status: StorageScanJobStatus;
+	progressMessage: string | null;
+	progressDetail: { done: number; total: number | null } | null;
+	result: StorageCategoryResult | null;
+	error: string | null;
+	startedAt: number | null;
+	finishedAt: number | null;
+}
+
 export interface StorageScanJobState {
 	status: StorageScanJobStatus;
 	progressMessage: string | null;
-	progressDetail: { done: number; total: number } | null;
+	progressDetail: { done: number; total: number | null } | null;
 	categories: StorageCategoryResult[];
+	categoryJobs: StorageCategoryJobState[];
 	result: StorageScanResult | null;
 	error: string | null;
 	startedAt: number | null;
@@ -270,23 +409,19 @@ export interface DatabaseStorageBreakdown {
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
-		apiRequestDumps: DatabaseCleanupCandidateSummary;
 		/**
 		 * Aged tool-call input/output payloads. Clears the columns and KEEPS the rows —
 		 * they carry the tree hashes that file-history revert depends on.
 		 */
 		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
+	/** Request dumps kept by an upgrade that deferred migration 0207's column rewrites. */
+	legacyRequestDumps?: { retained: boolean };
 }
 
-export type DatabaseCleanupTarget =
-	| "archivedSessions"
-	| "staleSessions"
-	| "apiRequestDumps"
-	| "toolCallPayloads";
+export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
-	| "chapterBound"
 	| "runningTerminal"
 	| "backgroundRunning"
 	| "nonArchived"
@@ -313,7 +448,6 @@ export interface DatabaseCleanupPreviewCounts {
 	messages: number;
 	toolCalls: number;
 	apiRequests: number;
-	dumpsCleared: number;
 }
 
 export interface DatabaseCleanupNarratorSample extends FallbackDiagnostics {
@@ -332,7 +466,6 @@ export interface DatabaseCleanupApiRequestSample extends FallbackDiagnostics {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
 	createdAt: string;
 	approxBytes: number;
 }
@@ -366,6 +499,52 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	freedBytes: number;
 	vacuumRan: boolean;
 	changed: boolean;
+	/** Planned sessions left in place because they changed mid-cleanup. */
+	skippedSessions?: number;
+}
+
+export interface LegacyRequestDumpClearResult {
+	ok: true;
+	cleared: number;
+	beforeBytes: number;
+	afterBytes: number;
+	restartRequired: boolean;
+}
+
+/** One background block job (`server/services/narrator-block-backfill.ts`). */
+export interface BlockJobState {
+	cursor: number;
+	complete: boolean;
+	paused: boolean;
+	processed: number;
+	updatedAt: string;
+}
+
+/** What a projection job needs that is missing. */
+export type BlockProjectionBlock =
+	| "unavailable"
+	| "compact_json_off"
+	| "compact_json_on"
+	| "backfill_incomplete";
+
+export interface BlockBackfillStatus {
+	available: boolean;
+	convert: BlockJobState | null;
+	verify: BlockJobState | null;
+	/** Rewrites every block's search index text; the message index retires after it. */
+	reindex: BlockJobState | null;
+	/** Drops verified messages' duplicate `content_json` (admin-started). */
+	clear: BlockJobState | null;
+	/** Writes it back from the block rows (admin-started). */
+	restore: BlockJobState | null;
+	blocked: { clear: BlockProjectionBlock | null; restore: BlockProjectionBlock | null };
+	/** Some message keeps its body only in block rows. */
+	rowsOnly: boolean;
+	projectionRunning: boolean;
+	/** Newest message row: a job's cursor against it is its progress. */
+	maxRowid: number;
+	diagnostics: number;
+	running: boolean;
 }
 
 export interface DatabaseVacuumResult {
@@ -379,95 +558,6 @@ export interface DatabaseVacuumResult {
 	checkpointRan: boolean;
 	optimized: boolean;
 	durationMs: number;
-}
-
-// === Workspace write barriers (external recovery) ===
-
-export type WorkspaceBarrierVerdict =
-	| "applied"
-	| "not_applied"
-	| "not_dispatched"
-	| "foreign"
-	| "unobservable";
-
-export interface WorkspaceBarrierScope {
-	id: string;
-	deviceId: string;
-	canonicalRoot: string;
-	pathFlavor: "posix" | "windows";
-	status: "active" | "retired" | "needs_verification";
-	activeLeaseId: string | null;
-	activeMutationCount: number;
-	updatedAt: string;
-}
-
-export interface WorkspaceBarrierEffect {
-	effectId: string;
-	operationId: string;
-	canonicalPath: string;
-	displayPath: string;
-	settlement: string;
-	dispatched: boolean;
-	beforeKind: "absent" | "regular" | "symlink" | "unknown";
-	intendedKind: "absent" | "regular" | "symlink" | "unknown";
-}
-
-export interface WorkspaceBarrierOperation {
-	operationId: string;
-	sourceKind: string;
-	narratorId: string | null;
-	toolCallId: string | null;
-	startedAt: string;
-}
-
-export interface WorkspaceBarrier {
-	scope: WorkspaceBarrierScope;
-	leaseId: string | null;
-	ranges: { kind: string; canonicalPath: string }[];
-	executionEnded: boolean;
-	blockedReason: string | null;
-	maintenanceRequired?: boolean;
-	ownerProbeRetryAllowed?: boolean;
-	kind: "quarantined" | "unverified_root";
-	local: boolean;
-	operations: WorkspaceBarrierOperation[];
-	effects: WorkspaceBarrierEffect[];
-}
-
-export interface WorkspaceBarrierObservation {
-	effectId: string;
-	canonicalPath: string;
-	displayPath: string;
-	verdict: WorkspaceBarrierVerdict;
-	actualKind: "absent" | "regular" | "unobservable";
-	alreadySettled: boolean;
-	observedDigest: string | null;
-	observedSizeBytes: number | null;
-	observedMode: number | null;
-}
-
-export interface WorkspaceBarrierObservationResult {
-	scope: WorkspaceBarrierScope;
-	leaseId: string | null;
-	confirmationToken: string;
-	rangeObservations: {
-		canonicalPath: string;
-		kind: string;
-		actualKind: string;
-		identity: string | null;
-		observedDigest: string | null;
-		observedSizeBytes: number | null;
-		observedMode: number | null;
-	}[];
-	observations: WorkspaceBarrierObservation[];
-}
-
-export interface WorkspaceBarrierRecoveryResult {
-	remaining?: { rootVerificationRequired: boolean; legacyBarrier: boolean; leaseBarrier: boolean };
-	recovered: "barrier_cleared" | "root_verified";
-	settledEffectCount: number;
-	revision?: number;
-	fencingToken?: number;
 }
 
 export interface RuntimeScanResult {
@@ -637,6 +727,8 @@ export interface BaseContentBlock {
 	summary?: string;
 	previewUrl?: string;
 	imageId?: string;
+	mediaId?: string;
+	size?: number;
 	filename?: string;
 	mediaType?: string;
 	uploadNarratorId?: string;
@@ -653,6 +745,12 @@ export interface BaseContentBlock {
 	 * for why it is kept out of `_metadata`.
 	 */
 	_awaitAgentNarratorId?: string;
+	/**
+	 * Display title of the awaited child session, shipped with the id above
+	 * (`AWAIT_AGENT_TITLE_FIELD`). Declared explicitly for the same reason:
+	 * the running card headlines it before the tool's metadata exists.
+	 */
+	_awaitAgentTitle?: string;
 	/** Accepted/queued Send receipts; message location must confirm persistence. */
 	_sendDeliveryTargets?: import("@shared/communication-tool").SendDeliveryTarget[];
 	_sendDeliveryTargetCount?: number;
@@ -872,6 +970,27 @@ export interface HookApiRecord {
 	updatedAt: string;
 }
 
+/**
+ * One reusable system prompt from the library (`/api/prompt-library`).
+ *
+ * A narrator created from an entry stores its own copy of `content`, so deleting the
+ * entry never changes an existing session.
+ */
+export interface PromptLibraryEntryData {
+	id: string;
+	name: string;
+	description: string;
+	content: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface PromptLibraryInputData {
+	name: string;
+	description?: string;
+	content: string;
+}
+
 export interface CustomSubagentData {
 	name: string;
 	description: string;
@@ -924,6 +1043,7 @@ export interface BufferMessageSummary {
 	imageCount: number;
 	/** Optional so a snapshot from an older server still parses. */
 	images?: BufferedImageSummary[];
+	media?: import("@shared/media-attachments").MediaRef[];
 	textFiles?: BufferedTextFileSummary[];
 	fileReferences?: FileReference[];
 	creator?: BufferCreator | null;
@@ -931,6 +1051,9 @@ export interface BufferMessageSummary {
 	/** Explicit sending intent; older servers only provide priority. */
 	queueMode?: "turn" | "tool" | "interrupt";
 }
+
+/** One block a message row holds: its identity and its elements (`messageBlocks`). */
+export type MessageRowBlock = RowBlock<ContentBlock>;
 
 export interface TreeMessage {
 	/** Actual model/provider for this message, not the narrator's current selection. */
@@ -941,7 +1064,11 @@ export interface TreeMessage {
 	parentToolUseId: string | null;
 	messageUuid?: string | null;
 	role: string;
-	contentJson: ContentBlock[];
+	/**
+	 * The message's body as blocks, in order. Read it through `messageBody` (elements) or
+	 * `messageBlocks` (blocks); rewrite it through the helpers next to them.
+	 */
+	blocks: MessageRowBlock[];
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
 	tokensIn?: number | null;
@@ -984,9 +1111,11 @@ export interface TreeMessage {
 	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
 	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
 	createdAt: string;
-	children: TreeMessage[];
-	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
-	_blockOriginalIndices?: number[];
+	/**
+	 * The row this one is nested under; absent at the top. Rows are flat, each row
+	 * followed by the rows nested under it (`message/nested-rows.ts`).
+	 */
+	parentMessageId?: string | null;
 	/**
 	 * Synthetic live row only: index of the text/reasoning block still being written,
 	 * or -1 when the model has moved on to tool calls.
@@ -1154,6 +1283,7 @@ export type CodexAuthMode = "oauth" | "personal_access_token" | "agent_identity"
 
 export interface CodexCredentialEntry {
 	id: string;
+	useCreditQuota: boolean;
 	displayName?: string;
 	authMode?: CodexAuthMode;
 	accountId?: string;
@@ -1291,6 +1421,8 @@ export interface ProjectAccess {
 		avatarImageId: string | null;
 	} | null;
 	members: ProjectMember[];
+	/** Server-authoritative permission to create project sessions and write project resources. */
+	canWrite?: boolean;
 	/** Whether the current user may change visibility, members or ownership. */
 	canManage: boolean;
 }

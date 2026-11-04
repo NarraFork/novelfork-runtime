@@ -10,7 +10,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { eq } from "drizzle-orm";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -39,21 +38,10 @@ function seed(narratorId = "n1") {
 	db.insert(projects)
 		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: ts(), updatedAt: ts() })
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "ch1",
-			projectId: "p1",
-			title: "Chapter 1",
-			branch: "chapter/ch1",
-			baseBranch: "main",
-			createdAt: ts(),
-			updatedAt: ts(),
-		})
-		.run();
 	db.insert(narrators)
 		.values({
 			id: narratorId,
-			chapterId: "ch1",
+			contextProjectId: "p1",
 			type: "primary",
 			inheritMode: "fresh",
 			createdAt: ts(),
@@ -79,7 +67,7 @@ function addMessage(id: string, seq: number, role: "user" | "assistant" | "sys" 
 		.run();
 }
 
-/** A second narrator in the same chapter, optionally a subagent of n1. */
+/** A second narrator in the same project, optionally a subagent of n1. */
 function seedExtraNarrator(
 	id: string,
 	opts: { type?: "primary" | "subagent"; parentNarratorId?: string } = {},
@@ -87,7 +75,7 @@ function seedExtraNarrator(
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: "ch1",
+			contextProjectId: "p1",
 			type: opts.type ?? "primary",
 			parentNarratorId: opts.parentNarratorId ?? null,
 			inheritMode: "fresh",
@@ -266,5 +254,68 @@ describe("isFirstUserTurn", () => {
 		addMessage("s1", 1, "sys");
 		addMessage("s2", 2, "sys");
 		expect(await isFirstUserTurn("n1")).toBe(true);
+	});
+
+	/** Share n1's messages with `forkId` via refs, mirroring a fork's copied prefix. */
+	function inheritPrefixInto(forkId: string, seqs: number[]) {
+		const parentRefs = db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, "n1"))
+			.all();
+		for (const [i, ref] of parentRefs.entries()) {
+			db.insert(narratorMessageRefs)
+				.values({
+					id: `ref-${forkId}-${i}`,
+					narratorId: forkId,
+					messageId: ref.messageId,
+					seq: seqs[i] ?? ref.seq,
+				})
+				.run();
+		}
+	}
+
+	it("treats a fork's first own user message as the first turn", async () => {
+		// Parent has a long history with several user turns.
+		addTurn(1, 3);
+		addTurn(2, 2);
+		expect(await isFirstUserTurn("n1")).toBe(false);
+
+		// Full fork: refs are shared, message rows still belong to the parent.
+		seedExtraNarrator("fork1");
+		inheritPrefixInto("fork1", []);
+		expect(await isFirstUserTurn("fork1")).toBe(true);
+
+		// The fork's own first user message keeps it on the first turn…
+		db.insert(narratorMessages)
+			.values({
+				id: "fork-u1",
+				narratorId: "fork1",
+				role: "user",
+				contentJson: [{ type: "text", text: "fork-u1" }],
+				contentText: "fork-u1",
+				createdAt: ts(),
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({ id: "ref-fork-u1", narratorId: "fork1", messageId: "fork-u1", seq: 1000 })
+			.run();
+		expect(await isFirstUserTurn("fork1")).toBe(true);
+
+		// …and the second one ends it.
+		db.insert(narratorMessages)
+			.values({
+				id: "fork-u2",
+				narratorId: "fork1",
+				role: "user",
+				contentJson: [{ type: "text", text: "fork-u2" }],
+				contentText: "fork-u2",
+				createdAt: ts(),
+			})
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({ id: "ref-fork-u2", narratorId: "fork1", messageId: "fork-u2", seq: 1001 })
+			.run();
+		expect(await isFirstUserTurn("fork1")).toBe(false);
 	});
 });

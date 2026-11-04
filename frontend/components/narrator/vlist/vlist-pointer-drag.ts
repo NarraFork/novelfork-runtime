@@ -3,8 +3,8 @@
  *
  * The width-settle rule needs to know whether the user is mid-drag. That fact
  * cannot be inferred from a clock (see vlist-width-settle), and it cannot come from
- * the resizing library either: the narrator list is dragged by at least two
- * independent hosts (dockview sashes, the ruler/graph node resizers) and is also
+ * the resizing library either: the narrator list is dragged by independent hosts
+ * (dockview sashes, panel resizers) and is also
  * embedded in places that resize it for reasons of their own. Subscribing to each
  * host's private drag events would couple this list to all of them and still miss
  * the next one.
@@ -29,6 +29,8 @@
  * Native dragstart therefore holds its own slot until drop/dragend clears ALL
  * slots. Otherwise the orphaned MOUSE_ID defers a Dockview merge/swap's new width
  * until the 3s backstop, even though the user has already released the panel.
+ * A dragstart whose default action is cancelled does not get a slot: that drag
+ * never emits dragend, and keeping the slot would freeze width settle until reload.
  *
  * Listeners use the CAPTURE phase with `passive: true`: capture runs before any
  * bubble-phase `stopPropagation` an intermediate node might apply, and passive
@@ -86,8 +88,20 @@ export function createPointerDragTracker(onRelease: () => void): PointerDragTrac
 	const onDown = (event: Event) => {
 		active.add(slotOf(event));
 	};
-	const onDragStart = () => {
+	const onDragStart = (event: Event) => {
+		// A dragstart whose default is cancelled never emits dragend. Counting it
+		// would leave this slot set for the life of the page. This list's text
+		// guard is registered first and is visible as defaultPrevented already.
+		// A later canceller (another list's guard, or the file-panel exit guard)
+		// runs after this listener, so the slot is dropped at the end of the turn.
+		// Do not call onRelease for that drop: the press, when one was counted,
+		// still ends on mouseup, and a dragstart-only slot was never a gesture.
+		if (event.defaultPrevented) return;
 		active.add(NATIVE_DRAG_ID);
+		queueMicrotask(() => {
+			if (!event.defaultPrevented) return;
+			active.delete(NATIVE_DRAG_ID);
+		});
 	};
 	/**
 	 * Release ONE pointer. Reports a release only when it was the last one held.

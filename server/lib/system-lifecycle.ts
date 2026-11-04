@@ -11,6 +11,7 @@ export interface SystemLifecycleStatus {
 }
 
 export interface SystemLifecycleDependencies {
+	changed?(): void;
 	coordination(): UpdateCoordinationStatus;
 	canShutdown(): boolean;
 	schedule(): UpdateCoordinationStatus;
@@ -31,6 +32,13 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 	let error: string | undefined;
 	let epoch: string | undefined;
 	let preparation: Promise<void> | null = null;
+	let lastChange = JSON.stringify([phase, shutdownRequested, error]);
+	const changed = () => {
+		const next = JSON.stringify([phase, shutdownRequested, error]);
+		if (next === lastChange) return;
+		lastChange = next;
+		deps.changed?.();
+	};
 
 	const status = (): SystemLifecycleStatus => ({
 		phase,
@@ -44,14 +52,22 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 	async function rollback(reason: unknown, ownedEpoch: string) {
 		const cancelled = deps.isCancellation(reason) || deps.coordination().cancelRequested;
 		error = reason instanceof Error ? reason.message : String(reason);
+		changed();
 		try {
 			await deps.cleanup(ownedEpoch, error, cancelled);
 		} catch (cleanupError) {
 			error = `${error}; cleanup failed: ${String(cleanupError)}`;
+			// Durable rollback has not completed. Retain the epoch so cancel can
+			// retry; do not report idle or admit another preparation over this one.
+			shutdownRequested = false;
+			phase = "failed";
+			changed();
+			return;
 		}
 		shutdownRequested = false;
 		phase = cancelled ? "idle" : "failed";
 		epoch = undefined;
+		changed();
 	}
 
 	function closePrepared() {
@@ -59,6 +75,7 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 		if (!deps.shutdown()) throw new Error("Server shutdown is unavailable");
 		deps.markClosing();
 		phase = "shutting_down";
+		changed();
 	}
 
 	function prepare(closeAfterPreparation = false) {
@@ -66,12 +83,17 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 		if (!deps.canShutdown()) return failure("Server shutdown is unavailable");
 		if (preparation || phase === "preparing") {
 			shutdownRequested ||= closeAfterPreparation;
+			changed();
 			return success();
 		}
 		if (phase === "prepared" && !closeAfterPreparation) return success();
 		if (phase !== "prepared") {
 			if (deps.coordination().scheduled) return failure("An update is already scheduled");
-			epoch = deps.schedule().updateEpoch;
+			try {
+				epoch = deps.schedule().updateEpoch;
+			} catch (reason) {
+				return failure(reason instanceof Error ? reason.message : String(reason));
+			}
 		}
 		// Prepared state can last indefinitely. Re-converge the same epoch before exiting,
 		// because resumable waits may settle or be interrupted while the gate is closed.
@@ -80,12 +102,19 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 		phase = "preparing";
 		error = undefined;
 		shutdownRequested = closeAfterPreparation;
+		changed();
 		preparation = (async () => {
 			try {
 				const snapshot = await deps.drain(ownedEpoch);
 				deps.assertNotCancelled();
-				deps.persist({ ...snapshot, resumeOnNextStartup: true });
+				deps.persist({
+					...snapshot,
+					resumeOnNextStartup: true,
+					evidenceOnly: undefined,
+					handoffMarkerNonce: undefined,
+				});
 				phase = "prepared";
+				changed();
 				if (shutdownRequested) closePrepared();
 			} catch (reason) {
 				await rollback(reason, ownedEpoch);
@@ -98,11 +127,14 @@ export function createSystemLifecycle(deps: SystemLifecycleDependencies) {
 
 	function cancel() {
 		if (phase === "shutting_down") return failure("Server shutdown has already begun");
-		if (phase !== "preparing" && phase !== "prepared") return success();
+		if (phase !== "preparing" && phase !== "prepared" && !(phase === "failed" && epoch))
+			return success();
 		deps.cancel();
 		shutdownRequested = false;
+		changed();
 		if (!preparation && epoch) {
 			phase = "preparing";
+			changed();
 			preparation = rollback(new Error("System preparation cancelled"), epoch).finally(() => {
 				preparation = null;
 			});

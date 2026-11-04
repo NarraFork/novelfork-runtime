@@ -4,8 +4,8 @@
  * Provides lifecycle management for SWE-bench evaluation containers:
  * create → exec → collect results → destroy.
  *
- * Uses podman (rootless) directly, independent of NarraFork's container-service
- * which is designed around chapter-level compose workflows.
+ * Uses podman (rootless) directly; container-service only detects and installs
+ * Podman and parses compose files.
  */
 
 import { logger } from "../lib/logger";
@@ -40,6 +40,7 @@ async function podman(args: string[], timeoutMs = 60_000): Promise<ExecResult> {
 	const proc = Bun.spawn([PODMAN, ...args], {
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 	});
 
 	const timer = setTimeout(() => {
@@ -153,6 +154,7 @@ export async function execScript(
 			stdin: new Blob([script]),
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 		},
 	);
 

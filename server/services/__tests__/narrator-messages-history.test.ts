@@ -516,56 +516,6 @@ describe("narrator model history projection", () => {
 });
 
 describe("pretext exact document transport", () => {
-	test("running Send pages carry reserved delivery receipts without persisting a fake result", async () => {
-		const { beginAgentReplyWaitRun } = await import("../agent-reply-waiter");
-		await seedNarrator();
-		await seedMessage({
-			id: "send-message",
-			narratorId: "n1",
-			seq: 1,
-			role: "assistant",
-			contentJson: [
-				{ type: "tool_use", id: "send-live", name: "Send", input: { id: "child", await: true } },
-			],
-		});
-		await db.insert(narratorToolCalls).values({
-			id: "send-row",
-			narratorId: "n1",
-			messageId: "send-message",
-			toolUseId: "send-live",
-			toolName: "Send",
-			inputJson: { id: "child", await: true },
-			status: "running",
-			createdAt: now,
-		});
-		const run = beginAgentReplyWaitRun({
-			requesterId: "n1",
-			toolUseId: "send-live",
-			requesterToolCallBinding: { toolCallId: "send-row", attempt: 0 },
-		});
-		try {
-			run.markStable({
-				prefixTargets: [
-					{ id: "child", status: "queued", deliveryMessageId: "reserved-not-persisted" },
-				],
-			});
-			const page = await narratorService.getPretextDocumentPage("n1", { limit: 2 });
-			const block = page.messages[0].contentJson[0];
-			expect(block._sendDeliveryTargets).toEqual([
-				{ id: "child", deliveryMessageId: "reserved-not-persisted" },
-			]);
-			expect(block.outputJson).toBeNull();
-			expect(block.status).toBe("running");
-			expect(
-				sqlite.query("SELECT output_json FROM narrator_tool_calls WHERE id = ?").get("send-row"),
-			).toEqual({ output_json: null });
-			expect(
-				sqlite.query("SELECT id FROM narrator_messages WHERE id = ?").get("reserved-not-persisted"),
-			).toBeNull();
-		} finally {
-			run.complete();
-		}
-	});
 	test("pages the complete ordered top-level history without layout estimates", async () => {
 		await seedNarrator();
 		for (let seq = 1; seq <= 5; seq++) {
@@ -687,7 +637,7 @@ describe("pretext exact document transport", () => {
 		});
 	});
 
-	test("rejects a page if the document revision changes while it is being built", async () => {
+	test("keeps an unpinned page when streaming only bumps the sync version", async () => {
 		await seedNarrator();
 		await seedMessage({
 			id: "m-1",
@@ -697,15 +647,143 @@ describe("pretext exact document transport", () => {
 			contentText: "message 1",
 		});
 		const original = narratorMessageQueries.getMessageVersion;
-		let calls = 0;
-		narratorMessageQueries.getMessageVersion = async () => (calls++ === 0 ? 10 : 11);
+		narratorMessageQueries.getMessageVersion = async (narratorId: string) => {
+			// A completed block / tool result advances the counter without inserting a ref.
+			sqlite
+				.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
+				.run(narratorId);
+			return original(narratorId);
+		};
+		try {
+			const page = await narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 });
+			expect(page.messages.map((message) => message.id)).toEqual(["m-1"]);
+			// The page reports the revision it read, not the counter that moved afterwards.
+			expect(page.messageVersion).toBe(0);
+		} finally {
+			narratorMessageQueries.getMessageVersion = original;
+		}
+	});
+
+	test("rebuilds an unpinned page when a message lands during hydration", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+		const original = narratorMessageQueries.getMessageVersion;
+		let inserted = false;
+		narratorMessageQueries.getMessageVersion = async (narratorId: string) => {
+			if (!inserted) {
+				inserted = true;
+				await seedMessage({
+					id: "m-2",
+					narratorId,
+					seq: 2,
+					role: "assistant",
+					contentText: "message 2",
+				});
+				sqlite
+					.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
+					.run(narratorId);
+			}
+			return original(narratorId);
+		};
+		try {
+			const page = await narratorMessageQueries.getPretextDocumentPage("n1", { limit: 10 });
+			expect(page.messages.map((message) => message.id)).toEqual(["m-1", "m-2"]);
+			expect(page.messageVersion).toBe(1);
+		} finally {
+			narratorMessageQueries.getMessageVersion = original;
+		}
+	});
+
+	test("rejects a pinned page if the revision changes while it is being built", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+		const original = narratorMessageQueries.getMessageVersion;
+		narratorMessageQueries.getMessageVersion = async () => 11;
 		try {
 			await expect(
-				narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
+				narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1, messageVersion: 0 }),
 			).rejects.toMatchObject({
 				statusCode: 409,
 				code: "PRETEXT_DOCUMENT_CHANGED",
 			});
+		} finally {
+			narratorMessageQueries.getMessageVersion = original;
+		}
+	});
+
+	test("rejects an unpinned page when the window keeps moving", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+		const original = narratorMessageQueries.getMessageVersion;
+		let seq = 1;
+		narratorMessageQueries.getMessageVersion = async (narratorId: string) => {
+			seq += 1;
+			await seedMessage({
+				id: `m-${seq}`,
+				narratorId,
+				seq,
+				role: "assistant",
+				contentText: `message ${seq}`,
+			});
+			sqlite
+				.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
+				.run(narratorId);
+			return original(narratorId);
+		};
+		try {
+			await expect(
+				narratorMessageQueries.getPretextDocumentPage("n1", { limit: 10 }),
+			).rejects.toMatchObject({
+				statusCode: 409,
+				code: "PRETEXT_DOCUMENT_CHANGED",
+			});
+		} finally {
+			narratorMessageQueries.getMessageVersion = original;
+		}
+	});
+
+	test("does not rebuild a page pinned to a revision when it drifts mid-build", async () => {
+		await seedNarrator();
+		await seedMessage({
+			id: "m-1",
+			narratorId: "n1",
+			seq: 1,
+			role: "user",
+			contentText: "message 1",
+		});
+		const pinned = await narratorMessageQueries.getMessageVersion("n1");
+		const original = narratorMessageQueries.getMessageVersion;
+		let calls = 0;
+		narratorMessageQueries.getMessageVersion = async () => {
+			calls++;
+			return pinned + 1;
+		};
+		try {
+			await expect(
+				narratorMessageQueries.getPretextDocumentPage("n1", {
+					limit: 1,
+					messageVersion: pinned,
+				}),
+			).rejects.toMatchObject({ statusCode: 409, code: "PRETEXT_DOCUMENT_CHANGED" });
+			expect(calls).toBe(1);
 		} finally {
 			narratorMessageQueries.getMessageVersion = original;
 		}

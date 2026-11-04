@@ -6,43 +6,11 @@ import { createElement, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import {
-	coerceCommitSyncErrorEvent,
 	coerceCompactProgressEvent,
 	coercePermissionRoutingFields,
 	normalizeSubagentActivityCatchUp,
 	useNarratorWS,
 } from "./useNarratorWS";
-
-describe("coerceCommitSyncErrorEvent", () => {
-	test("preserves structured commit sync diagnostics", () => {
-		expect(
-			coerceCommitSyncErrorEvent({
-				chapterId: "chapter-1",
-				code: "WORKTREE_WATCHER_COMMIT_SYNC_FAILED",
-				reason: "failed to read git log",
-				error: "git log failed",
-				fallback: true,
-				fatal: false,
-				backgroundSync: true,
-				extra: "kept",
-			}),
-		).toEqual({
-			chapterId: "chapter-1",
-			code: "WORKTREE_WATCHER_COMMIT_SYNC_FAILED",
-			reason: "failed to read git log",
-			error: "git log failed",
-			message: undefined,
-			fallback: true,
-			fatal: false,
-			backgroundSync: true,
-			extra: "kept",
-		});
-	});
-
-	test("ignores events without a chapter id", () => {
-		expect(coerceCommitSyncErrorEvent({ code: "WORKTREE_WATCHER_COMMIT_SYNC_FAILED" })).toBeNull();
-	});
-});
 
 describe("coerceCompactProgressEvent", () => {
 	test("normalizes live compact progress", () => {
@@ -209,6 +177,9 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		narratorWSManager.leavePresence = (() => {}) as typeof narratorWSManager.leavePresence;
 		const sourceListeners: Array<(data: Record<string, unknown>) => void> = [];
 		const sourceUpdates: unknown[] = [];
+		const warnings: unknown[] = [];
+		const subagentWarnings: unknown[] = [];
+		const errors: unknown[] = [];
 		narratorWSManager.addListener = ((_opts, listener) => {
 			sourceListeners.push(listener);
 			return { _id: nextHandleId++ };
@@ -230,6 +201,9 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			useNarratorWS(
 				props.narratorId,
 				{
+					onNarratorWarning: (info) => warnings.push(info),
+					onSubagentWarning: (id, info) => subagentWarnings.push({ id, ...info }),
+					onNarratorError: (...args) => errors.push(args),
 					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
 					onToolStarted: (...args) => sourceUpdates.push(args[8]),
 					onStreamingSnapshot: (snapshot) =>
@@ -293,6 +267,61 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			])
 				for (const listener of sourceListeners) listener(frame);
 			expect(sourceUpdates).toEqual([inputDocument, inputDocument, inputDocument]);
+			for (const frame of [
+				{
+					type: "warning",
+					narratorId: "n1",
+					message: "voice.mp3：当前模型不支持读取该模态数据，回退到一般文件",
+					warningCode: "native_media_fallback",
+				},
+				{
+					type: "warning",
+					narratorId: "n1",
+					message: "provider busy",
+					retryCount: 1,
+					maxRetries: 3,
+					delayMs: 2000,
+					diagnostics: { kind: "provider_error" },
+				},
+				{
+					type: "warning",
+					narratorId: "n1",
+					message: "unknown warning",
+					warningCode: "future_warning",
+				},
+				{
+					type: "subagent_warning",
+					narratorId: "n1",
+					subagentNarratorId: "child",
+					message: "clip.mp4 downgraded",
+					warningCode: "native_media_fallback",
+				},
+			]) {
+				for (const listener of sourceListeners) listener(frame);
+			}
+			expect(warnings).toEqual([
+				expect.objectContaining({
+					warningCode: "native_media_fallback",
+					message: "voice.mp3：当前模型不支持读取该模态数据，回退到一般文件",
+				}),
+				expect.objectContaining({
+					warningCode: undefined,
+					message: "provider busy",
+					retryCount: 1,
+					maxRetries: 3,
+					delayMs: 2000,
+					diagnostics: { kind: "provider_error" },
+				}),
+				expect.objectContaining({ warningCode: undefined, message: "unknown warning" }),
+			]);
+			expect(subagentWarnings).toEqual([
+				expect.objectContaining({
+					id: "child",
+					warningCode: "native_media_fallback",
+					message: "clip.mp4 downgraded",
+				}),
+			]);
+			expect(errors).toEqual([]);
 			props = { narratorId: "n2" };
 			root.render(createElement(Harness));
 			await settle();
@@ -405,8 +434,10 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		const receipts: unknown[] = [];
 		const editOrigins: unknown[] = [];
 		const snapshotOrigins: unknown[] = [];
+		const gitStatuses: unknown[] = [];
 		function Harness(): ReactNode {
 			useNarratorWS(narratorId, {
+				onGitStatus: (status) => gitStatuses.push(status),
 				onToolStarted: (_id, _name, _start, _end, _input, _parent, _meta, origin) =>
 					editOrigins.push(origin),
 				onStreamingSnapshot: (snapshot) =>
@@ -456,6 +487,17 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			expect(newListener).toBeFunction();
 			newListener?.({ type: "title_updated", narratorId: "n2", title: "fresh-new-frame" });
 			expect(newWrites).toEqual(["fresh-new-frame"]);
+			newListener?.({
+				type: "git_status",
+				narratorId: "n2",
+				linesAdded: 7,
+				linesRemoved: 2,
+			});
+			newListener?.({ type: "git_status", narratorId: "n2" });
+			expect(gitStatuses).toEqual([
+				{ linesAdded: 7, linesRemoved: 2 },
+				{ linesAdded: undefined, linesRemoved: undefined },
+			]);
 			// Dedicated evidence crosses the raw WS dispatcher; input metadata is not a fallback.
 			const editInput = { file_path: "a.ts", old_string: "h".repeat(20_000), new_string: "new" };
 			const origin = createStreamingEditOrigin("edit", editInput, {

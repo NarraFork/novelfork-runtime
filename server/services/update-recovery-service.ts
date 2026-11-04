@@ -1,3 +1,4 @@
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
@@ -25,18 +26,28 @@ import {
 	isAgentDependentToolExecutionGroup,
 } from "../lib/agent/tool-execution-groups";
 import { listRunningAwaits } from "../lib/agent/tools/await";
-import { NotFoundError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { isSubagentVariant } from "../lib/narrator-utils";
 import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { getObservedRestartHandoff } from "../lib/restart-handoff";
+import { executionPrincipalOf } from "../lib/runtime-source";
 import {
-	type AgentReplyWaitRunSnapshot,
-	getRunningAgentReplyWaitRunSnapshot,
-	waitForAgentReplyWaitRunStability,
-} from "./agent-reply-waiter";
+	type RunBindingInput,
+	readRuntimeRegistrationColumn,
+} from "../lib/validators/runtime-registration";
+import { buildRetiredSendAwaitToolOutput, sendAwaitSnapshotFromPayload } from "./legacy-send-await";
 import {
+	getRecoverySource,
+	getRegisteredRecoverySource,
+	invalidateRecoveryTarget,
+	type RecoverySource,
+	type RecoverySourceHandle,
+	registerRecoverySource,
+	withRecoveryAdvance,
+} from "./recovery-handoff";
+import {
+	type EpochScope,
 	hasPersistedToolContinuationResult,
 	isToolContinuationOwnerMounted,
 	type ToolContinuationProtectionSets,
@@ -95,148 +106,11 @@ function payloadString(payload: Record<string, unknown> | null, key: string): st
 	return typeof value === "string" && value ? value : undefined;
 }
 
-function payloadNumber(payload: Record<string, unknown> | null, key: string): number | undefined {
-	const value = payload?.[key];
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
 function timestampMs(value: string | number | Date | null | undefined): number | null {
 	if (value == null) return null;
 	const parsed =
 		value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
 	return Number.isFinite(parsed) ? parsed : null;
-}
-
-export function sendAwaitSnapshotFromPayload(
-	payload: Record<string, unknown> | null,
-): AgentReplyWaitRunSnapshot | null {
-	const value = payload?.sendAwait;
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	const snapshot = value as Partial<AgentReplyWaitRunSnapshot>;
-	if (
-		typeof snapshot.toolUseId !== "string" ||
-		typeof snapshot.requesterId !== "string" ||
-		!Array.isArray(snapshot.waiters) ||
-		!Array.isArray(snapshot.prefixSections) ||
-		!Array.isArray(snapshot.prefixTargets)
-	) {
-		return null;
-	}
-	// Old checkpoints legitimately lack these fields. If present, validate without
-	// inferring revision from a current mailbox row or silently repairing malformed identity.
-	for (const target of [...snapshot.waiters, ...snapshot.prefixTargets]) {
-		if (!target || typeof target !== "object" || Array.isArray(target)) return null;
-		for (const key of ["deliveryId", "recipientRefId"] as const) {
-			const pointer = target[key];
-			if (
-				pointer !== undefined &&
-				(typeof pointer !== "string" || pointer.length === 0 || Buffer.byteLength(pointer) > 512)
-			)
-				return null;
-		}
-		if (
-			target.revision !== undefined &&
-			(!Number.isSafeInteger(target.revision) || target.revision < 1)
-		)
-			return null;
-		if (
-			(target.recipientRefId !== undefined || target.revision !== undefined) &&
-			target.deliveryId === undefined
-		)
-			return null;
-	}
-	return snapshot as AgentReplyWaitRunSnapshot;
-}
-
-function earliestPendingSendAwaitDeadline(snapshot: AgentReplyWaitRunSnapshot): string | null {
-	let earliest = Number.POSITIVE_INFINITY;
-	for (const waiter of snapshot.waiters) {
-		if (waiter.result) continue;
-		const deadline = Date.parse(waiter.deadlineAt);
-		if (Number.isFinite(deadline)) earliest = Math.min(earliest, deadline);
-	}
-	return Number.isFinite(earliest) ? new Date(earliest).toISOString() : null;
-}
-
-export async function waitForStableSendAwaitCheckpoint(
-	input: { toolCallId: string; toolUseId: string },
-	hooks: {
-		loadStatus?: () => Promise<string | null>;
-		pause?: () => Promise<void>;
-	} = {},
-): Promise<AgentReplyWaitRunSnapshot | null> {
-	const loadStatus =
-		hooks.loadStatus ??
-		(async () => {
-			const current = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, input.toolCallId),
-				columns: { status: true },
-			});
-			return current?.status ?? null;
-		});
-	const pause = hooks.pause ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 5)));
-	for (;;) {
-		const snapshot =
-			getRunningAgentReplyWaitRunSnapshot(input.toolUseId) ??
-			(await waitForAgentReplyWaitRunStability(input.toolUseId));
-		if (snapshot) return snapshot;
-		const status = await loadStatus();
-		if (!status || !["initializing", "pending", "running"].includes(status)) return null;
-		// A granted Send await can be between the durable running row and its in-memory
-		// waiter registration. Wait for that setup to stabilize or for the tool to finish;
-		// never classify the possibly-delivered Send as a deferred re-execution.
-		await pause();
-	}
-}
-
-export interface SendAwaitCheckpointVerification {
-	stable: boolean;
-	unstableToolCallIds: string[];
-}
-
-function sameSendAwaitSnapshot(
-	left: AgentReplyWaitRunSnapshot | null,
-	right: AgentReplyWaitRunSnapshot | null,
-): boolean {
-	return JSON.stringify(left) === JSON.stringify(right);
-}
-
-/**
- * Reverse-check every Send await already persisted for this epoch. A terminal tool row is
- * authoritative and atomically advances the continuation to result_written; an active row is
- * stable only while its durable snapshot exactly matches the current process-local waiter run.
- */
-export async function verifySendAwaitCheckpointEpoch(
-	updateEpoch: string,
-): Promise<SendAwaitCheckpointVerification> {
-	const rows = await toolContinuationService.listSendAwaitCheckpointRows(updateEpoch);
-	const unstableToolCallIds: string[] = [];
-	for (const { record, toolCallStatus } of rows) {
-		if (isToolContinuationOwnerMounted(record) || record.state === "cancelled") continue;
-		if (toolCallStatus === "success" || toolCallStatus === "fail") {
-			await toolContinuationService.reconcileSendAwaitResult(record.toolCallId, updateEpoch);
-			continue;
-		}
-		if (hasPersistedToolContinuationResult(record)) continue;
-
-		const currentSnapshot = getRunningAgentReplyWaitRunSnapshot(
-			sendAwaitSnapshotFromPayload(record.payloadJson)?.toolUseId ?? "",
-		);
-		const persistedSnapshot = sendAwaitSnapshotFromPayload(record.payloadJson);
-		if (!currentSnapshot || !sameSendAwaitSnapshot(currentSnapshot, persistedSnapshot)) {
-			unstableToolCallIds.push(record.toolCallId);
-			if (currentSnapshot) {
-				await toolContinuationService.checkpointSendAwait({
-					toolCallId: record.toolCallId,
-					narratorId: record.narratorId,
-					updateEpoch,
-					deadlineAt: earliestPendingSendAwaitDeadline(currentSnapshot),
-					payloadJson: { ...(record.payloadJson ?? {}), sendAwait: currentSnapshot },
-				});
-			}
-		}
-	}
-	return { stable: unstableToolCallIds.length === 0, unstableToolCallIds };
 }
 
 export function resolveAgentExecutionDeadline(input: {
@@ -267,8 +141,25 @@ export function resolveAgentExecutionDeadline(input: {
 }
 
 function localeFor(snapshot: PlannedUpdateRecoverySnapshot, narratorId: string): Locale {
-	return (snapshot.narrators.find((target) => target.narratorId === narratorId)?.locale ??
+	return (recoveryTargets(snapshot).find((target) => target.narratorId === narratorId)?.locale ??
 		"en") as Locale;
+}
+
+export function recoveryEpochScope(snapshot: PlannedUpdateRecoverySnapshot): EpochScope {
+	return snapshot.sources?.length
+		? [snapshot.updateEpoch, ...snapshot.sources.map((source) => source.updateEpoch)]
+		: snapshot.updateEpoch;
+}
+
+function recoveryTargets(snapshot: PlannedUpdateRecoverySnapshot) {
+	return [
+		...new Map(
+			[
+				...(snapshot.sources?.flatMap((source) => source.narrators) ?? []),
+				...snapshot.narrators,
+			].map((target) => [target.narratorId, target]),
+		).values(),
+	];
 }
 
 /**
@@ -323,7 +214,7 @@ export function startContinuationClaimRenewal(
 	toolCallId: string,
 	claimToken: string,
 	abortController: AbortController,
-	options: { leaseMs?: number; intervalMs?: number } = {},
+	options: { leaseMs?: number; intervalMs?: number; updateEpoch?: string } = {},
 ): ContinuationClaimRenewal {
 	const leaseMs = options.leaseMs ?? CLAIM_LEASE_MS;
 	const intervalMs = options.intervalMs ?? CLAIM_RENEW_INTERVAL_MS;
@@ -352,6 +243,7 @@ export function startContinuationClaimRenewal(
 		if (stopped) return;
 		try {
 			const renewed = await toolContinuationService.renewClaim(toolCallId, {
+				updateEpoch: options.updateEpoch,
 				claimToken,
 				deadlineAt: new Date(Date.now() + leaseMs).toISOString(),
 			});
@@ -442,10 +334,17 @@ export async function runContinuationRecoveryGroups(
 export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpdateRecoverySnapshot> {
 	const snapshot = capturePlannedUpdateRecoverySnapshot();
 	const runningAwaits = new Map(listRunningAwaits().map((entry) => [entry.toolUseId, entry]));
-	const { BACKGROUND_TASK_TIMEOUT_MS, listRunningSubagentExecutions } = await import(
-		"./subagent-runner"
-	);
-	const runningAgents = listRunningSubagentExecutions();
+	const [{ BACKGROUND_TASK_TIMEOUT_MS }, { listDeliveringRuns }] = await Promise.all([
+		import("./subagent-runner"),
+		import("./agent-runtime/run"),
+	]);
+	// The live run registry: absolute deadlines and run ids are registered facts.
+	const runningAgents = listDeliveringRuns().map((run) => ({
+		...run,
+		subagentId: run.narratorId,
+		executionDeadlineAt: run.deadlineAt,
+		timeoutMs: null,
+	}));
 	const runningAgentByToolUseId = new Map(runningAgents.map((entry) => [entry.toolUseId, entry]));
 	const runningAgentBySubagentId = new Map(runningAgents.map((entry) => [entry.subagentId, entry]));
 	// Only rows owned by a narrator this process is still running may become continuations.
@@ -508,9 +407,10 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 		}
 	}
 
-	for (const toolCall of toolCalls) {
+	for (const [index, toolCall] of toolCalls.entries()) {
+		if (index > 0 && index % 100 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
 		if (toolCall.status === "pending") {
-			await toolContinuationService.upsert({
+			await toolContinuationService.checkpoint({
 				toolCallId: toolCall.id,
 				narratorId: toolCall.narratorId,
 				updateEpoch: snapshot.updateEpoch,
@@ -521,7 +421,7 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 			continue;
 		}
 		if (toolCall.status === "initializing") {
-			await toolContinuationService.upsert({
+			await toolContinuationService.checkpoint({
 				toolCallId: toolCall.id,
 				narratorId: toolCall.narratorId,
 				updateEpoch: snapshot.updateEpoch,
@@ -531,21 +431,6 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 			continue;
 		}
 		const input = toolCall.inputJson as Record<string, unknown> | null;
-		if (toolCall.toolName === "Send" && input?.await === true) {
-			const sendAwait = await waitForStableSendAwaitCheckpoint({
-				toolCallId: toolCall.id,
-				toolUseId: toolCall.toolUseId,
-			});
-			if (!sendAwait) continue;
-			await toolContinuationService.checkpointSendAwait({
-				toolCallId: toolCall.id,
-				narratorId: toolCall.narratorId,
-				updateEpoch: snapshot.updateEpoch,
-				deadlineAt: earliestPendingSendAwaitDeadline(sendAwait),
-				payloadJson: { sendAwait },
-			});
-			continue;
-		}
 		if (toolCall.toolName === "Agent") {
 			const subagentId = subagentByOrigin.get(toolCall.toolUseId);
 			if (!subagentId) continue;
@@ -557,7 +442,7 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 				toolInput: input,
 				startedAt: runtime?.startedAt ?? toolCall.executionStartedAt ?? toolCall.createdAt,
 			});
-			await toolContinuationService.upsert({
+			await toolContinuationService.checkpoint({
 				toolCallId: toolCall.id,
 				narratorId: toolCall.narratorId,
 				updateEpoch: snapshot.updateEpoch,
@@ -585,7 +470,7 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 				new Date(
 					Date.now() + (typeof input?.timeout === "number" ? input.timeout : 600_000),
 				).toISOString();
-			await toolContinuationService.upsert({
+			await toolContinuationService.checkpoint({
 				toolCallId: toolCall.id,
 				narratorId: toolCall.narratorId,
 				updateEpoch: snapshot.updateEpoch,
@@ -617,7 +502,7 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 			startedAt: runtime?.startedAt ?? task.startedAt ?? toolCall.executionStartedAt,
 			defaultTimeoutMs: BACKGROUND_TASK_TIMEOUT_MS,
 		});
-		await toolContinuationService.upsert({
+		await toolContinuationService.checkpoint({
 			toolCallId: toolCall.id,
 			narratorId: toolCall.narratorId,
 			updateEpoch: snapshot.updateEpoch,
@@ -634,9 +519,48 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 		});
 	}
 
+	const checkpointRows = await toolContinuationService.listByEpoch(recoveryEpochScope(snapshot));
+	if (snapshot.sources?.length) {
+		const evidence = new Map<string, { toolCallId: string; executionAttempt: number }[]>();
+		for (let offset = 0; offset < checkpointRows.length; offset += 100) {
+			const batch = checkpointRows.slice(offset, offset + 100);
+			const calls = await db
+				.select({
+					id: narratorToolCalls.id,
+					executionAttempt: narratorToolCalls.executionAttempt,
+					executionStartedAt: narratorToolCalls.executionStartedAt,
+					status: narratorToolCalls.status,
+				})
+				.from(narratorToolCalls)
+				.where(
+					inArray(
+						narratorToolCalls.id,
+						batch.map((row) => row.toolCallId),
+					),
+				);
+			for (const call of calls) {
+				if (call.executionStartedAt != null || !["initializing", "pending"].includes(call.status))
+					continue;
+				const epoch = batch.find((row) => row.toolCallId === call.id)?.updateEpoch;
+				if (epoch)
+					evidence.set(epoch, [
+						...(evidence.get(epoch) ?? []),
+						{
+							toolCallId: call.id,
+							executionAttempt: call.executionAttempt,
+						},
+					]);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		snapshot.sources = snapshot.sources.map((source) => ({
+			...source,
+			unstartedTools: evidence.get(source.updateEpoch) ?? [],
+		}));
+	}
 	logger.info("Checkpointed planned-update tool continuations", {
 		updateEpoch: snapshot.updateEpoch,
-		count: (await toolContinuationService.listByEpoch(snapshot.updateEpoch)).length,
+		count: checkpointRows.length,
 	});
 	return snapshot;
 }
@@ -666,7 +590,8 @@ async function loadUpdateSeveredNarrators(
 	const severed = new Set<string>();
 	if (snapshot.narrators.length === 0) return severed;
 	const { narratorService } = await import("./narrator-service");
-	for (const target of snapshot.narrators) {
+	for (const [index, target] of snapshot.narrators.entries()) {
+		if (index > 0 && index % 100 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
 		try {
 			const narrator = await narratorService.getById(target.narratorId);
 			if (UPDATE_SEVERED_STATUSES.has(narrator.status)) severed.add(target.narratorId);
@@ -682,7 +607,12 @@ async function loadUpdateSeveredNarrators(
 }
 
 /** Read the manifest epoch before generic startup cleanup mutates any protected row. */
-export async function getPlannedUpdateStartupProtection(): Promise<{
+export async function getPlannedUpdateStartupProtection(
+	options: {
+		claimAuthorization?: boolean;
+		onTargetsDiscovered?: (narratorIds: readonly string[]) => void;
+	} = {},
+): Promise<{
 	snapshot: PlannedUpdateRecoverySnapshot | null;
 	protection: ToolContinuationProtectionSets;
 	/** Manifest narrators observed mid-turn before generic recovery rewrote their status. */
@@ -690,6 +620,11 @@ export async function getPlannedUpdateStartupProtection(): Promise<{
 }> {
 	const snapshot = consumePlannedUpdateRecoverySnapshot();
 	if (!snapshot) {
+		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
+	}
+
+	if (options.claimAuthorization !== false && getRegisteredRecoverySource(snapshot.updateEpoch)) {
+		// Already claimed by this process: preserve evidence and never clear a live cold claim.
 		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
 	}
 
@@ -709,25 +644,160 @@ export async function getPlannedUpdateStartupProtection(): Promise<{
 		return { snapshot: null, protection: EMPTY_PROTECTION, severedNarratorIds: new Set() };
 	}
 
-	if (snapshot.resumeOnNextStartup) {
+	// Publish only owned, bounded manifest targets before continuation validation can fail.
+	options.onTargetsDiscovered?.(recoveryTargets(snapshot).map((target) => target.narratorId));
+	let claimedSnapshot = snapshot;
+	if (snapshot.resumeOnNextStartup && options.claimAuthorization !== false) {
 		// Claim before mounting any owner. Keep evidence for this recovery pass, but a later
 		// ordinary boot must not replay the authorization if recovery crashes or fails.
-		writePlannedUpdateRecoverySnapshot(
+		claimedSnapshot = writePlannedUpdateRecoverySnapshot(
 			{ ...snapshot, resumeOnNextStartup: false, evidenceOnly: true },
 			{ expectedEpoch: snapshot.updateEpoch },
 		);
 	}
 
-	return {
-		snapshot,
-		protection: await toolContinuationService.getProtectionSets(snapshot.updateEpoch),
-		severedNarratorIds: await loadUpdateSeveredNarrators(snapshot),
-	};
+	const scope = recoveryEpochScope(snapshot);
+	// This bounded load checks the combined row/payload budget before any cold repair or mount.
+	const records = await toolContinuationService.listByEpoch(scope);
+	let protection = await toolContinuationService.getProtectionSets(scope);
+	const severedNarratorIds = await loadUpdateSeveredNarrators(snapshot);
+	if (options.claimAuthorization !== false) {
+		const sources: RecoverySource[] = [
+			{
+				updateEpoch: snapshot.updateEpoch,
+				kind: "planned",
+				capturedAt: snapshot.capturedAt,
+				narrators: snapshot.narrators,
+				pendingNarratorIds: snapshot.narrators
+					.filter(
+						(target) =>
+							severedNarratorIds.has(target.narratorId) ||
+							records.some(
+								(row) =>
+									row.narratorId === target.narratorId && !isToolContinuationOwnerMounted(row),
+							),
+					)
+					.map((target) => target.narratorId),
+			},
+			...(snapshot.sources ?? []),
+		];
+		for (const source of sources)
+			registerRecoverySource(
+				source,
+				source.updateEpoch === snapshot.updateEpoch
+					? { manifestIdentity: JSON.stringify(claimedSnapshot) }
+					: undefined,
+			);
+		const evidence = snapshot.sources?.flatMap((source) => source.unstartedTools ?? []) ?? [];
+		if (evidence.length > 0 || snapshot.sources?.length) {
+			const pass = toolContinuationService.beginColdRecoveryPass({
+				rootEpoch: snapshot.updateEpoch,
+				sourceEpochs: sources.map((source) => source.updateEpoch),
+				unstartedTools: evidence,
+			});
+			try {
+				for (const [index, receipt] of evidence.entries()) {
+					if (index > 0 && index % 100 === 0)
+						await new Promise((resolve) => setTimeout(resolve, 0));
+					const record = records.find((row) => row.toolCallId === receipt.toolCallId);
+					if (!record || !NON_IDEMPOTENT_KINDS.has(record.kind) || record.state !== "resuming")
+						continue;
+					await toolContinuationService.controlledColdTakeover(
+						{
+							toolCallId: record.toolCallId,
+							narratorId: record.narratorId,
+							updateEpoch: record.updateEpoch,
+							kind: record.kind,
+							state: "paused",
+							payloadJson: record.payloadJson,
+							deadlineAt: record.deadlineAt,
+						},
+						{
+							sourceEpoch: record.updateEpoch,
+							executionAttempt: receipt.executionAttempt,
+							authorization: pass.authorization,
+						},
+					);
+					if (index > 0 && index % 100 === 0)
+						await new Promise((resolve) => setTimeout(resolve, 0));
+				}
+				// A permission/deferred Agent may have started after the handoff receipt. Reattach
+				// only its persisted original child; never execute the original Agent tool again.
+				for (const [index, record] of records.entries()) {
+					if (index > 0 && index % 100 === 0)
+						await new Promise((resolve) => setTimeout(resolve, 0));
+					if (
+						record.state === "cancelled" ||
+						hasPersistedToolContinuationResult(record) ||
+						!snapshot.sources?.some((source) => source.updateEpoch === record.updateEpoch)
+					)
+						continue;
+					const call = await db.query.narratorToolCalls.findFirst({
+						where: eq(narratorToolCalls.id, record.toolCallId),
+						columns: { toolName: true, executionStartedAt: true, executionAttempt: true },
+					});
+					if (call?.toolName !== "Agent" || call.executionStartedAt == null) continue;
+					const child = await db.query.narrators.findFirst({
+						where: and(
+							eq(narrators.originToolCallId, record.toolCallId),
+							eq(narrators.parentNarratorId, record.narratorId),
+						),
+						columns: { id: true, logicalRunId: true },
+					});
+					if (!child?.logicalRunId) continue;
+					const background = await db.query.backgroundTasks.findFirst({
+						where: and(
+							eq(backgroundTasks.subagentNarratorId, child.id),
+							eq(backgroundTasks.status, "running"),
+						),
+						columns: { id: true, alias: true },
+					});
+					await toolContinuationService.controlledColdReattachAgent(
+						{
+							toolCallId: record.toolCallId,
+							narratorId: record.narratorId,
+							updateEpoch: record.updateEpoch,
+							kind: background ? "background_agent" : "foreground_agent",
+							payloadJson: {
+								...record.payloadJson,
+								subagentId: child.id,
+								logicalRunId: child.logicalRunId,
+								...(background
+									? { backgroundTaskId: background.id, backgroundTaskAlias: background.alias }
+									: {}),
+							},
+						},
+						{
+							sourceEpoch: record.updateEpoch,
+							executionAttempt: call.executionAttempt,
+							authorization: pass.authorization,
+							subagentId: child.id,
+							logicalRunId: child.logicalRunId,
+						},
+					);
+					if (index > 0 && index % 100 === 0)
+						await new Promise((resolve) => setTimeout(resolve, 0));
+				}
+			} finally {
+				pass.close();
+			}
+			// Reattachment can add a child/task absent from the original pending-permission row.
+			protection = await toolContinuationService.getProtectionSets(scope);
+		}
+	}
+	for (const source of snapshot.sources ?? []) {
+		// Explicit handoff eligibility survives generic cleanup's idle/interrupted rewrite.
+		for (const id of source.pendingNarratorIds) {
+			if (source.kind === "planned") severedNarratorIds.add(id);
+			else protection.narratorIds.add(id);
+		}
+	}
+	return { snapshot, protection, severedNarratorIds };
 }
 
 async function finalizeInterruptedRecoveryParent(
 	narratorId: string,
-	updateEpoch: string,
+	updateEpoch: EpochScope,
 	locale: Locale,
 	recoveryToken: string,
 ): Promise<void> {
@@ -758,19 +828,18 @@ async function finalizeInterruptedRecoveryParent(
 	// already-running task/result row must remain untouched while ordinary interrupted tools
 	// receive their terminal ToolResult below.
 	const interruptedToolResults = cancelled.filter((record) => record.kind !== "background_agent");
+	// A legacy Send await already delivered its message: close it, never fail it.
 	const sendAwaits = interruptedToolResults.filter((record) => record.kind === "send_await");
 	if (sendAwaits.length > 0) {
-		const { formatSendAwaitSnapshotWithFallback } = await import("./agent-communication");
 		for (const record of sendAwaits) {
 			const snapshot = sendAwaitSnapshotFromPayload(record.payloadJson);
 			if (!snapshot) continue;
 			const toolCall = await toolContinuationService.getToolCallResult(record.toolCallId);
 			if (!toolCall || toolCall.status === "success" || toolCall.status === "fail") continue;
-			const result = formatSendAwaitSnapshotWithFallback(snapshot, { status: "aborted" });
 			await narratorPersistence.updateToolCallResultIfActive(
 				toolCall.toolUseId,
 				{
-					output: buildRecoveredSendAwaitToolOutput(snapshot, result),
+					output: buildRetiredSendAwaitToolOutput(snapshot),
 					status: "success",
 					completedAt: Date.now(),
 				},
@@ -812,6 +881,8 @@ type OwnerContinuationOutcome = "started" | "mounted" | "deferred";
 
 async function continueOwnerWhenReady(
 	record: ToolContinuationRecord,
+	recoveringToolCallIds?: ReadonlySet<string>,
+	scope: EpochScope = record.updateEpoch,
 ): Promise<OwnerContinuationOutcome> {
 	const { narratorService } = await import("./narrator-service");
 	let owner: Awaited<ReturnType<typeof narratorService.getById>>;
@@ -821,40 +892,28 @@ async function continueOwnerWhenReady(
 		if (error instanceof NotFoundError) return "mounted";
 		throw error;
 	}
-	if (isSubagentVariant(owner.variant)) {
-		const epochRows = await toolContinuationService.listByEpoch(record.updateEpoch);
-		const owningAgentContinuation = epochRows.find(
-			(row) =>
-				(row.kind === "foreground_agent" || row.kind === "background_agent") &&
-				payloadString(row.payloadJson, "subagentId") === owner.id &&
-				row.state !== "cancelled",
-		);
-		if (owningAgentContinuation) {
-			return hasPersistedToolContinuationResult(owningAgentContinuation) ? "mounted" : "deferred";
-		}
-		const { resumeSubagent } = await import("./subagent-resume");
-		try {
-			const resumed = await resumeSubagent({
-				subagentId: owner.id,
-				resumeLogicalRunId: owner.logicalRunId ?? undefined,
-				intent: "continue_tool_results",
-				actor: "parent_agent",
-				locale: "en",
-				allowRunningRestart: true,
-				skipStaleAttach: true,
-			});
-			if (resumed.started) return "started";
-		} catch (error) {
-			const current = await narratorService.getById(owner.id).catch(() => null);
-			if (current?.status === "working" || current?.status === "waiting") return "mounted";
-			throw error;
-		}
-		const current = await narratorService.getById(owner.id).catch(() => null);
-		if (current?.status === "working" || current?.status === "waiting") return "mounted";
-		throw new Error(`Subagent owner continuation did not start for ${owner.id}`);
+	// A session whose run another continuation re-drives (it owes that run's result to
+	// a recovering tool call) is mounted by that continuation, not here.
+	const epochRows = await toolContinuationService.listByEpoch(scope);
+	const owningAgentContinuation = epochRows.find(
+		(row) =>
+			(row.kind === "foreground_agent" || row.kind === "background_agent") &&
+			payloadString(row.payloadJson, "subagentId") === owner.id &&
+			row.state !== "cancelled",
+	);
+	if (
+		owningAgentContinuation &&
+		(!recoveringToolCallIds || recoveringToolCallIds.has(owningAgentContinuation.toolCallId))
+	) {
+		return hasPersistedToolContinuationResult(owningAgentContinuation) ? "mounted" : "deferred";
 	}
 	const { continueNarrator } = await import("./narrator-session");
-	const continued = await continueNarrator(owner.id);
+	const continued = await continueNarrator(owner.id, "en", false, undefined, {
+		resumeRunId: owner.logicalRunId ?? undefined,
+		recovered: true,
+		// An ordinary restart's own run already delivered (or never owed) its result.
+		deliver: !(record.payloadJson?.ordinaryRestart === true && !owningAgentContinuation),
+	});
 	if (continued.ok) return "started";
 	const current = await narratorService.getById(owner.id).catch(() => null);
 	if (current?.status === "working" || current?.status === "waiting") return "mounted";
@@ -872,11 +931,14 @@ async function restorePersistedTool(
 		record.payloadJson?.permissionMode === "preGranted"
 			? "preGranted"
 			: "normal";
-	const execution = executePersistedToolCall({
-		toolCallId: record.toolCallId,
-		narratorId: record.narratorId,
-		permissionMode,
-	});
+	// Only admission is critical; approval and execution may remain live for hours.
+	const { execution } = await withRecoveryAdvance(record.updateEpoch, () => ({
+		execution: executePersistedToolCall({
+			toolCallId: record.toolCallId,
+			narratorId: record.narratorId,
+			permissionMode,
+		}),
+	}));
 	const waitsForAgentRegistration = toolName === "Agent";
 	if (!waitsForAgentRegistration) onMounted();
 	const result = await execution;
@@ -888,7 +950,7 @@ async function restorePersistedTool(
 
 async function waitForChildContinuationResults(
 	subagentId: string,
-	updateEpoch: string,
+	updateEpoch: EpochScope,
 	signal: AbortSignal,
 ): Promise<void> {
 	while (await toolContinuationService.hasUnwrittenResultsForNarrator(subagentId, updateEpoch)) {
@@ -958,50 +1020,54 @@ async function restoreAgent(
 	locale: Locale,
 	signal: AbortSignal,
 	onMounted: () => void,
+	scope: EpochScope,
 ): Promise<void> {
 	const subagentId = payloadString(record.payloadJson, "subagentId");
 	if (!subagentId) throw new Error("Agent continuation is missing subagentId");
-	const executionDeadlineAt = payloadString(record.payloadJson, "executionDeadlineAt") ?? null;
-	const executionTimeoutMs = payloadNumber(record.payloadJson, "executionTimeoutMs") ?? null;
-	const deadlineMs = timestampMs(executionDeadlineAt);
-	const remainingExecutionTimeoutMs =
-		deadlineMs === null ? undefined : Math.max(deadlineMs - Date.now(), 0);
-	await waitForChildContinuationResults(subagentId, record.updateEpoch, signal);
-	const { resumeSubagent } = await import("./subagent-resume");
+	await waitForChildContinuationResults(subagentId, scope, signal);
 	const resumeLogicalRunId =
 		payloadString(record.payloadJson, "logicalRunId") ??
 		readAgentLogicalRunId(subagentId) ??
 		(await getRuntimePublicationService().getAgentRun(subagentId, record.narratorId)).logicalRunId;
-	const resumed = await resumeSubagent({
-		subagentId,
-		intent: "continue_tool_results",
-		actor: "parent_agent",
-		locale,
-		signal,
-		allowRunningRestart: true,
-		skipStaleAttach: true,
-		preserveBackground: background,
-		skipConclusionDelivery: background,
-		resumableUpdateLease: true,
-		resumeLogicalRunId,
-		timeoutMs: remainingExecutionTimeoutMs,
-		executionDeadlineAt,
-		executionTimeoutMs,
+	// New registrations win. A pre-registration checkpoint still carries its original
+	// absolute deadline: materialize it once, never turn it back into a fresh timeout.
+	const source = await db.query.narrators.findFirst({
+		where: eq(narrators.id, subagentId),
+		columns: { runtimeRegistrationJson: true, ownerUserId: true },
 	});
-	if (!resumed.started || !resumed.terminalCompletion) {
+	let legacyBinding: RunBindingInput | undefined;
+	if (!readRuntimeRegistrationColumn(source?.runtimeRegistrationJson)?.run) {
+		const call = await toolContinuationService.getToolCallResult(record.toolCallId);
+		if (!call) throw new Error("Agent continuation's spawning call no longer exists");
+		legacyBinding = {
+			deliverTo: {
+				narratorId: record.narratorId,
+				toolUseId: call.toolUseId,
+				toolCallId: record.toolCallId,
+			},
+			principal: executionPrincipalOf(source ?? {}) ?? { userId: null },
+			deadlineAt: payloadString(record.payloadJson, "executionDeadlineAt"),
+		};
+	}
+	const { continueNarrator } = await import("./narrator-session");
+	const resumed = await withRecoveryAdvance(record.updateEpoch, () =>
+		continueNarrator(subagentId, locale, false, undefined, {
+			resumeRunId: resumeLogicalRunId,
+			recovered: true,
+			...(legacyBinding ? { binding: legacyBinding } : {}),
+			...(background ? {} : { cancelSignal: signal }),
+		}),
+	);
+	if (!resumed.ok || !resumed.terminal) {
 		throw new Error("Agent continuation did not expose terminal completion");
 	}
-	if (
-		!(await toolContinuationService.markOwnerContinuationStartedForNarrator(
-			subagentId,
-			record.updateEpoch,
-		))
-	) {
+	const terminalCompletion = resumed.terminal;
+	if (!(await toolContinuationService.markOwnerContinuationStartedForNarrator(subagentId, scope))) {
 		throw new Error(`Failed to persist mounted child continuation for ${subagentId}`);
 	}
 	if (background) {
 		await persistRecoveredBackgroundAgentStartResult(record, subagentId);
-		void resumed.terminalCompletion.catch((error) => {
+		void terminalCompletion.catch((error) => {
 			logger.error("Recovered background Agent terminal completion failed", {
 				subagentId,
 				toolCallId: record.toolCallId,
@@ -1012,7 +1078,7 @@ async function restoreAgent(
 		return;
 	}
 	onMounted();
-	await resumed.terminalCompletion;
+	await terminalCompletion;
 	if (signal.aborted) throw signal.reason ?? new Error("Agent continuation recovery was aborted");
 }
 
@@ -1033,21 +1099,6 @@ export function buildRecoveredAwaitToolOutput(
 	};
 }
 
-export function buildRecoveredSendAwaitToolOutput(
-	snapshot: AgentReplyWaitRunSnapshot,
-	result: { output: string; targets: unknown[] },
-): { _text: string; _metadata: Record<string, unknown> } {
-	return {
-		_text: result.output,
-		_metadata: {
-			kind: "send",
-			targets: result.targets,
-			doInterrupt: snapshot.doInterrupt,
-			await: true,
-		},
-	};
-}
-
 async function restoreAwait(
 	record: ToolContinuationRecord,
 	signal: AbortSignal,
@@ -1061,12 +1112,14 @@ async function restoreAwait(
 		0,
 	);
 	const { awaitAgentResultDetailed } = await import("./agent-communication");
-	const waiting = awaitAgentResultDetailed({
-		callerNarratorId: record.narratorId,
-		id: targetId,
-		timeoutMs: remainingMs,
-		signal,
-	});
+	const { waiting } = await withRecoveryAdvance(record.updateEpoch, () => ({
+		waiting: awaitAgentResultDetailed({
+			callerNarratorId: record.narratorId,
+			id: targetId,
+			timeoutMs: remainingMs,
+			signal,
+		}),
+	}));
 	onMounted();
 	const result = await waiting;
 	if (signal.aborted) throw signal.reason ?? new Error("Await continuation recovery was aborted");
@@ -1087,63 +1140,17 @@ async function restoreAwait(
 	);
 }
 
-async function waitForPersistedSendAwaitResult(
-	toolCallId: string,
-	signal: AbortSignal,
-): Promise<"persisted" | "stopped"> {
-	for (;;) {
-		const toolCall = await toolContinuationService.getToolCallResult(toolCallId);
-		if (!toolCall || toolCall.status === "success" || toolCall.status === "fail") {
-			return "persisted";
-		}
-		if (signal.aborted) return "stopped";
-		await new Promise<void>((resolve) => {
-			const onAbort = () => {
-				clearTimeout(timer);
-				resolve();
-			};
-			const timer = setTimeout(() => {
-				signal.removeEventListener("abort", onAbort);
-				resolve();
-			}, 10);
-			signal.addEventListener("abort", onAbort, { once: true });
-		});
-	}
-}
-
+/**
+ * Close a Send await checkpointed by a process from before Send stopped waiting. Its
+ * messages were delivered; the call ends with the outcome the checkpoint recorded.
+ */
 async function restoreSendAwait(
 	record: ToolContinuationRecord,
-	signal: AbortSignal,
 	onMounted: () => void,
 ): Promise<void> {
 	const snapshot = sendAwaitSnapshotFromPayload(record.payloadJson);
 	if (!snapshot) throw new Error("Send await continuation is missing its waiter snapshot");
-	const { restoreSendAwaitFromSnapshot } = await import("./agent-communication");
-	const localAbort = new AbortController();
-	const waiterSignal = AbortSignal.any([signal, localAbort.signal]);
-	// The async function registers every pending request synchronously before its first await.
-	// Marking mounted immediately after the call therefore means responders can safely resume.
-	const waiting = restoreSendAwaitFromSnapshot(snapshot, waiterSignal);
 	onMounted();
-	const persistedResult = waitForPersistedSendAwaitResult(record.toolCallId, localAbort.signal);
-	const winner = await Promise.race([
-		waiting.then((result) => ({ kind: "waiter" as const, result })),
-		persistedResult.then((status) => ({ kind: "database" as const, status })),
-	]);
-	if (winner.kind === "database") {
-		if (winner.status === "persisted") {
-			// The old process won the settlement race after checkpointing. Retire the restored
-			// waiter and trust its already-durable ToolResult instead of writing a second result.
-			localAbort.abort(new Error("Send await ToolResult was persisted by the previous process"));
-			await waiting;
-			return;
-		}
-		throw new Error("Send await ToolResult monitor stopped before waiter completion");
-	}
-	localAbort.abort();
-	if (signal.aborted) {
-		throw signal.reason ?? new Error("Send await continuation recovery was aborted");
-	}
 	const toolCall = await toolContinuationService.getToolCallResult(record.toolCallId);
 	if (!toolCall) throw new Error("Send tool call was deleted before recovery");
 	if (toolCall.status === "success" || toolCall.status === "fail") return;
@@ -1151,7 +1158,7 @@ async function restoreSendAwait(
 	const updated = await narratorPersistence.updateToolCallResultIfActive(
 		toolCall.toolUseId,
 		{
-			output: buildRecoveredSendAwaitToolOutput(snapshot, winner.result),
+			output: buildRetiredSendAwaitToolOutput(snapshot),
 			status: "success",
 			completedAt: Date.now(),
 		},
@@ -1177,16 +1184,30 @@ async function restoreClaimedContinuation(
 			await restorePersistedTool(record, toolName, onMounted);
 			return;
 		case "foreground_agent":
-			await restoreAgent(record, false, localeFor(snapshot, record.narratorId), signal, onMounted);
+			await restoreAgent(
+				record,
+				false,
+				localeFor(snapshot, record.narratorId),
+				signal,
+				onMounted,
+				recoveryEpochScope(snapshot),
+			);
 			return;
 		case "background_agent":
-			await restoreAgent(record, true, localeFor(snapshot, record.narratorId), signal, onMounted);
+			await restoreAgent(
+				record,
+				true,
+				localeFor(snapshot, record.narratorId),
+				signal,
+				onMounted,
+				recoveryEpochScope(snapshot),
+			);
 			return;
 		case "await_agent":
 			await restoreAwait(record, signal, onMounted);
 			return;
 		case "send_await":
-			await restoreSendAwait(record, signal, onMounted);
+			await restoreSendAwait(record, onMounted);
 	}
 }
 
@@ -1197,10 +1218,12 @@ async function writeRecoveryToolError(
 ): Promise<boolean> {
 	const toolCall = await db.query.narratorToolCalls.findFirst({
 		where: eq(narratorToolCalls.id, record.toolCallId),
+		columns: { id: true, toolUseId: true, messageId: true, status: true },
 	});
 	if (!toolCall) return false;
-	const { narratorService } = await import("./narrator-service");
-	await narratorService.updateToolCallResult(
+	if (toolCall.status === "success" || toolCall.status === "fail") return true;
+	const { narratorPersistence } = await import("./narrator-persistence");
+	await narratorPersistence.updateToolCallResultIfActive(
 		toolCall.toolUseId,
 		{
 			output: {
@@ -1224,6 +1247,7 @@ async function writeAndFinalizeRecoveryFailure(
 ): Promise<ToolContinuationRecord | null> {
 	if (!(await writeRecoveryToolError(record, recoveryStatus, errorMessage))) return null;
 	return toolContinuationService.finalizeRecoveryFailure(record.toolCallId, {
+		updateEpoch: record.updateEpoch,
 		errorMessage,
 		payloadJson: {
 			...(record.payloadJson ?? {}),
@@ -1252,6 +1276,7 @@ async function resolveExpiredNonIdempotentClaim(
 		return null;
 	}
 	const failed = await toolContinuationService.markExecutionUnknown(record.toolCallId, {
+		updateEpoch: record.updateEpoch,
 		claimToken: record.claimToken,
 		errorMessage: EXECUTION_UNKNOWN_ERROR,
 		payloadJson: {
@@ -1284,6 +1309,8 @@ async function claimAndRestoreExecution(
 	onMounted: () => void,
 ): Promise<ToolContinuationRecord> {
 	let current = (await toolContinuationService.getByToolCallId(record.toolCallId)) ?? record;
+	if (current.updateEpoch !== record.updateEpoch)
+		throw new Error(`Continuation epoch changed for ${record.toolCallId}`);
 	if (current.kind === "send_await") {
 		current =
 			(await toolContinuationService.reconcileSendAwaitResult(
@@ -1299,6 +1326,42 @@ async function claimAndRestoreExecution(
 		onMounted();
 		return current;
 	}
+	// A prior process may have persisted the actual result and died before advancing the
+	// continuation phase. Terminal tool rows win over expired non-idempotent claims.
+	// Background Agent success is only its start receipt, so its child still needs mounting.
+	const persistedCall = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, current.toolCallId),
+		columns: { status: true },
+	});
+	if (
+		current.kind !== "background_agent" &&
+		(persistedCall?.status === "success" || persistedCall?.status === "fail")
+	) {
+		const resultClaim =
+			current.state === "resuming" && current.claimToken
+				? current
+				: await toolContinuationService.claim(current.toolCallId, {
+						updateEpoch: current.updateEpoch,
+						claimToken: generateId(),
+						deadlineAt: new Date(Date.now() + CLAIM_LEASE_MS).toISOString(),
+					});
+		if (resultClaim?.claimToken) {
+			const written = await toolContinuationService.markResultWritten(current.toolCallId, {
+				updateEpoch: current.updateEpoch,
+				claimToken: resultClaim.claimToken,
+			});
+			if (written) {
+				onMounted();
+				return written;
+			}
+		}
+		const latest = await toolContinuationService.getByToolCallId(current.toolCallId);
+		if (latest?.state === "cancelled" || (latest && hasPersistedToolContinuationResult(latest))) {
+			onMounted();
+			return latest;
+		}
+		throw new Error(`Could not reconcile persisted terminal result for ${current.toolCallId}`);
+	}
 	const repaired = await repairPendingRecoveryFailure(current);
 	if (repaired) {
 		onMounted();
@@ -1306,10 +1369,13 @@ async function claimAndRestoreExecution(
 	}
 
 	const claimToken = generateId();
-	let claimed = await toolContinuationService.claim(record.toolCallId, {
-		claimToken,
-		deadlineAt: new Date(Date.now() + CLAIM_LEASE_MS).toISOString(),
-	});
+	let claimed = await withRecoveryAdvance(recoveryEpochScope(snapshot), () =>
+		toolContinuationService.claim(record.toolCallId, {
+			updateEpoch: record.updateEpoch,
+			claimToken,
+			deadlineAt: new Date(Date.now() + CLAIM_LEASE_MS).toISOString(),
+		}),
+	);
 	if (!claimed) {
 		current = (await toolContinuationService.getByToolCallId(record.toolCallId)) ?? current;
 		if (current.state === "cancelled") {
@@ -1348,16 +1414,21 @@ async function claimAndRestoreExecution(
 			onMounted();
 			return executionUnknown;
 		}
-		claimed = await toolContinuationService.claim(record.toolCallId, {
-			claimToken,
-			deadlineAt: new Date(Date.now() + CLAIM_LEASE_MS).toISOString(),
-		});
+		claimed = await withRecoveryAdvance(recoveryEpochScope(snapshot), () =>
+			toolContinuationService.claim(record.toolCallId, {
+				updateEpoch: record.updateEpoch,
+				claimToken,
+				deadlineAt: new Date(Date.now() + CLAIM_LEASE_MS).toISOString(),
+			}),
+		);
 		if (!claimed) throw new Error(`Continuation ${record.toolCallId} lost its recovery claim`);
 	}
 
 	const abortController = new AbortController();
 	const renewal = RENEWABLE_KINDS.has(claimed.kind)
-		? startContinuationClaimRenewal(record.toolCallId, claimToken, abortController)
+		? startContinuationClaimRenewal(record.toolCallId, claimToken, abortController, {
+				updateEpoch: record.updateEpoch,
+			})
 		: null;
 	const restorationSignal =
 		parentInterrupt && claimed.kind !== "background_agent"
@@ -1378,6 +1449,7 @@ async function claimAndRestoreExecution(
 			await restoration;
 		}
 		const resultWritten = await toolContinuationService.markResultWritten(record.toolCallId, {
+			updateEpoch: record.updateEpoch,
 			claimToken,
 		});
 		if (!resultWritten) {
@@ -1410,6 +1482,7 @@ async function claimAndRestoreExecution(
 			? { ...(claimed.payloadJson ?? {}), recoveryStatus: "failed", toolErrorWritten: false }
 			: undefined;
 		const failed = await toolContinuationService.fail(record.toolCallId, {
+			updateEpoch: record.updateEpoch,
 			claimToken,
 			errorMessage: message,
 			payloadJson,
@@ -1442,10 +1515,12 @@ async function deliverRecoveredMessageOwner(
 	record: ToolContinuationRecord,
 	messageId: string,
 	parentInterrupt?: ParentRecoveryInterrupt,
+	recoveringToolCallIds?: ReadonlySet<string>,
+	scope: EpochScope = record.updateEpoch,
 ): Promise<void> {
 	const rows = await toolContinuationService.markOwnerContinuationPendingForMessage(
 		messageId,
-		record.updateEpoch,
+		scope,
 		parentInterrupt?.token,
 	);
 	if (!rows) {
@@ -1467,7 +1542,7 @@ async function deliverRecoveredMessageOwner(
 
 	const onlyBackgroundAgents = rows.every((row) => row.kind === "background_agent");
 	if (!onlyBackgroundAgents) {
-		const outcome = await continueOwnerWhenReady(record);
+		const outcome = await continueOwnerWhenReady(record, recoveringToolCallIds, scope);
 		// An interrupt can land after continueNarrator's admission check but before its active loop
 		// becomes visible to interruptNarrator. Abort that newly-started loop without recursively
 		// re-triggering planned-update control, then join the token's durable finalizer.
@@ -1476,7 +1551,7 @@ async function deliverRecoveredMessageOwner(
 	}
 	const started = await toolContinuationService.markOwnerContinuationStartedForMessage(
 		messageId,
-		record.updateEpoch,
+		scope,
 		parentInterrupt?.token,
 	);
 	if (parentInterrupt && (await settleInterruptedOwnerDelivery(record, parentInterrupt))) return;
@@ -1487,7 +1562,10 @@ async function deliverRecoveredMessageOwner(
 
 interface RecoveryQueueHandle {
 	mounted: Promise<void>;
+	/** Installation attempts, not terminal Send replies; rejection is reported by mounted. */
+	sendWaitersSettled: Promise<void>;
 	completion: Promise<void>;
+	ownerCompletions: ReadonlyMap<string, Promise<void>>;
 }
 
 function restoreRecoveryQueue(
@@ -1500,19 +1578,15 @@ function restoreRecoveryQueue(
 		mounted: Promise<void>;
 		executionMounted: Promise<void>;
 		markReady: () => void;
+		rejectMounts: (error: unknown) => void;
 		run: () => Promise<ToolContinuationRecord>;
-		prestarted?: Promise<ToolContinuationRecord>;
+		started?: Promise<ToolContinuationRecord>;
 	};
 	const plans = groupContinuationRecoveryItems(queue).map((messageItems) => {
 		const executionGroups = groupToolExecutions(messageItems);
 		const runs = new Map<ToolContinuationRecoveryItem, ScheduledRun>();
 
 		for (const [groupIndex, executionGroup] of executionGroups.entries()) {
-			const previousGroup = executionGroups[groupIndex - 1];
-			const followsAgentMountBarrier = isAgentDependentToolExecutionGroup(
-				previousGroup,
-				executionGroup,
-			);
 			for (const item of executionGroup) {
 				const {
 					promise: mounted,
@@ -1557,6 +1631,7 @@ function restoreRecoveryQueue(
 					mounted,
 					executionMounted,
 					markReady,
+					rejectMounts,
 					run: async () => {
 						try {
 							if (isToolContinuationOwnerMounted(item.record)) {
@@ -1587,86 +1662,97 @@ function restoreRecoveryQueue(
 					},
 				};
 				runs.set(item, scheduled);
-				// Later groups are queued behind an earlier barrier and count as safely mounted,
-				// except Send await and an Agent-dependent Await/Send group: both need their real
-				// responder/waiter setup to exist before planned-update recovery becomes ready.
-				if (groupIndex > 0 && item.record.kind !== "send_await" && !followsAgentMountBarrier) {
-					markReady();
-				}
+				// Ordinary restart has installed a durable queued owner already. Its HTTP readiness
+				// must not wait for a child's human gate, while executionMounted still keeps
+				// Agent-dependent Await/Send behind the actual child/alias registration.
+				if (snapshot.updateEpoch.startsWith("restart-")) markReady();
+				// Queued followers are safe for HTTP readiness even while an Agent is waiting
+				// for human approval. Their executionMounted dependency still prevents actual
+				// Await/Send execution before alias registration.
+				if (groupIndex > 0) markReady();
 			}
 		}
 		return { messageItems, executionGroups, runs };
 	});
 
-	// Globally install every Send await waiter before any Agent/Await continuation can run.
-	// These prestarts perform no delivery and therefore may safely bypass message barriers;
-	// their result promises are still consumed at the original execution-group position.
-	const sendMounts: Promise<void>[] = [];
-	for (const plan of plans) {
-		for (const item of plan.messageItems) {
-			if (item.record.kind !== "send_await" || isToolContinuationOwnerMounted(item.record))
-				continue;
-			const scheduled = plan.runs.get(item);
-			if (!scheduled) throw new Error("Send await recovery item was not scheduled");
-			scheduled.prestarted = scheduled.run();
-			// A prestart failure rejects `mounted`, which fails the barrier below before the
-			// execution loop can reach this item's original position. Observe the run promise now
-			// so the same error is not also reported as an unhandled rejection; the loop still
-			// consumes it (and propagates it) whenever it does get that far.
-			void scheduled.prestarted.catch(() => {});
-			sendMounts.push(scheduled.mounted);
-		}
-	}
-	const sendWaitersMounted = Promise.all(sendMounts).then(() => undefined);
-
 	const messageCompletions = plans.map((plan) =>
 		(async () => {
-			await sendWaitersMounted;
-			let activeRuns: Promise<ToolContinuationRecord>[] = [];
-			for (const [groupIndex, executionGroup] of plan.executionGroups.entries()) {
-				const previousGroup = plan.executionGroups[groupIndex - 1];
-				const followsAgentMountBarrier = isAgentDependentToolExecutionGroup(
-					previousGroup,
-					executionGroup,
-				);
-				if (followsAgentMountBarrier && previousGroup) {
-					// An Await/Send after Agent must not race the spawn, but it only depends on
-					// the Agent being registered/running — not on its terminal completion. Keep
-					// the previous group's completion active so the next ordinary barrier still
-					// waits for both groups.
-					await Promise.all(
-						previousGroup.map((item) => {
-							const scheduled = plan.runs.get(item);
-							if (!scheduled) throw new Error("Recovery item was not scheduled");
-							return scheduled.executionMounted;
-						}),
+			try {
+				let activeRuns: Promise<ToolContinuationRecord>[] = [];
+				for (const [groupIndex, executionGroup] of plan.executionGroups.entries()) {
+					const previousGroup = plan.executionGroups[groupIndex - 1];
+					const followsAgentMountBarrier = isAgentDependentToolExecutionGroup(
+						previousGroup,
+						executionGroup,
 					);
-				} else {
-					await Promise.all(activeRuns);
-					activeRuns = [];
-				}
+					if (followsAgentMountBarrier && previousGroup) {
+						// An Await/Send after Agent must not race the spawn, but it only depends on
+						// the Agent being registered/running — not on its terminal completion. Keep
+						// the previous group's completion active so the next ordinary barrier still
+						// waits for both groups.
+						await Promise.all(
+							previousGroup.map((item) => {
+								const scheduled = plan.runs.get(item);
+								if (!scheduled) throw new Error("Recovery item was not scheduled");
+								return scheduled.executionMounted;
+							}),
+						);
+					} else {
+						await Promise.all(activeRuns);
+						activeRuns = [];
+					}
 
-				for (const item of executionGroup) {
-					const scheduled = plan.runs.get(item);
-					if (!scheduled) throw new Error("Recovery item was not scheduled");
-					const run = scheduled.prestarted ?? scheduled.run();
-					// Keep errors observed while a later Agent-dependent group is being mounted;
-					// the next normal barrier or final join still propagates the same rejection.
-					void run.catch(() => {});
-					activeRuns.push(run);
+					for (const item of executionGroup) {
+						const scheduled = plan.runs.get(item);
+						if (!scheduled) throw new Error("Recovery item was not scheduled");
+						const run = scheduled.run();
+						scheduled.started = run;
+						// Keep errors observed while a later Agent-dependent group is being mounted;
+						// the next normal barrier or final join still propagates the same rejection.
+						void run.catch(() => {});
+						activeRuns.push(run);
+					}
 				}
+				await Promise.all(activeRuns);
+				await withRecoveryAdvance(recoveryEpochScope(snapshot), () =>
+					deliverRecoveredMessageOwner(
+						plan.messageItems[0].record,
+						plan.messageItems[0].messageId,
+						parentInterrupts.get(plan.messageItems[0].record.narratorId),
+						new Set(queue.map((item) => item.record.toolCallId)),
+						recoveryEpochScope(snapshot),
+					),
+				);
+			} catch (error) {
+				for (const scheduled of plan.runs.values()) scheduled.rejectMounts(error);
+				throw error;
+			} finally {
+				// A sibling failure must not release this owner while another execution is live.
+				await Promise.allSettled(
+					[...plan.runs.values()].flatMap((run) => (run.started ? [run.started] : [])),
+				);
 			}
-			await Promise.all(activeRuns);
-			await deliverRecoveredMessageOwner(
-				plan.messageItems[0].record,
-				plan.messageItems[0].messageId,
-				parentInterrupts.get(plan.messageItems[0].record.narratorId),
-			);
 		})(),
 	);
+	const owners = new Map<string, Promise<void>[]>();
+	for (const [index, plan] of plans.entries()) {
+		const id = plan.messageItems[0].record.narratorId;
+		owners.set(id, [...(owners.get(id) ?? []), messageCompletions[index]]);
+	}
 	return {
 		mounted: Promise.all(mountedPromises).then(() => undefined),
+		// Send no longer installs reply waiters, so nothing gates the legacy work behind it.
+		sendWaitersSettled: Promise.resolve(),
 		completion: Promise.all(messageCompletions).then(() => undefined),
+		ownerCompletions: new Map(
+			[...owners].map(([id, promises]) => [
+				id,
+				Promise.allSettled(promises).then((outcomes) => {
+					const failure = outcomes.find((outcome) => outcome.status === "rejected");
+					if (failure?.status === "rejected") throw failure.reason;
+				}),
+			]),
+		),
 	};
 }
 
@@ -1681,40 +1767,107 @@ function restoreRecoveryQueue(
  *  - A failure here is never written back to the manifest. The manifest is owned by one spawned
  *    replacement process, so a retry entry could only ever be consumed by a startup that does not
  *    own it — which is precisely how abandoned narrators came back on every boot. The failure is
- *    reported (and logged) instead, and the manifest is dropped with the rest of this epoch.
+ *    reported (and logged) instead, and the consumed manifest is retained as failure evidence.
  */
 async function restoreLegacyNarrators(
 	snapshot: PlannedUpdateRecoverySnapshot,
 	protection: ToolContinuationProtectionSets,
 	severedNarratorIds: ReadonlySet<string>,
+	controls?: ReadonlyMap<
+		string,
+		{
+			controller: AbortController;
+			registration: import("./narrator-session").PlannedUpdateRecoveryRegistration;
+		}
+	>,
 ): Promise<void> {
 	const { narratorService } = await import("./narrator-service");
+	const {
+		continueNarratorAfterPlannedUpdate,
+		registerPlannedUpdateRecoveryController,
+		isLoopRunning,
+	} = await import("./narrator-session");
+	const { withNarratorStartAdmission } = await import("./narrator-session-state");
 	const failures: string[] = [];
 	let skipped = 0;
-	for (const target of snapshot.narrators) {
+	for (const target of recoveryTargets(snapshot)) {
 		if (protection.narratorIds.has(target.narratorId)) continue;
+		// A current root target is a newer run than a historical source with the same ID.
+		const source = snapshot.narrators.some((entry) => entry.narratorId === target.narratorId)
+			? undefined
+			: snapshot.sources?.find((entry) => entry.pendingNarratorIds.includes(target.narratorId));
+		if (source?.kind === "ordinary") continue;
+		const epoch = source?.updateEpoch ?? snapshot.updateEpoch;
 		if (!severedNarratorIds.has(target.narratorId)) {
 			skipped++;
 			continue;
 		}
 		try {
-			const narrator = await narratorService.getById(target.narratorId);
-			if (isSubagentVariant(narrator.variant)) continue;
-			const { continueNarrator } = await import("./narrator-session");
-			const continued = await continueNarrator(
-				target.narratorId,
-				target.locale as Locale,
-				target.replyInUserLanguage ?? false,
-				target.userId ?? null,
+			await withRecoveryAdvance(recoveryEpochScope(snapshot), () =>
+				withNarratorStartAdmission(target.narratorId, async () => {
+					const registered = getRecoverySource(epoch);
+					if (registered && !registered.pendingNarratorIds.includes(target.narratorId)) return;
+					const existing = controls?.get(target.narratorId);
+					const controller = existing?.controller ?? new AbortController();
+					const registration =
+						existing?.registration ??
+						registerPlannedUpdateRecoveryController(target.narratorId, controller);
+					try {
+						if (controller.signal.aborted) return;
+						const narrator = await narratorService.getById(target.narratorId);
+						controller.signal.throwIfAborted();
+						if (narrator.status === "archived") {
+							invalidateRecoveryTarget(target.narratorId);
+							return;
+						}
+						const run = source?.logicalRuns?.find(
+							(entry) => entry.narratorId === target.narratorId,
+						);
+						if (run && run.logicalRunId !== (narrator.logicalRunId ?? null)) {
+							invalidateRecoveryTarget(target.narratorId);
+							return;
+						}
+						const continued = await continueNarratorAfterPlannedUpdate(
+							target.narratorId,
+							registration.token,
+							target.locale as Locale,
+							target.replyInUserLanguage ?? false,
+							target.userId ?? null,
+							{ resumeRunId: narrator.logicalRunId ?? undefined, recovered: true },
+						);
+						controller.signal.throwIfAborted();
+						if (!continued.ok && !isLoopRunning(target.narratorId)) {
+							throw new Error("Legacy narrator continuation did not start");
+						}
+						const original = getRegisteredRecoverySource(epoch);
+						const current = getRecoverySource(epoch);
+						if (current && original)
+							registerRecoverySource(original).update({
+								...current,
+								pendingNarratorIds: current.pendingNarratorIds.filter(
+									(id) => id !== target.narratorId,
+								),
+							});
+					} catch (error) {
+						if (!controller.signal.aborted) throw error;
+						await registration.finalizeInterrupt();
+						// Async preparation (especially updateStatus(working)) may have finished
+						// AFTER the interrupt finalizer. Settle last, before this start admission
+						// can release a newer user run; this also covers legacy-only epochs.
+						await narratorService.updateStatus(target.narratorId, "idle", {
+							substatus: ["interrupted"],
+							skipErrorMessage: true,
+						});
+					} finally {
+						if (!existing) registration.unregister();
+					}
+				}),
 			);
-			if (!continued.ok) {
-				const current = await narratorService.getById(target.narratorId);
-				if (current.status !== "working" && current.status !== "waiting") {
-					throw new Error("Legacy narrator continuation did not start");
-				}
-			}
 		} catch (error) {
-			if (error instanceof NotFoundError) continue;
+			if (error instanceof NotFoundError) {
+				invalidateRecoveryTarget(target.narratorId);
+				continue;
+			}
 			failures.push(target.narratorId);
 			logger.warn("Failed to resume legacy planned-update narrator", {
 				narratorId: target.narratorId,
@@ -1779,11 +1932,28 @@ export interface PlannedUpdateRecoveryHandle {
  * permission, or AskUserQuestion terminal completion. The returned completion drives readiness
  * failure reporting and manifest cleanup in the background.
  */
-export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
-	snapshot: PlannedUpdateRecoverySnapshot | null;
-	protection: ToolContinuationProtectionSets;
-	severedNarratorIds?: ReadonlySet<string>;
-}): Promise<PlannedUpdateRecoveryHandle | null> {
+export async function restoreNarratorsAfterPlannedUpdate(
+	prepared?: {
+		snapshot: PlannedUpdateRecoverySnapshot | null;
+		protection: ToolContinuationProtectionSets;
+		severedNarratorIds?: ReadonlySet<string>;
+	},
+	options: {
+		/** Ordinary restart owns a separate manifest, never the update handoff authorization. */
+		onQueueCompleted?: () => Promise<void>;
+		/** Ordinary independent children share the global Send waiter installation barrier. */
+		onSendWaitersSettled?: () => Promise<void>;
+		includedNarratorIds?: ReadonlySet<string>;
+		/** Explicit Continue affects only its clicked recipient, never the recovered subtree. */
+		humanReplyContext?: { narratorId: string; context: ReplyContext };
+	} = {},
+): Promise<PlannedUpdateRecoveryHandle | null> {
+	const humanReplyContext = options.humanReplyContext
+		? {
+				narratorId: options.humanReplyContext.narratorId,
+				context: parseReplyContext(options.humanReplyContext.context),
+			}
+		: undefined;
 	const startup = prepared ?? (await getPlannedUpdateStartupProtection());
 	const { snapshot, protection } = startup;
 	const severedNarratorIds = startup.severedNarratorIds ?? new Set<string>();
@@ -1791,9 +1961,18 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 		flushRuntimePublications();
 		return null;
 	}
-	const queue = (
-		await toolContinuationService.listRecoveryQueueByEpoch(snapshot.updateEpoch)
-	).filter(({ record }) => record.state !== "cancelled" && !isToolContinuationOwnerMounted(record));
+	const scope = recoveryEpochScope(snapshot);
+	const sourceHandles = new Map<string, RecoverySourceHandle>();
+	for (const epoch of typeof scope === "string" ? [scope] : scope) {
+		const source = getRegisteredRecoverySource(epoch);
+		if (source) sourceHandles.set(epoch, registerRecoverySource(source));
+	}
+	const queue = (await toolContinuationService.listRecoveryQueueByEpoch(scope)).filter(
+		({ record }) =>
+			record.state !== "cancelled" &&
+			!isToolContinuationOwnerMounted(record) &&
+			(!options.includedNarratorIds || options.includedNarratorIds.has(record.narratorId)),
+	);
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const parentControls = new Map<
 		string,
@@ -1802,39 +1981,62 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 			registration: ReturnType<typeof registerPlannedUpdateRecoveryController>;
 		}
 	>();
-	for (const narratorId of new Set(queue.map(({ record }) => record.narratorId))) {
-		const controller = new AbortController();
-		const recoveryToken = generateId();
-		await toolContinuationService.bindRecoveryTokenForNarrator(
-			narratorId,
-			snapshot.updateEpoch,
-			recoveryToken,
-		);
-		const registration = registerPlannedUpdateRecoveryController(
-			narratorId,
-			controller,
-			(token) =>
-				finalizeInterruptedRecoveryParent(
+	const registerRecovery = async () => {
+		try {
+			for (const narratorId of new Set(queue.map(({ record }) => record.narratorId))) {
+				const controller = new AbortController();
+				const recoveryToken = generateId();
+				await withRecoveryAdvance(scope, () =>
+					toolContinuationService.bindRecoveryTokenForNarrator(narratorId, scope, recoveryToken),
+				);
+				const registration = registerPlannedUpdateRecoveryController(
 					narratorId,
-					snapshot.updateEpoch,
-					localeFor(snapshot, narratorId),
-					token,
-				),
-			{
-				token: recoveryToken,
-				// The subagents this owner re-drives in the foreground. Named individually
-				// because their continuation runs on a signal that is not this narrator's,
-				// so an interrupt cannot otherwise find them — and so it cannot reach the
-				// parent's other children either.
-				foregroundSubagentIds: queue.flatMap(({ record }) => {
-					if (record.narratorId !== narratorId || record.kind !== "foreground_agent") return [];
-					const subagentId = payloadString(record.payloadJson, "subagentId");
-					return subagentId ? [subagentId] : [];
-				}),
-			},
+					controller,
+					(token) =>
+						finalizeInterruptedRecoveryParent(
+							narratorId,
+							scope,
+							localeFor(snapshot, narratorId),
+							token,
+						),
+					{
+						token: recoveryToken,
+						foregroundSubagentIds: queue.flatMap(({ record }) => {
+							if (record.narratorId !== narratorId || record.kind !== "foreground_agent") return [];
+							const subagentId = payloadString(record.payloadJson, "subagentId");
+							return subagentId ? [subagentId] : [];
+						}),
+					},
+				);
+				parentControls.set(narratorId, { controller, registration });
+			}
+			if (humanReplyContext?.context && parentControls.has(humanReplyContext.narratorId)) {
+				const { adoptHumanReplyContext } = await import("./narrator-reply-context");
+				await adoptHumanReplyContext(humanReplyContext.narratorId, humanReplyContext.context);
+			}
+		} catch (error) {
+			// No queue has started yet: release partial registrations so startup failure
+			// reconciliation can distinguish these owners from genuinely mounted work.
+			for (const control of parentControls.values()) control.registration.unregister();
+			throw error;
+		}
+	};
+	if (humanReplyContext) {
+		const { isNarratorRuntimeBusy, withNarratorStartAdmission } = await import(
+			"./narrator-session-state"
 		);
-		parentControls.set(narratorId, { controller, registration });
-	}
+		const { getExecutionOwner } = await import("./agent-runtime/ownership");
+		await withNarratorStartAdmission(humanReplyContext.narratorId, async () => {
+			if (
+				getExecutionOwner(humanReplyContext.narratorId) ||
+				isNarratorRuntimeBusy(humanReplyContext.narratorId)
+			) {
+				throw new ValidationError("Cannot continue while narrator is already running");
+			}
+			await registerRecovery();
+		});
+	} else await registerRecovery();
+	// Release start admission before a recovery can re-enter continueNarrator.
 	const queueRecovery = restoreRecoveryQueue(
 		queue,
 		snapshot,
@@ -1849,37 +2051,140 @@ export async function restoreNarratorsAfterPlannedUpdate(prepared?: {
 			]),
 		),
 	);
+	const backgroundOnlyOwners = new Set(parentControls.keys());
+	for (const { record } of queue) {
+		if (record.kind !== "background_agent") backgroundOnlyOwners.delete(record.narratorId);
+	}
+	const ownerReleases = [...queueRecovery.ownerCompletions].map(([id, settled]) => {
+		const release = (async () => {
+			try {
+				try {
+					await settled;
+					// Keep interrupt coverage until the actual foreground execution takes over.
+					// This helper owns its advance; nesting it here makes a handoff reservation
+					// wait for the outer advance while the inner waits for that reservation.
+					if (!options.onQueueCompleted && backgroundOnlyOwners.has(id)) {
+						const narratorIds = new Set(protection.narratorIds);
+						narratorIds.delete(id);
+						await restoreLegacyNarrators(
+							snapshot,
+							{ ...protection, narratorIds },
+							new Set(severedNarratorIds.has(id) ? [id] : []),
+							parentControls,
+						);
+					}
+				} finally {
+					// Wait for this owner's actual executions, not an aggregate sibling failure.
+					parentControls.get(id)?.registration.unregister();
+				}
+				await withRecoveryAdvance(scope, async () => {
+					const rows = (await toolContinuationService.listByEpoch(scope)).filter(
+						(row) => row.narratorId === id,
+					);
+					if (
+						rows.every((row) => row.state === "cancelled" || isToolContinuationOwnerMounted(row))
+					) {
+						for (const [epoch, handle] of sourceHandles) {
+							const source = getRecoverySource(epoch);
+							if (source)
+								handle.update({
+									...source,
+									pendingNarratorIds: source.pendingNarratorIds.filter((target) => target !== id),
+								});
+						}
+					}
+					const { reconcileRunningStatus } = await import("./narrator-session");
+					await reconcileRunningStatus(id);
+				});
+				// Queue wake may itself acquire recovery admission. Never hold an epoch
+				// advance across that nested entry point.
+				if (!parentControls.get(id)?.controller.signal.aborted)
+					await drainQueuedMessagesAfterRecovery(snapshot, [id]);
+			} catch (error) {
+				const { failUnownedStartupRecovery } = await import("./narrator-session");
+				await failUnownedStartupRecovery([id], error);
+				throw error;
+			} finally {
+				flushRuntimePublications();
+			}
+		})();
+		// A mount failure may make the caller return before background owners settle.
+		void release.catch(() => {});
+		return release;
+	});
+	// Independent legacy work only waits for global Send waiter installation attempts.
+	// Ordinary restart has its own qualified targets and must never take this branch.
+	const legacyRecovery = options.onQueueCompleted
+		? queueRecovery.sendWaitersSettled.then(() => options.onSendWaitersSettled?.())
+		: queueRecovery.sendWaitersSettled.then(async () => {
+				const driven = new Set(
+					queue.flatMap(({ record }) => [
+						record.narratorId,
+						...(typeof record.payloadJson?.subagentId === "string"
+							? [record.payloadJson.subagentId]
+							: []),
+					]),
+				);
+				await Promise.all([
+					restoreLegacyNarrators(snapshot, protection, severedNarratorIds),
+					...(snapshot.sources
+						?.filter((source) => source.kind === "ordinary")
+						.map(async (source) => {
+							const { restoreCarriedOrdinaryTargets } = await import("./restart-recovery-service");
+							await restoreCarriedOrdinaryTargets(source, driven);
+						}) ?? []),
+				]);
+			});
+	void legacyRecovery.catch(() => {});
+	void queueRecovery.completion.catch(() => {});
 	try {
 		await queueRecovery.mounted;
+		if (options.onSendWaitersSettled) await legacyRecovery;
 	} catch (error) {
 		// `completion` was created eagerly alongside `mounted` and shares its rejection. Nobody
 		// will ever await it on this path, so observe it here — otherwise the same failure is
 		// reported a second time as a process-level unhandled rejection.
 		void queueRecovery.completion.catch(() => {});
-		for (const control of parentControls.values()) control.registration.unregister();
+		// Owner release remains attached to its actual executions, never this aggregate rejection.
+		await legacyRecovery.catch((legacyError) => {
+			logger.error("Independent legacy recovery failed", { error: String(legacyError) });
+		});
 		throw error;
 	}
 
 	const completion = (async () => {
 		try {
-			await queueRecovery.completion;
-			const unfinished = (await toolContinuationService.listByEpoch(snapshot.updateEpoch)).filter(
-				(row) => !isToolContinuationOwnerMounted(row),
+			await Promise.all([queueRecovery.completion, legacyRecovery]);
+			const unfinished = (await toolContinuationService.listByEpoch(scope)).filter(
+				(row) =>
+					!isToolContinuationOwnerMounted(row) &&
+					(!options.includedNarratorIds || options.includedNarratorIds.has(row.narratorId)),
 			);
 			if (unfinished.length > 0) {
 				throw new Error(`${unfinished.length} continuation owner deliveries remain unfinished`);
 			}
-			await restoreLegacyNarrators(snapshot, protection, severedNarratorIds);
-			// Only clear the manifest this recovery pass owns. If a newer update already replaced it,
-			// the epoch guard keeps the newer manifest intact.
-			removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });
+			await Promise.all(ownerReleases);
+			await withRecoveryAdvance(scope, async () => {
+				if (options.onQueueCompleted) {
+					await options.onQueueCompleted();
+				} else {
+					for (const source of snapshot.sources ?? []) {
+						if (source.kind !== "ordinary") continue;
+						const { removeCarriedOrdinaryManifest } = await import("./restart-recovery-service");
+						await removeCarriedOrdinaryManifest(source.updateEpoch);
+					}
+					// Only clear the manifest this recovery pass owns, never a newer root.
+					removePlannedUpdateRecoverySnapshot({ expectedEpoch: snapshot.updateEpoch });
+				}
+				for (const [epoch, handle] of sourceHandles) {
+					if (!getRecoverySource(epoch)?.pendingNarratorIds.length) handle.retire();
+				}
+			});
 		} finally {
-			for (const control of parentControls.values()) control.registration.unregister();
-			// Only now, with every runtime claim released, can queued input be judged
-			// orphaned. Messages sent while recovery held these narrators busy are
-			// consumed by whichever loop recovery started; a background-agents-only
-			// epoch starts no loop at all, so those queues would otherwise stay stuck.
-			await drainQueuedMessagesAfterRecovery(snapshot, [...parentControls.keys()]);
+			// Observe releases without allowing a failed owner to release another live owner.
+			void Promise.all(ownerReleases).catch((error) => {
+				logger.error("Recovery owner release failed", { error: String(error) });
+			});
 			flushRuntimePublications();
 		}
 	})();

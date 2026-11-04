@@ -1,8 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { resolve } from "node:path";
 import { getDbPath } from "../server/db/connection";
-import { narraforkDir } from "../server/lib/settings";
-import { testEnvironment } from "./preload";
+import { narraforkDir, settings } from "../server/lib/settings";
+import { repairMissingSettingsBranches, testEnvironment } from "./preload";
 
 function normalizedPath(path: string): string {
 	const resolved = resolve(path);
@@ -10,6 +10,27 @@ function normalizedPath(path: string): string {
 }
 
 describe("global test data isolation", () => {
+	test("valid settings repair does not deep-clone the entire defaults", () => {
+		const clone = spyOn(globalThis, "structuredClone");
+		try {
+			repairMissingSettingsBranches();
+			expect(clone).not.toHaveBeenCalled();
+		} finally {
+			clone.mockRestore();
+		}
+	});
+
+	test("missing branches are restored from the isolated snapshot, not shipped defaults", () => {
+		const expected = structuredClone(settings.requestEvidence);
+		expect(expected.ringEnabled).toBe(false);
+		for (const value of [undefined, null]) {
+			Reflect.set(settings, "requestEvidence", value);
+			repairMissingSettingsBranches();
+			expect(settings.requestEvidence).toEqual(expected);
+			expect(settings.requestEvidence).not.toBe(expected);
+		}
+	});
+
 	test("redirects database and home-based storage away from the real ~/.narrafork", () => {
 		expect(normalizedPath(process.env.HOME ?? "")).toBe(
 			normalizedPath(testEnvironment.isolatedHome),

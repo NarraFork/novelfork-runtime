@@ -16,7 +16,6 @@ import type {
 } from "@frontend/types/usage-history";
 
 import { ApiError, authorizedFetch, readFetchError } from "./api/client";
-import { parseContentDispositionFileName } from "./api/narrators";
 
 async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
 	const response = await authorizedFetch(url, { signal });
@@ -30,7 +29,6 @@ async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
 function appendUsageHistoryFilters(params: URLSearchParams, filters: UsageHistoryFilters): void {
 	if (filters.userId) params.append("userId", filters.userId);
 	if (filters.narratorId) params.append("narratorId", filters.narratorId);
-	if (filters.chapterId) params.append("chapterId", filters.chapterId);
 	if (filters.projectId) params.append("projectId", filters.projectId);
 	if (filters.provider) params.append("provider", filters.provider);
 	if (filters.credentialId) params.append("credentialId", filters.credentialId);
@@ -132,25 +130,6 @@ export const usageHistoryApi = {
 	 */
 	async getRecord(id: string): Promise<UsageHistoryRecord> {
 		return fetchJson(`/api/usage-history/${id}`);
-	},
-
-	/**
-	 * 下载一条请求的完整 dump。
-	 *
-	 * 必须走这个端点而不是把 `getRecord()` 的 `rawDump` 序列化下来：超过行预算的 dump
-	 * 完整内容在服务器文件里，库里只留一个带 `spill` 指针的预览。前端自己拼 JSON
-	 * 会静默下载到那个预览——正是「打开了 dump 却拿不到完整数据」的成因。
-	 */
-	async downloadRawDump(id: string): Promise<{ blob: Blob; fileName: string | null }> {
-		const res = await authorizedFetch(`/api/usage-history/${id}/raw-dump`);
-		if (!res.ok) {
-			const error = await readFetchError(res, `HTTP ${res.status}`);
-			throw new ApiError(error.message, res.status, error.data);
-		}
-		return {
-			blob: await res.blob(),
-			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
-		};
 	},
 
 	/**

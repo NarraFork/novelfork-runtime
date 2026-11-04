@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getTestDb } from "../../../../../tests/setup";
+import {
+	LocalFileChangeRuntime,
+	withLocalFileChangeRuntime,
+} from "../../../../services/file-change-runtime";
 import type { ExecutionBackend } from "../../execution/backend";
+import { localBackend } from "../../execution/local-backend";
 import { windowsPathSemantics } from "../../execution/path-semantics";
 import { resolveBackend } from "../../execution/registry";
 import type { ToolContext } from "../../types";
@@ -18,12 +24,35 @@ describe("missing working directory recovery", () => {
 	test("uses backend stat for Windows-style local paths", async () => {
 		const windowsCwd = "D:\\GoSLAM Mapping Master Pro\\goslam_go\\goslam_go";
 		let executedCwd: string | undefined;
-		const backend = {
-			kind: "local",
-			deviceId: "local",
+		const workspace = mkdtempSync(join(tmpdir(), "nf-recovery-windows-"));
+		const originalCwd = process.cwd();
+		// On POSIX a drive-qualified path is a literal filename. A private cwd makes
+		// that spelling resolve to a real directory while admission still sees Windows grammar.
+		const physicalPath = process.platform === "win32" ? workspace : join(workspace, windowsCwd);
+		if (process.platform !== "win32") {
+			mkdirSync(physicalPath);
+			process.chdir(workspace);
+		}
+		const { db, sqlite } = getTestDb();
+		const runtime = new LocalFileChangeRuntime({
+			db,
+			privateRoot: join(workspace, "private"),
+			blobStoreOptions: { minimumFreeBytes: 0 },
+		});
+		const backend = Object.assign(Object.create(localBackend), {
 			pathFlavor: "windows",
 			paths: windowsPathSemantics,
-			runtimeGeneration: 0,
+			// Map only this synthetic drive path to a real, privately owned directory.
+			// Admission and object identities stay real; no fail-closed gate is stubbed.
+			resolvePathIdentity: async (path: string) => {
+				expect(path).toBe(windowsCwd);
+				const identity = await localBackend.resolvePathIdentity(physicalPath);
+				return {
+					...identity,
+					lexicalPath: windowsCwd,
+					canonicalPath: process.platform === "win32" ? workspace : windowsCwd,
+				};
+			},
 			statFile: async (path: string) =>
 				path === windowsCwd ? { isDirectory: true, isFile: false, size: 0 } : null,
 			execCommand: async ({ cwd }: { cwd: string }) => {
@@ -36,29 +65,38 @@ describe("missing working directory recovery", () => {
 					kill: async () => {},
 				};
 			},
-		} as unknown as ExecutionBackend;
+		}) as ExecutionBackend;
 
-		const result = await bashTool.execute({ command: "pwd" }, {
-			narratorId: "test-narrator",
-			cwd: windowsCwd,
-			signal: new AbortController().signal,
-			locale: "en",
-			requestPermission: async () => ({ behavior: "allow" as const }),
-			resolveBackend: () => backend,
-		} satisfies ToolContext);
-
-		expect(result.isError).toBeFalsy();
-		expect(executedCwd).toBe(windowsCwd);
+		try {
+			const result = await withLocalFileChangeRuntime(runtime, () =>
+				bashTool.execute({ command: "pwd" }, {
+					narratorId: "test-narrator",
+					cwd: windowsCwd,
+					signal: new AbortController().signal,
+					locale: "en",
+					requestPermission: async () => ({ behavior: "allow" as const }),
+					resolveBackend: () => backend,
+				} satisfies ToolContext),
+			);
+			expect(result.output).toContain("ok");
+			expect(result.isError).toBeFalsy();
+			expect(executedCwd).toBe(windowsCwd);
+			const scopes = await db.query.fileChangeScopes.findMany();
+			expect(scopes).toHaveLength(0);
+		} finally {
+			process.chdir(originalCwd);
+			sqlite.close();
+			rmSync(workspace, { recursive: true, force: true });
+		}
 	});
 
-	test("suggests the active worktree when the narrator cwd is missing", async () => {
+	test("suggests the project root when the narrator cwd is missing", async () => {
 		const worktree = mkdtempSync(join(tmpdir(), "nf-recovery-worktree-"));
 		try {
 			const result = await bashTool.execute({ command: "pwd" }, {
 				narratorId: "test-narrator",
 				cwd: join(worktree, "missing"),
-				worktreePath: worktree,
-				projectGitPath: join(worktree, "project-missing"),
+				projectGitPath: worktree,
 				signal: new AbortController().signal,
 				locale: "en",
 				requestPermission: async () => ({ behavior: "allow" as const }),

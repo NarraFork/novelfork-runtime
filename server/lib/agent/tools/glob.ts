@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { isSecretPlatformPath, SECRET_PATH_TOOL_REFUSAL } from "../../fs-secret-paths";
 import { toolSpecPathError } from "../../spec-uri";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
@@ -28,7 +29,7 @@ export const globTool: ToolDefinition = {
 		'- This tool does not enumerate spec:// Dynamic Spec virtual files; use Grep with path "spec://" or Read known spec:// files instead\n' +
 		"- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead\n" +
 		"- You can call multiple tools in a single response. It is always better to speculatively perform multiple searches in parallel if they are potentially useful.",
-	rawJsonSchema: {
+	rawJsonSchema: withDeviceParam({
 		type: "object",
 		properties: {
 			pattern: {
@@ -48,10 +49,7 @@ export const globTool: ToolDefinition = {
 		},
 		required: ["pattern"],
 		additionalProperties: false,
-	},
-	getRawJsonSchema(config) {
-		return withDeviceParam(globTool.rawJsonSchema as Record<string, unknown>, config);
-	},
+	}),
 	parameters: z.object({
 		pattern: z.string().describe("Glob pattern to match files, e.g. '**/*.ts' or 'src/*.json'"),
 		path: z.string().optional().describe("Base directory to search from. Defaults to cwd"),
@@ -75,6 +73,11 @@ export const globTool: ToolDefinition = {
 			// Resolve relative paths against the backend's base cwd (device default
 			// cwd for remote, narrator cwd for local).
 			const cwd = pathArg ? resolveBackendPath(backend, base, pathArg) : base;
+			// Application authorization guard enforced in every permission mode: do not
+			// enumerate inside a NarraFork platform secret store on the host.
+			if (backend.kind === "local" && isSecretPlatformPath(cwd)) {
+				return { output: SECRET_PATH_TOOL_REFUSAL, isError: true };
+			}
 			const results = await backend.glob(pattern, {
 				cwd,
 				dot: dot ?? false,

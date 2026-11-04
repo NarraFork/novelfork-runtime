@@ -1,4 +1,4 @@
-import { ActionIcon, Anchor, Code, Collapse, CopyButton, Group, Stack, Text } from "@mantine/core";
+import { ActionIcon, Anchor, Code, Collapse, Group, Stack, Text } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -7,6 +7,7 @@ import {
 	describeApiError,
 	hasDistinctRawMessage,
 } from "../../lib/api-error";
+import { CopyButton } from "./CopyButton";
 
 export interface ErrorDetailProps {
 	error: unknown;
@@ -25,9 +26,9 @@ export interface ErrorDetailProps {
  * The disclosure appears only for a translated error (one carrying a `messageCode`), and the raw
  * block inside it only when the raw text actually differs from what is shown. Those are two
  * separate conditions because they fail in opposite directions: several catalog entries translate
- * into English identical to the server's template (`FORBIDDEN_ACTION`, the `MERGE_DIRTY_*`
- * family), so rendering the block there printed the same sentence twice under a link promising
- * the "original" — while an un-migrated error has no second version at all, and offering a link
+ * into English identical to the server's template (`FORBIDDEN_ACTION`, `RESOURCE_NOT_FOUND`),
+ * so rendering the block there printed the same sentence twice under a link promising the
+ * "original" — while an un-migrated error has no second version at all, and offering a link
  * for its coarse `code` alone would put a near-empty panel on almost every error in the app.
  */
 /**

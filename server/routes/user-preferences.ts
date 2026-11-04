@@ -17,6 +17,7 @@ import {
 	removeRecentTabSchema,
 	restoreRecentTabsSchema,
 	setRecentTabDirectoryOrderSchema,
+	specTabLayoutPatchSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
@@ -86,6 +87,9 @@ const DEFAULTS = {
 	navLayout: "{}",
 	// Narrator header toolbar layout
 	narratorToolbarLayout: "{}",
+	// Git 提交身份入口的显示位置（跟账号走）
+	gitIdentityContextMenu: false,
+	gitIdentityCreateModal: false,
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -168,6 +172,8 @@ const INSERT_COLUMNS = [
 	"gateway_config",
 	"nav_layout",
 	"narrator_toolbar_layout",
+	"git_identity_context_menu",
+	"git_identity_create_modal",
 	"created_at",
 	"updated_at",
 ] as const;
@@ -304,6 +310,7 @@ function serializeUserPreferences(
 		gatewayConfig: serializeGatewayConfig(pref.gatewayConfig),
 		navLayout: parseJsonObject(pref.navLayout),
 		narratorToolbarLayout: parseJsonObject(pref.narratorToolbarLayout),
+		specTabLayout: parseJsonObject(pref.specTabLayout),
 	};
 }
 
@@ -326,6 +333,7 @@ userPreferencesRoutes.get("/", async (c) => {
 			gatewayConfig: {},
 			navLayout: {},
 			narratorToolbarLayout: {},
+			specTabLayout: {},
 		});
 	}
 
@@ -432,6 +440,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   gateway_config = COALESCE(?, gateway_config),
 		   nav_layout = COALESCE(?, nav_layout),
 		   narrator_toolbar_layout = COALESCE(?, narrator_toolbar_layout),
+		   git_identity_context_menu = COALESCE(?, git_identity_context_menu),
+		   git_identity_create_modal = COALESCE(?, git_identity_create_modal),
 		   updated_at = ?`,
 			[
 				// INSERT values
@@ -477,6 +487,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 				gatewayConfigJson ?? DEFAULTS.gatewayConfig,
 				navLayoutJson ?? DEFAULTS.navLayout,
 				narratorToolbarLayoutJson ?? DEFAULTS.narratorToolbarLayout,
+				(d.gitIdentityContextMenu ?? DEFAULTS.gitIdentityContextMenu) ? 1 : 0,
+				(d.gitIdentityCreateModal ?? DEFAULTS.gitIdentityCreateModal) ? 1 : 0,
 				now,
 				now,
 				// ON CONFLICT UPDATE values (null = keep existing)
@@ -520,6 +532,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 				gatewayConfigJson,
 				navLayoutJson,
 				narratorToolbarLayoutJson,
+				d.gitIdentityContextMenu != null ? (d.gitIdentityContextMenu ? 1 : 0) : null,
+				d.gitIdentityCreateModal != null ? (d.gitIdentityCreateModal ? 1 : 0) : null,
 				now,
 			],
 		);
@@ -575,10 +589,16 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 	const parsed = removeRecentTabSchema.safeParse({
 		type: c.req.param("type"),
 		id: c.req.param("id"),
+		// `?cascade=1` marks entity-teardown cleanups (project deleted, narrator archived).
+		cascade: c.req.query("cascade") === "1" ? true : undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const type = parsed.data.type === "session" ? "narrator" : parsed.data.type;
-	return c.json(await removeRecentTab(userId, type, parsed.data.id));
+	// User-initiated close (swipe / context menu / middle-click) mints an undo token;
+	// cascade cleanups must not (they would clobber a pending user undo).
+	return c.json(
+		await removeRecentTab(userId, type, parsed.data.id, { storeUndo: !parsed.data.cascade }),
+	);
 });
 
 userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
@@ -676,6 +696,42 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 			   graph_viewports = ?,
 			   updated_at = ?`,
 			[id, userId, JSON.stringify(viewports), now, now, JSON.stringify(viewports), now],
+		);
+	});
+
+	return c.json({ ok: true });
+});
+
+// --- Dynamic Spec 大纲标签排布（按叙述者） ---
+
+/**
+ * 写入某个叙述者的大纲标签排布。整张映射按 narratorId 合并写入，
+ * 其他叙述者的记录不受影响。
+ */
+userPreferencesRoutes.patch("/spec-tab-layout", async (c) => {
+	const userId = c.get("user").sub;
+	const parsed = specTabLayoutPatchSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const { narratorId, order, pinned } = parsed.data;
+	const now = new Date().toISOString();
+	const id = generateId();
+
+	await userPreferencesLock.acquire(userId, async () => {
+		const existing = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { specTabLayout: true },
+		});
+		const layouts = parseJsonObject(existing?.specTabLayout);
+		layouts[narratorId] = { order, pinned };
+		const specTabLayout = JSON.stringify(layouts);
+		sqlite.run(
+			`INSERT INTO user_preferences (id, user_id, spec_tab_layout, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (user_id) DO UPDATE SET
+			   spec_tab_layout = ?,
+			   updated_at = ?`,
+			[id, userId, specTabLayout, now, now, specTabLayout, now],
 		);
 	});
 

@@ -1,8 +1,17 @@
 import { notifications } from "@mantine/notifications";
+import { useQueryClient } from "@tanstack/react-query";
 import type { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../../../lib/api";
+import { copyTextToClipboard } from "../../../lib/clipboard";
+import {
+	formatRevertFailure,
+	formatRevertSuccessWarning,
+	invalidateRevertQueries,
+	isRevertHistoryCommitted,
+} from "../../../lib/revert-result";
 import { handleRegistry } from "../content/ContentViewer";
+import { blockTargetOf } from "../message/block-target";
 import {
 	BLOCK_ID_ATTR,
 	collectSelectedText,
@@ -12,6 +21,7 @@ import {
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
 } from "../message/MessageSelectionCtx";
+import type { MessageListHandle } from "../message/message-list-handle";
 import {
 	getGlobalCloseSwipe,
 	setGlobalOnSelectionRange,
@@ -19,10 +29,7 @@ import {
 	setGlobalToggleBlock,
 } from "../scroll/swipeState";
 
-interface ChunkListLike {
-	detachFromBottom: () => void;
-	refreshStructure: (mode?: "diff" | "full") => void;
-}
+type ChunkListLike = Pick<MessageListHandle, "detachFromBottom" | "refreshStructure" | "messageOf">;
 
 export interface UseMessageSelectionOptions {
 	narratorId: string;
@@ -67,6 +74,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		compactUsesFallbackSummary,
 		compactFallbackSummaryReason,
 	} = options;
+	const qc = useQueryClient();
 
 	const [selectionMode, setSelectionMode] = useState(false);
 	const [selectedBlockIds, setSelectedBlockIds] = useState<Set<string>>(new Set());
@@ -324,7 +332,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		}
 		if (!selectedText.text) return;
 		try {
-			await navigator.clipboard.writeText(selectedText.text);
+			await copyTextToClipboard(selectedText.text);
 			notifications.show({
 				message: selectedText.truncated
 					? t("batchCopyTruncated", { count: selectedBlockIds.size })
@@ -353,23 +361,44 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		// Confirm
 		const ok = await confirm({ message: t("batchDeleteConfirm", { count: metas.length }) });
 		if (!ok) return;
+		// Only blocks the server named can be deleted; the live row has none yet.
+		const targets = metas.flatMap(
+			(m) => blockTargetOf(chunkListRef.current, m.messageId, m.blockIndex) ?? [],
+		);
 		exitSelection();
+		if (targets.length === 0) return;
 		try {
-			const res = await api.deleteMessageBlocks(
-				narratorId,
-				metas.map((m) => ({ messageId: m.messageId, blockIndex: m.blockIndex })),
-			);
-			// Always re-fetch from server to ensure consistency
-			chunkListRef.current?.refreshStructure("full");
-			if (res.failed > 0) {
-				notifications.show({ message: t("batchDeleteFailed"), color: "orange" });
+			const res = await api.deleteMessageBlocks(narratorId, targets);
+			if (
+				!res.ok ||
+				res.failed > 0 ||
+				(res.revertResult && !isRevertHistoryCommitted(res.revertResult))
+			) {
+				throw new ApiError(t("batchDeleteFailed"), 409, { ...res });
 			}
-		} catch {
-			// Network / unexpected error — re-fetch to reflect whatever actually happened
+			const warning = formatRevertSuccessWarning(t, res);
+			if (warning) {
+				notifications.show({
+					title: t("rollbackPartialTitle"),
+					message: warning,
+					color: "yellow",
+					autoClose: false,
+				});
+			}
+		} catch (error) {
+			// The error can carry successful file writes even though history stayed intact.
+			notifications.show({
+				title: t("batchDeleteFailed"),
+				message: formatRevertFailure(t, error, { fallbackKey: "batchDeleteFailed" }),
+				color: "red",
+				autoClose: false,
+			});
+		} finally {
+			invalidateRevertQueries(qc, narratorId);
 			chunkListRef.current?.refreshStructure("full");
-			notifications.show({ message: t("batchDeleteFailed"), color: "red" });
 		}
 	}, [
+		qc,
 		selectedBlockIds,
 		isCurrentResolverOwner,
 		resolverOwner,

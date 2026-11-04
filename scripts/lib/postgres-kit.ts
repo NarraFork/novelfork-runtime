@@ -50,7 +50,10 @@ export function resolvePgSchemaPath(root: string, input?: string): string {
 		"file",
 	);
 	if (!path.endsWith(".ts")) throw new Error("PG schema must be an ordinary TS file");
-	return path;
+	// Same reason as `resolvePgStageOut`: Kit 解析 schema 时把路径当 glob，
+	// Windows 原生反斜杠会被当作转义符（`\n`、`\t` 等），使合法路径解析不到文件。
+	// 正斜杠在 Windows 上同样被 fs 接受。
+	return path.replaceAll("\\", "/");
 }
 
 export interface PostgresKitOptions {
@@ -126,6 +129,9 @@ export async function runPostgresKit(opts: PostgresKitOptions): Promise<Postgres
 	};
 	const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
 	const append = (target: "stdout" | "stderr", chunk: Uint8Array | string) => {
+		// The pipes can still deliver queued bytes after a cutoff kills the child.
+		// Never feed those bytes into a decoder holding a truncated UTF-8 prefix.
+		if (failure) return;
 		const data = Buffer.from(chunk);
 		// Reserve bounded room for fail-closed diagnostics inside the combined 256 KiB cap.
 		const remaining = OUTPUT_LIMIT - 512 - bytes;

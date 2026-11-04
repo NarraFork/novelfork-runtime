@@ -22,6 +22,7 @@
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
 import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
+import { QUOTE_ROLE_ATTR } from "../composer/quote-source-attrs";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
 import { useRuntimeToolResultRenderer } from "../RuntimeToolResultRendererContext";
 import { openCommunicationRecipient } from "./communication-navigation";
@@ -30,7 +31,6 @@ import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-c
 import type { MeasuredTraceRow } from "./measure/measure-tool-run";
 import { CaretFiller } from "./render/caret-filler";
 import type { AskInPassingPendingInteraction } from "./render/RenderAskInPassing";
-import type { ReviewCardActions } from "./render/RenderReviewCard";
 import type {
 	ErrorNoticeActions,
 	InjectionGuardActions,
@@ -201,7 +201,7 @@ export interface ExactRowProps {
 	reviewTruncatedLabel?: string;
 	/**
 	 * What this host can do when the reader clicks an injection bubble's speaker row:
-	 * open a child session, a knowledge entry, a Dynamic Spec file, or a chapter.
+	 * open a child session, a knowledge entry, or a Dynamic Spec file.
 	 *
 	 * Same gating rule as `onOpenFilePanel`, applied per kind: only hosts that can
 	 * actually reach a destination supply that opener, and a row whose destination has
@@ -290,6 +290,11 @@ export interface ExactRowProps {
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
 	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
 	/**
+	 * Close the subagent-recovery card without resuming anything (mutation lives
+	 * outside vlist/). Absent → the card paints no close button at all.
+	 */
+	onDismissSubagentRecovery?: (messageId: string) => void;
+	/**
 	 * Live handlers for a Dynamic Spec notice card's buttons (view tasks / clear
 	 * tasks / reset spec). Present only on those rows; absent → the buttons render
 	 * disabled instead of silently inert.
@@ -307,11 +312,6 @@ export interface ExactRowProps {
 	 * absent → no close button is painted at all.
 	 */
 	injectionGuardActions?: InjectionGuardActions;
-	/**
-	 * Live handler for a review-feedback card's action button. Present only on review
-	 * rows; absent → the button renders disabled instead of silently inert.
-	 */
-	reviewFeedbackActions?: ReviewCardActions;
 	/**
 	 * Compact-marker callbacks for THIS row (open summary / cancel a running
 	 * compaction). Absent for every non-marker row; referentially stable per key so
@@ -404,10 +404,10 @@ export const ExactRow = memo(
 		onTogglePromptForKey,
 		resolveRowToolActions,
 		onResumeSubagentRecovery,
+		onDismissSubagentRecovery,
 		specCarryoverActions,
 		errorNoticeActions,
 		injectionGuardActions,
-		reviewFeedbackActions,
 		compactActions,
 		compactCancelTitle,
 		askInPassingPending,
@@ -468,10 +468,8 @@ export const ExactRow = memo(
 		// only decides whether they respond to a click.
 		if (kind === "knowledge-hint" && injectionNavigation?.onOpenKnowledge) {
 			const openKnowledge = injectionNavigation.onOpenKnowledge;
-			// A hint always names GLOBAL entries: the injector matches against the
-			// project's shared collections, so a personal scope here would resolve to an
-			// id that does not exist.
-			extra.onOpenEntry = (entryId: string) => openKnowledge(entryId, "global");
+			extra.onOpenEntry = (entryId: string, scope: "global" | "personal" = "global") =>
+				openKnowledge(entryId, scope);
 		}
 		// Dynamic Spec task rows animate ONLY on the newest surface of a running
 		// narrator. Both surfaces get the same flag: a framed task bubble
@@ -671,8 +669,8 @@ export const ExactRow = memo(
 			};
 		}
 		// The recovery card owns a checkbox list plus two submit buttons. Its rows
-		// reuse the generic per-row toggle; the submit itself is a mutation living
-		// outside vlist/, injected by the panel.
+		// reuse the generic per-row toggle; the submit and the dismiss are mutations
+		// living outside vlist/, injected by the panel.
 		if (kind === "subagent-recovery") {
 			extra.onToggleRow = toggles.onToggleRow;
 			// System cards carry no `-b{n}` suffix, so they never get a RowInteraction.
@@ -682,6 +680,9 @@ export const ExactRow = memo(
 				const specKey = item.spec.key;
 				extra.onResume = (mode: "notify" | "await") =>
 					onResumeSubagentRecovery(messageId, specKey, mode);
+			}
+			if (messageId && onDismissSubagentRecovery) {
+				extra.onDismiss = () => onDismissSubagentRecovery(messageId);
 			}
 		}
 		// Dynamic Spec notice cards (fork carryover / context cleared / goal added)
@@ -697,11 +698,6 @@ export const ExactRow = memo(
 		// the dismiss DELETE lives outside vlist/, so the shell injects it. Without
 		// this the card shows no close button at all.
 		if (injectionGuardActions) extra.injectionGuardActions = injectionGuardActions;
-		// Review feedback card: the button hands the conclusion to the narrator through a
-		// REST call, so the shell injects it. Without this the card would show findings the
-		// reader has no way to act on — and an idle narrator is never woken by a conclusion
-		// on purpose, so this button is the only path.
-		if (reviewFeedbackActions) extra.reviewFeedbackActions = reviewFeedbackActions;
 		if (kind === "review-card" && reviewTruncatedLabel) {
 			extra.truncatedLabel = reviewTruncatedLabel;
 		}
@@ -990,6 +986,10 @@ export const ExactRow = memo(
 				// to this node (see vlist-fold-motion). `id` cannot serve: it is the
 				// MESSAGE id, which several rows of one message share. Height-neutral.
 				data-nf-row-key={item.spec.key}
+				// Lets a message jump rank this message's rows (prose over thinking / tool
+				// cards that share its id). Height-neutral (a data attribute).
+				data-nf-row-kind={kind}
+				{...(kind === "markdown" ? { [QUOTE_ROLE_ATTR]: "assistant" } : {})}
 				style={{
 					position: "absolute",
 					top,
@@ -1103,10 +1103,10 @@ export const ExactRow = memo(
 		prev.onTogglePromptForKey === next.onTogglePromptForKey &&
 		prev.resolveRowToolActions === next.resolveRowToolActions &&
 		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery &&
+		prev.onDismissSubagentRecovery === next.onDismissSubagentRecovery &&
 		prev.specCarryoverActions === next.specCarryoverActions &&
 		prev.errorNoticeActions === next.errorNoticeActions &&
 		prev.injectionGuardActions === next.injectionGuardActions &&
-		prev.reviewFeedbackActions === next.reviewFeedbackActions &&
 		prev.compactActions === next.compactActions &&
 		prev.compactCancelTitle === next.compactCancelTitle &&
 		prev.askInPassingPending === next.askInPassingPending &&

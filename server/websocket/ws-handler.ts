@@ -1,17 +1,20 @@
 import { Buffer } from "node:buffer";
+import { isLiveFrame } from "@shared/outline-live-protocol";
 import type { ServerWebSocket } from "bun";
 import { isChunkFrame } from "../lib/agent/execution/rpc-types";
-import { hotTimer, hotTimerClear } from "../lib/hot-safe";
+import { resolveLiveSession } from "../lib/auth";
+import { eventBus } from "../lib/event-bus";
+import { hotSafe, hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import type { VNetClientMessage } from "../lib/vnet/types";
-import type { VerifiedPublicShare } from "../services/public-narrator-share-service";
 import {
 	type DeviceWSData,
 	getDeviceConnections,
 	handleDeviceWS,
 } from "../services/device-connection-service";
+import type { VerifiedPublicShare } from "../services/public-narrator-share-service";
 import {
 	handleExternalNarratorWS,
 	rejectOversizedExternalNarratorFrame,
@@ -30,22 +33,25 @@ import {
 	getExternalNarratorConnections,
 	sendExternalNarratorFrame,
 } from "./oauth-connection-registry";
+import { drainOutlineLive, handleOutlineLiveBinary } from "./outline-live-ws";
 import { getTerminalConnections, handleTerminalWS, type TerminalWSData } from "./terminal-ws";
 import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
 // === Unified WS data type ===
 
 /**
- * Session credential snapshot captured at upgrade time.
+ * The session a socket was opened with.
  *
- * The upgrade verifies the session JWT once and the socket then lives as long as
- * the TCP connection does. With sliding renewal on the HTTP side, "the token
- * expired" is no longer a natural end point for a long-lived socket, so the
- * heartbeat has to enforce `exp` itself.
+ * The upgrade verifies the session token once and the socket then lives as long as
+ * the TCP connection does, so the server re-checks the session itself: when the known
+ * expiry passes (the session may have slid forward meanwhile) and whenever the user's
+ * authorization changes (logout, revocation, role change).
  */
 export interface SessionWSAuth {
-	/** `exp` (unix seconds) of the session JWT presented at upgrade. */
+	/** Last known expiry (unix seconds) of the session. */
 	sessionExp?: number;
+	/** `auth_sessions.id`, for re-checking the session. */
+	sessionId?: string;
 	/** `sub` of that token, for logging when the connection is dropped. */
 	sessionUserId?: string;
 }
@@ -155,6 +161,7 @@ export function resolveWSData(
 			userRole: userInfo?.role,
 			...(publicShare ? { publicShare } : {}),
 			sessionExp: sessionAuth?.sessionExp,
+			sessionId: sessionAuth?.sessionId,
 			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}
@@ -165,6 +172,7 @@ export function resolveWSData(
 			lastPongAt: Date.now(),
 			subscribedTerminals: new Set(),
 			sessionExp: sessionAuth?.sessionExp,
+			sessionId: sessionAuth?.sessionId,
 			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}
@@ -206,7 +214,7 @@ const SESSION_EXPIRED_CLOSE_CODE = 4001;
  * Whether a session-authenticated socket has outlived the token that opened it.
  *
  * Connections opened before this snapshot existed (or by paths that do not carry
- * a session JWT) have no `sessionExp` and are left alone — the heartbeat timeout
+ * a session token) have no `sessionExp` and are left alone — the heartbeat timeout
  * still governs them.
  */
 function isSessionWSExpired(data: SessionWSAuth, nowSeconds: number): boolean {
@@ -215,7 +223,85 @@ function isSessionWSExpired(data: SessionWSAuth, nowSeconds: number): boolean {
 	return exp <= nowSeconds;
 }
 
+type SessionSocket = ServerWebSocket<WSData & { channel: "narrator" | "terminal" }>;
+
+function closeFinishedSessionSocket(ws: SessionSocket): void {
+	logger.debug("Closing WS whose session ended", {
+		channel: ws.data.channel,
+		userId: ws.data.sessionUserId,
+		connectedAt: ws.data.connectedAt,
+	});
+	// Delegate to the channel handler so subscriptions / presence are cleaned up.
+	if (ws.data.channel === "narrator") {
+		handleNarratorWS.close(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
+	} else {
+		handleTerminalWS.close(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
+	}
+	try {
+		ws.close(SESSION_EXPIRED_CLOSE_CODE, "session ended");
+	} catch {
+		// already dead
+	}
+}
+
+/**
+ * Re-read the session behind each socket: close the ones whose session ended, and
+ * refresh the expiry and live role of the rest. A storage failure keeps the socket —
+ * it must not read as "your session is gone".
+ */
+export async function revalidateSessionSockets(sockets: readonly SessionSocket[]): Promise<void> {
+	for (const ws of sockets) {
+		if (ws.readyState !== 1) continue;
+		const sessionId = ws.data.sessionId;
+		if (!sessionId) {
+			// No session to re-check: only the snapshotted expiry can end it.
+			if (isSessionWSExpired(ws.data, Math.floor(Date.now() / 1000))) {
+				closeFinishedSessionSocket(ws);
+			}
+			continue;
+		}
+		let session: Awaited<ReturnType<typeof resolveLiveSession>>;
+		try {
+			session = await resolveLiveSession(sessionId);
+		} catch (error) {
+			logger.warn("Failed to re-check WS session", {
+				userId: ws.data.sessionUserId,
+				error: error instanceof Error ? error.name : "UnknownError",
+			});
+			continue;
+		}
+		if (ws.readyState !== 1) continue;
+		if (!session || session.sub !== ws.data.sessionUserId) {
+			closeFinishedSessionSocket(ws);
+			continue;
+		}
+		ws.data.sessionExp = session.exp;
+		if (ws.data.channel === "narrator") ws.data.userRole = session.role;
+	}
+}
+
+/** Re-check a user's session sockets whenever their authorization changes. */
+const authChangeWatch = hotSafe("narrafork.wsAuthChangeWatch", () => ({
+	handler: null as ((event: { userId?: string }) => void) | null,
+}));
+
+function watchAuthChanges(): void {
+	if (authChangeWatch.handler) eventBus.off("auth:changed", authChangeWatch.handler);
+	authChangeWatch.handler = (event) => {
+		const affected: SessionSocket[] = [];
+		for (const ws of getNarratorConnections()) {
+			if (!event.userId || ws.data.sessionUserId === event.userId) affected.push(ws);
+		}
+		for (const ws of getTerminalConnections()) {
+			if (!event.userId || ws.data.sessionUserId === event.userId) affected.push(ws);
+		}
+		if (affected.length > 0) void revalidateSessionSockets(affected);
+	};
+	eventBus.on("auth:changed", authChangeWatch.handler);
+}
+
 export function startHeartbeat() {
+	watchAuthChanges();
 	hotTimer(HEARTBEAT_KEY, () =>
 		setInterval(() => {
 			const now = Date.now();
@@ -303,24 +389,8 @@ export function startHeartbeat() {
 				}
 			}
 
-			for (const ws of expiredSession) {
-				logger.debug("Closing WS with expired session token", {
-					channel: ws.data.channel,
-					userId: ws.data.sessionUserId,
-					connectedAt: ws.data.connectedAt,
-				});
-				// Delegate to the channel handler so subscriptions / presence are cleaned up.
-				if (ws.data.channel === "narrator") {
-					handleNarratorWS.close(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
-				} else {
-					handleTerminalWS.close(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
-				}
-				try {
-					ws.close(SESSION_EXPIRED_CLOSE_CODE, "session token expired");
-				} catch {
-					// already dead
-				}
-			}
+			// The known expiry passed, but the session may have slid forward since: re-check.
+			if (expiredSession.length > 0) void revalidateSessionSockets(expiredSession);
 
 			for (const ws of staleNarrator) {
 				// Delegate to the channel handler so presence / stats are cleaned up
@@ -471,6 +541,22 @@ export const wsHandlers = {
 			rejectOversizedExternalNarratorFrame(ws as ExternalNarratorWS, message)
 		) {
 			return;
+		}
+
+		// Narrator channel: binary frames carrying the outline magic byte are outline live
+		// session frames (Yjs updates as raw bytes), routed without the JSON parse below.
+		if (channel === "narrator" && typeof message !== "string") {
+			const bytes = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+			if (isLiveFrame(bytes)) {
+				const narratorWs = ws as ServerWebSocket<WSData & { channel: "narrator" }>;
+				narratorWs.data.lastPongAt = Date.now();
+				try {
+					handleOutlineLiveBinary(narratorWs, bytes);
+				} catch (error) {
+					logger.warn("Outline live frame handler error", { error: String(error) });
+				}
+				return;
+			}
 		}
 
 		// Device channel: binary messages are file-transfer chunk frames. Route
@@ -648,6 +734,13 @@ export const wsHandlers = {
 				handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
 				(err) => logger.warn("Device WS message handler error", { error: String(err) }),
 			);
+		}
+	},
+
+	/** The socket's send buffer drained: outline live sessions resume a participant that lagged. */
+	drain(ws: ServerWebSocket<WSData>) {
+		if (ws.data.channel === "narrator") {
+			drainOutlineLive(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
 		}
 	},
 

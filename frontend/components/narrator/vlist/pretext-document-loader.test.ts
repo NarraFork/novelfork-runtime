@@ -1,26 +1,29 @@
 import { describe, expect, it } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	firstScreenPageSizeForLod,
 	loadPretextDocument,
 	loadPretextDocumentOlder,
 	loadPretextDocumentTail,
 	type PretextDocumentInput,
+	refreshPretextDocumentWindow,
 } from "./pretext-document-loader";
 
 function message(seq: number): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text: `message ${seq}` }],
-		contentText: `message ${seq}`,
-		toolCalls: [],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: `message ${seq}`,
+			toolCalls: [],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text: `message ${seq}` }],
+	) as TreeMessage;
 }
 
 function page(
@@ -90,6 +93,45 @@ describe("loadPretextDocumentTail", () => {
 			},
 		});
 		expect(limit).toBe(50);
+	});
+});
+
+describe("refreshPretextDocumentWindow", () => {
+	const previous: PretextDocumentInput = {
+		messages: page(1, 150).messages,
+		messageVersion: 7,
+		oldestLoadedSeq: 1,
+		hasPrev: false,
+	};
+	const locateMessage = async () => ({ messageId: "m-1", topLevelMessageId: "m-1", seq: 1 });
+
+	it("reports a stale window when a pinned continuation page is rejected as changed", async () => {
+		const pinned: (number | undefined)[] = [];
+		const result = await refreshPretextDocumentWindow("n1", previous, {
+			locateMessage,
+			fetchPage: async (_narratorId, opts) => {
+				pinned.push(opts.messageVersion);
+				if (opts.messageVersion != null)
+					throw Object.assign(new Error("changed"), {
+						status: 409,
+						data: { code: "PRETEXT_DOCUMENT_CHANGED" },
+					});
+				return page(1, 100, { hasNext: true });
+			},
+		});
+		expect(result).toBeUndefined();
+		expect(pinned).toEqual([undefined, 7]);
+	});
+
+	it("still surfaces unrelated page failures", async () => {
+		await expect(
+			refreshPretextDocumentWindow("n1", previous, {
+				locateMessage,
+				fetchPage: async () => {
+					throw Object.assign(new Error("forbidden"), { status: 403, data: { code: "FORBIDDEN" } });
+				},
+			}),
+		).rejects.toThrow("forbidden");
 	});
 });
 

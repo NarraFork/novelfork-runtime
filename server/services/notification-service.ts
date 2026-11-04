@@ -1,5 +1,5 @@
 import { db } from "@server/db";
-import { chapters, narrators, userPreferences, users } from "@server/db/schema";
+import { narrators, userPreferences, users } from "@server/db/schema";
 import { ForbiddenError } from "@server/lib/errors";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
@@ -262,24 +262,14 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
 	if (reason === "error") return;
 
-	// Fetch narrator + optional chapter info
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 	});
 	if (!narrator) return;
 
 	const narratorTitle = narrator.title || narratorId;
-	let chapterName: string | undefined;
-	if (narrator.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-		});
-		chapterName = chapter?.title;
-	}
-
-	const chapterLine = chapterName ? `\n\n> Chapter: ${chapterName}` : "";
 	const displayStatus = reason === "done" ? "done" : "waiting";
-	const markdownText = `**${narratorTitle}** status: **${displayStatus}**${chapterLine}`;
+	const markdownText = `**${narratorTitle}** status: **${displayStatus}**`;
 
 	// Recipients are everyone with this narrator in a recent tab, minus anyone who
 	// may no longer read it. Access can be revoked after a tab was opened, and a
@@ -361,6 +351,12 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 // takeover fallbacks never emit attention, so they can never leak an IM.
 
 eventBus.on("narrator:attention", (event) => {
+	// A turn that finished while its background work is still running is not
+	// worth an IM ping — the wake-up turn after the last background task
+	// completes emits a fresh, unflagged "done" which notifies normally. Hooks
+	// still observe the flagged event via the attention-hook-bridge.
+	// The reason check is defensive — the flag is only produced for done.
+	if (event.backgroundWorkActive && event.reason === "done") return;
 	handleAttention(event.narratorId, event.reason).catch((err) => {
 		logger.error("Notification handler error", {
 			narratorId: event.narratorId,

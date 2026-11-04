@@ -9,8 +9,9 @@ let providerScenario:
 	| "reasoning_high_context_abort" // attempt 1: high-context reasoning only; recovery waits for abort
 	| "reasoning_forever" = "reasoning_then_text"; // every attempt: reasoning only (exhausts retries)
 let providerAttempts = 0;
-// Captures the `content` passed to each chat() call so we can assert the
-// previous-block recovery behavior (same-turn resend vs continue nudge).
+// Captures the input each chat() call ends with (its current content, or the last input
+// row of the projected history) so we can assert the previous-block recovery behavior
+// (same-turn resend vs continue nudge).
 const contentLog: string[] = [];
 const resetLog: boolean[] = [];
 let highContextRecoveryCompleted = false;
@@ -18,11 +19,14 @@ let highContextSecondAttemptSawRecovery = false;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({
+		history: rows.map((row) => ({ role: row.role, content: row.contentText ?? "" })),
+	}),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
-		contentLog.push(params.content);
+		const last = params.history.at(-1) as { role?: string; content?: string } | undefined;
+		contentLog.push(params.content || (last?.role === "user" ? (last.content ?? "") : ""));
 		resetLog.push(params.resetUpstreamSession === true);
 		params.onRequestStart?.();
 
@@ -54,9 +58,6 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -99,6 +100,76 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 }
 
 describe("agentLoop reasoning-only dead turn", () => {
+	test("等待外部工作时首个纯 reasoning 回合直接 idle，不重试或压缩", async () => {
+		providerScenario = "reasoning_high_context_then_text";
+		providerAttempts = 0;
+		const events: AgentEvent[] = [];
+		let compactCalls = 0;
+		for await (const event of agentLoop(
+			makeConfig(new AbortController().signal, {
+				shouldIdleOnReasoningOnly: async () => true,
+				onReasoningOnlyHighContext: async () => {
+					compactCalls++;
+					return null;
+				},
+			}),
+			"wait for result",
+			{ rows: [] },
+		))
+			events.push(event);
+		expect(providerAttempts).toBe(1);
+		expect(compactCalls).toBe(0);
+		expect(events.some((event) => event.type === "stream_reset")).toBe(true);
+		expect(
+			events.some((event) => event.type === "retrying" || event.type === "invalid_state"),
+		).toBe(false);
+		expect(
+			events.some((event) => event.type === "assistant_message" || event.type === "block_complete"),
+		).toBe(false);
+		expect(events.at(-1)).toEqual({ type: "done", reason: "reasoning_only_idle" });
+	});
+
+	test("不满足 idle 条件时仍重试，正常文本不会查询 idle 条件", async () => {
+		providerScenario = "reasoning_then_text";
+		providerAttempts = 0;
+		let idleChecks = 0;
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			makeConfig(new AbortController().signal, {
+				shouldIdleOnReasoningOnly: () => {
+					idleChecks++;
+					return false;
+				},
+			}),
+			"do the thing",
+			{ rows: [] },
+		))
+			events.push(event);
+		expect(providerAttempts).toBe(2);
+		expect(idleChecks).toBe(1);
+		expect(events.at(-1)).toEqual({ type: "done" });
+	});
+
+	test("idle 检查期间被中断仍报告 Aborted", async () => {
+		providerScenario = "reasoning_forever";
+		providerAttempts = 0;
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			makeConfig(ac.signal, {
+				shouldIdleOnReasoningOnly: async () => {
+					ac.abort();
+					return true;
+				},
+			}),
+			"wait",
+			{ rows: [] },
+		))
+			events.push(event);
+		expect(providerAttempts).toBe(1);
+		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+	});
+
 	test("首回合纯 reasoning 死回合不入库，重发后产出正常文本", async () => {
 		providerScenario = "reasoning_then_text";
 		providerAttempts = 0;
@@ -106,7 +177,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -150,13 +221,13 @@ describe("agentLoop reasoning-only dead turn", () => {
 				highContextRecoveryCompleted = true;
 				return {
 					history: [{ role: "system", content: "rebuilt after compact" }],
-					pendingToolResults: [],
+					rows: [],
 					systemPrompt: "rebuilt system prompt",
 				};
 			},
 		});
 
-		for await (const event of agentLoop(config, "compact before retry", [])) {
+		for await (const event of agentLoop(config, "compact before retry", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -191,7 +262,7 @@ describe("agentLoop reasoning-only dead turn", () => {
 			},
 		});
 		const abortTimer = setTimeout(() => ac.abort(), 0);
-		for await (const event of agentLoop(config, "abort compact", [])) events.push(event);
+		for await (const event of agentLoop(config, "abort compact", { rows: [] })) events.push(event);
 		clearTimeout(abortTimer);
 
 		expect(highContextRecoveryCompleted).toBe(true);
@@ -205,7 +276,15 @@ describe("agentLoop reasoning-only dead turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", [])) {
+		const endedRequests: Array<Extract<AgentEvent, { type: "api_request_end" }>> = [];
+		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", { rows: [] })) {
+			if (event.type === "api_request_end") {
+				// Match the real consumer's successful end persistence boundary: enrich
+				// this exact attempt before the generator resumes and builds invalid_state.
+				endedRequests.push(event);
+				if (!event.diagnostics) throw new Error("missing ended-attempt diagnostics");
+				event.diagnostics.apiRequestId = `persisted-reasoning-row-${endedRequests.length}`;
+			}
 			events.push(event);
 		}
 
@@ -230,5 +309,18 @@ describe("agentLoop reasoning-only dead turn", () => {
 		expect((last as { diagnostics?: { reason?: string } }).diagnostics?.reason).toBe(
 			"reasoning_only_exhausted",
 		);
+		if (last?.type !== "invalid_state") throw new Error("missing exhausted terminal error");
+		expect(endedRequests).toHaveLength(4);
+		const failedAttempt = endedRequests.at(-1);
+		expect(last.diagnostics).toMatchObject({
+			recordingRequestId: failedAttempt?.requestId,
+			apiRequestId: "persisted-reasoning-row-4",
+			source: "agent",
+			phase: "response",
+			reason: "reasoning_only_exhausted",
+			message: last.message,
+			responseSnippet: "retries=3",
+		});
+		expect(last.diagnostics?.recordingRequestId).not.toBe(endedRequests[0].requestId);
 	});
 });

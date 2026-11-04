@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-
 import { eq } from "drizzle-orm";
 
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
@@ -11,6 +10,14 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_URL,
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
+import { CHROMIUM_PATHS } from "../shared/browser-paths";
+import { urlHost } from "../shared/server-host";
+import {
+	declaredBodyExceeds,
+	isStorageImportUpload,
+	MAX_IMPORT_BYTES,
+	MAX_ORDINARY_BODY_BYTES,
+} from "../shared/storage-transfer";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -33,16 +40,25 @@ import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
+import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
+import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
+import {
+	createManagerRebindCoordinator,
+	isListenerPortConflict,
+	resolveManagerListenHost,
+	startManagerListenerGroup,
+} from "./lib/manager-control-server";
+import { readManagerToken } from "./lib/manager-token";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
+import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { getRuntimeProductIntegration } from "./lib/product-host";
-import { projectDbManager } from "./lib/project-db";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import {
 	registerGracefulShutdownHandler,
@@ -50,7 +66,10 @@ import {
 	registerRuntimeAddressGetter,
 	registerServerRestart,
 } from "./lib/server-restart";
-import { settings } from "./lib/settings";
+import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/settings";
+import { startServerAddressWatcher } from "./lib/settings-address-watcher";
+import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
+import { shellExecute } from "./lib/shell-exec";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, inlineScriptHashes, spaIndexHeaders } from "./lib/spa-base-href";
 import {
@@ -60,6 +79,7 @@ import {
 	shouldServeRequests,
 	shouldStartGatedBackgroundWork,
 } from "./lib/startup-readiness";
+import { reissueBuiltinTlsOnStartup } from "./lib/tls";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 import { BUILD_PRODUCT } from "./lib/version";
@@ -72,30 +92,31 @@ import {
 	readWindowsExcludedPortRanges,
 } from "./lib/windows-excluded-ports";
 import { pluginManager } from "./services/plugin-manager";
+import { pluginPlatformServices } from "./services/plugin-platform-services";
+import { listPluginProviderReadiness } from "./services/plugin-provider-readiness";
 import { pluginProviderRegistry } from "./services/plugin-provider-registry";
 import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
-import { shutdownPrivateArchiveWorkers } from "./services/project-archive/worker-client";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
 
-import { chapterBatchMerge } from "./services/chapter-batch-merge";
-import { chapterCleanup } from "./services/chapter-cleanup";
 import {
-	reconcileContainerStates,
-	startContainerProxy,
-	stopContainerProxy,
-} from "./services/container-proxy";
+	backgroundOccupancyInitializer,
+	withBackgroundOccupancyInitialization,
+} from "./services/background-occupancy-startup";
 import { ensureRootlessEnv } from "./services/container-service";
+import { retireLegacyChapterResources } from "./services/legacy-chapter-resource-cleanup";
 import {
+	failUnownedStartupRecovery,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
+import { scheduleProjectIndexRebuild } from "./services/project-index";
 import "./services/notification-service"; // Register notification event listeners
 import {
 	startNotificationCenterMaintenance,
@@ -105,11 +126,11 @@ import { initNotificationFanout, stopNotificationFanout } from "./services/notif
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { initChatNotify } from "./services/chat-notify";
-import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
 import { initKnowledgeNotify } from "./services/knowledge-notify";
+import { materializeLegacyDelegations } from "./services/legacy-delegation-materializer";
 import { backfillOAuthGrantAuthoritiesOnStartup } from "./services/oauth-grant-service";
 import {
 	consumeOAuthWsTicket,
@@ -117,20 +138,25 @@ import {
 	getExternalWebSocketRolloutSettings,
 	isExternalWebSocketOriginAllowed,
 } from "./services/oauth-ws-ticket-service";
-import { registerProjectDbSync } from "./services/project-db-sync";
 import { recoverProviderPrefixMigrationOnStartup } from "./services/provider-prefix-migration-service";
 import { publicShareConnectionBudget } from "./services/public-narrator-share-connections";
 import {
 	type VerifiedPublicShare,
 	verifyPublicShare,
 } from "./services/public-narrator-share-service";
-import { initReviewEventHandler } from "./services/review-event-handler";
+import { beginRecoveryDiscovery, finishRecoveryDiscovery } from "./services/recovery-handoff";
+import {
+	automaticResumeEnabled,
+	mergeStartupProtection,
+	prepareOrdinaryRestartRecovery,
+	prepareSignalRestartRecovery,
+	restoreOrdinaryRestartRecovery,
+} from "./services/restart-recovery-service";
 import { terminalService } from "./services/terminal-service";
 import {
 	getPlannedUpdateStartupProtection,
 	restoreNarratorsAfterPlannedUpdate,
 } from "./services/update-recovery-service";
-import { worktreeWatcher } from "./services/worktree-watcher";
 import { canAcceptExternalNarratorConnection } from "./websocket/oauth-connection-registry";
 import {
 	closeAllConnections,
@@ -139,15 +165,26 @@ import {
 	resolveWSData,
 	startHeartbeat,
 	stopHeartbeat,
+	type WSData,
 	waitForWebSocketActivityDrain,
 	wsHandlers,
 } from "./websocket/ws-handler";
 
+// Startup ownership must be classified before a new shutdown/update may allocate
+// an epoch. This is separate from long-running recovery terminal completion.
+beginRecoveryDiscovery();
+
 // Builtin/compatible-API providers are resolved first. Only an unregistered plugin
 // prefix may decline here; preserve registered providers' actual failure reasons.
-const unregisterExternalProviderResolver = registerExternalProviderResolver((provider, model) =>
-	pluginProviderRegistry.resolveExternalProvider(provider, model),
-);
+const unregisterExternalProviderResolver = registerExternalProviderResolver({
+	resolve: (provider, model) => pluginProviderRegistry.resolveExternalProvider(provider, model),
+	listReadiness: (signal) =>
+		listPluginProviderReadiness(
+			pluginProviderRegistry,
+			pluginPlatformServices.providerConfigService,
+			signal,
+		),
+});
 
 // Resolve any interrupted cross-store provider prefix migration before accepting requests.
 // A mismatched journal intentionally fails startup rather than serving mixed model references.
@@ -166,31 +203,14 @@ if (postgresRuntime) {
 	await activatePostgresRuntimeQueue();
 }
 
-// Invalidate interrupted merge sessions before HTTP/WS or narrator recovery can
-// accept an old continue/cancel decision. This gate only updates session metadata;
-// it must never restore a worktree or advance chapter snapshots. Fail closed if
-// the database cannot invalidate old sessions, rather than serving stale commands.
-try {
-	await chapterBatchMerge.cleanupStaleSessions();
-} catch (error) {
-	logger.error("Interrupted merge-session startup gate failed; refusing to serve requests", {
-		error: String(error),
-	});
-	throw error;
-}
-
-// Record the actual local process owner once, before HTTP/agent writes can start.
-// Identity probe failure never invents proof; unavailable registration disables reconciliation.
-const {
-	initializeWorkspaceOwnerOnStartup,
-	startWorkspaceStartupReconciliation,
-	stopWorkspaceStartupReconciliation,
-} = await import("./services/workspace-startup-reconciliation");
+// Ordinary cold continuation recovery requires strict single-instance provenance.
+// Register it directly, independently of file history and workspace writes.
 if (activeDatabaseBackend === "sqlite") {
 	try {
-		await initializeWorkspaceOwnerOnStartup();
+		const { initializeInstanceLockProcessIdentity } = await import("./lib/instance-lock");
+		await initializeInstanceLockProcessIdentity();
 	} catch (error) {
-		logger.warn("Workspace execution owner registration unavailable; barriers remain protected", {
+		logger.warn("Strict instance identity unavailable for cold continuation recovery", {
 			error: String(error),
 		});
 	}
@@ -238,6 +258,8 @@ import { refreshWindowsPath } from "./lib/win-env";
 		const gitCheck = Bun.spawnSync(["git", "--version"], {
 			stdout: "pipe",
 			stderr: "pipe",
+			// GUI 模式（管理器托管的后端）下不隐藏会闪出控制台窗口。
+			windowsHide: true,
 		});
 		if (gitCheck.exitCode === 0) {
 			_gitAvailable = true;
@@ -255,6 +277,7 @@ import { refreshWindowsPath } from "./lib/win-env";
 				const retry = Bun.spawnSync(["git", "--version"], {
 					stdout: "pipe",
 					stderr: "pipe",
+					windowsHide: true,
 				});
 				if (retry.exitCode === 0) {
 					_gitAvailable = true;
@@ -293,7 +316,12 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 
 const portExplicit = !!(cliPort || process.env.PORT);
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
-let currentHost = cliHost || process.env.HOST || settings.server.host;
+let configuredHost = cliHost || process.env.HOST || settings.server.host;
+let configuredPort = port;
+let currentHost = await resolveManagerListenHost(
+	resolveListenHost(configuredHost),
+	readManagerToken(),
+);
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
 const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
@@ -557,7 +585,11 @@ function tryReclaimPort(targetPort: number): void {
 		// netstat -ano gives lines like:
 		//   TCP    0.0.0.0:7778           0.0.0.0:0              LISTENING       12345
 		//   TCP    [::]:7778              [::]:0                 LISTENING       12345
-		const result = Bun.spawnSync(["netstat", "-ano"], { stdout: "pipe", stderr: "ignore" });
+		const result = Bun.spawnSync(["netstat", "-ano"], {
+			stdout: "pipe",
+			stderr: "ignore",
+			windowsHide: true,
+		});
 		if (result.exitCode !== 0) return;
 		const output = new TextDecoder().decode(result.stdout);
 		const listeningPids = new Set<number>();
@@ -597,6 +629,7 @@ function killPortHolder(pid: number, port: number): void {
 	const directKill = Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], {
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 	});
 	const stderr = new TextDecoder().decode(directKill.stderr).toLowerCase();
 	if (directKill.exitCode === 0) {
@@ -623,7 +656,7 @@ function killPortHolder(pid: number, port: number): void {
 				"Caption,ProcessId",
 				"/FORMAT:CSV",
 			],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		const childOutput = new TextDecoder().decode(childQuery.stdout);
 		for (const line of childOutput.split("\n")) {
@@ -638,6 +671,8 @@ function killPortHolder(pid: number, port: number): void {
 			try {
 				Bun.spawnSync(["taskkill", "/F", "/PID", String(childPid)], {
 					stdio: ["ignore", "ignore", "ignore"],
+					// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+					windowsHide: true,
 				});
 			} catch {
 				// best effort
@@ -648,7 +683,7 @@ function killPortHolder(pid: number, port: number): void {
 		// inherited the handle. Look up the parent first.
 		const parentQuery = Bun.spawnSync(
 			["wmic", "process", "where", `(ProcessId=${pid})`, "get", "ParentProcessId", "/FORMAT:CSV"],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		const parentOutput = new TextDecoder().decode(parentQuery.stdout);
 		for (const line of parentOutput.split("\n")) {
@@ -668,7 +703,7 @@ function killPortHolder(pid: number, port: number): void {
 					"Caption,ProcessId",
 					"/FORMAT:CSV",
 				],
-				{ stdout: "pipe", stderr: "ignore" },
+				{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 			);
 			const siblingOutput = new TextDecoder().decode(siblingQuery.stdout);
 			for (const sLine of siblingOutput.split("\n")) {
@@ -683,6 +718,8 @@ function killPortHolder(pid: number, port: number): void {
 					try {
 						Bun.spawnSync(["taskkill", "/F", "/PID", String(sPid)], {
 							stdio: ["ignore", "ignore", "ignore"],
+							// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+							windowsHide: true,
 						});
 					} catch {
 						// best effort
@@ -708,7 +745,7 @@ function getWindowsChildProcesses(parentPid: number): WindowsProcessInfo[] {
 				"Caption,CommandLine,ProcessId",
 				"/FORMAT:CSV",
 			],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		if (result.exitCode !== 0) return [];
 		return parseWmicProcessCsv(new TextDecoder().decode(result.stdout)).filter((proc) => {
@@ -755,6 +792,8 @@ function killOwnWindowsChildProcesses(): void {
 			);
 			Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
 				stdio: ["ignore", "ignore", "ignore"],
+				// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+				windowsHide: true,
 			});
 		} catch {
 			// best effort — process may already be gone
@@ -767,9 +806,9 @@ const startupReadiness = createStartupReadinessGate();
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
 
-/** Return the URL protocol based on current TLS config. */
+/** Advertise the listener's real protocol, including after a TLS rollback. */
 function getProtocol(): "https" | "http" {
-	return settings.server.tls?.enabled ? "https" : "http";
+	return _server.url.protocol === "https:" ? "https" : "http";
 }
 
 async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAuth | null> {
@@ -785,7 +824,7 @@ async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAu
 	if (token) {
 		try {
 			const payload = await verifyToken(token);
-			return { kind: "jwt", userId: payload.sub };
+			return { kind: "session", userId: payload.sub };
 		} catch {
 			// Fall through to anonymous only when explicitly enabled.
 		}
@@ -841,8 +880,47 @@ function stopHttpListener(): void {
 	});
 }
 
-function startServer(listenPort: number) {
-	const tlsCfg = settings.server.tls;
+let boundTlsConfig = settings.server.tls;
+
+const BODYLESS_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * `maxRequestBodySize` 是全局的，导入预览把它抬到 4 GB。
+ * 其它带正文的请求仍按 128 MB 拒绝：声明的 Content-Length 直接 413，
+ * 缺省或偏小的长度则在读流时计数，避免未声明长度的请求把 4 GB 吃满。
+ * WebSocket 升级在调用这里之前已经返回。
+ */
+function limitOrdinaryRequestBody(req: Request, url: URL): Request | Response {
+	if (isStorageImportUpload(req.method, url.pathname)) return req;
+	if (BODYLESS_METHODS.has(req.method.toUpperCase())) return req;
+	if (declaredBodyExceeds(req.headers.get("content-length"), MAX_ORDINARY_BODY_BYTES)) {
+		return new Response("Request body too large", {
+			status: 413,
+			headers: { "content-type": "text/plain; charset=utf-8" },
+		});
+	}
+	if (!req.body) return req;
+	let seen = 0;
+	const limited = req.body.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			transform(chunk, controller) {
+				seen += chunk.byteLength;
+				if (seen > MAX_ORDINARY_BODY_BYTES) {
+					controller.error(new Error("Request body too large"));
+					return;
+				}
+				controller.enqueue(chunk);
+			},
+		}),
+	);
+	return new Request(req, { body: limited, duplex: "half" } as RequestInit);
+}
+
+function startServer(
+	listenPort: number,
+	tlsCfg: typeof settings.server.tls,
+	allowHostFallback = false,
+) {
 	const tls =
 		tlsCfg?.enabled && tlsCfg.certFile && tlsCfg.keyFile
 			? {
@@ -853,251 +931,295 @@ function startServer(listenPort: number) {
 				}
 			: undefined;
 
-	const server = Bun.serve({
-		port: listenPort,
-		hostname: currentHost,
-		idleTimeout: 255,
-		tls,
-		fetch(req, server) {
-			if (!acceptingHttpRequests) {
-				return new Response("Server is shutting down", {
+	const fetchRequest = (
+		req: Request,
+		server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade">,
+	) => {
+		if (!acceptingHttpRequests) {
+			return new Response("Server is shutting down", {
+				status: 503,
+				headers: { "Retry-After": "1" },
+			});
+		}
+		const requestId = ++nextHttpRequestId;
+		const execution = httpRequestContext.run(requestId, async () => {
+			const url = new URL(req.url);
+
+			// Keep liveness available while exposing whether continuation recovery is still
+			// running or has failed. Recovery is considered admitted once every continuation
+			// has been protected and mounted in the background; terminal Agent/Await and user
+			// permission waits must never hold this barrier.
+			if (url.pathname === "/api/health") {
+				const healthResponse = await app.fetch(req);
+				const healthPayload = (await healthResponse.json().catch(() => ({}))) as Record<
+					string,
+					unknown
+				>;
+				const headers = new Headers(healthResponse.headers);
+				headers.delete("content-length");
+				headers.set("content-type", "application/json; charset=UTF-8");
+				return new Response(
+					JSON.stringify({
+						...buildHealthPayload(healthPayload, startupReadiness.state),
+						// Which database backend this process wired at startup. A monitor that
+						// watches a PostgreSQL deployment must be able to tell it actually came
+						// up on PostgreSQL — a silent fallback would report a healthy SQLite.
+						database: { backend: activeDatabaseBackend },
+					}),
+					{
+						status: healthStatusCode(startupReadiness.state, healthResponse.status),
+						headers,
+					},
+				);
+			}
+
+			const narratorWsRefusal = narratorWebSocketBackendRefusal(
+				url.pathname,
+				activeDatabaseBackend,
+			);
+			if (narratorWsRefusal) return narratorWsRefusal;
+
+			// Wait for recovery to reach a terminal outcome so restored narrators observe a
+			// consistent state, but never turn a recovery failure into a dead server: the
+			// frontend, auth and settings routes are what the user needs to repair whatever
+			// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
+			await startupReadiness.barrier;
+			if (!shouldServeRequests(startupReadiness.state)) {
+				return new Response("Startup narrator recovery failed", {
 					status: 503,
-					headers: { "Retry-After": "1" },
+					headers: { "Retry-After": "5" },
 				});
 			}
-			const requestId = ++nextHttpRequestId;
-			const execution = httpRequestContext.run(requestId, async () => {
-				const url = new URL(req.url);
 
-				// Keep liveness available while exposing whether continuation recovery is still
-				// running or has failed. Recovery is considered admitted once every continuation
-				// has been protected and mounted in the background; terminal Agent/Await and user
-				// permission waits must never hold this barrier.
-				if (url.pathname === "/api/health") {
-					const healthResponse = await app.fetch(req);
-					const healthPayload = (await healthResponse.json().catch(() => ({}))) as Record<
-						string,
-						unknown
-					>;
-					const headers = new Headers(healthResponse.headers);
-					headers.delete("content-length");
-					headers.set("content-type", "application/json; charset=UTF-8");
-					return new Response(
-						JSON.stringify({
-							...buildHealthPayload(healthPayload, startupReadiness.state),
-							// Which database backend this process wired at startup. A monitor that
-							// watches a PostgreSQL deployment must be able to tell it actually came
-							// up on PostgreSQL — a silent fallback would report a healthy SQLite.
-							database: { backend: activeDatabaseBackend },
-						}),
-						{
-							status: healthStatusCode(startupReadiness.state, healthResponse.status),
-							headers,
-						},
-					);
+			if (url.pathname === "/ws/external/v1/narrators") {
+				const rollout = getExternalWebSocketRolloutSettings();
+				const origin = req.headers.get("origin");
+				if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
+					return new Response("WebSocket Origin is not allowed", { status: 403 });
 				}
-
-				const narratorWsRefusal = narratorWebSocketBackendRefusal(
-					url.pathname,
-					activeDatabaseBackend,
-				);
-				if (narratorWsRefusal) return narratorWsRefusal;
-
-				// Wait for recovery to reach a terminal outcome so restored narrators observe a
-				// consistent state, but never turn a recovery failure into a dead server: the
-				// frontend, auth and settings routes are what the user needs to repair whatever
-				// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
-				await startupReadiness.barrier;
-				if (!shouldServeRequests(startupReadiness.state)) {
-					return new Response("Startup narrator recovery failed", {
-						status: 503,
-						headers: { "Retry-After": "5" },
-					});
+				if (!canAcceptExternalNarratorConnection()) {
+					return new Response("External narrator WebSocket capacity reached", { status: 503 });
 				}
-
-				if (url.pathname === "/ws/external/v1/narrators") {
-					const rollout = getExternalWebSocketRolloutSettings();
-					const origin = req.headers.get("origin");
-					if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
-						return new Response("WebSocket Origin is not allowed", { status: 403 });
-					}
-					if (!canAcceptExternalNarratorConnection()) {
-						return new Response("External narrator WebSocket capacity reached", { status: 503 });
-					}
-					const ticket = url.searchParams.get("ticket");
-					if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
-					const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
-					if (!consumed)
-						return new Response("Invalid or expired WebSocket ticket", { status: 401 });
-					const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
-					if (
-						!live ||
-						live.userId !== consumed.auth.user.sub ||
-						live.clientId !== consumed.auth.oauth.clientId ||
-						live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
-						live.grantId !== consumed.auth.oauth.grantId ||
-						live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
-						!live.scopes.includes("narrator.read") ||
-						!live.scopes.includes("event.subscribe")
-					) {
-						return new Response("OAuth authorization is no longer valid", { status: 401 });
-					}
-					const upgraded = server.upgrade(req, {
-						data: resolveExternalNarratorWSData(consumed.auth),
-					});
-					if (upgraded) return undefined;
-					return new Response("WebSocket upgrade failed", { status: 400 });
+				const ticket = url.searchParams.get("ticket");
+				if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
+				const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
+				if (!consumed) return new Response("Invalid or expired WebSocket ticket", { status: 401 });
+				const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
+				if (
+					!live ||
+					live.userId !== consumed.auth.user.sub ||
+					live.clientId !== consumed.auth.oauth.clientId ||
+					live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
+					live.grantId !== consumed.auth.oauth.grantId ||
+					live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
+					!live.scopes.includes("narrator.read") ||
+					!live.scopes.includes("event.subscribe")
+				) {
+					return new Response("OAuth authorization is no longer valid", { status: 401 });
 				}
+				const upgraded = server.upgrade(req, {
+					data: resolveExternalNarratorWSData(consumed.auth),
+				});
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
-				if (url.pathname === "/ws/vnet") {
-					const auth = await resolveVNetRelayAuth(req, url);
-					if (!auth) {
-						return new Response("VNet relay authentication required", { status: 401 });
-					}
-					const wsData = resolveWSData(url, undefined, auth);
-					if (!wsData) {
-						return new Response("Unknown WebSocket endpoint", { status: 404 });
-					}
-					const upgraded = server.upgrade(req, { data: wsData });
-					if (upgraded) return undefined;
-					return new Response("WebSocket upgrade failed", { status: 400 });
+			if (url.pathname === "/ws/vnet") {
+				const auth = await resolveVNetRelayAuth(req, url);
+				if (!auth) {
+					return new Response("VNet relay authentication required", { status: 401 });
 				}
-
-				// Remote executor devices authenticate via the hello frame (device token),
-				// not a JWT, so accept the upgrade here and let the handshake verify.
-				if (url.pathname === "/ws/device") {
-					const wsData = resolveWSData(url);
-					if (!wsData) {
-						return new Response("Unknown WebSocket endpoint", { status: 404 });
-					}
-					const upgraded = server.upgrade(req, { data: wsData });
-					if (upgraded) return undefined;
-					return new Response("WebSocket upgrade failed", { status: 400 });
+				const wsData = resolveWSData(url, undefined, auth);
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
 				}
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
-				// WebSocket upgrade for /ws/narrator and /ws/terminal
-				if (url.pathname.startsWith("/ws")) {
-					// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
-					// of a session JWT. Verified once at upgrade, scoped at subscribe time
-					// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
-					const shareId = url.searchParams.get("share");
-					if (shareId && url.pathname === "/ws/narrator") {
-						const shareToken = url.searchParams.get("token");
-						if (!shareToken) {
-							return new Response("Authentication required", { status: 401 });
-						}
-						let share: VerifiedPublicShare;
-						try {
-							share = verifyPublicShare(shareId, `Share ${shareToken}`);
-						} catch {
-							return new Response("Share link unavailable", { status: 401 });
-						}
-						const wsData = resolveWSData(url, undefined, undefined, undefined, share);
-						if (!wsData) {
-							return new Response("Unknown WebSocket endpoint", { status: 404 });
-						}
-						const ip = resolveClientIp({
-							peerIp: server.requestIP(req)?.address,
-							xForwardedFor: req.headers.get("x-forwarded-for"),
-							xRealIp: req.headers.get("x-real-ip"),
-							trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
-						});
-						if (wsData.channel !== "narrator") {
-							return new Response("Unknown WebSocket endpoint", { status: 404 });
-						}
-						const upgraded = publicShareConnectionBudget.upgrade(share.shareId, ip, (lease) => {
-							wsData.publicShareConnectionLease = lease;
-							return server.upgrade(req, { data: wsData });
-						});
-						if (upgraded === null) {
-							return new Response("Too many sharing connections", {
-								status: 429,
-								headers: { "Retry-After": "15" },
-							});
-						}
-						if (upgraded) return undefined;
-						return new Response("WebSocket upgrade failed", { status: 400 });
-					}
+			// Remote executor devices authenticate via the hello frame (device token),
+			// not a JWT, so accept the upgrade here and let the handshake verify.
+			if (url.pathname === "/ws/device") {
+				const wsData = resolveWSData(url);
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				}
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
-					// Verify JWT from query param
-					const token = url.searchParams.get("token");
-					if (!token) {
+			// WebSocket upgrade for /ws/narrator and /ws/terminal
+			if (url.pathname.startsWith("/ws")) {
+				// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
+				// of a session token. Verified once at upgrade, scoped at subscribe time
+				// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
+				const shareId = url.searchParams.get("share");
+				if (shareId && url.pathname === "/ws/narrator") {
+					const shareToken = url.searchParams.get("token");
+					if (!shareToken) {
 						return new Response("Authentication required", { status: 401 });
 					}
-					let payload: Awaited<ReturnType<typeof verifyToken>>;
+					let share: VerifiedPublicShare;
 					try {
-						payload = await verifyToken(token);
+						share = verifyPublicShare(shareId, `Share ${shareToken}`);
 					} catch {
-						return new Response("Invalid or expired token", { status: 401 });
+						return new Response("Share link unavailable", { status: 401 });
 					}
-
-					// Look up user info for presence tracking
-					const user = await db.query.users.findFirst({
-						where: eq(users.id, payload.sub),
-						columns: {
-							id: true,
-							username: true,
-							avatarColor: true,
-							avatarImageId: true,
-							// Read live rather than taken from the token, so a demotion applies to
-							// the next socket instead of riding along until the JWT expires. The
-							// narrator subscribe path uses it for the admin short-circuit.
-							role: true,
-						},
-					});
-					const userInfo = user
-						? {
-								userId: user.id,
-								username: user.username,
-								avatarColor: user.avatarColor,
-								avatarImageId: user.avatarImageId,
-								role: user.role,
-							}
-						: undefined;
-
-					// Snapshot the credential's expiry so the heartbeat can drop the socket
-					// when it lapses; the upgrade is the only place the token is verified.
-					const wsData = resolveWSData(url, userInfo, undefined, {
-						sessionExp: payload.exp,
-						sessionUserId: payload.sub,
-					});
+					const wsData = resolveWSData(url, undefined, undefined, undefined, share);
 					if (!wsData) {
 						return new Response("Unknown WebSocket endpoint", { status: 404 });
 					}
-
-					const upgraded = server.upgrade(req, { data: wsData });
+					const ip = resolveClientIp({
+						peerIp: server.requestIP(req)?.address,
+						xForwardedFor: req.headers.get("x-forwarded-for"),
+						xRealIp: req.headers.get("x-real-ip"),
+						trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
+					});
+					if (wsData.channel !== "narrator") {
+						return new Response("Unknown WebSocket endpoint", { status: 404 });
+					}
+					const upgraded = publicShareConnectionBudget.upgrade(share.shareId, ip, (lease) => {
+						wsData.publicShareConnectionLease = lease;
+						return server.upgrade(req, { data: wsData });
+					});
+					if (upgraded === null) {
+						return new Response("Too many sharing connections", {
+							status: 429,
+							headers: { "Retry-After": "15" },
+						});
+					}
 					if (upgraded) return undefined;
 					return new Response("WebSocket upgrade failed", { status: 400 });
 				}
 
-				// Everything else goes to Hono. Resolve the client IP and whether the immediate
-				// socket peer is trusted at the Bun boundary, so routes never trust forwarding
-				// headers solely because a caller supplied them.
-				const peerIp = server.requestIP(req)?.address;
-				const trustedProxyCidrs = settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"];
-				const clientIp = resolveClientIp({
-					peerIp,
-					xForwardedFor: req.headers.get("x-forwarded-for"),
-					xRealIp: req.headers.get("x-real-ip"),
-					trustedProxyCidrs,
-				});
-				return app.fetch(req, {
-					clientIp,
-					trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
-				});
-			});
-			activeHttpRequests.set(requestId, execution);
-			void execution.then(
-				() => activeHttpRequests.delete(requestId),
-				() => activeHttpRequests.delete(requestId),
-			);
-			return execution;
-		},
-		websocket: wsHandlers,
-	});
+				// Verify the session token from the query param
+				const token = url.searchParams.get("token");
+				if (!token) {
+					return new Response("Authentication required", { status: 401 });
+				}
+				let payload: Awaited<ReturnType<typeof verifyToken>>;
+				try {
+					payload = await verifyToken(token);
+				} catch {
+					return new Response("Invalid or expired token", { status: 401 });
+				}
 
+				// Look up user info for presence tracking
+				const user = await db.query.users.findFirst({
+					where: eq(users.id, payload.sub),
+					columns: {
+						id: true,
+						username: true,
+						avatarColor: true,
+						avatarImageId: true,
+						// Read live, so a demotion applies to the next socket. The narrator
+						// subscribe path uses it for the admin short-circuit.
+						role: true,
+					},
+				});
+				// `verifyToken` already rejected revoked and expired sessions; a user row that
+				// vanished since still fails the upgrade.
+				if (!user) {
+					return new Response("Invalid or expired token", { status: 401 });
+				}
+				const userInfo = user
+					? {
+							userId: user.id,
+							username: user.username,
+							avatarColor: user.avatarColor,
+							avatarImageId: user.avatarImageId,
+							role: user.role,
+						}
+					: undefined;
+
+				// Remember the session so the socket can be re-checked when it lapses or
+				// when the user's authorization changes (logout, revocation, role).
+				const wsData = resolveWSData(url, userInfo, undefined, {
+					sessionExp: payload.exp,
+					sessionId: payload.sid,
+					sessionUserId: payload.sub,
+				});
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				}
+
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
+
+			// Everything else goes to Hono. Resolve the client IP and whether the immediate
+			// socket peer is trusted at the Bun boundary, so routes never trust forwarding
+			// headers solely because a caller supplied them.
+			const peerIp = server.requestIP(req)?.address;
+			const trustedProxyCidrs = settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"];
+			const clientIp = resolveClientIp({
+				peerIp,
+				xForwardedFor: req.headers.get("x-forwarded-for"),
+				xRealIp: req.headers.get("x-real-ip"),
+				trustedProxyCidrs,
+			});
+			const limited = limitOrdinaryRequestBody(req, url);
+			if (limited instanceof Response) return limited;
+			return app.fetch(limited, {
+				clientIp,
+				peerIp,
+				trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
+			});
+		});
+		activeHttpRequests.set(requestId, execution);
+		void execution.then(
+			() => activeHttpRequests.delete(requestId),
+			() => activeHttpRequests.delete(requestId),
+		);
+		return execution;
+	};
+	const group = startManagerListenerGroup({
+		bindPublic: () => {
+			const bind = (host: string) => ({
+				listener: Bun.serve({
+					port: listenPort,
+					hostname: host,
+					idleTimeout: 255,
+					// Bun 只能设一个全局请求体上限。导入预览要收最大 4 GB 的包，所以这里取
+					// MAX_IMPORT_BYTES；其它请求在 limitOrdinaryRequestBody 里按 128 MB 拒绝。
+					maxRequestBodySize: MAX_IMPORT_BYTES,
+					tls,
+					fetch: fetchRequest,
+					websocket: wsHandlers,
+				}),
+				host,
+			});
+			// Only public binding may fall back. A companion collision fails the whole group.
+			return allowHostFallback
+				? listenWithLanFallback(configuredHost, currentHost, bind)
+				: bind(currentHost);
+		},
+		managerToken: readManagerToken(),
+		tls,
+		dispatch: (req, server) =>
+			fetchRequest(req, {
+				requestIP: server.requestIP.bind(server),
+				upgrade: () => false,
+			}),
+	});
+	currentHost = group.host;
+	boundTlsConfig = tlsCfg;
 	clearInheritableHandlesAfterServerBind();
-	return server;
+	return group;
+}
+
+function startServerWithHostFallback(listenPort: number) {
+	return startServer(listenPort, settings.server.tls, true);
+}
+
+// Refresh the built-in certificate before the listener reads it, without a restart.
+try {
+	await reissueBuiltinTlsOnStartup(settings.server.tls);
+} catch (error) {
+	logger.warn("Could not update TLS certificate on startup; check TLS settings", { error });
 }
 
 let actualPort = port;
@@ -1137,10 +1259,10 @@ if (portExplicit) {
 		process.exit(1);
 	}
 	try {
-		_server = startServer(port);
+		_server = startServerWithHostFallback(port);
+		actualPort = _server.port ?? port;
 	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+		if (isListenerPortConflict(err)) {
 			logger.error(`Port ${port} is already in use. Cannot start server.`);
 			console.error(
 				`\x1b[31mError: Port ${port} is already in use.\x1b[0m\nPlease free the port or choose a different one with --port=XXXX.`,
@@ -1158,8 +1280,8 @@ if (portExplicit) {
 		const tryPort: number = candidate;
 		attemptedPorts.push(tryPort);
 		try {
-			_server = startServer(tryPort);
-			actualPort = tryPort;
+			_server = startServerWithHostFallback(tryPort);
+			actualPort = _server.port ?? tryPort;
 			started = true;
 			if (tryPort !== port) {
 				if (excludedRangeForPort) {
@@ -1180,8 +1302,7 @@ if (portExplicit) {
 			}
 			break;
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+			if (isListenerPortConflict(err)) {
 				candidate = nextAllowedPort(tryPort + 1, excludedPortRanges);
 				continue;
 			}
@@ -1204,63 +1325,117 @@ if (portExplicit) {
 	}
 }
 
-logger.info(`${BUILD_PRODUCT} server running on ${getProtocol()}://${currentHost}:${actualPort}`, {
-	isProd,
-	isCompiledBinary,
-	metaUrl: import.meta.url,
+logger.info(
+	`${BUILD_PRODUCT} server running on ${getProtocol()}://${urlHost(currentHost)}:${actualPort}`,
+	{
+		isProd,
+		isCompiledBinary,
+		metaUrl: import.meta.url,
+		listenHost: currentHost,
+	},
+);
+
+function runtimeAddress() {
+	return {
+		protocol: _server.url.protocol === "https:" ? ("https" as const) : ("http" as const),
+		host: currentHost,
+		port: _server.port ?? actualPort,
+	};
+}
+registerRuntimeAddressGetter(runtimeAddress);
+
+// Startup CLI overrides and default-port fallback are not committed settings intents.
+let lastCommittedAddressIntent: { host: string; port: number } | undefined;
+// Register server restart handler for hot-reloading host/port from settings
+const restartHttpListener = createManagerRebindCoordinator({
+	// Resolve before detaching; stale DNS completions must never overwrite a newer rebind.
+	resolveHost: (host) => resolveManagerListenHost(resolveListenHost(host), readManagerToken()),
+	getCurrentAddress: runtimeAddress,
+	isAccepting: () => acceptingHttpRequests,
+	rebind: (newHost, newPort, resolvedHost, options) => {
+		const oldHost = currentHost;
+		const oldConfiguredHost = configuredHost;
+		const oldConfiguredPort = configuredPort;
+		const oldPort = actualPort;
+		const oldTls = boundTlsConfig;
+		_server = rebindHttpListener(
+			_server,
+			() => {
+				configuredHost = newHost;
+				configuredPort = newPort;
+				currentHost = resolvedHost;
+				const replacement = startServerWithHostFallback(newPort);
+				actualPort = replacement.port ?? newPort;
+				lastCommittedAddressIntent = { host: newHost, port: newPort };
+				return replacement;
+			},
+			() => {
+				configuredHost = oldConfiguredHost;
+				configuredPort = oldConfiguredPort;
+				currentHost = oldHost;
+				// Restore the TLS options actually used by the previous listener, not newly saved settings.
+				const replacement = startServer(oldPort, oldTls);
+				actualPort = replacement.port ?? oldPort;
+				return replacement;
+			},
+			options?.preserveResponse === true,
+		);
+		const address = runtimeAddress();
+		// 与启动时同一句式，管理器才能在热重绑后更新面板上的地址。
+		logger.info(
+			`${BUILD_PRODUCT} server running on ${address.protocol}://${urlHost(address.host)}:${address.port}`,
+			{ rebound: true, listenHost: address.host, port: address.port },
+		);
+		return address;
+	},
+});
+registerServerRestart(restartHttpListener);
+
+// settings.json 地址热重载：管理器面板或外部编辑直接写文件也能即时生效。
+// PATCH /api/settings 的保存路径同样写该文件，isCurrent 比对可避免双重重绑。
+startServerAddressWatcher({
+	onIntentChanged: (address) => {
+		restartHttpListener.invalidatePendingUnless(address.host, address.port);
+		return (
+			lastCommittedAddressIntent !== undefined &&
+			(address.host !== lastCommittedAddressIntent.host ||
+				address.port !== lastCommittedAddressIntent.port)
+		);
+	},
+	isCurrent: (address) =>
+		(address.host === configuredHost && address.port === configuredPort) ||
+		restartHttpListener.isPending(address.host, address.port),
+	onChanged: (address) => {
+		reloadSettings();
+		if (process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART === "1") {
+			logger.warn("Server restart suppressed for contract harness", address);
+			return;
+		}
+		// The watcher already debounced and has no HTTP response to flush. Start the intent now;
+		// an additional timer would leave queued work that a later no-op intent cannot invalidate.
+		void restartHttpListener(address.host, address.port).catch((error) => {
+			logger.error("Server restart failed", { error: String(error) });
+		});
+	},
 });
 
-registerRuntimeAddressGetter(() => ({
-	protocol: getProtocol(),
-	host: currentHost,
-	port: actualPort,
-}));
-
-// Register server restart handler for hot-reloading host/port from settings
-registerServerRestart(async (newHost: string, newPort: number) => {
-	const oldHost = currentHost;
-	const oldPort = actualPort;
-	try {
-		// Fire-and-forget: awaiting stop()'s promise would hang forever once any WebSocket was
-		// closed server-side (see stopHttpListener), leaving the server unbound and the user
-		// stranded with no listener at all. The call itself releases the port synchronously, which
-		// is what the rebind below needs.
-		stopHttpListener();
-		currentHost = newHost;
-		_server = startServer(newPort);
-		actualPort = newPort;
-		logger.info(
-			`Server restarted: ${getProtocol()}://${oldHost}:${oldPort} → ${getProtocol()}://${currentHost}:${actualPort}`,
-		);
-	} catch (err) {
-		// Rollback: try to restart on the old address
-		logger.error("Failed to restart server on new address, rolling back", {
-			newHost,
-			newPort,
-			error: String(err),
-		});
-		try {
-			currentHost = oldHost;
-			_server = startServer(oldPort);
-			actualPort = oldPort;
-			logger.info(`Server rolled back to ${getProtocol()}://${oldHost}:${oldPort}`);
-		} catch (rollbackErr) {
-			logger.error("Rollback also failed — server is down", {
-				error: String(rollbackErr),
-			});
-		}
-		throw err;
-	}
+// 其余配置（实例名、主题色、打开方式等）由管理器面板直接写文件，没有地址那样的重绑回路：
+// 文件变化时重载配置即可，运行时组件按需读取新值。地址变化由上面的监听单独处理。
+// 本进程自己的保存同样会触发文件事件，内容与上次写入一致时无需重载。
+startSettingsFileWatcher(() => {
+	reloadSettingsIfChanged();
 });
 
 /** Open a URL in the user's default browser. */
 function openInBrowser(url: string) {
+	// Windows 走 ShellExecuteW：不经 cmd start，避免偶尔闪出的控制台窗口。
+	if (IS_WINDOWS) {
+		if (shellExecute(url)) return;
+	}
 	try {
-		if (IS_WINDOWS) {
-			Bun.spawn(["cmd", "/c", "start", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} else if (IS_MACOS) {
+		if (IS_MACOS) {
 			Bun.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} else {
+		} else if (!IS_WINDOWS) {
 			Bun.spawn(["xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] });
 		}
 	} catch {
@@ -1268,38 +1443,50 @@ function openInBrowser(url: string) {
 	}
 }
 
-/** Try to open the URL in Chromium's --app mode (frameless window); fall back to default browser. */
 async function openAsApp(url: string) {
-	const candidates: string[][] = IS_WINDOWS
-		? [
-				["cmd", "/c", "start", "", "msedge", `--app=${url}`],
-				["cmd", "/c", "start", "", "chrome", `--app=${url}`],
-			]
-		: IS_MACOS
-			? [
-					["open", "-a", "Google Chrome", url, "--args", `--app=${url}`],
-					["open", "-a", "Microsoft Edge", url, "--args", `--app=${url}`],
-					["open", "-a", "Chromium", url, "--args", `--app=${url}`],
-				]
-			: [
-					["google-chrome", `--app=${url}`],
-					["google-chrome-stable", `--app=${url}`],
-					["chromium", `--app=${url}`],
-					["chromium-browser", `--app=${url}`],
-					["microsoft-edge", `--app=${url}`],
-				];
-
-	for (const cmd of candidates) {
-		try {
-			const proc = Bun.spawn(cmd, { stdio: ["ignore", "ignore", "ignore"] });
-			// On Unix, check if the process exits immediately with an error
-			if (!IS_WINDOWS) {
-				// Give it a moment to fail (e.g. command not found)
-				const exited = proc.exited;
-				const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
-				const result = await Promise.race([exited, timeout]);
-				if (result !== null && result !== 0) continue;
+	// Windows 上 Edge/Chrome 不在 PATH 里（Bun.which 找不到），按标准安装路径探测；
+	// 直接 spawn 绝对路径，避免经 cmd start 时参数被重新解析。
+	if (IS_WINDOWS) {
+		const browser = CHROMIUM_PATHS.find((path) => existsSync(path));
+		if (browser) {
+			try {
+				Bun.spawn([browser, `--app=${url}`], {
+					stdio: ["ignore", "ignore", "ignore"],
+					windowsHide: true,
+				});
+				return;
+			} catch {
+				// 落到默认浏览器兜底
 			}
+		}
+		openInBrowser(url);
+		return;
+	}
+
+	const candidates: { program: string; args: string[] }[] = IS_MACOS
+		? [
+				{ program: "open", args: ["-a", "Google Chrome", url, "--args", `--app=${url}`] },
+				{ program: "open", args: ["-a", "Microsoft Edge", url, "--args", `--app=${url}`] },
+				{ program: "open", args: ["-a", "Chromium", url, "--args", `--app=${url}`] },
+			]
+		: [
+				{ program: "google-chrome", args: [`--app=${url}`] },
+				{ program: "google-chrome-stable", args: [`--app=${url}`] },
+				{ program: "chromium", args: [`--app=${url}`] },
+				{ program: "chromium-browser", args: [`--app=${url}`] },
+				{ program: "microsoft-edge", args: [`--app=${url}`] },
+			];
+
+	for (const { program, args } of candidates) {
+		try {
+			const proc = Bun.spawn([program, ...args], {
+				stdio: ["ignore", "ignore", "ignore"],
+				windowsHide: true,
+			});
+			// Give it a moment to fail (e.g. command not found)
+			const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
+			const result = await Promise.race([proc.exited, timeout]);
+			if (result !== null && result !== 0) continue;
 			return;
 		} catch {}
 	}
@@ -1313,18 +1500,28 @@ async function openAsApp(url: string) {
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
 	const proto = getProtocol();
-	const url = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	const listenUrl = `${proto}://${urlHost(currentHost)}:${runtimeAddress().port}`;
+	// dev:all sets NARRAFORK_DEV_APP_URL to the Vite origin. This process is the API
+	// (7779); the banner and the browser open must send the user to the frontend.
+	const url = resolveAdvertisedAppUrl({
+		listenUrl,
+		devAppUrl: process.env.NARRAFORK_DEV_APP_URL,
+	});
 	console.log("");
 	console.log(`  \x1b[1m\x1b[38;5;105m⛏  ${BUILD_PRODUCT}\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
 	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
 	console.log("");
 
-	const openMode = settings.server.openBrowser;
-	if (openMode === "app") {
-		openAsApp(url);
-	} else if (openMode === "browser") {
-		openInBrowser(url);
+	// 由管理器面板托管的实例：前端窗口交给面板打开 —— 它会先聚焦已有窗口，
+	// 这里再开一次就会重复弹窗（同一份逻辑不该有两份实现）。
+	if (process.env.NARRAFORK_MANAGER_MANAGED !== "1") {
+		const openMode = settings.server.openBrowser;
+		if (openMode === "app") {
+			openAsApp(url);
+		} else if (openMode === "browser") {
+			openInBrowser(url);
+		}
 	}
 }
 
@@ -1339,7 +1536,6 @@ async function openAsApp(url: string) {
 // there is the "cannot skip verification" answer). A server-managed engine verifies itself.
 if (activeDatabaseBackend === "sqlite") {
 	scheduleBackgroundIntegrityCheck(startupShutdownState);
-	startWorkspaceStartupReconciliation();
 }
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
@@ -1349,12 +1545,21 @@ startHeartbeat();
 initDeviceConnectionService();
 // Wire the file-transfer chunk-frame receiver.
 initDeviceTransferService();
+// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
+// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
+await import("./services/modeltrace-compat")
+	.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
+	.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
 // Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
 // These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
 // instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
 if (activeDatabaseBackend === "postgres") {
 	logger.warn("OAuth/integration startup backfills are not yet migrated to PostgreSQL; path gated");
 } else {
+	// Narrators written before runtime registrations store their relations from now on.
+	await materializeLegacyDelegations().catch((error) =>
+		logger.warn("Legacy delegation materialization failed", { error: String(error) }),
+	);
 	try {
 		await backfillOAuthGrantAuthoritiesOnStartup();
 		await backfillIntegrationResourceBindingsOnStartup();
@@ -1382,6 +1587,23 @@ try {
 	void refreshAllKimiUsages().catch(() => {});
 } catch (err) {
 	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
+}
+
+try {
+	// Demand-driven warmup, like Kimi; usage is intentionally memory-only, so a
+	// restart re-reads it rather than trusting numbers from the previous process.
+	const { refreshAllOpencodeUsages } = await import("./lib/opencode-usage-cache");
+	void refreshAllOpencodeUsages().catch(() => {});
+} catch (err) {
+	logger.warn("OpenCode usage startup refresh failed", { error: String(err) });
+}
+
+try {
+	// Demand-driven warmup, like Kimi; balances are intentionally memory-only.
+	const { refreshAllDeepSeekBalances } = await import("./lib/deepseek-balance-cache");
+	void refreshAllDeepSeekBalances().catch(() => {});
+} catch {
+	logger.warn("DeepSeek balance startup refresh failed");
 }
 
 // Mark any stale terminals from a previous run as exited
@@ -1415,6 +1637,7 @@ pluginManager
 	});
 
 function startQuestionAnswerRecovery(): void {
+	if (!automaticResumeEnabled()) return;
 	void recoverPendingQuestionAnswerDeliveries().catch((error) => {
 		logger.error("Pending question answer recovery failed", { error: String(error) });
 	});
@@ -1428,18 +1651,48 @@ try {
 	logger.error("Runtime product integration initialization failed", { error: String(err) });
 }
 
+// Keep only targets discovered by this startup. An early discovery failure may leave this empty;
+// never compensate by scanning every narrator or interrupting another queue's live owner.
+const startupRecoveryNarratorIds = new Set<string>();
+const onStartupRecoveryTargetsDiscovered = (ids: readonly string[]): void => {
+	for (const id of ids) startupRecoveryNarratorIds.add(id);
+};
+
 // Read planned-update protection before generic cleanup can mutate process-owned rows. The
 // admission barrier covers generic recovery, browser-session handoff restoration, and mounting the
 // ordered continuation queue; terminal Agent/Await work and interactive permissions continue in
 // the background after that queue is mounted.
-getPlannedUpdateStartupProtection()
-	.then(async (plannedUpdate) => {
+withBackgroundOccupancyInitialization(
+	async () => {
+		const plannedUpdate = await getPlannedUpdateStartupProtection({
+			claimAuthorization: automaticResumeEnabled(),
+			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+		});
+		for (const id of plannedUpdate.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+		for (const target of plannedUpdate.snapshot?.narrators ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
+		for (const source of plannedUpdate.snapshot?.sources ?? [])
+			for (const target of source.narrators) startupRecoveryNarratorIds.add(target.narratorId);
 		// The instance lock is already held. Release only previous-process mailbox claims
 		// before planned recovery mounts owners; hot reload preserves the process marker.
 		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
 			recoverInboxClaimsOnColdStartup(),
 		);
-		await recoverNarrators(plannedUpdate.protection);
+		const ordinaryRestart = await prepareOrdinaryRestartRecovery(plannedUpdate.protection, {
+			onTargetsDiscovered: onStartupRecoveryTargetsDiscovered,
+		});
+		for (const id of ordinaryRestart.protection.narratorIds) startupRecoveryNarratorIds.add(id);
+		for (const target of ordinaryRestart.manifest?.snapshot.narrators ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
+		for (const target of ordinaryRestart.manifest?.targets ?? [])
+			startupRecoveryNarratorIds.add(target.narratorId);
+		const protection = mergeStartupProtection(plannedUpdate.protection, ordinaryRestart.protection);
+		await recoverNarrators(protection);
+		return { plannedUpdate, ordinaryRestart };
+	},
+	activeDatabaseBackend === "sqlite" ? backgroundOccupancyInitializer : undefined,
+)
+	.then(async ({ plannedUpdate, ordinaryRestart }) => {
 		await restorePendingModelOverrides();
 		// Browser-backed narrators must see their restored sessions before planned-update continuation
 		// starts. Keep failures non-fatal: affected narrators receive a persisted diagnostic instead.
@@ -1450,31 +1703,50 @@ getPlannedUpdateStartupProtection()
 					error: err instanceof Error ? err.message : String(err),
 				});
 			});
-		const plannedRecovery = await restoreNarratorsAfterPlannedUpdate(plannedUpdate);
-		if (plannedRecovery) startupReadiness.markRecovering();
+		// All sources are now registered. New preparation can reserve them without
+		// waiting for an Agent, Await, or human approval to finish (or even mount).
+		finishRecoveryDiscovery();
+		const recoveryHandles = automaticResumeEnabled()
+			? await Promise.all([
+					restoreNarratorsAfterPlannedUpdate(plannedUpdate),
+					restoreOrdinaryRestartRecovery(ordinaryRestart),
+				])
+			: [];
+		const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
+		if (completions.length) startupReadiness.markRecovering();
 		else startupReadiness.markReady();
 		startupReadiness.settle({ ok: true });
-		if (plannedRecovery) {
-			plannedRecovery.completion
+		// Convert legacy envelopes to block rows in the background, slice by slice (§10.3).
+		void import("./services/narrator-block-backfill")
+			.then(({ startBlockBackfill }) => startBlockBackfill())
+			.catch((err) =>
+				logger.warn("Block backfill did not start", {
+					error: err instanceof Error ? err.message : String(err),
+				}),
+			);
+		if (completions.length) {
+			Promise.all(completions)
 				.then(() => {
 					startupReadiness.markReady();
 					startQuestionAnswerRecovery();
 					logger.info("Planned-update background continuation recovery completed");
 				})
-				.catch((err) => {
+				.catch(async (err) => {
 					const error = err instanceof Error ? err.message : String(err);
 					startupReadiness.markFailed(error);
 					logger.error("Planned-update background continuation recovery failed", { error });
+					await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
 				});
 		} else {
 			startQuestionAnswerRecovery();
 		}
 	})
-	.catch((err) => {
+	.catch(async (err) => {
 		const error = err instanceof Error ? err.message : String(err);
 		startupReadiness.markFailed(error);
 		logger.error("Narrator state recovery failed", { error });
 		startupReadiness.settle({ ok: false, error });
+		await failUnownedStartupRecovery(startupRecoveryNarratorIds, err);
 		// A recovery failure caused by an unusable provider is almost always a persisted
 		// narrator pointing at a prefix the user has since removed. Surface which narrators
 		// are affected instead of leaving the reason buried in this log line.
@@ -1529,6 +1801,11 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Request dumps and token repair data from before request evidence unification are discarded.
+import { removeLegacyRequestDumpDirs } from "./services/legacy-request-dump-cleanup";
+
+void removeLegacyRequestDumpDirs();
+
 // Clean up leftover pack extraction directories from previous server runs and mark any
 // still-"active" pack activations as released (their temp dirs don't survive a restart).
 import { packActivationService } from "./services/knowledge-pack-activation-service";
@@ -1540,10 +1817,23 @@ import { startSkillCacheCleanupTimer } from "./services/skill-service";
 
 startSkillCacheCleanupTimer();
 
+// Small worker-owned batches reclaim unpublished or no-longer-referenced prefix snapshots.
+import {
+	closePrefixSnapshotStore,
+	startPrefixSnapshotMaintenance,
+} from "./services/narrator-prefix-snapshots";
+
+const stopPrefixSnapshotMaintenance = startPrefixSnapshotMaintenance();
+
 // Periodically remove expired/abandoned WebAuthn (passkey) ceremony challenges.
 import { startChallengeCleanupTimer } from "./lib/webauthn";
 
 startChallengeCleanupTimer();
+
+// Periodically delete expired and revoked login sessions.
+import { startSessionCleanupTimer } from "./lib/auth";
+
+startSessionCleanupTimer();
 
 // Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
 import {
@@ -1573,6 +1863,23 @@ void startupReadiness.barrier.then((recovery) => {
 		.catch((err) => {
 			logger.warn("Startup abandoned tool-call cleanup failed", { error: String(err) });
 		});
+});
+
+// Outline pages edited live when the previous process ended: commit what their logs hold.
+void startupReadiness.barrier.then((recovery) => {
+	if (!shouldStartGatedBackgroundWork(recovery)) return;
+	import("./services/outline/live/registry")
+		.then(({ startLiveReplay }) => startLiveReplay())
+		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
+	// Outline tasks: reopen tasks whose session's lease ran out (every minute, bounded) or whose
+	// session was archived or deleted (on those events), and derive the in-process flag of
+	// blocks written before it existed (once, page by page).
+	import("./services/outline/tasks")
+		.then(({ startOutlineTaskLeaseJob }) => startOutlineTaskLeaseJob())
+		.catch((err) => logger.warn("Outline lease job failed to start", { error: String(err) }));
+	import("./services/outline/in-process")
+		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
+		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
@@ -1607,15 +1914,6 @@ dissolveOrphanWorkspaces()
 		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
 	});
 
-// Register project DB backup sync (event-driven dual-write)
-registerProjectDbSync();
-
-// Register review event handler (inject feedback into source narrator on conclude)
-initReviewEventHandler();
-
-// Register container event handler (inject access info + auto-enable Browser on container start)
-initContainerEventHandler();
-
 // Register knowledge notification bridge (push publish/review state to reviewers + submitters)
 initKnowledgeNotify();
 
@@ -1626,22 +1924,19 @@ initChatNotify();
 initNotificationFanout();
 startNotificationCenterMaintenance();
 
-// Reconcile container states on startup (mark stale DB records as stopped)
-reconcileContainerStates().catch((err) => {
-	logger.warn("Container state reconciliation failed", { error: String(err) });
-});
+if (activeDatabaseBackend === "sqlite") {
+	// Stop containers and release ports that removed chapters left behind.
+	retireLegacyChapterResources().catch((err) => {
+		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
+	});
+	// Re-derive which project every session belongs to, in bounded background pages.
+	void scheduleProjectIndexRebuild();
+}
 
 // Establish client-egress relay channels for NUG providers configured with
 // local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
 // every settings save.
 reconcileNugRelayClients(settings.nugProviders ?? []);
-
-// Start container proxy if enabled
-if (settings.containers.proxy?.enabled) {
-	startContainerProxy().catch((err) => {
-		logger.error("Container proxy startup failed", { error: String(err) });
-	});
-}
 
 // One-time cleanup of legacy snapshot shadow repos (replaced by file-snapshot-service)
 const legacySnapshotsDir = getNarraforkPath("snapshots");
@@ -1718,6 +2013,7 @@ async function performGracefulShutdown(
 
 	shutdownPromise = (async () => {
 		logger.info("Graceful shutdown started", { reason: options.reason });
+		backgroundOccupancyInitializer.stop();
 		stopHeartbeat();
 
 		// Track every teardown step's outcome. The clean-shutdown marker is a promise that the DB
@@ -1736,13 +2032,21 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		acceptingHttpRequests = false;
+		if (options.reason === "signal") {
+			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
+		}
+		const shutdownRequestId = httpRequestContext.getStore();
+		// Outline pages being edited live: log what arrived and acknowledge it while the sockets
+		// are still open, so the editors forget it instead of replaying it after the restart.
 		await shutdownStep(
 			tracker,
-			"workspaceReconciliation.stop",
-			stopWorkspaceStartupReconciliation,
-			5_000,
+			"outlineLive.persist",
+			async () => {
+				const live = await import("./services/outline/live/registry");
+				await live.persistAllLiveSessions();
+			},
+			2_000,
 		);
-		const shutdownRequestId = httpRequestContext.getStore();
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design
 		// (it never awaits stop()'s promise), so anything beyond a moment means the
@@ -1769,18 +2073,38 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
+		// Outline pages being edited live: commit their text, end the sessions.
+		await shutdownStep(
+			tracker,
+			"outlineLive.close",
+			async () => {
+				const live = await import("./services/outline/live/registry");
+				await live.closeAllLiveSessions("ended");
+			},
+			5_000,
+		);
+		await shutdownStep(
+			tracker,
+			"outlineTaskLeases.stop",
+			async () => {
+				const tasks = await import("./services/outline/tasks");
+				const inProcess = await import("./services/outline/in-process");
+				await Promise.all([
+					inProcess.stopOutlineInProcessRebuild(),
+					tasks.stopOutlineTaskLeaseJob(),
+				]);
+			},
+			5_000,
+		);
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
+		await shutdownStep(tracker, "prefixSnapshots.stop", stopPrefixSnapshotMaintenance);
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
-		await shutdownStep(tracker, "containerProxy.stop", () => stopContainerProxy());
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}
-		chapterCleanup.clearAllTimers();
-		worktreeWatcher.shutdown();
-		projectDbManager.closeAll();
 		await shutdownStep(tracker, "runtimeProductIntegration.shutdown", () =>
 			getRuntimeProductIntegration().shutdown?.(),
 		);
@@ -1791,8 +2115,8 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "privateArchiveWorkers.shutdown", shutdownPrivateArchiveWorkers);
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
+		await shutdownStep(tracker, "prefixSnapshots.close", closePrefixSnapshotStore);
 		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
 		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
 		// backend, so the SQLite teardown sequence is neither extended nor bypassed.

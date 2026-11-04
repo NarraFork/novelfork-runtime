@@ -1,4 +1,5 @@
-import { type AgentConfig, agentLoop } from "../lib/agent";
+import type { MediaRef, NativeMediaInput } from "@shared/media-attachments";
+import { type AgentConfig, type AgentLoopHistory, agentLoop } from "../lib/agent";
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -13,9 +14,11 @@ import {
 export interface ExecuteLoopOptions {
 	config: AgentConfig;
 	userText: string;
-	history: unknown[];
-	trailingToolResults?: unknown[];
+	history: AgentLoopHistory;
+	/** The history ends with tool results the model has not answered yet. */
+	startedWithToolResults?: boolean;
 	images?: Array<{ format: string; base64: string }>;
+	media?: (MediaRef | NativeMediaInput)[];
 	eventContext: EventHandlerContext;
 	hooks?: EventHooks;
 }
@@ -46,8 +49,8 @@ export interface ExecuteLoopResult {
 	 * caller should suspend the turn and wait for recovery, then resume. Two causes
 	 * share this field: a NUG model whose credential pool is disabled
 	 * (`waitKind: "credentials"`, waited for via the availability poller) and an
-	 * exhausted Kimi coding-plan allowance (`waitKind: "quota"`, waited for until
-	 * the published `resumeAt`).
+	 * exhausted Kimi coding-plan or OpenCode Go allowance (`waitKind: "quota"`,
+	 * waited for until the published `resumeAt`).
 	 */
 	modelUnavailable?: {
 		message: string;
@@ -57,6 +60,9 @@ export interface ExecuteLoopResult {
 		providerPrefix?: string;
 		nugModelId?: string;
 		waitKind?: "credentials" | "quota";
+		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+		quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
+		quotaBucket?: string;
 		/** Epoch ms the turn may be replayed at. Absent for a too-far-out quota wall. */
 		resumeAt?: number;
 		/** Epoch ms the quota window resets at, whenever upstream published one. */
@@ -88,6 +94,8 @@ export interface ExecuteLoopResult {
 	 * work to do", and would produce an extra no-op request.
 	 */
 	completedNaturally?: boolean;
+	/** Quiet reasoning-only stop; do not immediately restart via spec continuation. */
+	reasoningOnlyIdle?: boolean;
 	/**
 	 * Set when the provider explicitly reports output was cut off — either by
 	 * completion token limits (`output_truncated`) or by a transient failure
@@ -102,6 +110,9 @@ export interface ExecuteLoopResult {
 	 * `interrupted`.
 	 */
 	interruptedReason?: "completion_limit" | "resumable_error";
+	/** Original upstream failure retained for bounded continuation exhaustion. */
+	interruptionError?: string;
+	interruptionDiagnostics?: ApiRequestDiagnostics;
 	/** Set when the agent loop exhausted its configured max-turn budget. */
 	maxTurnsExceeded?: boolean;
 	/** Replay the tool-result request packet instead of sending a textual continue prompt. */
@@ -124,14 +135,15 @@ export async function executeAgentLoop(
 	options: ExecuteLoopOptions,
 	sourceOptions?: ExecuteLoopSourceOptions,
 ): Promise<ExecuteLoopResult> {
-	const { config, userText, history, trailingToolResults, images, eventContext, hooks } = options;
+	const { config, userText, history, images, eventContext, hooks } = options;
+	const startedWithToolResults = options.startedWithToolResults ?? false;
 	config.requireToolCallBinding = true;
 	eventContext.requireToolCallBinding = true;
 	// Read the active pass's mutable default only when a new text block starts.
 	// Rebind per pass: a reused event context must not close over an older config.
 	eventContext.getFileReferenceContext = () => getAgentFileReferenceContext(config);
 	const eventSource =
-		sourceOptions?.eventSource ?? agentLoop(config, userText, history, trailingToolResults, images);
+		sourceOptions?.eventSource ?? agentLoop(config, userText, history, images, options.media);
 	const processEventFn = sourceOptions?.processEventFn ?? processEvent;
 
 	let finalText = "";
@@ -150,12 +162,14 @@ export async function executeAgentLoop(
 	let aborted = false;
 	let interrupted = false;
 	let interruptedReason: ExecuteLoopResult["interruptedReason"];
+	let interruptionError: string | undefined;
+	let interruptionDiagnostics: ApiRequestDiagnostics | undefined;
 	let maxTurnsExceeded = false;
-	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
 	let lastAssistantHadToolUses = false;
 	let hadToolUses = false;
 	let completedNaturally = false;
+	let reasoningOnlyIdle = false;
 	const taskReflectionDenialFingerprints = new Set<string>();
 
 	try {
@@ -231,6 +245,7 @@ export async function executeAgentLoop(
 				// model has nothing left to do. Recorded rather than `break`-ing so the
 				// remaining events of this pass are still drained normally.
 				completedNaturally = true;
+				reasoningOnlyIdle = event.reason === "reasoning_only_idle";
 			}
 			if (event.type === "context_length_exceeded") {
 				contextLengthExceeded = true;
@@ -263,6 +278,8 @@ export async function executeAgentLoop(
 					providerPrefix: event.providerPrefix,
 					nugModelId: event.nugModelId,
 					waitKind: event.waitKind,
+					quotaProvider: event.quotaProvider,
+					quotaBucket: event.quotaBucket,
 					resumeAt: event.resumeAt,
 					quotaResetAt: event.quotaResetAt,
 					diagnostics: event.diagnostics,
@@ -279,6 +296,8 @@ export async function executeAgentLoop(
 				// output_truncated) so the caller can append a continuation turn.
 				interrupted = true;
 				interruptedReason = "resumable_error";
+				interruptionError = event.message;
+				interruptionDiagnostics = event.diagnostics;
 				break;
 			}
 			if (event.type === "max_turns_exceeded") {
@@ -346,8 +365,11 @@ export async function executeAgentLoop(
 		// An aborted pass never counts as a natural completion, even if `done` was
 		// observed while draining post-abort events.
 		completedNaturally: completedNaturally && !aborted,
+		reasoningOnlyIdle: reasoningOnlyIdle && !aborted,
 		interrupted,
 		interruptedReason,
+		interruptionError,
+		interruptionDiagnostics,
 		maxTurnsExceeded,
 		shouldReplayInterruptedToolResultTurn:
 			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),

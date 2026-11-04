@@ -17,7 +17,7 @@
  * session. It must degrade to a null boundary and let the tool proceed.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -29,6 +29,7 @@ import {
 	narratorToolCalls,
 	worktreeTreeSnapshots,
 } from "../../db/schema";
+import { LOCAL_DEVICE_ID } from "../../lib/agent/execution/backend";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import { normalizePathForComparison } from "../../lib/platform-path";
@@ -39,6 +40,7 @@ import {
 	buildTreeSnapshotEventHooks,
 	buildTreeSnapshotExecutionHooks,
 } from "../tree-snapshot-loop-hooks";
+import { treeSnapshotPhysicalDir } from "../tree-snapshot-paths";
 import { resetHotPathCaptureStateForTests, worktreeTreeSnapshot } from "../worktree-tree-snapshot";
 import { peekClaim } from "../worktree-write-claims";
 
@@ -115,7 +117,7 @@ afterEach(async () => {
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
 	}
 	for (const dir of tempDirs.splice(0)) {
-		await worktreeTreeSnapshot.destroy(dir).catch(() => {});
+		rmSync(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, dir), { recursive: true, force: true });
 		await db
 			.delete(worktreeTreeSnapshots)
 			.where(eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(dir)));
@@ -124,6 +126,54 @@ afterEach(async () => {
 });
 
 describe("execution-owned snapshot boundaries", () => {
+	test("GenUI create records a generated file boundary while show records none", async () => {
+		const repo = await createRepo("nf-ui-snapshot-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const hooks = buildTreeSnapshotExecutionHooks({ session, narratorId, isInGitRepo: true });
+		const directory = join(repo, ".narrafork/gen_ui/demo-unique");
+		for (const [seq, action] of [
+			[1, "create"],
+			[2, "show"],
+		] as const) {
+			const call = await seedToolCall(narratorId, "GenUI", seq);
+			const row = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.messageId, call.messageId),
+			});
+			if (!row) throw new Error("Missing UI tool fixture");
+			await db
+				.update(narratorToolCalls)
+				.set({ executionAttempt: 1 })
+				.where(eq(narratorToolCalls.id, row.id));
+			const input = action === "create" ? { action, prefix: "demo" } : { action, path: directory };
+			const context = {
+				toolUse: { name: "GenUI", toolUseId: call.toolUseId, input },
+				effectiveInput: input,
+				binding: { toolCallId: row.id, attempt: 1 },
+				executionTarget: {
+					deviceId: "local",
+					backendKind: "local" as const,
+					cwd: repo,
+					selectionSource: "local_default" as const,
+				},
+			};
+			await hooks.onToolExecutionBefore?.(context);
+			if (action === "create") {
+				mkdirSync(directory, { recursive: true });
+				writeFileSync(join(directory, "App.tsx"), "export default () => null");
+			}
+			await hooks.onToolExecutionAfter?.({ ...context, result: { output: "ok" } });
+			const boundary = await readToolCallBoundaries(call.toolUseId);
+			if (action === "create") {
+				expect(boundary?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
+				expect(boundary?.treeHashAfter).toMatch(/^[0-9a-f]{40}$/);
+				expect(boundary?.treeHashAfter).not.toBe(boundary?.treeHashBefore);
+			} else {
+				expect(boundary?.treeHashBefore).toBeNull();
+				expect(boundary?.treeHashAfter).toBeNull();
+			}
+		}
+	});
 	test("uses redirected inputs and updates only the bound row among repeated provider ids", async () => {
 		const repo = await createRepo("nf-lifecycle-binding-");
 		const narratorId = await createSubagent(repo);
@@ -234,10 +284,10 @@ describe("subagent snapshot hooks record boundaries", () => {
 		expect(message?.treeHashAfter).toBe(row?.treeHashAfter);
 	});
 
-	test("a recorded subagent boundary is restorable, undoing the tool's writes", async () => {
-		// The point of the tree path over per-file replay: the boundary is real bytes,
-		// so restoring it works for a shell command whose writes no input describes.
-		const repo = await createRepo("nf-sa-snap-restore-");
+	test("a recorded subagent boundary holds the bytes from before a shell command", async () => {
+		// The point of the tree path: the boundary is real bytes, so it observes a shell
+		// command whose writes no input describes.
+		const repo = await createRepo("nf-sa-snap-before-");
 		const narratorId = await createSubagent(repo);
 		const session: TreeSnapshotSession = { cwd: repo };
 		const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
@@ -258,8 +308,16 @@ describe("subagent snapshot hooks record boundaries", () => {
 		// A shell command declares nothing, so its owned set is derived from the delta.
 		expect((row?.ownedPathsJson as string[]).sort()).toEqual(["a.txt", "b.txt"]);
 
-		await worktreeTreeSnapshot.restore(repo, beforeHash);
-		expect(await worktreeTreeSnapshot.capture(repo)).toBe(beforeHash);
+		expect(
+			await worktreeTreeSnapshot.readFilePreviewAtTree(
+				repo,
+				beforeHash,
+				"a.txt",
+				LOCAL_DEVICE_ID,
+				4096,
+				{ signal: new AbortController().signal, timeoutMs: 15_000 },
+			),
+		).toEqual({ status: "available", content: "original\n" });
 	});
 
 	test("read-only tools are skipped entirely", async () => {
@@ -437,6 +495,241 @@ describe("subagent snapshot hooks record boundaries", () => {
 		expect((await readToolCallBoundaries(toolUseId))?.ownedPathsJson).toEqual(["a.txt"]);
 	});
 
+	test("a canonical alias of the local workspace still records a boundary", async () => {
+		// Session cwd can be a symlink while the frozen target carries the real path.
+		// Those are the same worktree; skipping would drop every later revert boundary.
+		const repo = await createRepo("nf-sa-snap-alias-");
+		const real = realpathSync(repo);
+		const linkDir = mkdtempSync(join(tmpdir(), "nf-sa-snap-alias-link-"));
+		tempDirs.push(linkDir);
+		const link = join(linkDir, "workspace");
+		symlinkSync(real, link, "dir");
+		const narratorId = await createSubagent(link);
+		const session: TreeSnapshotSession = { cwd: link };
+		const canonicalFile = join(real, "a.txt");
+		writeFileSync(canonicalFile, "before\n");
+		const hooks = buildTreeSnapshotEventHooks({
+			session,
+			narratorId,
+			isInGitRepo: true,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: real,
+				canonicalPath: canonicalFile,
+				selectionSource: "local_default",
+			},
+		});
+		const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: canonicalFile });
+			writeFileSync(canonicalFile, "after\n");
+			await hooks.onSnapshotAfter?.(toolUseId, "Write");
+			expect(warn).not.toHaveBeenCalledWith(
+				"Tree snapshot skipped: tool target is not verified inside the local workspace",
+				expect.anything(),
+			);
+		} finally {
+			warn.mockRestore();
+			rmSync(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, link), { recursive: true, force: true });
+			await db
+				.delete(worktreeTreeSnapshots)
+				.where(eq(worktreeTreeSnapshots.worktreePath, normalizePathForComparison(link)));
+		}
+		const row = await readToolCallBoundaries(toolUseId);
+		expect(row?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
+		expect(row?.treeHashAfter).toMatch(/^[0-9a-f]{40}$/);
+		expect(row?.treeHashBefore).not.toBe(row?.treeHashAfter);
+		expect(row?.ownedPathsJson).toEqual(["a.txt"]);
+	});
+
+	test("a trailing-slash workspace cwd is the same local target", async () => {
+		const repo = await createRepo("nf-sa-snap-slash-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		writeFileSync(join(repo, "a.txt"), "before\n");
+		const hooks = buildTreeSnapshotEventHooks({
+			session,
+			narratorId,
+			isInGitRepo: true,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: `${repo}/`,
+				canonicalPath: join(repo, "a.txt"),
+				selectionSource: "local_default",
+			},
+		});
+		const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+		await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: join(repo, "a.txt") });
+		writeFileSync(join(repo, "a.txt"), "after\n");
+		await hooks.onSnapshotAfter?.(toolUseId, "Write");
+		expect((await readToolCallBoundaries(toolUseId))?.ownedPathsJson).toEqual(["a.txt"]);
+	});
+
+	test("a symlink that leaves the workspace is not recorded as a local no-op", async () => {
+		const repo = await createRepo("nf-sa-snap-escape-");
+		const outside = mkdtempSync(join(tmpdir(), "nf-sa-snap-escape-out-"));
+		tempDirs.push(outside);
+		symlinkSync(outside, join(repo, "escape"), "dir");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const canonicalFile = join(realpathSync(outside), "secret.txt");
+		const hooks = buildTreeSnapshotEventHooks({
+			session,
+			narratorId,
+			isInGitRepo: true,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: repo,
+				canonicalPath: canonicalFile,
+				selectionSource: "local_default",
+			},
+		});
+		const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
+		const capture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await hooks.onSnapshotBefore?.(toolUseId, "Write", {
+				file_path: join(repo, "escape", "secret.txt"),
+			});
+			await hooks.onSnapshotAfter?.(toolUseId, "Write");
+			expect(capture).not.toHaveBeenCalled();
+			expect(warn).toHaveBeenCalledWith(
+				"Tree snapshot skipped: tool target is not verified inside the local workspace",
+				expect.objectContaining({ reason: "canonical_path" }),
+			);
+		} finally {
+			capture.mockRestore();
+			warn.mockRestore();
+		}
+		expect(await readToolCallBoundaries(toolUseId)).toEqual({
+			treeHashBefore: null,
+			treeHashAfter: null,
+			ownedPathsJson: null,
+		});
+	});
+
+	test("bash workdir inside the workspace still records a boundary", async () => {
+		const repo = await createRepo("nf-sa-snap-subdir-");
+		mkdirSync(join(repo, "sub"));
+		writeFileSync(join(repo, "sub", "b.txt"), "before\n");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const sub = join(repo, "sub");
+		const dot = buildTreeSnapshotEventHooks({
+			session,
+			narratorId,
+			isInGitRepo: true,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: repo,
+				selectionSource: "local_default",
+			},
+		});
+		const dotCall = await seedToolCall(narratorId, "Bash", 1);
+		await dot.onSnapshotBefore?.(dotCall.toolUseId, "Bash", { command: "...", workdir: "." });
+		writeFileSync(join(repo, "a.txt"), "from-dot\n");
+		await dot.onSnapshotAfter?.(dotCall.toolUseId, "Bash");
+		expect((await readToolCallBoundaries(dotCall.toolUseId))?.ownedPathsJson).toEqual(["a.txt"]);
+
+		const nested = buildTreeSnapshotEventHooks({
+			session,
+			narratorId,
+			isInGitRepo: true,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: sub,
+				selectionSource: "local_default",
+			},
+		});
+		const nestedCall = await seedToolCall(narratorId, "Bash", 2);
+		await nested.onSnapshotBefore?.(nestedCall.toolUseId, "Bash", {
+			command: "...",
+			workdir: "sub",
+		});
+		writeFileSync(join(repo, "sub", "b.txt"), "after\n");
+		await nested.onSnapshotAfter?.(nestedCall.toolUseId, "Bash");
+		const row = await readToolCallBoundaries(nestedCall.toolUseId);
+		expect(row?.treeHashBefore).toMatch(/^[0-9a-f]{40}$/);
+		expect(row?.treeHashAfter).not.toBe(row?.treeHashBefore);
+		expect(row?.ownedPathsJson).toEqual(["sub/b.txt"]);
+	});
+
+	test("a bash workdir that symlinks out of the workspace stays unverified", async () => {
+		const repo = await createRepo("nf-sa-snap-wd-escape-");
+		const outside = mkdtempSync(join(tmpdir(), "nf-sa-snap-wd-escape-out-"));
+		tempDirs.push(outside);
+		symlinkSync(outside, join(repo, "linked-out"), "dir");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const linked = join(repo, "linked-out");
+		const hooks = buildTreeSnapshotEventHooks({
+			session,
+			narratorId,
+			isInGitRepo: true,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: linked,
+				selectionSource: "local_default",
+			},
+		});
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		const capture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		try {
+			await hooks.onSnapshotBefore?.(toolUseId, "Bash", {
+				command: "...",
+				workdir: "linked-out",
+			});
+			await hooks.onSnapshotAfter?.(toolUseId, "Bash");
+			expect(capture).not.toHaveBeenCalled();
+		} finally {
+			capture.mockRestore();
+		}
+		expect(await readToolCallBoundaries(toolUseId)).toEqual({
+			treeHashBefore: null,
+			treeHashAfter: null,
+			ownedPathsJson: null,
+		});
+	});
+
+	test("a missing bash workdir stays unverified", async () => {
+		const repo = await createRepo("nf-sa-snap-missing-wd-");
+		const narratorId = await createSubagent(repo);
+		const session: TreeSnapshotSession = { cwd: repo };
+		const missing = join(repo, "missing");
+		const hooks = buildTreeSnapshotEventHooks({
+			session,
+			narratorId,
+			isInGitRepo: true,
+			executionTarget: {
+				deviceId: "local",
+				backendKind: "local",
+				cwd: missing,
+				selectionSource: "local_default",
+			},
+		});
+		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+		const capture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		try {
+			await hooks.onSnapshotBefore?.(toolUseId, "Bash", { command: "...", workdir: "missing" });
+			await hooks.onSnapshotAfter?.(toolUseId, "Bash");
+			expect(capture).not.toHaveBeenCalled();
+		} finally {
+			capture.mockRestore();
+		}
+		expect(await readToolCallBoundaries(toolUseId)).toEqual({
+			treeHashBefore: null,
+			treeHashAfter: null,
+			ownedPathsJson: null,
+		});
+	});
+
 	test("the treeSnapshotsEnabled escape hatch applies to subagents too", async () => {
 		// The setting exists for worktrees whose whole-tree scan is not viable at all.
 		// It gates `captureSessionTree`, so it has to reach the subagent path as well —
@@ -447,8 +740,8 @@ describe("subagent snapshot hooks record boundaries", () => {
 		const hooks = buildTreeSnapshotEventHooks({ session, narratorId, isInGitRepo: true });
 		writeFileSync(join(repo, "a.txt"), "one\n");
 
-		const previous = settings.chapters.treeSnapshotsEnabled;
-		settings.chapters.treeSnapshotsEnabled = false;
+		const previous = settings.workspace.treeSnapshotsEnabled;
+		settings.workspace.treeSnapshotsEnabled = false;
 		try {
 			const { toolUseId } = await seedToolCall(narratorId, "Write", 1);
 			await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: join(repo, "a.txt") });
@@ -460,7 +753,7 @@ describe("subagent snapshot hooks record boundaries", () => {
 			expect(row?.treeHashAfter).toBeNull();
 			expect(session._lastTreeHash).toBeUndefined();
 		} finally {
-			settings.chapters.treeSnapshotsEnabled = previous;
+			settings.workspace.treeSnapshotsEnabled = previous;
 		}
 
 		// Re-enabled, the same session captures again — the disabled window left no
@@ -515,14 +808,22 @@ describe("subagent snapshot hooks never block the loop", () => {
 					);
 				}),
 		);
+		// Same real budget path, shorter budget: the production 4 s budget elapses twice (before
+		// and after hooks), which made this case ~8 s of waiting. Only "the hook returns once its
+		// budget expires instead of waiting for the hung scan" is under test.
+		const realHot = worktreeTreeSnapshot.tryCaptureHot.bind(worktreeTreeSnapshot);
+		const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot").mockImplementation(
+			(path, deviceId, hotOpts) => realHot(path, deviceId, { ...hotOpts, budgetMs: 400 }),
+		);
 		try {
 			const startedAt = Date.now();
-			// The real budget is 4s; the hook must return well inside it and NOT wait
-			// for the hung scan. Asserting the elapsed time is the whole point — a
-			// version that awaited the capture would sit here for 30s.
+			// The hook must return at its budget and NOT wait for the hung scan. Asserting
+			// the elapsed time is the whole point — a version that awaited the capture would
+			// sit here for 30 s.
 			await hooks.onSnapshotBefore?.(toolUseId, "Write", { file_path: join(repo, "a.txt") });
 			const elapsed = Date.now() - startedAt;
 			expect(elapsed).toBeLessThan(10_000);
+			expect(hot).toHaveBeenCalled();
 
 			// The tool proceeds and its result hook also returns, with no boundary
 			// recorded: degraded to per-file replay, which is the designed fallback.
@@ -533,10 +834,11 @@ describe("subagent snapshot hooks never block the loop", () => {
 			expect(row?.treeHashBefore).toBeNull();
 			expect(row?.treeHashAfter).toBeNull();
 		} finally {
+			hot.mockRestore();
 			spy.mockRestore();
 			// Kill the promoted background warm-up so the hung mock cannot outlive this
-			// test; destroy() aborts an in-flight warm-up by contract.
-			await worktreeTreeSnapshot.destroy(repo).catch(() => {});
+			// test; a direct capture preempts an in-flight warm-up by contract.
+			await worktreeTreeSnapshot.capture(repo).catch(() => {});
 			resetHotPathCaptureStateForTests();
 		}
 	}, 30_000);

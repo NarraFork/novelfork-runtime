@@ -1,16 +1,28 @@
-import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import type { NativeMediaInput } from "@shared/media-attachments";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { GeminiProviderConfig } from "../settings";
-import { parseModelId, settings } from "../settings";
+import { parseModelId } from "../settings";
 import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import type { UsageData } from "../usage-tracking";
+import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
+import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason } from "./error-handling";
+import { GeminiMediaFiles } from "./gemini-media-files";
 import { reportInputCharacters } from "./input-characters";
+import {
+	createNativeMediaDumpEncoder,
+	geminiInlineMedia,
+	storedMessageMedia,
+	supportsNativeMediaProtocolInput,
+} from "./native-media";
+import { buildOpencodeSessionHeader } from "./opencode-session";
+import { type NeutralTurn, projectHistory, webSearchSummary } from "./projection";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -20,15 +32,19 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
-import { signatureSourcesCompatible } from "./reasoning-source";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
+import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
+import { geminiResponseSchema, structuredResult } from "./response-format";
+import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 // === Gemini identity prompt ===
 const GEMINI_IDENTITY: Record<string, string> = {
@@ -42,7 +58,6 @@ export const GEMINI_GENERATE_MAX_STREAM_BYTES = 64 * 1024 * 1024;
 export const GEMINI_GENERATE_MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
 export const GEMINI_GENERATE_MAX_TEXT_BYTES = 16 * 1024 * 1024;
 export const GEMINI_GENERATE_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024;
-const GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES = 4 * 1024 * 1024;
 
 // === Gemini wire types ===
 
@@ -64,6 +79,7 @@ interface GeminiFunctionResponse {
 interface GeminiPart {
 	text?: string;
 	inlineData?: GeminiInlineData;
+	fileData?: { mimeType: string; fileUri: string };
 	functionCall?: GeminiFunctionCall;
 	functionResponse?: GeminiFunctionResponse;
 	/** Reasoning marker — parts with thought:true carry the model's thinking text. */
@@ -94,6 +110,37 @@ interface GeminiFunctionDeclaration {
 interface GeminiToolResult {
 	name: string;
 	response: Record<string, unknown>;
+	mediaParts?: GeminiPart[];
+	toolUseId?: string;
+}
+
+function isGeminiNativeMediaPart(part: GeminiPart): boolean {
+	const mime = part.inlineData?.mimeType ?? part.fileData?.mimeType;
+	return !!mime && /^(audio|video)\//.test(mime);
+}
+
+function geminiToolResultParts(results: GeminiToolResult[]): GeminiPart[] {
+	return [
+		...results.map((tr) => ({
+			functionResponse: {
+				name: tr.name,
+				response:
+					tr.toolUseId && tr.mediaParts?.some(isGeminiNativeMediaPart)
+						? { ...tr.response, toolCallId: tr.toolUseId }
+						: tr.response,
+			},
+		})),
+		...results.flatMap((tr) =>
+			(tr.mediaParts ?? []).flatMap((part) => {
+				return tr.toolUseId && isGeminiNativeMediaPart(part)
+					? [
+							{ text: `Tool result media source: ${JSON.stringify({ toolCallId: tr.toolUseId })}` },
+							part,
+						]
+					: [part];
+			}),
+		),
+	];
 }
 
 // === SSE response types ===
@@ -128,30 +175,6 @@ function assertByteLimit(value: string, limit: number, label: string): void {
 	}
 }
 
-function resolveDumpLimit(configured: number | undefined): number {
-	if (configured == null) return DEFAULT_DUMP_MAX_BYTES;
-	if (configured < 0) return GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES;
-	return Math.min(configured, GEMINI_GENERATE_MAX_REQUEST_DUMP_BYTES);
-}
-
-function truncateUtf8ToBytes(
-	text: string,
-	maxBytes: number,
-): { text: string; bytes: number; truncated: boolean } {
-	const fullBytes = byteLength(text);
-	if (fullBytes <= maxBytes) return { text, bytes: fullBytes, truncated: false };
-	let low = 0;
-	let high = text.length;
-	while (low < high) {
-		const mid = Math.ceil((low + high) / 2);
-		if (byteLength(text.slice(0, mid)) <= maxBytes) low = mid;
-		else high = mid - 1;
-	}
-	if (low > 0 && /[\uD800-\uDBFF]/.test(text[low - 1])) low--;
-	const accepted = text.slice(0, low);
-	return { text: accepted, bytes: byteLength(accepted), truncated: true };
-}
-
 /**
  * Google Gemini API provider.
  *
@@ -161,15 +184,29 @@ function truncateUtf8ToBytes(
  */
 export class GeminiProvider implements ProviderAdapter {
 	private config: GeminiProviderConfig;
+	private mediaFiles: GeminiMediaFiles;
 
-	constructor(config: GeminiProviderConfig) {
+	constructor(
+		config: GeminiProviderConfig,
+		private transport?: ProviderTransport,
+	) {
 		this.config = config;
+		this.mediaFiles = new GeminiMediaFiles({
+			baseUrl: this.baseUrl(),
+			apiKey: config.apiKey,
+			fetch: (input, init) => this.pfetch(input, init),
+		});
 	}
 
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, { proxy });
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+			}),
+		);
 	}
 
 	private getApiKey(): string {
@@ -182,6 +219,30 @@ export class GeminiProvider implements ProviderAdapter {
 
 	private baseUrl(): string {
 		return (this.config.baseUrl || DEFAULT_GEMINI_BASE).replace(/\/+$/, "");
+	}
+
+	private headers(apiKey: string, conversationId?: string, stream = false): Record<string, string> {
+		const fingerprint = resolveClientFingerprint({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+			extraHeaders: this.config.extraHeaders,
+			conversationId,
+		});
+		const headers = new Headers({
+			"Content-Type": "application/json",
+			"x-goog-api-key": apiKey,
+			"User-Agent": fingerprint.userAgent,
+			...(stream ? { Accept: "text/event-stream" } : {}),
+			...buildOpencodeSessionHeader({
+				baseUrl: this.baseUrl(),
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		});
+		// HTTP names are case-insensitive; extra headers replace, never comma-join defaults.
+		for (const [name, value] of Object.entries(fingerprint.headers)) headers.set(name, value);
+		return Object.fromEntries(headers.entries());
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
@@ -205,12 +266,31 @@ export class GeminiProvider implements ProviderAdapter {
 		return [{ functionDeclarations }];
 	}
 
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		return supportsNativeMediaProtocolInput("generate", media, model);
+	}
+
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[]; trailingUserText?: string }> {
-		return this.buildGeminiHistory(dbMessages);
+		model: string,
+		narratorId?: string,
+	): Promise<BuiltHistory> {
+		assertModelInputModalities(model, dbMessages.flatMap(storedMessageMedia));
+		const projected = await projectHistory(
+			dbMessages,
+			{
+				strict: hasCredentialBoundReasoning(parseModelId(model).model),
+				reasoningSource: this.getActiveReasoningSource(),
+			},
+			narratorId,
+		);
+		return {
+			history: this.geminiWireHistory(projected.turns),
+			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
+		};
 	}
 
 	injectSystemPrompt(
@@ -226,8 +306,18 @@ export class GeminiProvider implements ProviderAdapter {
 		h.unshift({ role: "system", text });
 	}
 
+	private reasoningSourceOverride?: string;
+
+	setReasoningSourceOverride(source: string | undefined): void {
+		this.reasoningSourceOverride = source;
+	}
+
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "gemini-compatible" };
+	}
+
 	getActiveReasoningSource(): string | undefined {
-		return `gemini:${this.config.prefix}:generate-content`;
+		return this.reasoningSourceOverride ?? `gemini:${this.config.prefix}:generate-content`;
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
@@ -239,19 +329,13 @@ export class GeminiProvider implements ProviderAdapter {
 		const { systemInstruction, contents } = splitSystemAndContents(rawHistory);
 
 		// Append trailing tool results as a user turn with functionResponse parts.
-		const toolResultParts: GeminiPart[] = (params.toolResults as GeminiToolResult[]).map((tr) => ({
-			functionResponse: { name: tr.name, response: tr.response },
-		}));
+		const toolResultParts = geminiToolResultParts((params.toolResults ?? []) as GeminiToolResult[]);
 
 		// Append current user message (skip "." continuation markers).
-		const userParts: GeminiPart[] = [];
 		const hasText = !!params.content && params.content !== ".";
-		if (hasText) userParts.push({ text: params.content });
-		if (params.images?.length) {
-			for (const img of params.images) {
-				userParts.push({ inlineData: { mimeType: `image/${img.format}`, data: img.base64 } });
-			}
-		}
+		const userParts = geminiUserParts(hasText ? params.content : "", params.images);
+
+		userParts.push(...(params.media ?? []).map(geminiInlineMedia));
 
 		if (toolResultParts.length > 0) {
 			contents.push({ role: "user", parts: toolResultParts });
@@ -267,7 +351,7 @@ export class GeminiProvider implements ProviderAdapter {
 		const tools = params.tools as Array<{ functionDeclarations: GeminiFunctionDeclaration[] }>;
 
 		const generationConfig: Record<string, unknown> = {};
-		const metadata = effectiveProviderMetadata(params.model);
+		const metadata = effectiveModelProfile(params.model);
 		const maxOutputTokens = resolveOutputTokenLimit(metadata, params.maxOutputTokens);
 		if (maxOutputTokens !== undefined) generationConfig.maxOutputTokens = maxOutputTokens;
 		const thinkingConfig = mapReasoningEffortToThinking(
@@ -276,7 +360,7 @@ export class GeminiProvider implements ProviderAdapter {
 		);
 		if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
-		const body: Record<string, unknown> = { contents };
+		let body: Record<string, unknown> = { contents };
 		if (systemInstruction) {
 			body.systemInstruction = { parts: [{ text: systemInstruction }] };
 		}
@@ -288,18 +372,10 @@ export class GeminiProvider implements ProviderAdapter {
 		}
 
 		assertModelInputModalities(params.model, body, metadata);
+		body = await this.mediaFiles.prepare(body, "generate", params.signal);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
-		const headers: Record<string, string> = {
-			"Content-Type": "application/json",
-			"x-goog-api-key": apiKey,
-		};
+		const headers = this.headers(apiKey, params.conversationId);
 
-		params.requestDump?.setRequest({
-			transport: "http",
-			url,
-			headers: sanitizeHeaders(headers),
-			body,
-		});
 		logger.debug("Gemini chat request", {
 			model,
 			baseUrl,
@@ -310,195 +386,53 @@ export class GeminiProvider implements ProviderAdapter {
 		});
 
 		await reportInputCharacters(params, body);
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, params.signal);
+		params.requestDump?.beginResponseAttempt({
+			transport: "http",
+			method: "POST",
+			url,
+			headers: sanitizeHeaders(headers),
+			bodyText: await createNativeMediaDumpEncoder()(body, bodyText, params.signal),
+		});
 		params.onRequestStart?.();
+		params.streamProgress?.beginAttempt();
 		const response = await this.pfetch(url, {
 			method: "POST",
 			headers,
 			body: bodyText,
 			signal: params.signal,
+		}).catch((error) => {
+			params.requestDump?.setResponseError(error);
+			params.requestDump?.finishResponseCapture(false);
+			throw error;
 		});
+		params.streamProgress?.onHeaders(response.status);
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
 
-		const dumpLimit = resolveDumpLimit(settings.agent?.requestDumpMaxSize);
-		if (!response.ok) {
-			const errText = await readResponseTextWithLimit(
-				response,
-				GEMINI_GENERATE_MAX_SSE_EVENT_BYTES,
-			).catch(() => "");
-			params.requestDump?.setResponseBodyText(truncateUtf8ToBytes(errText, dumpLimit).text);
-			throw new ApiError(response.status, `Gemini API error ${response.status}: ${errText}`);
-		}
-		if (!response.body) {
-			throw new Error("Gemini API returned no body");
-		}
-
-		let dumpText = "";
-		let dumpedBytes = 0;
-		let dumpTruncated = false;
-		const onRawChunk = params.requestDump
-			? (chunk: string) => {
-					if (dumpTruncated) return;
-					const remaining = dumpLimit - dumpedBytes;
-					if (remaining <= 0) {
-						dumpTruncated = true;
-						return;
-					}
-					const accepted = truncateUtf8ToBytes(chunk, remaining);
-					dumpText += accepted.text;
-					dumpedBytes += accepted.bytes;
-					dumpTruncated = accepted.truncated || dumpedBytes >= dumpLimit;
-					params.requestDump?.setResponseBodyText(dumpText);
-				}
-			: undefined;
+		if (!response.body) throw new Error("Gemini API returned no body");
+		const tap = captureResponseStream(response.body, params.requestDump, params.streamProgress);
 		try {
-			yield* this.parseSSEStream(response.body, onRawChunk);
+			if (!response.ok) {
+				const errText = await readResponseTextWithLimit(
+					new Response(tap.stream),
+					GEMINI_GENERATE_MAX_SSE_EVENT_BYTES,
+				).catch(() => "");
+				throw createGeminiHttpError(response, errText);
+			}
+			yield* this.parseSSEStream(tap.stream);
 		} catch (error) {
 			params.requestDump?.setResponseError(error);
 			throw error;
 		} finally {
-			if (params.requestDump && dumpTruncated) {
-				const marker = "\n\n[... response dump truncated]";
-				const prefix = truncateUtf8ToBytes(
-					dumpText,
-					Math.max(0, dumpLimit - byteLength(marker)),
-				).text;
-				params.requestDump.setResponseBodyText(`${prefix}${marker}`);
-			}
+			tap.finish();
 		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		_images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		// Gemini matches results to calls by function name, not by an ID. The loop
-		// passes the tool-use id here; buildHistory/pushAssistantTurn track the
-		// name->id association, but for trailing results we must recover the name.
-		// The loop always pairs formatToolResult output with the tool name via the
-		// tool-call record, so we encode name in a lookup done by the loop caller.
-		// To keep the name we stash it on a private map keyed by toolUseId.
-		assertByteLimit(output, GEMINI_GENERATE_MAX_TEXT_BYTES, "tool result text");
-		const name = toolName ?? this.toolUseIdToName.get(toolUseId) ?? toolUseId;
-		const response: Record<string, unknown> = isError ? { error: output } : { output };
-		return { name, response } satisfies GeminiToolResult;
 	}
 
 	/** Maps a tool_use id to its function name so tool results can reference it. */
 	private toolUseIdToName = new Map<string, string>();
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const h = history as GeminiHistoryItem[];
-		const toolParts: GeminiPart[] = (toolResults as GeminiToolResult[]).map((tr) => ({
-			functionResponse: { name: tr.name, response: tr.response },
-		}));
-		if (toolParts.length > 0) {
-			h.push({ role: "user", parts: toolParts });
-		}
-		const hasText = !!content && content !== ".";
-		const userParts: GeminiPart[] = [];
-		if (hasText) userParts.push({ text: content });
-		else if (images?.length) userParts.push({ text: "[user sent image(s)]" });
-		if (images?.length) {
-			for (const img of images) {
-				userParts.push({ inlineData: { mimeType: `image/${img.format}`, data: img.base64 } });
-			}
-		}
-		if (userParts.length > 0) {
-			h.push({ role: "user", parts: userParts });
-		}
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		_webSearches?: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }>,
-		_messageId?: string,
-		_imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const ordered: Array<{ index: number; sequence: number; part: GeminiPart }> = [];
-		let sequence = 0;
-		if (orderedContent) {
-			// Gemini's wire parts carry no outputIndex; use encounter positions only
-			// for assembly and retain opaque signatures on their entire native part.
-			reasoningBlocks = [];
-			toolUses = [];
-			text = "";
-			for (const [index, block] of orderedContent.entries()) {
-				if (block.type === "text" && block.text)
-					ordered.push({ index, sequence: sequence++, part: { text: block.text } });
-				else if (block.type === "reasoning") reasoningBlocks.push({ ...block, outputIndex: index });
-				else if (block.type === "tool_use") toolUses.push({ ...block, outputIndex: index });
-			}
-		}
-		const currentSource = this.getActiveReasoningSource();
-		for (const block of reasoningBlocks ?? []) {
-			if (!block.text) continue;
-			const part: GeminiPart = { text: block.text, thought: true };
-			const signature = extractThoughtSignature(block.providerMetadata, currentSource);
-			if (signature) part.thoughtSignature = signature;
-			ordered.push({
-				index: block.outputIndex ?? Number.MAX_SAFE_INTEGER - 2,
-				sequence: sequence++,
-				part,
-			});
-		}
-		if (text) {
-			ordered.push({
-				index: textOutputIndex ?? Number.MAX_SAFE_INTEGER - 1,
-				sequence: sequence++,
-				part: { text },
-			});
-		}
-		for (const toolUse of toolUses) {
-			this.toolUseIdToName.set(toolUse.toolUseId, toolUse.name);
-			const { args, signature, signatureSource } = extractArgsAndSignature(toolUse.input);
-			const replaySignature = signatureSourcesCompatible(
-				toolUse.thoughtSignatureSource ?? signatureSource,
-				currentSource,
-			)
-				? (toolUse.thoughtSignature ?? signature)
-				: undefined;
-			const part: GeminiPart = { functionCall: { name: toolUse.name, args } };
-			if (replaySignature) part.thoughtSignature = replaySignature;
-			ordered.push({
-				index: toolUse.outputIndex ?? Number.MAX_SAFE_INTEGER,
-				sequence: sequence++,
-				part,
-			});
-		}
-		ordered.sort((left, right) => left.index - right.index || left.sequence - right.sequence);
-		const parts = ordered.map((item) => item.part);
-		if (parts.length === 0) parts.push({ text: "" });
-		(history as GeminiHistoryItem[]).push({ role: "model", parts });
-	}
 
 	async generate(text: string, model: string): Promise<string> {
 		const result = await this.generateWithMeta(text, model);
@@ -520,6 +454,7 @@ export class GeminiProvider implements ProviderAdapter {
 			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
+			responseFormat: options?.responseFormat,
 		});
 	}
 
@@ -571,6 +506,7 @@ export class GeminiProvider implements ProviderAdapter {
 		maxOutputTokens?: number;
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
+		responseFormat?: GenerateOptions["responseFormat"];
 	}): Promise<GenerateMetaResult> {
 		const apiKey = this.getApiKey();
 		const baseUrl = this.baseUrl();
@@ -582,28 +518,33 @@ export class GeminiProvider implements ProviderAdapter {
 		if (opts.systemInstruction) {
 			body.systemInstruction = { parts: [{ text: opts.systemInstruction }] };
 		}
-		const metadata = effectiveProviderMetadata(opts.model);
+		const metadata = effectiveModelProfile(opts.model);
 		const thinkingConfig = mapReasoningEffortToThinking(
 			resolveMetadataReasoning(metadata, opts.reasoningEffort),
 			metadata.reasoning?.mode,
 		);
 		const maxOutputTokens = resolveOutputTokenLimit(metadata, opts.maxOutputTokens);
-		if (thinkingConfig || maxOutputTokens !== undefined)
+		// Gemini expresses the constraint inside generationConfig, with a schema
+		// dialect that rejects unknown keywords — hence the projection through
+		// `geminiResponseSchema` rather than sending the caller's JSON Schema raw.
+		const responseConfig = opts.responseFormat
+			? {
+					responseMimeType: "application/json",
+					responseSchema: geminiResponseSchema(opts.responseFormat.schema),
+				}
+			: {};
+		if (thinkingConfig || maxOutputTokens !== undefined || opts.responseFormat)
 			body.generationConfig = {
 				...(thinkingConfig && { thinkingConfig }),
 				...(maxOutputTokens !== undefined && { maxOutputTokens }),
+				...responseConfig,
 			};
 
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, opts.signal);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 		const response = await this.pfetch(url, {
 			method: "POST",
-			headers: {
-				Accept: "text/event-stream",
-				"Content-Type": "application/json",
-				"x-goog-api-key": apiKey,
-			},
+			headers: this.headers(apiKey, undefined, true),
 			body: bodyText,
 			signal: opts.signal,
 		});
@@ -612,7 +553,7 @@ export class GeminiProvider implements ProviderAdapter {
 				response,
 				GEMINI_GENERATE_MAX_STREAM_BYTES,
 			);
-			throw new ApiError(response.status, `Gemini API error ${response.status}: ${responseText}`);
+			throw createGeminiHttpError(response, responseText);
 		}
 		if (!response.body) throw new Error("Gemini API returned no body");
 
@@ -621,7 +562,8 @@ export class GeminiProvider implements ProviderAdapter {
 				response,
 				GEMINI_GENERATE_MAX_STREAM_BYTES,
 			);
-			return parseGenerateJsonFallback(responseText, opts.onTextDelta);
+			const parsed = await parseGenerateJsonFallback(responseText, opts.onTextDelta);
+			return { ...parsed, ...structuredResult(opts, parsed.text, "Gemini") };
 		}
 
 		let text = "";
@@ -645,163 +587,95 @@ export class GeminiProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(opts, text, "Gemini"),
+		};
 	}
 
-	private buildGeminiHistory(dbMessages: DbMessage[]): {
-		history: GeminiHistoryItem[];
-		trailingToolResults: GeminiToolResult[];
-	} {
-		const topLevel = dbMessages.filter(
-			(m) =>
-				!m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
-		);
-
-		// Drop the last user message — it is sent as the current message.
-		if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-			topLevel.pop();
-		}
-
+	/**
+	 * Second projection stage for generateContent: neutral turns → contents.
+	 *
+	 * functionResponse parts carry no call id, so results pair with calls by name and
+	 * order; the first stage emits both in call order.
+	 */
+	private geminiWireHistory(turns: readonly NeutralTurn[]): GeminiHistoryItem[] {
 		const history: GeminiHistoryItem[] = [];
-		let pendingToolResults: GeminiToolResult[] = [];
-
-		const flushToolResults = () => {
-			if (pendingToolResults.length > 0) {
+		for (const turn of turns) {
+			if (turn.kind === "input") {
+				for (const item of turn.items) {
+					const parts = geminiUserParts(
+						item.text,
+						item.images.flatMap((image) => (image ? [image] : [])),
+					);
+					parts.push(...(item.media ?? []).map(geminiInlineMedia));
+					if (parts.length) history.push({ role: "user", parts });
+				}
+				continue;
+			}
+			if (turn.kind === "tool_results") {
 				history.push({
 					role: "user",
-					parts: pendingToolResults.map((tr) => ({
-						functionResponse: { name: tr.name, response: tr.response },
-					})),
+					parts: [
+						...turn.results.map(
+							(result): GeminiPart => ({
+								functionResponse: {
+									name: result.name,
+									response: {
+										...(result.isError ? { error: result.text } : { output: result.text }),
+										...(result.media?.length ? { toolCallId: result.wireId } : {}),
+									},
+								},
+							}),
+						),
+						...turn.results.flatMap((result) =>
+							(result.media ?? []).flatMap((media) => [
+								{
+									text: `Tool result media source: ${JSON.stringify({ toolCallId: result.wireId })}`,
+								},
+								geminiInlineMedia(media),
+							]),
+						),
+					],
 				});
-				pendingToolResults = [];
+				continue;
 			}
-		};
-
-		for (const msg of topLevel) {
-			if (msg.role === "assistant") {
-				flushToolResults();
-
-				const content = Array.isArray(msg.contentJson)
-					? (msg.contentJson as Array<Record<string, unknown>>)
-					: [];
-				const completedCalls =
-					msg.toolCalls?.filter((call) => call.status === "success" || call.status === "fail") ??
-					[];
-				const callsById = new Map(completedCalls.map((call) => [call.toolUseId, call]));
-				const seenCalls = new Set<string>();
-				const ordered: Array<{ index: number; sequence: number; part: GeminiPart }> = [];
-				let sequence = 0;
-				const currentSource = this.getActiveReasoningSource();
-				for (const block of content) {
-					const index = numericOutputIndex(block.outputIndex);
-					if (block.type === "reasoning" && typeof block.text === "string" && block.text) {
-						const metadata = block.providerMetadata as
-							| import("./types").ReasoningProviderMetadata
-							| undefined;
-						const signature = extractThoughtSignature(metadata, currentSource);
-						ordered.push({
-							index: index ?? Number.MAX_SAFE_INTEGER - 2,
-							sequence: sequence++,
-							part: {
-								text: block.text,
-								thought: true,
-								...(signature ? { thoughtSignature: signature } : {}),
-							},
-						});
-					} else if (block.type === "text" && typeof block.text === "string" && block.text) {
-						ordered.push({
-							index: index ?? Number.MAX_SAFE_INTEGER - 1,
-							sequence: sequence++,
-							part: { text: block.text },
-						});
-					} else if (block.type === "tool_use") {
-						const toolUseId =
-							typeof block.id === "string"
-								? block.id
-								: typeof block.toolUseId === "string"
-									? block.toolUseId
-									: undefined;
-						const call = toolUseId ? callsById.get(toolUseId) : undefined;
-						if (!call) continue;
-						seenCalls.add(call.toolUseId);
-						this.toolUseIdToName.set(call.toolUseId, call.toolName);
-						const { args, signature, signatureSource } = extractArgsAndSignature(
-							block.input ?? call.inputJson,
-						);
-						const source =
-							typeof block.thoughtSignatureSource === "string"
-								? block.thoughtSignatureSource
-								: signatureSource;
-						const replaySignature = signatureSourcesCompatible(source, currentSource)
-							? typeof block.thoughtSignature === "string"
-								? block.thoughtSignature
-								: signature
+			const searches = turn.items.filter((item) => item.kind === "web_search");
+			// Searches ran on another provider; the model only learns of them as context.
+			if (searches.length)
+				history.push({
+					role: "user",
+					parts: [{ text: searches.map(webSearchSummary).join("\n") }],
+				});
+			const parts: GeminiPart[] = [];
+			for (const item of turn.items) {
+				if (item.kind === "reasoning") {
+					if (!item.text) continue;
+					const gemini = item.credentials.gemini as { thoughtSignature?: unknown } | undefined;
+					const signature =
+						item.sameSource && typeof gemini?.thoughtSignature === "string"
+							? gemini.thoughtSignature
 							: undefined;
-						ordered.push({
-							index: index ?? Number.MAX_SAFE_INTEGER,
-							sequence: sequence++,
-							part: {
-								functionCall: { name: call.toolName, args },
-								...(replaySignature ? { thoughtSignature: replaySignature } : {}),
-							},
-						});
-					}
-				}
-				if (!content.some((block) => block.type === "text") && msg.contentText) {
-					ordered.push({
-						index: Number.MAX_SAFE_INTEGER - 1,
-						sequence: sequence++,
-						part: { text: msg.contentText },
+					parts.push({
+						text: item.text,
+						thought: true,
+						...(signature ? { thoughtSignature: signature } : {}),
+					});
+				} else if (item.kind === "text") {
+					parts.push({ text: item.text });
+				} else if (item.kind === "tool_call") {
+					this.toolUseIdToName.set(item.wireId, item.name);
+					parts.push({
+						functionCall: { name: item.name, args: item.input },
+						...(item.signature?.sameSource ? { thoughtSignature: item.signature.value } : {}),
 					});
 				}
-				for (const call of completedCalls) {
-					if (seenCalls.has(call.toolUseId)) continue;
-					this.toolUseIdToName.set(call.toolUseId, call.toolName);
-					const { args, signature, signatureSource } = extractArgsAndSignature(call.inputJson);
-					const replaySignature = signatureSourcesCompatible(signatureSource, currentSource)
-						? signature
-						: undefined;
-					ordered.push({
-						index: Number.MAX_SAFE_INTEGER,
-						sequence: sequence++,
-						part: {
-							functionCall: { name: call.toolName, args },
-							...(replaySignature ? { thoughtSignature: replaySignature } : {}),
-						},
-					});
-				}
-				ordered.sort((left, right) => left.index - right.index || left.sequence - right.sequence);
-				const parts = ordered.map((item) => item.part);
-				if (parts.length === 0) continue;
-				history.push({ role: "model", parts });
-
-				// Collect tool results for the following user turn.
-				if (msg.toolCalls) {
-					for (const tc of msg.toolCalls) {
-						if (tc.status === "success" || tc.status === "fail") {
-							const outputText = outputToText(tc.outputJson);
-							pendingToolResults.push({
-								name: tc.toolName,
-								response: tc.status === "fail" ? { error: outputText } : { output: outputText },
-							});
-						}
-					}
-				}
-			} else if (msg.role === "user") {
-				flushToolResults();
-				const text = msg.contentText || "";
-				if (text) history.push({ role: "user", parts: [{ text }] });
-			} else if (msg.role === "sys") {
-				flushToolResults();
-
-				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-				const text = modelTextFromContentBlocks(content) || msg.contentText || "";
-				// Gemini has no system role in contents; fold as a user turn.
-				if (text) history.push({ role: "user", parts: [{ text }] });
 			}
+			if (parts.length) history.push({ role: "model", parts });
 		}
-
-		return { history, trailingToolResults: pendingToolResults };
+		return history;
 	}
 
 	private async *parseSSEStream(
@@ -1049,11 +923,24 @@ async function readResponseTextWithLimit(response: Response, limit: number): Pro
 
 // === Helpers ===
 
+/** Placed images follow their `[image #N]` placeholder; the rest trail the text as before. */
+function geminiUserParts(
+	text: string,
+	images?: Array<{ format: string; base64: string }>,
+): GeminiPart[] {
+	return orderUserContent(text, images ?? [], "after").map((part) =>
+		part.type === "text"
+			? { text: part.text }
+			: { inlineData: { mimeType: `image/${part.image.format}`, data: part.image.base64 } },
+	);
+}
+
 /**
  * Recursively sanitize a JSON Schema for Gemini's function-declaration format.
  * Gemini's Schema type is a strict OpenAPI subset — it rejects `additionalProperties`,
  * `$schema`, `const`, `$ref`, and a few other keywords. This drops the unsupported
- * keys and rewrites `const` to a single-value `enum`.
+ * keys and rewrites string `const` to a single-value `enum`. Non-string enum
+ * constraints are dropped while preserving the schema's type.
  */
 export function sanitizeGeminiSchema(schema: Record<string, unknown>): Record<string, unknown> {
 	return sanitizeNode(schema) as Record<string, unknown>;
@@ -1108,8 +995,11 @@ function sanitizeNode(node: unknown): unknown {
 	for (const [key, value] of Object.entries(input)) {
 		if (GEMINI_UNSUPPORTED_KEYS.has(key)) continue;
 		if (key === "const") {
-			// Rewrite const → single-value enum, which Gemini supports.
-			out.enum = [value];
+			// Gemini's enum field accepts strings only; retain the type for other literals.
+			if (typeof value === "string") out.enum = [value];
+			continue;
+		}
+		if (key === "enum" && Array.isArray(value) && !value.every((v) => typeof v === "string")) {
 			continue;
 		}
 		if (key === "properties" && value && typeof value === "object") {
@@ -1223,6 +1113,47 @@ async function parseGenerateJsonFallback(
 	return { text, usage: mapUsage(json.usageMetadata), ...(outputTruncated && { outputTruncated }) };
 }
 
+/**
+ * Build the error for a non-2xx Gemini response with structured diagnostics.
+ *
+ * The message keeps its historical `Gemini API error <status>: <body>` shape,
+ * but the status, the `{ error: { status, message } }` envelope and the
+ * response headers now travel in `diagnostics` too, like the OpenAI and
+ * Anthropic providers. Quota recovery needs exactly those: OpenCode Go's
+ * per-family Gemini root (`/inference/go/google/v1beta`) answers a spent plan
+ * with a 429 whose wait hint lives only in `retry-after`.
+ */
+function createGeminiHttpError(response: Response, rawBody: string): ApiError {
+	let payload: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(rawBody);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			payload = parsed as Record<string, unknown>;
+		}
+	} catch {
+		// Non-JSON body: the raw text below is still the message.
+	}
+	const nested =
+		payload.error && typeof payload.error === "object"
+			? (payload.error as Record<string, unknown>)
+			: undefined;
+	const message = typeof nested?.message === "string" ? nested.message : rawBody;
+	const diagnostics = parseErrorDiagnostics(
+		{
+			...payload,
+			statusCode: response.status,
+			message,
+			responseHeaders: Object.fromEntries(response.headers.entries()),
+		},
+		{ source: "provider", phase: "http_error", statusCode: response.status, message },
+	);
+	return new ApiError(
+		response.status,
+		`Gemini API error ${response.status}: ${rawBody}`,
+		diagnostics,
+	);
+}
+
 function invalidStateHttpStatus(reason: string): number {
 	const numericStatus = Number(reason);
 	if (Number.isInteger(numericStatus) && numericStatus >= 400 && numericStatus <= 599) {
@@ -1237,46 +1168,50 @@ function invalidStateHttpStatus(reason: string): number {
 }
 
 function usageFromStreamEvent(usage: NonNullable<ParsedStreamEvent["usage"]>): UsageData {
+	const cachedInputTokens = usage.cachedInputTokens ?? 0;
+	const cacheCreationInputTokens = usage.cacheCreationInputTokens ?? 0;
+	// inputTokens 已归一；仅在缺失时从完整 prompt 扣除缓存读写。
 	return {
-		inputTokens: usage.promptTokens ?? usage.inputTokens ?? 0,
+		inputTokens:
+			usage.inputTokens ??
+			Math.max((usage.promptTokens ?? 0) - cachedInputTokens - cacheCreationInputTokens, 0),
 		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
 }
 
+/**
+ * ⚠️ 新增 provider adapter 前必须先调研其 token 数据组成：input 是否已含缓存、缓存读取/写入
+ * 分别落在哪个字段、数值是「单次值」还是「会话累计值」，再决定换算方式。弄错的代价不会立刻
+ * 显现——错误口径会被静默写入 api_requests，污染用量统计与缓存命中率，事后只能靠数据特征
+ * 反推修补。
+ */
 function mapUsage(usage: GeminiUsageMetadata | undefined): UsageData | null {
 	if (!usage) return null;
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		inputTokens: usage.promptTokenCount ?? 0,
+		// Gemini promptTokenCount 明确包含缓存读取，异常计数也不能按净输入猜测。
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		outputTokens: usage.candidatesTokenCount ?? 0,
-		cachedInputTokens: usage.cachedContentTokenCount ?? 0,
+		cachedInputTokens,
 		cacheCreationInputTokens: 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? 0,
 	};
 }
 
 function mapUsageStream(usage: GeminiUsageMetadata): NonNullable<ParsedStreamEvent["usage"]> {
+	const promptTokens = usage.promptTokenCount ?? 0;
+	const cachedInputTokens = usage.cachedContentTokenCount ?? 0;
 	return {
-		promptTokens: usage.promptTokenCount ?? 0,
-		inputTokens: (usage.promptTokenCount ?? 0) - (usage.cachedContentTokenCount ?? 0),
+		promptTokens,
+		inputTokens: Math.max(promptTokens - cachedInputTokens, 0),
 		completionTokens: usage.candidatesTokenCount ?? 0,
 		reasoningTokens: usage.thoughtsTokenCount ?? undefined,
 		cachedInputTokens: usage.cachedContentTokenCount ?? undefined,
 	};
-}
-
-/** Extract a Gemini thoughtSignature stored on reasoning provider metadata. */
-function extractThoughtSignature(
-	metadata: import("./types").ReasoningProviderMetadata | undefined,
-	currentSource: string | undefined,
-): string | undefined {
-	const signature = metadata?.gemini?.thoughtSignature;
-	if (!signature) return undefined;
-	return signatureSourcesCompatible(metadata.signatureSource, currentSource)
-		? signature
-		: undefined;
 }
 
 /**
@@ -1286,39 +1221,6 @@ function extractThoughtSignature(
  */
 export const GEMINI_THOUGHT_SIGNATURE_KEY = "__geminiThoughtSignature";
 export const GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY = "__geminiThoughtSignatureSource";
-
-/**
- * Split a persisted/streamed tool-call input into the real function args and the
- * embedded Gemini thought signature (if any). The reserved signature key is
- * removed from the returned args so it never reaches the model.
- */
-function extractArgsAndSignature(input: unknown): {
-	args: Record<string, unknown>;
-	signature?: string;
-	signatureSource?: string;
-} {
-	if (!input || typeof input !== "object" || Array.isArray(input)) {
-		return { args: (input as Record<string, unknown>) ?? {} };
-	}
-	const record = input as Record<string, unknown>;
-	if (!(GEMINI_THOUGHT_SIGNATURE_KEY in record)) {
-		return { args: record };
-	}
-	const {
-		[GEMINI_THOUGHT_SIGNATURE_KEY]: signature,
-		[GEMINI_THOUGHT_SIGNATURE_SOURCE_KEY]: signatureSource,
-		...args
-	} = record;
-	return {
-		args,
-		signature: typeof signature === "string" ? signature : undefined,
-		signatureSource: typeof signatureSource === "string" ? signatureSource : undefined,
-	};
-}
-
-function numericOutputIndex(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
 
 let geminiToolIdCounter = 0;
 function generateGeminiToolId(): string {

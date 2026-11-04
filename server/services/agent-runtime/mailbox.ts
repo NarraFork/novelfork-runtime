@@ -1,3 +1,4 @@
+import { mailboxReplyContext } from "@shared/reply-context";
 import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import {
 	narratorBufferedMessages as mailbox,
@@ -9,7 +10,14 @@ import { generateId } from "../../lib/id";
 import { MAILBOX_LIMITS as L } from "./limits";
 // The dialect-neutral kernel lives in mailbox-shared.ts so the PostgreSQL adapter never
 // runtime-imports this SQLite module. The re-export below keeps existing call sites stable.
-import { boundedError, boundedJson, mailboxDedupeKey, pointer } from "./mailbox-shared";
+import {
+	boundedError,
+	boundedJson,
+	mailboxDedupeKey,
+	pointer,
+	recipientDeletedReceiptPatch,
+	semanticEditReceiptPatch,
+} from "./mailbox-shared";
 
 export { boundedError, boundedJson, mailboxDedupeKey };
 
@@ -36,6 +44,7 @@ const releasedPayload = {
 	metadataJson: null,
 	payloadRefJson: null,
 	imagesJson: null,
+	mediaJson: null,
 	textFilePathsJson: null,
 	fileReferencesJson: null,
 	creatorJson: null,
@@ -156,6 +165,7 @@ function validate(input: MailboxInput) {
 	if (input.kind === "user_input") {
 		const refs = [
 			input.imagesJson,
+			input.mediaJson,
 			input.creatorJson,
 			input.textFilePathsJson,
 			input.fileReferencesJson,
@@ -250,6 +260,7 @@ export function createMailboxStore(db: RuntimeDb) {
 				...(input.kind === "user_input"
 					? {
 							imagesJson: input.imagesJson,
+							mediaJson: input.mediaJson,
 							creatorJson: input.creatorJson,
 							textFilePathsJson: input.textFilePathsJson,
 							fileReferencesJson: input.fileReferencesJson,
@@ -302,6 +313,9 @@ export function createMailboxStore(db: RuntimeDb) {
 			)
 			.get();
 		if (!ref) throw new Error("Materializer did not persist the recipient ref in this transaction");
+		const replyContext = mailboxReplyContext(row);
+		if (replyContext)
+			tx.update(narrators).set({ replyContext }).where(eq(narrators.id, row.narratorId)).run();
 		return tx
 			.update(mailbox)
 			.set({
@@ -726,6 +740,7 @@ export function createMailboxStore(db: RuntimeDb) {
 						state: "cancelled",
 						text: "",
 						imagesJson: null,
+						mediaJson: null,
 						textFilePathsJson: null,
 						fileReferencesJson: null,
 						payloadRefJson: null,
@@ -869,20 +884,17 @@ export function createMailboxStore(db: RuntimeDb) {
 			}
 			return tx
 				.update(mailbox)
-				.set({
-					currentMessageId: change.kind === "deleted" ? null : change.messageId,
-					...(change.kind === "semantic_edit"
-						? {
-								receiptDisposition: "superseded" as const,
-								currentRevision: sql`max(${mailbox.currentRevision}, ${mailbox.contentRevision}) + 1`,
-								currentAdoptedRevision: null,
-								currentAdoptedAt: null,
-							}
-						: change.kind === "deleted"
-							? { receiptDisposition: "recipient_deleted" as const }
-							: {}),
-					updatedAt: now(),
-				})
+				.set(
+					change.kind === "deleted"
+						? recipientDeletedReceiptPatch(now())
+						: change.kind === "semantic_edit"
+							? semanticEditReceiptPatch(
+									change.messageId,
+									sql`max(${mailbox.currentRevision}, ${mailbox.contentRevision}) + 1`,
+									now(),
+								)
+							: { currentMessageId: change.messageId, updatedAt: now() },
+				)
 				.where(
 					and(
 						eq(mailbox.narratorId, narratorId),

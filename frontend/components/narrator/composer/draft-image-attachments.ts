@@ -23,6 +23,8 @@
  * event, and a user who never attaches anything pays nothing.
  */
 
+import { MAX_MEDIA_FILE_SIZE, MEDIA_MIME_TO_EXT } from "@shared/media-attachments";
+
 const DB_NAME = "narrafork-draft-image-attachments";
 /**
  * v3 adds `textFiles`, `updatedAtMs` and `totalBytes` to each record.
@@ -56,6 +58,8 @@ export const DRAFT_ATTACHMENT_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 
 /** Total bytes across every record, all users and narrators in this browser. */
 export const MAX_DRAFT_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024;
+/** Media is budgeted separately so it cannot evict existing image/text drafts. */
+export const MAX_DRAFT_MEDIA_TOTAL_BYTES = 100 * 1024 * 1024;
 
 /**
  * Most records kept, oldest-first eviction beyond it.
@@ -68,7 +72,49 @@ export const MAX_DRAFT_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024;
  */
 export const MAX_DRAFT_ATTACHMENT_RECORDS = 20;
 
+/** Only explicitly interrupted uploads retain Files in this tab, never ordinary drafts. */
+const MAX_INTERRUPTED_DRAFT_RECORDS = 8;
+interface InterruptedDraftAttachments extends DraftAttachmentRecordStat {
+	images: File[];
+	textFiles: File[];
+	media: File[];
+	ordinaryUpdatedAtMs: number;
+	mediaUpdatedAtMs: number;
+	droppedCount: number;
+}
+const interruptedDraftAttachments = new Map<string, InterruptedDraftAttachments>();
+
+const composerAssetIds = new WeakMap<File, string>();
+
+/** Resource identity belongs to the File object, never its (possibly duplicated) name. */
+export function getComposerAssetId(file: File): string {
+	let id = composerAssetIds.get(file);
+	if (!id) {
+		id =
+			globalThis.crypto?.randomUUID?.() ??
+			`asset-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		composerAssetIds.set(file, id);
+	}
+	return id;
+}
+
+function isComposerAssetId(id: unknown): id is string {
+	if (typeof id !== "string" || !id.length || id.length > 4096) return false;
+	for (let i = 0; i < id.length; i++) {
+		const code = id.charCodeAt(i);
+		if (code <= 32 || code === 127) return false;
+	}
+	return true;
+}
+
+export function setComposerAssetId(file: File, id: string): void {
+	if (!isComposerAssetId(id)) throw new Error("Invalid composer asset id");
+	composerAssetIds.set(file, id);
+}
+
 interface DraftAttachmentEntry {
+	/** Optional for records written before inline attachments. */
+	id?: string;
 	name: string;
 	type: string;
 	size: number;
@@ -89,16 +135,20 @@ interface DraftAttachmentRecord {
 	 * ISO string per record.
 	 */
 	updatedAtMs: number;
+	ordinaryUpdatedAtMs?: number;
+	mediaUpdatedAtMs?: number;
 	/** Sum of the stored blob sizes, so the budget pass never reads a Blob. */
 	totalBytes: number;
 	images: DraftAttachmentEntry[];
 	textFiles: DraftAttachmentEntry[];
+	media: DraftAttachmentEntry[];
 }
 
 /** What `loadDraftAttachments` recovered, and what it could not. */
 export interface LoadedDraftAttachments {
 	images: File[];
 	textFiles: File[];
+	media: File[];
 	/**
 	 * Entries present in the record but unusable (blob gone, invalid type).
 	 *
@@ -130,7 +180,8 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 	if (!idb) return Promise.resolve(null);
 	if (dbPromise) return dbPromise;
 
-	dbPromise = new Promise((resolve) => {
+	let failed = false;
+	const pending = new Promise<IDBDatabase>((resolve, reject) => {
 		const request = idb.open(DB_NAME, DB_VERSION);
 
 		request.onupgradeneeded = (event) => {
@@ -143,8 +194,8 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 			}
 
 			// v2 → v3 adds fields only, so an existing store is kept as-is and its
-			// records are read with defaults (see `resolveUpdatedAtMs` /
-			// `resolveTotalBytes`). Recreating it here would delete attachments the
+			// records are read with defaults (see `resolveUpdatedAtMs`).
+			// Recreating it here would delete attachments the
 			// user is holding right now.
 			if (!db.objectStoreNames.contains(STORE_NAME)) {
 				db.createObjectStore(STORE_NAME, { keyPath: "draftKey" });
@@ -152,26 +203,38 @@ function openDraftImageAttachmentDb(): Promise<IDBDatabase | null> {
 		};
 
 		request.onerror = () => {
-			dbPromise = null;
-			resolve(null);
+			failed = true;
+			reject(request.error ?? new Error("IndexedDB draft attachments open failed"));
 		};
 
 		request.onblocked = () => {
-			dbPromise = null;
-			resolve(null);
+			failed = true;
+			reject(new Error("IndexedDB draft attachments open blocked"));
 		};
 
 		request.onsuccess = () => {
 			const db = request.result;
+			// A blocked request can still succeed after the caller has retried.
+			// It must not retain a handle or replace the newer cached connection.
+			if (failed) {
+				db.close();
+				return;
+			}
 			db.onversionchange = () => {
 				db.close();
-				dbPromise = null;
+				if (dbPromise === pending) dbPromise = null;
 			};
 			resolve(db);
 		};
 	});
+	dbPromise = pending;
+	// Also reset after a synchronous open() exception. Only this attempt owns
+	// this cache entry; a late failure must not clear a newer successful open.
+	void pending.catch(() => {
+		if (dbPromise === pending) dbPromise = null;
+	});
 
-	return dbPromise;
+	return pending;
 }
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
@@ -215,7 +278,7 @@ function getStoredFileName(file: File, index: number, kind: AttachmentKind): str
 		: `attachment-${index + 1}.txt`;
 }
 
-type AttachmentKind = "image" | "text";
+type AttachmentKind = "image" | "text" | "media";
 
 /**
  * Whether a file is worth mirroring.
@@ -227,12 +290,20 @@ type AttachmentKind = "image" | "text";
  * that go out fine but disappear on reload, for no reason the user can see.
  */
 function shouldPersistFile(file: File, kind: AttachmentKind): boolean {
+	if (kind === "media") {
+		return (
+			file.size > 0 &&
+			file.size <= MAX_MEDIA_FILE_SIZE &&
+			Object.hasOwn(MEDIA_MIME_TO_EXT, file.type)
+		);
+	}
 	if (file.size > MAX_DRAFT_ATTACHMENT_BYTES) return false;
 	return kind === "image" ? ACCEPTED_IMAGE_TYPES.has(file.type) : true;
 }
 
 function fileToEntry(file: File, index: number, kind: AttachmentKind): DraftAttachmentEntry {
 	return {
+		id: getComposerAssetId(file),
 		name: getStoredFileName(file, index, kind),
 		type: file.type,
 		size: file.size,
@@ -259,7 +330,9 @@ function entryToFile(entry: unknown, index: number, kind: AttachmentKind): File 
 	const blob = item.blob;
 	if (!isBlob(blob)) return null;
 	const type = typeof item.type === "string" ? item.type : blob.type;
-	if (blob.size > MAX_DRAFT_ATTACHMENT_BYTES) return null;
+	if (blob.size > (kind === "media" ? MAX_MEDIA_FILE_SIZE : MAX_DRAFT_ATTACHMENT_BYTES))
+		return null;
+	if (kind === "media" && (!blob.size || !Object.hasOwn(MEDIA_MIME_TO_EXT, type))) return null;
 	if (kind === "image" && (!type || !ACCEPTED_IMAGE_TYPES.has(type))) return null;
 	const fallbackName =
 		kind === "image"
@@ -267,7 +340,14 @@ function entryToFile(entry: unknown, index: number, kind: AttachmentKind): File 
 			: `attachment-${index + 1}.txt`;
 	const name = typeof item.name === "string" && item.name.trim() ? item.name : fallbackName;
 	const lastModified = typeof item.lastModified === "number" ? item.lastModified : Date.now();
-	return new File([blob], name, { type, lastModified });
+	const file = new File([blob], name, { type, lastModified });
+	if (isComposerAssetId(item.id)) {
+		setComposerAssetId(file, item.id);
+	} else {
+		getComposerAssetId(file);
+	}
+	item.id = getComposerAssetId(file);
+	return file;
 }
 
 /** Epoch millis for a record, tolerating v2 records that only have `updatedAt`. */
@@ -284,6 +364,14 @@ function resolveUpdatedAtMs(record: Partial<DraftAttachmentRecord>): number {
 	return 0;
 }
 
+function categoryUpdatedAtMs(
+	record: Partial<DraftAttachmentRecord>,
+	category: "ordinary" | "media",
+): number {
+	const value = category === "media" ? record.mediaUpdatedAtMs : record.ordinaryUpdatedAtMs;
+	return typeof value === "number" && Number.isFinite(value) ? value : resolveUpdatedAtMs(record);
+}
+
 function sumEntryBytes(entries: unknown[]): number {
 	let total = 0;
 	for (const entry of entries) {
@@ -292,16 +380,6 @@ function sumEntryBytes(entries: unknown[]): number {
 		if (typeof size === "number" && Number.isFinite(size) && size > 0) total += size;
 	}
 	return total;
-}
-
-/** Byte total for a record, computed when a v2 record has no `totalBytes`. */
-function resolveTotalBytes(record: Partial<DraftAttachmentRecord>): number {
-	if (typeof record.totalBytes === "number" && Number.isFinite(record.totalBytes)) {
-		return record.totalBytes;
-	}
-	return (
-		sumEntryBytes(readEntryList(record.images)) + sumEntryBytes(readEntryList(record.textFiles))
-	);
 }
 
 /**
@@ -371,53 +449,182 @@ export function selectDraftAttachmentsToEvict(options: {
 	return [...doomed];
 }
 
+function getInterruptedDraftAttachments(draftKey: string): LoadedDraftAttachments | null {
+	const cutoff = Date.now() - DRAFT_ATTACHMENT_TTL_MS;
+	for (const [key, record] of interruptedDraftAttachments) {
+		if (record.ordinaryUpdatedAtMs < cutoff) {
+			record.images = [];
+			record.textFiles = [];
+		}
+		if (record.mediaUpdatedAtMs < cutoff) record.media = [];
+		if (!record.images.length && !record.textFiles.length && !record.media.length)
+			interruptedDraftAttachments.delete(key);
+	}
+	const record = interruptedDraftAttachments.get(draftKey);
+	// Copy membership only: callers may edit their arrays, but Files (and asset ids)
+	// stay identical across reads and panels. Reading does not extend the TTL.
+	return record
+		? {
+				images: [...record.images],
+				textFiles: [...record.textFiles],
+				media: [...record.media],
+				droppedCount: record.droppedCount,
+			}
+		: null;
+}
+
+/**
+ * Synchronously retain a switch-interrupted upload before its composer unmounts.
+ * This is an opt-in recovery snapshot, not another ordinary draft store: it keeps
+ * the original File references without slicing/copying blobs, including files
+ * above the IndexedDB per-file limit. The newest snapshot always survives even
+ * if it alone exceeds the total budget; all older snapshots then make room.
+ */
+export function retainInterruptedDraftAttachments(
+	userId: string,
+	narratorId: string,
+	images: File[],
+	textFiles: File[],
+	media: File[] = [],
+): void {
+	if (!userId || !narratorId) return;
+	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
+	const previous = interruptedDraftAttachments.get(draftKey);
+	interruptedDraftAttachments.delete(draftKey);
+	if (images.length === 0 && textFiles.length === 0 && media.length === 0) return;
+	const now = Date.now();
+	const sameFiles = (a: readonly File[], b: readonly File[]) =>
+		a.length === b.length && a.every((file, index) => file === b[index]);
+	const sameOrdinary =
+		!!previous && sameFiles(previous.images, images) && sameFiles(previous.textFiles, textFiles);
+	const sameMedia = !!previous && sameFiles(previous.media, media);
+	for (const file of [...images, ...textFiles, ...media]) getComposerAssetId(file);
+	interruptedDraftAttachments.set(draftKey, {
+		draftKey,
+		updatedAtMs: now,
+		ordinaryUpdatedAtMs: previous && sameOrdinary ? previous.ordinaryUpdatedAtMs : now,
+		mediaUpdatedAtMs: previous && sameMedia ? previous.mediaUpdatedAtMs : now,
+		totalBytes: [...images, ...textFiles, ...media].reduce((sum, file) => sum + file.size, 0),
+		images: [...images],
+		textFiles: [...textFiles],
+		media: [...media],
+		droppedCount: 0,
+	});
+	for (const category of ["ordinary", "media"] as const) {
+		const records = [...interruptedDraftAttachments.values()].flatMap((record) => {
+			const files = category === "media" ? record.media : [...record.images, ...record.textFiles];
+			return files.length
+				? [
+						{
+							...record,
+							updatedAtMs:
+								category === "media" ? record.mediaUpdatedAtMs : record.ordinaryUpdatedAtMs,
+							totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+						},
+					]
+				: [];
+		});
+		if (!records.some((record) => record.draftKey === draftKey)) continue;
+		const doomed = selectDraftAttachmentsToEvict({
+			records,
+			now: Date.now(),
+			protectKey: draftKey,
+			maxRecords: MAX_INTERRUPTED_DRAFT_RECORDS,
+			maxTotalBytes:
+				category === "media" ? MAX_DRAFT_MEDIA_TOTAL_BYTES : MAX_DRAFT_ATTACHMENT_TOTAL_BYTES,
+		});
+		for (const key of doomed) {
+			const record = interruptedDraftAttachments.get(key);
+			if (!record) continue;
+			if (category === "media") {
+				record.droppedCount += record.media.length;
+				record.media = [];
+			} else {
+				record.droppedCount += record.images.length + record.textFiles.length;
+				record.images = [];
+				record.textFiles = [];
+			}
+			if (!record.images.length && !record.textFiles.length && !record.media.length)
+				interruptedDraftAttachments.delete(key);
+		}
+	}
+}
+
 export async function loadDraftImageAttachments(
 	userId: string,
 	narratorId: string,
 ): Promise<LoadedDraftAttachments> {
-	const empty: LoadedDraftAttachments = { images: [], textFiles: [], droppedCount: 0 };
-	const db = await openDraftImageAttachmentDb();
-	if (!db || !userId || !narratorId) return empty;
-
+	const empty: LoadedDraftAttachments = { images: [], textFiles: [], media: [], droppedCount: 0 };
+	if (!userId || !narratorId) return empty;
 	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
-	const transaction = db.transaction(STORE_NAME, "readonly");
+	const interrupted = getInterruptedDraftAttachments(draftKey);
+	if (interrupted) return interrupted;
+	const db = await openDraftImageAttachmentDb();
+	// Unreadable storage is not evidence that this owner has no stored draft.
+	// Callers must retain the old record rather than autosaving a partial cache.
+	if (!db) throw new Error("IndexedDB draft attachments storage unavailable");
+
+	// Migrate legacy resource ids atomically with this read; never overwrite a newer record.
+	const transaction = db.transaction(STORE_NAME, "readwrite");
 	const store = transaction.objectStore(STORE_NAME);
 	const record = await requestToPromise<unknown>(store.get(draftKey));
 	if (!isDraftRecord(record)) return empty;
 
-	// An expired record is reported as absent AND deleted here, not only by the
-	// write-triggered prune. Otherwise "expires after 3 days" would really mean
-	// "expires once something else writes", and a user returning to an old tab
-	// would get back attachments the policy already considers abandoned.
-	if (resolveUpdatedAtMs(record) < Date.now() - DRAFT_ATTACHMENT_TTL_MS) {
-		void deleteDraftRecords(db, [draftKey]).catch(() => {
-			// Best effort: the caller already treats the record as gone.
-		});
+	// The categories expire independently; updating media must not extend image TTL.
+	const cutoff = Date.now() - DRAFT_ATTACHMENT_TTL_MS;
+	const ordinaryExpired = categoryUpdatedAtMs(record, "ordinary") < cutoff;
+	const mediaExpired = categoryUpdatedAtMs(record, "media") < cutoff;
+	if (ordinaryExpired && mediaExpired) {
+		store.delete(draftKey);
 		return empty;
 	}
+	if (ordinaryExpired) {
+		record.images = [];
+		record.textFiles = [];
+	}
+	if (mediaExpired) record.media = [];
 
 	const rawImages = readEntryList(record.images);
 	const rawTextFiles = readEntryList(record.textFiles);
+	const rawMedia = readEntryList(record.media);
+	const originalIds = JSON.stringify(
+		[...rawImages, ...rawTextFiles, ...rawMedia].map((entry) =>
+			entry && typeof entry === "object" ? (entry as Partial<DraftAttachmentEntry>).id : null,
+		),
+	);
 	const images = rawImages
 		.map((entry, index) => entryToFile(entry, index, "image"))
 		.filter((file): file is File => file != null);
 	const textFiles = rawTextFiles
 		.map((entry, index) => entryToFile(entry, index, "text"))
 		.filter((file): file is File => file != null);
-
+	const media = rawMedia
+		.map((entry, index) => entryToFile(entry, index, "media"))
+		.filter((file): file is File => file != null);
+	const migratedIds = JSON.stringify(
+		[...rawImages, ...rawTextFiles, ...rawMedia].map((entry) =>
+			entry && typeof entry === "object" ? (entry as Partial<DraftAttachmentEntry>).id : null,
+		),
+	);
+	if (originalIds !== migratedIds || ordinaryExpired || mediaExpired) {
+		const done = transactionDone(transaction);
+		if (ordinaryExpired || mediaExpired)
+			record.totalBytes =
+				sumEntryBytes(rawImages) + sumEntryBytes(rawTextFiles) + sumEntryBytes(rawMedia);
+		store.put(record);
+		await done;
+	}
 	return {
 		images,
 		textFiles,
-		droppedCount: rawImages.length - images.length + (rawTextFiles.length - textFiles.length),
+		media,
+		droppedCount:
+			rawImages.length -
+			images.length +
+			(rawTextFiles.length - textFiles.length) +
+			rawMedia.length -
+			media.length,
 	};
-}
-
-async function deleteDraftRecords(db: IDBDatabase, keys: readonly string[]): Promise<void> {
-	if (keys.length === 0) return;
-	const transaction = db.transaction(STORE_NAME, "readwrite");
-	const store = transaction.objectStore(STORE_NAME);
-	for (const key of keys) store.delete(key);
-	await transactionDone(transaction);
 }
 
 /**
@@ -425,32 +632,91 @@ async function deleteDraftRecords(db: IDBDatabase, keys: readonly string[]): Pro
  *
  * `getAll()` is acceptable here even though records hold blobs: a Blob read back
  * from IndexedDB is a lazy handle to the stored file, not its bytes, and rule (3)
- * caps the record count at `MAX_DRAFT_ATTACHMENT_RECORDS` anyway. `totalBytes`
- * lives on the record precisely so the budget pass never has to touch a blob to
- * learn its size.
+ * caps each category's record count at `MAX_DRAFT_ATTACHMENT_RECORDS`. Stored
+ * entry sizes let each budget pass avoid reading blob contents.
  */
 export async function pruneDraftAttachments(protectKey: string | null): Promise<number> {
 	const db = await openDraftImageAttachmentDb();
 	if (!db) return 0;
 
-	const transaction = db.transaction(STORE_NAME, "readonly");
+	// Keep selection and mutation in one transaction so a concurrent save cannot
+	// be overwritten by an eviction plan based on stale data.
+	const transaction = db.transaction(STORE_NAME, "readwrite");
+	const done = transactionDone(transaction);
 	const store = transaction.objectStore(STORE_NAME);
 	const all = await requestToPromise<unknown[]>(store.getAll());
-	const records: DraftAttachmentRecordStat[] = [];
-	for (const value of all) {
-		if (!isDraftRecord(value)) continue;
-		const draftKey = value.draftKey;
-		if (typeof draftKey !== "string" || !draftKey) continue;
-		records.push({
-			draftKey,
-			updatedAtMs: resolveUpdatedAtMs(value),
-			totalBytes: resolveTotalBytes(value),
+	const valid = all
+		.filter(isDraftRecord)
+		.filter((record) => typeof record.draftKey === "string" && record.draftKey);
+	const plans = (["ordinary", "media"] as const).map((category) => {
+		const records = valid.flatMap((record) => {
+			const entries =
+				category === "media"
+					? readEntryList(record.media)
+					: [...readEntryList(record.images), ...readEntryList(record.textFiles)];
+			const available = entries.filter(
+				(entry) =>
+					entry &&
+					typeof entry === "object" &&
+					isBlob((entry as Partial<DraftAttachmentEntry>).blob),
+			);
+			return available.length
+				? [
+						{
+							draftKey: record.draftKey as string,
+							updatedAtMs: categoryUpdatedAtMs(record, category),
+							totalBytes: sumEntryBytes(available),
+						},
+					]
+				: [];
 		});
+		if (protectKey && !records.some((record) => record.draftKey === protectKey))
+			return new Set<string>();
+		return new Set(
+			selectDraftAttachmentsToEvict({
+				records,
+				now: Date.now(),
+				protectKey,
+				maxTotalBytes:
+					category === "media" ? MAX_DRAFT_MEDIA_TOTAL_BYTES : MAX_DRAFT_ATTACHMENT_TOTAL_BYTES,
+			}),
+		);
+	});
+	const [ordinaryDoomed, mediaDoomed] = plans;
+	const tombstone = (entries: unknown[]) =>
+		entries.map((entry) =>
+			entry && typeof entry === "object" ? { ...entry, blob: undefined, size: 0 } : entry,
+		);
+	let changed = 0;
+	for (const record of valid) {
+		const key = record.draftKey as string;
+		const ordinary = ordinaryDoomed.has(key);
+		const media = mediaDoomed.has(key);
+		if (!ordinary && !media) continue;
+		changed++;
+		const images = ordinary
+			? tombstone(readEntryList(record.images))
+			: readEntryList(record.images);
+		const textFiles = ordinary
+			? tombstone(readEntryList(record.textFiles))
+			: readEntryList(record.textFiles);
+		const mediaFiles = media ? tombstone(readEntryList(record.media)) : readEntryList(record.media);
+		const remaining = [...images, ...textFiles, ...mediaFiles].some(
+			(entry) =>
+				entry && typeof entry === "object" && isBlob((entry as Partial<DraftAttachmentEntry>).blob),
+		);
+		if (!remaining) store.delete(key);
+		else
+			store.put({
+				...record,
+				images,
+				textFiles,
+				media: mediaFiles,
+				totalBytes: sumEntryBytes(images) + sumEntryBytes(textFiles) + sumEntryBytes(mediaFiles),
+			});
 	}
-
-	const doomed = selectDraftAttachmentsToEvict({ records, now: Date.now(), protectKey });
-	await deleteDraftRecords(db, doomed);
-	return doomed.length;
+	await done;
+	return changed;
 }
 
 export async function saveDraftImageAttachments(
@@ -458,39 +724,70 @@ export async function saveDraftImageAttachments(
 	narratorId: string,
 	files: File[],
 	textFiles: File[] = [],
+	mediaFiles: File[] = [],
 ): Promise<void> {
+	if (!userId || !narratorId) return;
+	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
+	// Update an opted-in snapshot at invocation, before yielding to IndexedDB.
+	// An earlier pending save must not overwrite a later synchronous retain, and
+	// removals/clear must take effect even when IndexedDB is unavailable or fails.
+	if (getInterruptedDraftAttachments(draftKey)) {
+		retainInterruptedDraftAttachments(userId, narratorId, files, textFiles, mediaFiles);
+	}
 	const db = await openDraftImageAttachmentDb();
-	if (!db || !userId || !narratorId) return;
+	if (!db) return;
 
 	const transaction = db.transaction(STORE_NAME, "readwrite");
+	const done = transactionDone(transaction);
 	const store = transaction.objectStore(STORE_NAME);
+	const existing = await requestToPromise<unknown>(store.get(draftKey));
+	const previous = isDraftRecord(existing) ? existing : null;
 	const images = files
 		.filter((file) => shouldPersistFile(file, "image"))
 		.map((file, index) => fileToEntry(file, index, "image"));
 	const texts = textFiles
 		.filter((file) => shouldPersistFile(file, "text"))
 		.map((file, index) => fileToEntry(file, index, "text"));
-	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
+	const media = mediaFiles
+		.filter((file) => shouldPersistFile(file, "media"))
+		.map((file, index) => fileToEntry(file, index, "media"));
 
-	if (images.length === 0 && texts.length === 0) {
+	if (images.length === 0 && texts.length === 0 && media.length === 0) {
 		store.delete(draftKey);
 	} else {
 		const now = new Date();
+		const signature = (entries: unknown[]) =>
+			JSON.stringify(
+				entries.map((entry) => {
+					if (!entry || typeof entry !== "object") return null;
+					const item = entry as Partial<DraftAttachmentEntry>;
+					return [item.id, item.name, item.type, item.size, item.lastModified, isBlob(item.blob)];
+				}),
+			);
+		const sameOrdinary =
+			previous &&
+			signature([...readEntryList(previous.images), ...readEntryList(previous.textFiles)]) ===
+				signature([...images, ...texts]);
+		const sameMedia = previous && signature(readEntryList(previous.media)) === signature(media);
 		store.put({
 			draftKey,
 			userId,
 			narratorId,
 			updatedAt: now.toISOString(),
 			updatedAtMs: now.getTime(),
+			ordinaryUpdatedAtMs: sameOrdinary ? categoryUpdatedAtMs(previous, "ordinary") : now.getTime(),
+			mediaUpdatedAtMs: sameMedia ? categoryUpdatedAtMs(previous, "media") : now.getTime(),
 			totalBytes:
 				images.reduce((sum, entry) => sum + entry.size, 0) +
-				texts.reduce((sum, entry) => sum + entry.size, 0),
+				texts.reduce((sum, entry) => sum + entry.size, 0) +
+				media.reduce((sum, entry) => sum + entry.size, 0),
 			images,
 			textFiles: texts,
+			media,
 		} satisfies DraftAttachmentRecord);
 	}
 
-	await transactionDone(transaction);
+	await done;
 
 	// The write is the only thing that grows this store, so it is also the prune
 	// trigger — no timer, no startup scan, and nothing for a user who never

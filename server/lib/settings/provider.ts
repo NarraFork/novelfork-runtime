@@ -4,18 +4,23 @@
  */
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { ERROR_CATALOG } from "@shared/error-catalog";
-import type { ModelCard } from "@shared/model-card";
+import { modelProfile } from "@shared/model-catalog/profile";
 import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
+import { resolveCommandCodeToken } from "../commandcode-manager";
+import { peekCommandCodeModels } from "../commandcode-models";
+import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
-import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
-import { getEffectiveModelMetadata } from "../model-catalog";
+import { getEffectiveModelProfile, resolveEffectiveModelCard } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
+import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
 	AnthropicProviderConfig,
 	GeminiProviderConfig,
 	ModelAggregation,
+	ModelProtocol,
 	NarraForkSettings,
 	NUGProviderConfig,
 	OpenAIProviderConfig,
@@ -123,6 +128,17 @@ function resolveExtraProvider(bareModel: string): string | undefined {
 	}
 	return undefined;
 }
+
+registerExtraModelSource("tokendance", {
+	listModels: () => {
+		const config = getTokenDanceRuntimeConfig();
+		return config && !config.disabled
+			? getTokenDanceCatalogModels()
+					.filter((m) => selectTokenDanceProtocol(m.supported_protocols))
+					.map((m) => `tokendance:${m.id}`)
+			: [];
+	},
+});
 
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
@@ -252,6 +268,8 @@ export function getAggregation(aggId: string): ModelAggregation | undefined {
 
 function getDisabledProviderPrefixes(): Set<string> {
 	const disabled = new Set(s().agent.disabledProviders ?? []);
+	const tokenDance = getTokenDanceRuntimeConfig();
+	if (tokenDance?.disabled) disabled.add("tokendance");
 	for (const provider of [
 		...(s().customApiProviders ?? []),
 		...(s().openaiProviders ?? []),
@@ -590,6 +608,19 @@ export function resolveEffectiveModel(
 }
 
 /**
+ * Command Code 的模型来自上游目录（`GET /provider/v1/models`），这里只读它已有的缓存：
+ * `peekCommandCodeModels` 立刻返回（命中、过期旧值或空），并在需要时补一次去重的后台拉取，
+ * 所以这条同步路径不会被上游延迟拖住。未启用或没有凭据时没有模型。
+ */
+function listCommandCodeModelValues(): string[] {
+	const config = s().commandCode;
+	if (config?.disabled) return [];
+	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models.map(
+		(model) => `${COMMAND_CODE_PREFIX}:${model}`,
+	);
+}
+
+/**
  * Get all available model values (provider:id format), excluding hidden models
  * and models from disabled providers.
  */
@@ -601,6 +632,7 @@ export function getVisibleModels(): string[] {
 	const codex = codexModelLister?.() ?? [];
 	const nug = nugModelLister?.() ?? [];
 	const gemini = geminiModelLister?.() ?? [];
+	const commandCode = listCommandCodeModelValues();
 	const custom = (s().agent.customModels ?? []).map((m) => {
 		const value = m.value ?? "";
 		return value.includes(":") ? value : `${m.provider ?? "openai"}:${value}`;
@@ -610,7 +642,16 @@ export function getVisibleModels(): string[] {
 	const extra = listExtraModels();
 	const seen = new Set<string>();
 	const result: string[] = [];
-	for (const v of [...openai, ...anthropic, ...codex, ...nug, ...gemini, ...custom, ...extra]) {
+	for (const v of [
+		...openai,
+		...anthropic,
+		...codex,
+		...nug,
+		...gemini,
+		...commandCode,
+		...custom,
+		...extra,
+	]) {
 		if (seen.has(v) || hidden.has(v)) continue;
 		const colonIdx = v.indexOf(":");
 		if (colonIdx > 0 && disabledPrefixes.has(v.slice(0, colonIdx))) continue;
@@ -677,6 +718,15 @@ export function usesStatefulApi(prefix?: string): boolean {
 }
 
 export function usesStatefulModel(prefix?: string, model?: string): boolean {
+	if (prefix === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const rawModel = model?.startsWith("tokendance:") ? model.slice("tokendance:".length) : model;
+		const catalog = getTokenDanceCatalogModels().find((m) => m.id === rawModel);
+		if (!catalog) return false;
+		const protocol =
+			resolveModelProtocol("tokendance", model) ??
+			selectTokenDanceProtocol(catalog.supported_protocols);
+		return protocol === "openai-responses";
+	}
 	if (usesStatefulApi(prefix)) return true;
 	if (usesCodexModel(prefix, model)) return true;
 	// NUG "responses" channel models use the stateful /responses endpoint too.
@@ -779,6 +829,33 @@ function hasConfiguredCodexProvider(): boolean {
 	}
 }
 
+/** Command Code 的凭据可以来自设置页手填的 API key，或 CLI 落盘的 auth.json。 */
+export function hasConfiguredCommandCodeProvider(): boolean {
+	const config = s().commandCode;
+	return !config?.disabled && !!resolveCommandCodeToken(config?.apiKey).credential;
+}
+
+/**
+ * 逐模型协议：`modelProtocolOverrides`（「编辑此连接覆盖」里单独保存的那层）优先于
+ * `modelProtocols`（设置页模型行写的 provider 层）；两层都没有时由各 provider 的默认规则决定。
+ */
+/**
+ * 协议表的键是带前缀的完整模型 id（`openai:gpt-4o`）。
+ * 调用方有时传入裸模型名，有时传入已经带前缀的 id；两种都收成同一把键。
+ */
+export function modelProtocolKey(prefix: string, model: string): string {
+	const parsed = parseModelId(model);
+	const bare = !parsed.provider || parsed.provider === prefix ? parsed.model : model;
+	return `${prefix}:${bare}`;
+}
+
+export function resolveModelProtocol(prefix: string, model?: string): ModelProtocol | undefined {
+	if (!model) return undefined;
+	const key = modelProtocolKey(prefix, model);
+	const agent = s().agent;
+	return agent?.modelProtocolOverrides?.[key] ?? agent?.modelProtocols?.[key];
+}
+
 export function hasConfiguredNugProvider(): boolean {
 	const providers = s().nugProviders ?? [];
 	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
@@ -794,6 +871,8 @@ export function getFirstNugProvider(): NUGProviderConfig | undefined {
 
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
+	const tokenDance = getTokenDanceRuntimeConfig();
+	if (tokenDance && !tokenDance.disabled) available.add("tokendance");
 	if (hasConfiguredOpenaiProvider()) {
 		for (const p of s().openaiProviders ?? []) {
 			if (!p.disabled && p.apiKey) available.add(p.prefix || "openai");
@@ -806,6 +885,9 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
+	}
+	if (hasConfiguredCommandCodeProvider()) {
+		available.add("CommandCode");
 	}
 	if (hasConfiguredNugProvider()) {
 		for (const p of s().nugProviders ?? []) {
@@ -911,39 +993,8 @@ function resolveMetaModelForLookup(model: string, seen = new Set<string>()): str
 }
 
 /**
- * Model-card lookups, wrapped so this module reads the effective card set
- * (builtin seed data overlaid with the user's edits) with a single memoized
- * index rather than rebuilding one per call.
- *
- * `settingsRevision` keys the memo: it already increments on every save and
- * reload, which is exactly when the card set can change.
- */
-function userModelCards(): readonly ModelCard[] {
-	return s().agent.modelCards ?? [];
-}
-
-function getModelCardContextWindow(
-	model: string,
-	_provider: string,
-): { contextWindow: number; userSet: boolean } | null {
-	// Two shapes are probed, mirroring what the pre-card lookup did: the bare
-	// model id, and the id with a leading channel segment removed. A
-	// gateway-routed id keeps that segment (`anthropic:GLM-5.1`) after the
-	// provider prefix is stripped, and only the second form matches a card key.
-	const bare = parseModelId(model).model;
-	const cards = userModelCards();
-	const stripped = stripChannelSegment(bare);
-	return (
-		modelCardContextWindow(bare, cards) ??
-		(stripped === bare ? null : modelCardContextWindow(stripped, cards))
-	);
-}
-
-/**
  * Drop a leading channel segment from an id (`anthropic:GLM-5.1` → `GLM-5.1`).
- *
- * The pre-card lookup did the same thing by probing the substring after the
- * first colon, which is how gateway-routed ids ever matched the table.
+ * Gateway-routed ids keep that segment after the provider prefix is stripped.
  */
 function stripChannelSegment(model: string): string {
 	const idx = model.indexOf(":");
@@ -951,27 +1002,23 @@ function stripChannelSegment(model: string): string {
 	return model;
 }
 
-function getNugModelContextWindow(model: string, provider: string): number | null {
-	const config = getNugProviderConfig(provider);
-	if (!config) return null;
-	try {
-		const meta = resolveNugModelMeta(config.id, config.prefix, model);
-		// The gateway's own number wins; a card is the fallback for a catalog that
-		// reports no window (several channels never do).
-		return (
-			meta.contextWindow ?? getModelCardContextWindow(meta.bareModel, "")?.contextWindow ?? null
-		);
-	} catch {
-		return null;
+/** The catalog's window for a bare upstream id, independent of any provider binding. */
+function catalogContextWindow(upstreamModelId: string): number | null {
+	for (const id of new Set([upstreamModelId, stripChannelSegment(upstreamModelId)])) {
+		try {
+			const window = modelProfile(resolveEffectiveModelCard({ upstreamModelId: id })).contextWindow;
+			if (typeof window === "number") return window;
+		} catch {
+			/* An ambiguous or invalid identity has no seed window. */
+		}
 	}
+	return null;
 }
 
 /**
  * Seed windows for a list of models, used to prefill the per-model override
- * inputs in the provider settings UI.
- *
- * Reads card data, which is what the hardcoded builtin table became. The name is
- * kept because several call sites and the settings API response field use it.
+ * inputs in the provider settings UI. The name is kept because several call
+ * sites and the settings API response field use it.
  */
 export function getBuiltinModelContextWindows(
 	models: string[],
@@ -979,11 +1026,9 @@ export function getBuiltinModelContextWindows(
 ): Record<string, number> {
 	const result: Record<string, number> = {};
 	for (const model of models) {
-		const contextWindow = getModelCardContextWindow(model, "")?.contextWindow;
-		if (contextWindow) {
-			const bareModel = parseModelId(model).model;
-			result[provider ? `${provider}:${bareModel}` : model] = contextWindow;
-		}
+		const bareModel = parseModelId(model).model;
+		const contextWindow = bareModel ? catalogContextWindow(bareModel) : null;
+		if (contextWindow) result[provider ? `${provider}:${bareModel}` : model] = contextWindow;
 	}
 	return result;
 }
@@ -1025,6 +1070,8 @@ export interface ModelContextWindowResolution {
 export function resolveModelContextWindow(
 	model: string,
 	provider: string,
+	/** `own: false` skips the provider entry's own window: what clearing it would leave. */
+	options: { own?: boolean } = {},
 ): ModelContextWindowResolution {
 	// Defensive: callers may pass a meta-model reference instead of a concrete
 	// model — either the follow-default sentinel or an aggregation value. When an
@@ -1044,81 +1091,65 @@ export function resolveModelContextWindow(
 		const concrete = resolveMetaModelForLookup(metaRef);
 		if (concrete && concrete !== metaRef) {
 			const parsed = parseModelId(concrete);
-			return resolveModelContextWindow(parsed.model, parsed.provider ?? "");
+			return resolveModelContextWindow(parsed.model, parsed.provider ?? "", options);
 		}
 	}
 
-	const bareModel = parseModelId(model).model;
+	const bareModel =
+		provider === "tokendance" && getTokenDanceRuntimeConfig()
+			? model.startsWith("tokendance:")
+				? model.slice("tokendance:".length)
+				: model
+			: parseModelId(model).model;
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
 
-	if (s().agent.modelCatalog) {
-		const metadataModel =
-			provider && !model.startsWith(`${provider}:`) ? `${provider}:${model}` : model;
-		const resolved = getEffectiveModelMetadata(metadataModel);
-		const window = resolved.metadata.limits?.contextWindow;
-		const layer = resolved.provenance["limits.contextWindow"]?.layer;
-		// Explicit unknown blocks fallback to stale legacy model cards.
-		if (window === null) return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
-		if (window !== undefined && (layer?.startsWith("local-") || layer === "discovered"))
+	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const user = getEffectiveModelProfile(fullModelValue, options);
+		if (
+			typeof user.contextWindow === "number" &&
+			user.contextWindowSource?.layer.startsWith("local-")
+		)
 			return {
-				contextWindow: window,
-				source: layer === "local-binding" ? "user" : layer === "discovered" ? "catalog" : "card",
+				contextWindow: user.contextWindow,
+				source:
+					user.contextWindowSource.layer === "local-model" ||
+					user.contextWindowSource.layer === "local-variant"
+						? "card"
+						: "user",
 			};
-		// A provider's explicit budget outranks presets, but not local model/binding
-		// decisions or the gateway's discovered window (the legacy NUG precedence).
-		const configured =
-			getOpenaiProviderConfig(provider)?.defaultContextWindow ??
-			getAnthropicProviderConfig(provider)?.defaultContextWindow ??
-			getGeminiProviderConfig(provider)?.defaultContextWindow;
-		if (configured) return { contextWindow: configured, source: "provider" };
-		return window !== undefined
-			? { contextWindow: window, source: "builtin" }
-			: { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
+		if (catalog && catalog.context_length > 0)
+			return { contextWindow: catalog.context_length, source: "catalog" };
+		return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
 	}
 
-	// 0. Check per-model user overrides (highest priority)
-	const userOverrides = s().agent.modelContextWindows ?? {};
-	if (userOverrides[fullModelValue]) {
-		return { contextWindow: userOverrides[fullModelValue], source: "user" };
-	}
-	if (model !== fullModelValue && userOverrides[model]) {
-		return { contextWindow: userOverrides[model], source: "user" };
-	}
-
-	// 1. Check model cards the user edited. Ranked above the gateway catalog
-	// because an edited card is a deliberate local decision, while the catalog is
-	// whatever the gateway reported. Untouched builtin cards are consulted later,
-	// at step 4, so they keep losing to the catalog as the old builtin table did.
-	const card = getModelCardContextWindow(model, provider);
-	if (card?.userSet) return { contextWindow: card.contextWindow, source: "card" };
-
-	// 2. Check NUG model-catalog metadata. NUG model ids often include a
-	// channel prefix (e.g. antigravity:claude-opus-4-6-thinking), so the
-	// card table alone would otherwise miss them and fall back to the default.
-	const nugContextWindow = getNugModelContextWindow(model, provider);
-	if (nugContextWindow) return { contextWindow: nugContextWindow, source: "catalog" };
-
-	// 3. Check provider configuration
-	{
-		const oaiConfig = getOpenaiProviderConfig(provider);
-		if (oaiConfig?.defaultContextWindow) {
-			return { contextWindow: oaiConfig.defaultContextWindow, source: "provider" };
-		}
-		const anthropicConfig = getAnthropicProviderConfig(provider);
-		if (anthropicConfig?.defaultContextWindow) {
-			return { contextWindow: anthropicConfig.defaultContextWindow, source: "provider" };
-		}
-		const geminiConfig = getGeminiProviderConfig(provider);
-		if (geminiConfig?.defaultContextWindow) {
-			return { contextWindow: geminiConfig.defaultContextWindow, source: "provider" };
-		}
-	}
-
-	// 4. Fall back to builtin card data (what the hardcoded table used to be).
-	// Reported as `builtin` rather than `card` so the Anthropic 1M floor keeps
-	// applying to it exactly as before.
-	if (card) return { contextWindow: card.contextWindow, source: "builtin" };
-	return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+	const metadataModel =
+		provider && !model.startsWith(`${provider}:`) ? `${provider}:${model}` : model;
+	const profile = getEffectiveModelProfile(metadataModel, options);
+	const window = profile.contextWindow;
+	const layer = profile.contextWindowSource?.layer;
+	// Explicit unknown blocks every lower fallback.
+	if (window === null) return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+	if (window !== undefined && (layer?.startsWith("local-") || layer === "discovered"))
+		return {
+			contextWindow: window,
+			source:
+				layer === "local-binding" || layer === "local-connection"
+					? "user"
+					: layer === "discovered"
+						? "catalog"
+						: "card",
+		};
+	// A provider's explicit budget outranks presets, but not local model/binding
+	// decisions or the gateway's discovered window.
+	const configured =
+		getOpenaiProviderConfig(provider)?.defaultContextWindow ??
+		getAnthropicProviderConfig(provider)?.defaultContextWindow ??
+		getGeminiProviderConfig(provider)?.defaultContextWindow;
+	if (configured) return { contextWindow: configured, source: "provider" };
+	return window !== undefined
+		? { contextWindow: window, source: "builtin" }
+		: { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
 }
 
 export function getModelContextWindow(model: string, provider: string): number | null {
@@ -1156,6 +1187,21 @@ export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
  * configured" to the generate call that actually needs one.
  */
 export function getSummaryModelContextWindow(modelOverride?: string): number {
+	return getSummaryModelContextWindowDetail(modelOverride).contextWindow;
+}
+
+/**
+ * Resolve the summary model's context window WITH its provenance, so compact can
+ * tell "user filled this in" apart from "nothing matched, using the tier default".
+ *
+ * Compact packing must be more conservative on `fallback`: a custom model with an
+ * empty window would otherwise be packed as if it had `DEFAULT_CONTEXT_WINDOW`
+ * and the summary request hangs with zero streamed chars until the stall watchdog.
+ */
+export function getSummaryModelContextWindowDetail(modelOverride?: string): {
+	contextWindow: number;
+	source: ModelContextWindowSource;
+} {
 	const configured = s().agent.summaryModel?.trim();
 	const summaryRef =
 		!configured || isFollowSummaryModelValue(configured) ? FOLLOW_DEFAULT_MODEL : configured;
@@ -1166,11 +1212,14 @@ export function getSummaryModelContextWindow(modelOverride?: string): number {
 	// A broken/empty aggregation falls back to the default model, mirroring
 	// `resolveEffectiveModel` / `resolveConfiguredSummaryModel`.
 	if (isMetaModelReference(concrete)) concrete = resolveMetaModelForLookup(FOLLOW_DEFAULT_MODEL);
-	if (!concrete || isMetaModelReference(concrete)) return DEFAULT_CONTEXT_WINDOW;
+	if (!concrete || isMetaModelReference(concrete)) {
+		return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+	}
 
 	const parsed = parseModelId(concrete);
 	const prov = parsed.provider ?? "anthropic";
-	return getModelContextWindow(parsed.model, prov) ?? DEFAULT_CONTEXT_WINDOW;
+	const resolved = resolveModelContextWindow(parsed.model, prov);
+	return { contextWindow: resolved.contextWindow, source: resolved.source };
 }
 
 export function getContextThresholds(model: string, provider: string): { compactStart: number } {
@@ -1199,18 +1248,7 @@ export function getQueueDuringCompaction(): boolean {
 	return s().agent.queueDuringCompaction ?? false;
 }
 
-export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {
-	if (s().agent.modelCatalog) {
-		const full = _provider && !model.startsWith(`${_provider}:`) ? `${_provider}:${model}` : model;
-		return getEffectiveModelMetadata(full).metadata.limits?.maxOutputTokens ?? null;
-	}
-	const bareModel = parseModelId(model).model;
-	const cards = userModelCards();
-	const stripped = stripChannelSegment(bareModel);
-	const fromCard =
-		modelCardMaxCompletionTokens(bareModel, cards) ??
-		(stripped === bareModel ? null : modelCardMaxCompletionTokens(stripped, cards));
-	if (fromCard != null) return fromCard;
-
-	return null;
+export function getModelMaxCompletionTokens(model: string, provider: string): number | null {
+	const full = provider && !model.startsWith(`${provider}:`) ? `${provider}:${model}` : model;
+	return getEffectiveModelProfile(full).maxOutputTokens ?? null;
 }

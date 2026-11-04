@@ -25,6 +25,7 @@ import type {
 	FileReferenceContext,
 	FileReferenceEditorSelection,
 } from "@shared/file-reference";
+import type { SavedRecording } from "@shared/request-recording";
 import {
 	IconArrowDown,
 	IconArrowLeft,
@@ -43,13 +44,14 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
+import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
-import { useModelCardIndex } from "../../hooks/useModelCards";
+import { useActualResolvedModelCard } from "../../hooks/useModelCatalog";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
@@ -69,7 +71,9 @@ import {
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
-import { useNarratorLod } from "../../hooks/useNarratorLod";
+import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
+import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
+import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -78,11 +82,11 @@ import {
 	useNarratorRetryRecoveryCapability,
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
-	useProviderModelRefreshCapability,
-	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
+import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	useUpdateExecutionDevice,
@@ -90,7 +94,8 @@ import {
 	workspaceFileTarget,
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
-import type { RevertScope } from "../../lib/api/narrators";
+import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
+import { describeApiError } from "../../lib/api-error";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
@@ -98,20 +103,34 @@ import {
 	formatColonDuration,
 	formatFullLocaleDateTime,
 } from "../../lib/format";
-import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
+import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
+import {
+	type OutlineOpener,
+	OutlineOpenerProvider,
+	useOutlineOpener,
+} from "../../lib/outline-opener";
+import type { OutlinePanelState } from "../../lib/outline-panel";
+import { formatProviderBalance } from "../../lib/provider-balance-format";
+import {
+	formatRevertFailure,
+	formatRevertSuccessWarning,
+	invalidateRevertQueries,
+	isRevertHistoryCommitted,
+} from "../../lib/revert-result";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
 } from "../../lib/safe-area";
+import { openTokenDanceRecharge } from "../../lib/tokendance-recovery";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
-import { NarratorCompatibilityEntry } from "../project/NarratorCompatibilityEntry";
+import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
@@ -129,6 +148,7 @@ import {
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import { HeaderToolbar } from "./header/HeaderToolbar";
+import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
 import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
@@ -142,44 +162,48 @@ import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
+import { returnFromModelTrace } from "./interaction/model-trace-return";
 import {
 	normalizeBooleanOverride,
 	normalizeDangerReflectionLevel,
 	normalizeDangerReflectionOverride,
 } from "./interaction/reflection-types";
+import { useAskSelectionInPassing } from "./interaction/use-ask-selection-in-passing";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
 import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
-import {
-	ordinaryPromoteDestination,
-	useNarratorForkActions,
-} from "./interaction/use-narrator-fork-actions";
+import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { inputBlockIdOf } from "./message/block-target";
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
 import type { MessageListHandle, MessageListTailMeta } from "./message/message-list-handle";
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
-import {
-	formatKimiBarText,
-	formatKimiDetailsText,
-	isKimiProviderBaseUrl,
-} from "./model/kimi-usage-format";
+import { commandCodeQuotaView } from "./model/commandcode-quota-format";
+import { customApiBalanceDisplayFor, usageSourceFor } from "./model/custom-api-usage-source";
+import { formatDeepSeekBalance, isDeepSeekProviderBaseUrl } from "./model/deepseek-balance-format";
+import { buildKimiQuotaView, isKimiProviderBaseUrl } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import { isOpencodeProviderBaseUrl } from "./model/opencode-usage-format";
+import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
+import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
+import { useNarratorPanelVisible } from "./narrator-panel-visibility";
+import { OutlineDrawerHost } from "./OutlineDrawerHost";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -191,6 +215,8 @@ import {
 	RevertActionConfirmModal,
 	SetGlobalModelModal,
 } from "./panels/memoized-dialogs";
+import { filePanelBaseName } from "./panels/panel-kind";
+import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -208,6 +234,10 @@ import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
+const SaveDumpModal = lazy(() =>
+	import("./SaveDumpModal").then((m) => ({ default: m.SaveDumpModal })),
+);
+
 const NarratorDetailsPanel = lazy(() =>
 	import("./details/NarratorDetailsPanel").then((module) => ({
 		default: module.NarratorDetailsPanel,
@@ -217,12 +247,10 @@ const NarratorDetailsPanel = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
 );
-// Body of the read-only file viewer. Shared with the `file` dock panel — the
-// drawer below is just the off-dock (mobile) host for the same content, so both
-// surfaces show the same viewer instead of the drawer growing its own.
-const FileViewerContent = lazy(() =>
-	import("./file-viewer/FileViewerContent").then((module) => ({
-		default: module.FileViewerContent,
+// The drawer and dock use the same editor / binary-preview entry.
+const FilePanelContent = lazy(() =>
+	import("./file-panel/FilePanelContent").then((module) => ({
+		default: module.FilePanelContent,
 	})),
 );
 
@@ -254,9 +282,9 @@ export const NarratorPanel = createResponsiveNarratorPanel<NarratorPanelProps>(N
 function NarratorPanelBody({
 	narratorId,
 	narrator: narratorProp,
-	onForkFromMessage,
 	highlightMessageId,
 	highlightRequestId,
+	highlightNeedle,
 	onSendToTerminal,
 	appendInputRef,
 	terminalOpen,
@@ -278,8 +306,22 @@ function NarratorPanelBody({
 	onToggleSpecPanel,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
+	const fileDrawerVisible = useNarratorPanelVisible();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
+	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
+	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
 	const narrator = narratorProp ?? fetchedNarrator;
+	const isModelTrace = Array.isArray(narrator?.traits) && narrator.traits.includes("modeltrace");
+	const handleModelTraceReturn = useCallback(() => {
+		if (!narrator) return;
+		returnFromModelTrace({
+			narrator,
+			onClose,
+			navigateToNarrator: (id) =>
+				navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
+			navigateToDefault: () => navigate({ to: "/narrators" }),
+		});
+	}, [narrator, onClose, navigate]);
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
@@ -294,20 +336,25 @@ function NarratorPanelBody({
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
 	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
-	const { data: chapterData } = useChapter(chapterId ?? "");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const projectId = (chapterData as any)?.projectId as string | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterStatus = (chapterData as any)?.status as string | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterWorktreePath = (chapterData as any)?.worktreePath as string | null | undefined;
-	const isChapterMerged = chapterStatus === "merged";
+	const projectId = ((narrator as any)?.contextProjectId as string | null | undefined) ?? undefined;
 	const createNarratorMutation = useCreateNarrator();
 	const updateConclusionMutation = useUpdateSubagentConclusion();
 	const takeoverMutation = useTakeoverSubagent();
 	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const isWorkspacePreview = workspacePreview === true;
+	useEffect(() => {
+		if (isWorkspacePreview) return;
+		const controller = new AbortController();
+		void import("./vlist/PretextExactMessageList").catch(() => {});
+		void preloadPendingPanelTail({
+			narratorId,
+			signal: controller.signal,
+			readOpeningLod: () => readOpeningLod(narratorId),
+			getCurrent: () => preloadStateRef.current,
+			loadModule: () => import("./vlist/pretext-document-loader"),
+		}).catch(() => {});
+		return () => controller.abort();
+	}, [narratorId, isWorkspacePreview]);
 	const gitWorkspaceQuery = useGitWorkspace(isWorkspacePreview ? null : narratorId);
 	// Chunk mode is the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below.
@@ -318,6 +365,10 @@ function NarratorPanelBody({
 	useEffect(() => {
 		setMessageListTailMeta({ lastRealMessage: null });
 	}, [narratorId]);
+	const firstScreenActivity = useFirstScreenActivity(
+		narratorId,
+		chunkTailMeta.statusReady === true,
+	);
 	const handleMessageListTailMetaChange = useCallback((meta: MessageListTailMeta) => {
 		setMessageListTailMeta((prev) => {
 			if (
@@ -361,7 +412,6 @@ function NarratorPanelBody({
 		providerLabels,
 		nugProviderIdByPrefix,
 	} = useAllModels();
-	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
 	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
@@ -390,6 +440,7 @@ function NarratorPanelBody({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { t: balanceT } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -439,8 +490,11 @@ function NarratorPanelBody({
 	 * Still skipped for workspace previews, which stay lightweight and offer no
 	 * tool entries at all.
 	 */
-	const userChatRoomQuery = useNarratorChatRoom(narratorId, !isWorkspacePreview);
-	const chatUnreadQuery = useChatUnread();
+	const userChatRoomQuery = useNarratorChatRoom(
+		narratorId,
+		!isWorkspacePreview && firstScreenActivity,
+	);
+	const chatUnreadQuery = useChatUnread(firstScreenActivity);
 	const userChatRoomId = userChatRoomQuery.data?.id;
 	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
 	const qc = useQueryClient();
@@ -497,56 +551,7 @@ function NarratorPanelBody({
 		},
 		[mutateSettings, t],
 	);
-	// Re-fetch one NUG gateway's model catalog straight from the model menu. This
-	// is also how a stale "temporarily unavailable" flag gets cleared, since a
-	// refresh replaces the cached list wholesale.
-	const nugModelRefreshCapability = useProviderModelRefreshCapability("nug");
-	const nugRuntimeCapability = useProviderRuntimeCapability("nug");
-	const canRefreshNugModels =
-		nugModelRefreshCapability.supported &&
-		nugRuntimeCapability?.routes?.supported !== false &&
-		nugRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
-	const [refreshingNugProviderId, setRefreshingNugProviderId] = useState<string | null>(null);
-	const handleRefreshNugModels = useCallback(
-		async (providerId: string) => {
-			setRefreshingNugProviderId(providerId);
-			try {
-				await api.nugRefreshProviderModels(providerId);
-				await qc.invalidateQueries({ queryKey: ["settings"] });
-			} catch (error) {
-				notifications.show({
-					color: "red",
-					title: t("refreshProviderModelsErrorTitle"),
-					message: error instanceof Error ? error.message : String(error),
-				});
-			} finally {
-				setRefreshingNugProviderId(null);
-			}
-		},
-		[qc, t],
-	);
-	// Opening the picker also kicks off an opportunistic catalog refresh, so a
-	// model that recovered upstream stops showing as "temporarily unavailable"
-	// without the user having to find the per-provider refresh button. The real
-	// rate limit is a process-wide cooldown on the server; `requestNugModelRefresh…`
-	// only avoids redundant round-trips from this tab.
-	const handleModelPickerOpened = useCallback(() => {
-		void requestNugModelRefreshOnPickerOpen().then((refreshed) => {
-			if (refreshed) qc.invalidateQueries({ queryKey: ["settings"] });
-		});
-	}, [qc]);
-	const hasNugModelGroups = Object.keys(nugProviderIdByPrefix).length > 0;
-	const modelMenuRefreshProps = canRefreshNugModels
-		? {
-				nugProviderIdByPrefix,
-				onRefreshProviderModels: (providerId: string) => {
-					void handleRefreshNugModels(providerId);
-				},
-				refreshingProviderId: refreshingNugProviderId,
-				// No NUG gateway in the picker → nothing to refresh, so don't even ask.
-				...(hasNugModelGroups ? { onPickerOpened: handleModelPickerOpened } : {}),
-			}
-		: {};
+	const modelMenuRefreshProps = useModelMenuRefreshProps(nugProviderIdByPrefix);
 	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
 		settingsData?.agent?.dangerReflectionLevel,
 		settingsData?.agent?.dangerReflectionEnabled ?? true,
@@ -575,19 +580,11 @@ function NarratorPanelBody({
 	}, [settingsData?.agent]);
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
-			onSuccess: (data) => {
-				if (data.type === "forked") {
-					notifications.show({
-						message: t("promote_success_forked"),
-						color: "teal",
-					});
-					navigate(ordinaryPromoteDestination(data.narratorId));
-				} else {
-					notifications.show({
-						message: t("promote_success_unlocked"),
-						color: "teal",
-					});
-				}
+			onSuccess: () => {
+				notifications.show({
+					message: t("promote_success_unlocked"),
+					color: "teal",
+				});
 			},
 			onError: (error: Error) => {
 				notifications.show({
@@ -597,14 +594,13 @@ function NarratorPanelBody({
 				});
 			},
 		});
-	}, [promoteMutation, narratorId, t, navigate]);
+	}, [promoteMutation, narratorId, t]);
 
 	/**
-	 * A chapter node's header already shows this title and owns the edit / generate
-	 * actions, so drawing them again here is not just redundant — this header's dozen
-	 * tool buttons squeezed the title to zero width, leaving the node with a header
-	 * full of icons and no readable title at all. The whole title block is dropped in
-	 * that case, which also hands its width to the tool row.
+	 * A host that already shows this title and owns the edit / generate actions sets
+	 * `hostOwnsTitle`; drawing them again would squeeze the title to zero width
+	 * behind this header's tool buttons. The whole title block is dropped in that
+	 * case, which also hands its width to the tool row.
 	 *
 	 * The editing state below stays wired up: every other surface (focus page,
 	 * workspace, detached subagent panel) still renders this block.
@@ -616,6 +612,16 @@ function NarratorPanelBody({
 		if (hostOwnsTitle || isWorkspacePreview) return 0;
 		return headerTitleLayoutWidth(headerDisplayTitle);
 	}, [hostOwnsTitle, isWorkspacePreview, headerDisplayTitle]);
+
+	// Single predicate for the leading chrome slot: the layout budget
+	// (`showBack`) and the render branch below must never disagree. A
+	// host-provided `onBack` (subagent → parent, workspace origin) is shown
+	// whenever there is somewhere to go back to.
+	const showLeadingChrome = showHeaderLeadingChrome({
+		isWorkspacePreview,
+		onMinimize,
+		onBack,
+	});
 
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
@@ -634,6 +640,8 @@ function NarratorPanelBody({
 			aggregations,
 			allModels,
 		);
+	// The catalog card a request for this model resolves to; feeds the reasoning tiers.
+	const { data: modelCard } = useActualResolvedModelCard(resolvedModel || undefined);
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -646,7 +654,36 @@ function NarratorPanelBody({
 	// NUG quota data layer (provider config + quota queries + cache writeback +
 	// derived provider info). Kept lifted here because the derived info feeds the
 	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
-	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
+	const nugProviderInfo = useNugQuota(
+		resolvedModel,
+		settingsData?.nugProviders,
+		firstScreenActivity,
+	);
+	const tokenDanceConnection = settingsData?.tokendance;
+	const tokenDanceGeneration =
+		resolvedModel?.startsWith("tokendance:") &&
+		tokenDanceConnection?.connected &&
+		!tokenDanceConnection.disabled &&
+		Number.isSafeInteger(tokenDanceConnection.generation)
+			? (tokenDanceConnection.generation as number)
+			: undefined;
+	const tokenDanceBalanceQuery = useTokenDanceBalance(tokenDanceGeneration);
+	const tokenDanceQuota = tokenDanceQuotaView(
+		tokenDanceBalanceQuery.data,
+		tokenDanceGeneration,
+		currentUser?.role === "admin",
+		t,
+	);
+
+	// Command Code 额度：仅在当前模型走 commandcode 前缀时启用，避免无谓的接口调用。
+	const commandCodeEnabled = !!resolvedModel?.startsWith("CommandCode:");
+	const commandCodeUsageQuery = useQuery({
+		queryKey: ["commandcode", "usage"],
+		queryFn: () => api.commandCodeUsage(),
+		enabled: commandCodeEnabled,
+		refetchInterval: commandCodeEnabled ? 60_000 : false,
+	});
+	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
 
 	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
 	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
@@ -668,10 +705,85 @@ function NarratorPanelBody({
 	const { data: kimiUsagesData } = useQuery({
 		queryKey: ["kimi", "usages"],
 		queryFn: api.kimiGetUsages,
-		enabled: currentKimiProviderId != null,
+		enabled: currentKimiProviderId != null && firstScreenActivity,
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});
+
+	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
+	// generation token so an allowance fetched for a replaced account is never shown.
+	// The current window lives in the status bar; weekly/monthly are in the popover.
+	const currentOpencodeProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isOpencodeProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const opencodeGeneration = currentOpencodeProviderId
+		? settingsData?.opencodeUsageGenerations?.[currentOpencodeProviderId]
+		: undefined;
+	const opencodeUsageQuery = useOpencodeUsage(
+		currentOpencodeProviderId,
+		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
+		firstScreenActivity,
+	);
+
+	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
+	// generation so a balance fetched for a replaced account is never shown.
+	const currentDeepSeekProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (
+			(settingsData?.customApiProviders ?? []) as Array<{
+				id: string;
+				prefix?: string;
+				baseUrl?: string;
+				disabled?: boolean;
+			}>
+		).find((p) => p.prefix === prefix);
+		return cfg && !cfg.disabled && isDeepSeekProviderBaseUrl(cfg.baseUrl) ? cfg.id : null;
+	}, [resolvedModel, settingsData?.customApiProviders]);
+	const deepseekGeneration = currentDeepSeekProviderId
+		? settingsData?.deepseekBalanceGenerations?.[currentDeepSeekProviderId]
+		: undefined;
+	const deepseekBalancesQuery = useDeepSeekBalance(
+		currentDeepSeekProviderId,
+		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
+		firstScreenActivity,
+	);
+
+	const currentBalanceProviderId = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const cfg = (settingsData?.customApiProviders ?? []).find(
+			(p: { id: string; prefix?: string; disabled?: boolean }) =>
+				p.prefix === prefix && !p.disabled,
+		);
+		return cfg && typeof settingsData?.providerBalanceGenerations?.[cfg.id] === "string"
+			? (cfg.id as string)
+			: null;
+	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.providerBalanceGenerations]);
+	const balanceGeneration = currentBalanceProviderId
+		? settingsData?.providerBalanceGenerations?.[currentBalanceProviderId]
+		: undefined;
+	const providerBalanceQuery = useProviderBalance(
+		currentBalanceProviderId,
+		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
+		firstScreenActivity,
+	);
+	const { pushedQuota, subscriptionSnapshot: sub2ApiSubscriptionSnapshot } =
+		customApiBalanceDisplayFor({
+			providerId: currentBalanceProviderId,
+			pushedQuotas: settingsData?.customApiQuotas,
+			snapshot: providerBalanceQuery.data,
+		});
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -686,13 +798,16 @@ function NarratorPanelBody({
 		async (
 			messageId: string,
 			newContent: string,
-			revertOpts: { skipRevert: boolean; scope?: RevertScope },
+			revertOpts: RevertActionConfirmOptions,
 			opts?: {
 				keepImageIds: string[];
 				newImages: File[];
+				keepMediaIds?: string[];
+				newMedia?: File[];
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
 				fileReferences?: FileReference[];
+				composerDocument?: import("@shared/composer-document").ComposerDocument;
 			},
 		): Promise<boolean> => {
 			if (!rollbackEditRegenerateSupported) {
@@ -707,11 +822,18 @@ function NarratorPanelBody({
 				const result = await api.editAndRegenerate(narratorId, messageId, newContent, {
 					...revertOpts,
 					...opts,
+					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});
-				// The rollback this edit performed can reach past the chosen scope
-				// (subagent writes, a workspace restore) — reported exactly as it is for
-				// rollback-to-block, so the outcome is verified rather than assumed.
-				const warningText = formatRevertWarnings(t, result.warnings);
+				if (!result.ok || (result.revertResult && !isRevertHistoryCommitted(result.revertResult))) {
+					throw new ApiError(t("editFailed"), 409, { ...result });
+				}
+				// File writes and the COW history update have independent outcomes.
+				const warningText = [
+					formatRevertSuccessWarning(t, result),
+					formatRevertWarnings(t, result.warnings),
+				]
+					.filter(Boolean)
+					.join("\n");
 				if (warningText) {
 					notifications.show({
 						title: t("rollbackPartialTitle"),
@@ -721,19 +843,32 @@ function NarratorPanelBody({
 					});
 				}
 				return result.ok;
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
-				notifications.show({ title: t("editFailed"), message, color: "red" });
+			} catch (error) {
+				notifications.show({
+					title: t("editFailed"),
+					message: formatRevertFailure(t, error, {
+						fallbackKey: "editFailed",
+						skipRevert: revertOpts.skipRevert,
+					}),
+					color: "red",
+					autoClose: false,
+				});
 				return false;
+			} finally {
+				invalidateRevertQueries(qc, narratorId);
+				chunkListRef.current?.refreshStructure("full");
 			}
 		},
-		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
+		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t, qc],
 	);
 
 	const handleEditAssistantMessage = useCallback(
 		async (messageId: string, newContent: string) => {
 			try {
 				await api.editAssistantMessage(narratorId, messageId, newContent);
+				// The `message_updated` broadcast can be deferred (reader not at the
+				// bottom) or declined as a non-prefix change, so force a refetch.
+				chunkListRef.current?.refreshStructure("full");
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to edit message";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
@@ -746,6 +881,7 @@ function NarratorPanelBody({
 		async (messageId: string) => {
 			try {
 				await api.restoreAssistantMessage(narratorId, messageId);
+				chunkListRef.current?.refreshStructure("full");
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to restore message";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
@@ -815,24 +951,54 @@ function NarratorPanelBody({
 		(draft: NarratorRemoteDraft) => composerRef.current?.handleDraftChanged(draft),
 		[],
 	);
+	// Reconnect reconciles carry draft metadata (never a body): let the composer
+	// pull the body when the snapshot proves the live event stream was missed.
+	const forwardDraftMeta = useCallback(
+		(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) =>
+			composerRef.current?.handleDraftMeta(meta),
+		[],
+	);
 
 	// Pending composer attachments (images + text files) + their IndexedDB draft
-	// persistence. The send flow (hide/clear/restore) and drag handlers below
+	// persistence. The send flow (clear after acceptance) and drag handlers below
 	// consume these; see the hook for why both kinds share one version counter.
 	const {
 		attachedImages,
 		attachedTextFiles,
-		attachedImagesRef,
-		attachedTextFilesRef,
+		attachedMedia,
+		attachedMediaRef,
+		updateAttachedMedia,
 		isDragging,
 		setIsDragging,
 		dragCounterRef,
 		updateAttachedImages,
 		updateAttachedTextFiles,
-		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
+		reconcileDocumentAssets,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
+		retryAttachmentRestore,
+		restoredAttachmentResources,
 	} = useComposerAttachments({ narratorId, currentUserId, sendingRef, t });
 
+	// Composer file ingestion (image/text validation + resize, file picker, paste
+	// bridge, and the whole-panel dropzone handlers). The dropzone stays wired to
+	// the panel root below, so the hook is called here rather than sunk into a child.
+	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps, ingestingRef } =
+		useComposerFileIngest({
+			narratorId,
+			sendingRef,
+			updateAttachedImages,
+			updateAttachedTextFiles,
+			updateAttachedMedia,
+			attachedMediaRef,
+			setIsDragging,
+			dragCounterRef,
+			captureInsertion: (origin) => composerRef.current?.captureAttachmentInsertion(origin),
+			onAcceptedFiles: (files, bookmark) =>
+				composerRef.current?.insertAcceptedFiles(files, bookmark) ?? false,
+			t,
+		});
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
@@ -1018,15 +1184,43 @@ function NarratorPanelBody({
 			settingsData?.customApiProviders ?? [];
 		const cfg = customApiProviders.find((p) => p.prefix === prefix);
 		if (!cfg) return null;
-		// Kimi providers show structured usage (5h window in the bar, weekly/monthly
-		// in the details popover) instead of the generic relay quota string.
-		const kimiUsage = kimiUsagesData?.[cfg.id];
-		if (kimiUsage) {
-			const quotaBalance = formatKimiBarText(kimiUsage, t);
-			const detailedQuotaBalance = formatKimiDetailsText(kimiUsage, t);
-			if (quotaBalance || detailedQuotaBalance) {
-				return { providerId: cfg.id, quotaBalance, detailedQuotaBalance };
-			}
+		if (cfg.id === currentDeepSeekProviderId) {
+			return {
+				providerId: cfg.id,
+				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
+			};
+		}
+		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
+		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
+		// Go one would otherwise fall through to the previous account's Kimi allowance.
+		const usageSource = usageSourceFor({
+			providerId: cfg.id,
+			opencodeProviderId: currentOpencodeProviderId,
+			kimiProviderId: currentKimiProviderId,
+		});
+		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
+		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
+		// generic text-balance slot — showing both would duplicate the 5h figure.
+		if (usageSource === "opencode") {
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
+		}
+		// Kimi likewise has its own progress-bar indicator (`kimiQuotaView` below).
+		if (usageSource === "kimi") {
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
+		}
+		if (cfg.id === currentBalanceProviderId && pushedQuota) {
+			return { providerId: cfg.id, ...pushedQuota };
+		}
+		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
+			// The shared window panel owns subscription amounts, including unknown/stale
+			// placeholders. Do not duplicate them in the generic balance text slot.
+			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
+		}
+		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
+			return {
+				providerId: cfg.id,
+				...formatProviderBalance(providerBalanceQuery.data, balanceT, providerBalanceQuery.isError),
+			};
 		}
 		const quotas = settingsData?.customApiQuotas as
 			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
@@ -1043,7 +1237,17 @@ function NarratorPanelBody({
 		resolvedModel,
 		settingsData?.customApiProviders,
 		settingsData?.customApiQuotas,
-		kimiUsagesData,
+		currentKimiProviderId,
+		currentOpencodeProviderId,
+		currentDeepSeekProviderId,
+		deepseekBalancesQuery.data,
+		deepseekBalancesQuery.isError,
+		currentBalanceProviderId,
+		pushedQuota,
+		sub2ApiSubscriptionSnapshot,
+		providerBalanceQuery.data,
+		providerBalanceQuery.isError,
+		balanceT,
 		t,
 	]);
 
@@ -1062,6 +1266,7 @@ function NarratorPanelBody({
 		nugProviderId: nugProviderInfo?.providerId,
 		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
 		onDraftChanged: forwardDraftChanged,
+		onDraftMeta: forwardDraftMeta,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
 		},
@@ -1315,16 +1520,18 @@ function NarratorPanelBody({
 	// for pushed subagent views so the badge and opened panel never disagree.
 	const tasksPanelMatchesCurrentNarrator = !dock || dock.narratorId === narratorId;
 	const tasksButtonEnabled = !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
-	const { supported: tasksSupported, runningCount: tasksRunningCount } = useBackgroundTasksButton(
-		narratorId,
-		tasksButtonEnabled,
-	);
+	const {
+		supported: tasksSupported,
+		runningCount: tasksRunningCount,
+		workCount: tasksWorkCount,
+		serviceCount: tasksServiceCount,
+	} = useBackgroundTasksButton(narratorId, tasksButtonEnabled && firstScreenActivity);
 	// Open state and toggling for the tasks entry now live in the registry-driven
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
 
 	// Dynamic Spec current task, for the compact status bar above the input.
-	const { data: specTasksData } = useSpecTasks(narratorId);
+	const { data: specTasksData } = useSpecTasks(narratorId, firstScreenActivity);
 	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
@@ -1348,8 +1555,8 @@ function NarratorPanelBody({
 	// context (focus page) or the workspace shard store.
 	const dockApiRef = dock?.apiRef;
 	useEffect(() => {
-		pluginSurface?.registerNarratorContext({ narratorId, chapterId, projectId });
-	}, [pluginSurface, narratorId, chapterId, projectId]);
+		pluginSurface?.registerNarratorContext({ narratorId, projectId });
+	}, [pluginSurface, narratorId, projectId]);
 	const openPluginPanel = useCallback(
 		(pick: {
 			pluginId: string;
@@ -1362,7 +1569,6 @@ function NarratorPanelBody({
 				workspaceDock.openPluginPanel(narratorId, pick, {
 					...pluginSurface.hostContext,
 					narratorId,
-					chapterId,
 					projectId,
 				});
 				return;
@@ -1391,13 +1597,13 @@ function NarratorPanelBody({
 			const request = buildPluginDockPanelOpenRequest({
 				pick,
 				hostContext: pluginSurface
-					? { ...pluginSurface.hostContext, narratorId, chapterId, projectId }
+					? { ...pluginSurface.hostContext, narratorId, projectId }
 					: undefined,
 				panels: api.panels,
 			});
 			api.addPanel(request);
 		},
-		[dockApiRef, pluginSurface, narratorId, chapterId, projectId, workspaceDock],
+		[dockApiRef, pluginSurface, narratorId, projectId, workspaceDock],
 	);
 
 	// ── Asynchronous questions (AskUserQuestion with `async: true`) ──────────
@@ -1411,7 +1617,11 @@ function NarratorPanelBody({
 	// above the composer reads the cross-session query instead (it has to be able to say
 	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
 	// and global inbox queries on every decision.
-	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(narratorId, true, isWorkspacePreview);
+	const asyncQuestionSlots = useNarratorAsyncQuestionSlots(
+		narratorId,
+		firstScreenActivity || substatus.includes("waiting"),
+		isWorkspacePreview,
+	);
 	const permCbWithAsyncQuestions = useMemo(
 		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
 		[renderPermCb, asyncQuestionSlots],
@@ -1590,7 +1800,8 @@ function NarratorPanelBody({
 	// What the composer currently holds, split by ownership: the text flag comes
 	// from NarratorComposer (updates only on empty↔non-empty flips), attachments
 	// are panel state. An image-only draft behaves like a typed one everywhere below.
-	const composerHasAttachments = attachedImages.length + attachedTextFiles.length > 0;
+	const composerHasAttachments =
+		attachedImages.length + attachedTextFiles.length + attachedMedia.length > 0;
 	const composerSendable = composerHasText || composerHasAttachments;
 
 	// Index-based keyboard navigation for permission buttons. Kept lifted here:
@@ -1645,22 +1856,19 @@ function NarratorPanelBody({
 		narratorIsIdle &&
 		retryRecoveryAllowsContinue;
 
-	const hasChapter = !!narrator?.chapterId;
-
 	// --- Fork + ask-in-passing handlers ---
 	// Kept lifted here: the resolved handlers feed the trace-row action context
 	// memo below, consumed by descendants.
 	const { forkHandler, handleAskInPassing } = useNarratorForkActions({
 		narratorId,
-		chapterId: narrator?.chapterId,
-		onForkFromMessage,
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 	});
+	const askSelectionInPassing = useAskSelectionInPassing(narratorId);
 
 	// Slash-command handlers for /fork and /compact, mirroring the manual
 	// controls exactly: fork from the latest real message (its right-click fork
-	// action — chapter-bound narrators open the same host fork flow), and trigger
+	// action), and trigger
 	// a compaction (the context-ring "compact now" action, with the same
 	// capability gating handleCompactBefore applies).
 	const handleForkCommand = useCallback(() => {
@@ -1781,6 +1989,51 @@ function NarratorPanelBody({
 	const [mobileToolPanel, setMobileToolPanel] = useState<MobileToolPanelKind | null>(null);
 	/** Off-dock host state for the background-tasks drawer. */
 	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
+	/**
+	 * Project settings modal state lives here, not in the overflow menu: the menu's
+	 * dropdown unmounts on close and would take a nested modal down with it.
+	 */
+	const [compatibilityOpen, setCompatibilityOpen] = useState(false);
+	/**
+	 * Only an explicit project context gets the menu entry: without one the modal
+	 * is just a directory of links, which is noise in the toolbar menu.
+	 */
+	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
+	/** Stable identity so HeaderToolbar's memo is not busted every render. */
+	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
+	/**
+	 * Outline places this session opens (its menu, its tool cards' addresses and commits, links in
+	 * its messages): in the surrounding dock when there is one (the session page's side dock, the
+	 * workspace cluster, the outline page), else in this panel's own drawer (a phone, a detached
+	 * window). Null while the outline is off, so nothing is intercepted and no entry is shown.
+	 */
+	const outlineEnabled = useOutlineEnabled().enabled;
+	const hostOutlineOpener = useOutlineOpener();
+	const [outlineDrawer, setOutlineDrawer] = useState<OutlinePanelState | null>(null);
+	const outlineOpener = useMemo<OutlineOpener | null>(
+		() =>
+			outlineEnabled && !isWorkspacePreview
+				? {
+						open: (state, options) => {
+							if (hostOutlineOpener?.open(state, options)) return true;
+							setOutlineDrawer(state);
+							return true;
+						},
+					}
+				: null,
+		[outlineEnabled, isWorkspacePreview, hostOutlineOpener],
+	);
+	/** The session's outline space, offered in the overflow menu while the outline is on. */
+	const { open: openOutlineSpace } = useOpenOutlineSpace({
+		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
+		onError: (error) =>
+			notifications.show({ color: "red", message: describeApiError(error, t).message }),
+		onOpen: (space) => outlineOpener?.open({ spaceId: space.id }),
+	});
+	const openOutline = useCallback(
+		() => openOutlineSpace("narrator", narratorId),
+		[openOutlineSpace, narratorId],
+	);
 	useMobileDrawerHistory(useInternalSpec && internalSpecOpen, () => setInternalSpecOpen(false));
 
 	// File opening (dock file panel when hosted in a dock, else an off-dock right
@@ -1789,12 +2042,18 @@ function NarratorPanelBody({
 	const {
 		internalFileViewerPath,
 		setInternalFileViewerPath,
+		onFileEditorDirtyChange,
+		canExitFileEditor,
 		internalFileViewerTarget,
 		handleOpenFilePanel,
 		handleOpenReferencedFile,
 		canOpenReferencedFile,
 	} = useInternalFileViewer({ narratorId, isWorkspacePreview, t });
-	useMobileDrawerHistory(!!internalFileViewerPath, () => setInternalFileViewerPath(null));
+	useMobileDrawerHistory(
+		!!internalFileViewerPath,
+		() => setInternalFileViewerPath(null),
+		canExitFileEditor,
+	);
 	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
 		null,
 	);
@@ -1870,10 +2129,7 @@ function NarratorPanelBody({
 				return;
 			}
 			if (scope === "personal") {
-				navigate({
-					to: "/knowledge/personal/$personalEntryId",
-					params: { personalEntryId: entryId },
-				});
+				navigate(knowledgePersonalEntryDestination(entryId));
 				return;
 			}
 			navigate({ to: "/knowledge/$entryId", params: { entryId } });
@@ -1890,19 +2146,6 @@ function NarratorPanelBody({
 			revealSpecFile(narratorId, uri);
 		},
 		[openSpecTool, narratorId],
-	);
-
-	/**
-	 * Open a chapter referenced by a review-feedback / merge-summary row.
-	 *
-	 * Always a route: a chapter is not a panel kind, so there is no in-surface
-	 * destination to prefer over navigation.
-	 */
-	const handleOpenChapter = useCallback(
-		(chapterId: string) => {
-			navigate({ to: "/chapters/$chapterId", params: { chapterId } });
-		},
-		[navigate],
 	);
 
 	const handleDetachSubagent = useCallback(async (subagentNarratorId: string) => {
@@ -1991,7 +2234,6 @@ function NarratorPanelBody({
 			// the destination, which leaves those rows inert rather than dead-clickable.
 			onOpenKnowledgeEntry: handleOpenKnowledgeEntry,
 			onOpenSpecFile: handleOpenSpecFile,
-			onOpenChapter: handleOpenChapter,
 		}),
 		[
 			forkHandler,
@@ -2016,7 +2258,6 @@ function NarratorPanelBody({
 			handleOpenFilePanel,
 			handleOpenKnowledgeEntry,
 			handleOpenSpecFile,
-			handleOpenChapter,
 		],
 	);
 
@@ -2093,10 +2334,12 @@ function NarratorPanelBody({
 			domIds,
 			targetIds,
 			highlightId,
+			needle,
 		}: {
 			domIds: string[];
 			targetIds: string[];
 			highlightId?: string;
+			needle?: string;
 		}): Promise<boolean> => {
 			// The virtual list owns the whole jump (reveal, flash, and paging upward into
 			// not-yet-loaded history). Short-circuiting on a mounted DOM node here would
@@ -2105,7 +2348,7 @@ function NarratorPanelBody({
 			// `highlightedId` state.
 			const handle = chunkListRef.current;
 			if (!handle) return false;
-			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId });
+			return await handle.scrollToMessageTarget({ domIds, targetIds, highlightId, needle });
 		},
 		[],
 	);
@@ -2115,13 +2358,14 @@ function NarratorPanelBody({
 	const registerScrollToMessage = dock?.registerScrollToMessage;
 	useEffect(() => {
 		if (!registerScrollToMessage) return;
-		return registerScrollToMessage((messageId: string) => {
+		return registerScrollToMessage((messageId, options) => {
 			// The dock callback is synchronous; the list reports an unreachable target to the
 			// user itself, so there is nothing for the search panel to do with the result.
 			void scrollToMessageTarget({
 				domIds: [`msg-${messageId}`],
 				targetIds: [messageId],
 				highlightId: messageId,
+				needle: options?.needle,
 			});
 		});
 	}, [registerScrollToMessage, scrollToMessageTarget]);
@@ -2374,6 +2618,17 @@ function NarratorPanelBody({
 	// Kept lifted here: its inputs (composerRef, attachments, scroll, sendingRef)
 	// and the stable send refs it returns are shared with the composer, the queue
 	// actions below, and the dock bridge.
+	const [savedRecording, setSavedRecording] = useState<SavedRecording | null>(null);
+	const [saveDumpOpened, setSaveDumpOpened] = useState(false);
+	// A command actively opens the result; an in-modal save only updates its result.
+	const handleRecordingSaved = useCallback(
+		(recording: SavedRecording) => {
+			setSavedRecording(recording);
+			setSaveDumpOpened(true);
+			void qc.invalidateQueries({ queryKey: ["request-recordings", recording.narratorId] });
+		},
+		[qc],
+	);
 	const {
 		sendingState,
 		isSending,
@@ -2388,14 +2643,14 @@ function NarratorPanelBody({
 		handleContinue,
 	} = useNarratorSend({
 		narratorId,
+		composerVisible: !isWorkspacePreview && fileDrawerVisible,
 		composerRef,
+		ingestingRef,
+		attachmentsHydrating,
+		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
-		attachedImagesRef,
-		attachedTextFilesRef,
-		updateAttachedImages,
-		updateAttachedTextFiles,
-		hideAttachedFilesForSend,
+		attachedMedia,
 		clearAttachedFilesAndDraft,
 		sendingRef,
 		setQueuedMessages,
@@ -2409,7 +2664,6 @@ function NarratorPanelBody({
 		canContinueNarrator,
 		fetchedNarrator,
 		narrator,
-		chapterWorktreePath,
 		currentUser,
 		enterQueueMode: userPrefs?.enterQueueMode ?? "turn",
 		ctrlEnterQueueMode: userPrefs?.ctrlEnterQueueMode ?? "tool",
@@ -2421,6 +2675,12 @@ function NarratorPanelBody({
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 		onForkCommand: handleForkCommand,
 		onCompactCommand: handleCompactCommand,
+		onModelTraceStarted: (id) => {
+			void qc.invalidateQueries({ queryKey: ["modeltrace-narrator"] });
+			if (dock?.openSubagentPanel) dock.openSubagentPanel(id);
+			else navigate({ to: "/narrators/$narratorId", params: { narratorId: id } });
+		},
+		onRequestRecordingSaved: handleRecordingSaved,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,
@@ -2461,19 +2721,6 @@ function NarratorPanelBody({
 		[narratorIsIdle, allowRetryLatestAssistantMessageId, handleAllowRetryToolCall],
 	);
 
-	// Composer file ingestion (image/text validation + resize, file picker, paste
-	// bridge, and the whole-panel dropzone handlers). The dropzone stays wired to
-	// the panel root below, so the hook is called here rather than sunk into a child.
-	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps } = useComposerFileIngest(
-		{
-			updateAttachedImages,
-			updateAttachedTextFiles,
-			setIsDragging,
-			dragCounterRef,
-			t,
-		},
-	);
-
 	/*
 	 * ── Header toolbar: entries, layout and activation ──
 	 *
@@ -2501,11 +2748,20 @@ function NarratorPanelBody({
 	const toolbarBadgeCounts = useMemo<NarratorToolbarBadgeCounts>(
 		() => ({
 			backgroundTasks: tasksRunningCount,
+			backgroundWork: tasksWorkCount,
+			backgroundServices: tasksServiceCount,
 			browserSessions: wsState.browserSessionCount,
 			userChatUnread,
 			terminals: activeTerminalCount,
 		}),
-		[tasksRunningCount, wsState.browserSessionCount, userChatUnread, activeTerminalCount],
+		[
+			tasksRunningCount,
+			tasksWorkCount,
+			tasksServiceCount,
+			wsState.browserSessionCount,
+			userChatUnread,
+			activeTerminalCount,
+		],
 	);
 
 	const toolbarController = useHeaderToolbar({
@@ -2514,8 +2770,8 @@ function NarratorPanelBody({
 		dock,
 		gitWorkspaceAvailable:
 			!gitWorkspaceQuery.isError &&
-			gitWorkspaceQuery.data?.state === "ready" &&
-			gitWorkspaceQuery.data.capabilities.read,
+			gitWorkspaceQuery.authoritativeData?.state === "ready" &&
+			gitWorkspaceQuery.authoritativeData.capabilities.read,
 		tasksSupported,
 		tasksButtonEnabled,
 		specToolAvailable,
@@ -2593,13 +2849,9 @@ function NarratorPanelBody({
 		if (!revertHistorySubmitting) setPendingBlockDelete(null);
 	}, [revertHistorySubmitting, setPendingBlockDelete]);
 
-	// List props are not detail readiness: wait until the workspace shape is known
-	// before exposing messages, otherwise a late Git strip shifts the whole panel.
-	if (
-		!narrator ||
-		(!isWorkspacePreview && !isSubagent && (!fetchedNarrator || !gitWorkspaceQuery.layoutReady))
-	)
-		return <NarratorPanelSkeleton />;
+	// The detail determines variant and operation permissions. Git discovery does
+	// not determine message readiness: its fixed-height slot owns the transition.
+	if (!narrator || (!isWorkspacePreview && !fetchedNarrator)) return <NarratorPanelSkeleton />;
 
 	const statusBarDisplay = getNarratorStatusBarDisplay({
 		panelNarratorId: narratorId,
@@ -2640,6 +2892,65 @@ function NarratorPanelBody({
 		const resumeAt = quotaWaitInfo?.resumeAt;
 		if (!isWaitingForQuota || !resumeAt) return label;
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
+	})();
+
+	/**
+	 * Which plan the narrator is parked on, so only that provider's allowance
+	 * indicator turns red: the live event names the plan, and after a reload the
+	 * persisted waiting payload does (`errorMessage` carries `quotaProvider` while
+	 * parked). A Kimi wait never turns the OpenCode badge red, and vice versa.
+	 */
+	const quotaWaitProvider = (() => {
+		if (!isWaitingForQuota) return undefined;
+		if (quotaWaitInfo?.quotaProvider) return quotaWaitInfo.quotaProvider;
+		if (!narrator?.errorMessage) return undefined;
+		try {
+			const parsed = JSON.parse(narrator.errorMessage) as { quotaProvider?: unknown };
+			if (parsed.quotaProvider === "opencode" || parsed.quotaProvider === "kimi") {
+				return parsed.quotaProvider;
+			}
+		} catch {
+			// Not a waiting payload; leave the provider unknown.
+		}
+		return undefined;
+	})();
+
+	/**
+	 * Props for the OpenCode Go allowance indicator, or undefined when the current
+	 * model is not on a Go endpoint.
+	 */
+	const opencodeQuotaProps = (() => {
+		if (!currentOpencodeProviderId) return undefined;
+		const waitingForQuota = quotaWaitProvider === "opencode";
+		return {
+			usage: opencodeUsageQuery.data,
+			waitingForQuota,
+			waitingText: waitingForQuota ? quotaWaitText : null,
+		};
+	})();
+
+	/**
+	 * Kimi or Command Code allowance, drawn with the same progress-bar indicator
+	 * as OpenCode Go. Kimi is gated on the provider id it is CURRENTLY configured
+	 * for, like the generic quota slot above, so a disabled query's stale entry
+	 * for a re-pointed provider is never shown.
+	 */
+	const kimiQuotaView = currentKimiProviderId
+		? buildKimiQuotaView(kimiUsagesData?.[currentKimiProviderId], t)
+		: null;
+	const quotaPanelProps = (() => {
+		if (currentKimiProviderId) {
+			const waitingForQuota = quotaWaitProvider === "kimi";
+			return {
+				view: kimiQuotaView,
+				waitingForQuota,
+				waitingText: waitingForQuota ? quotaWaitText : null,
+			};
+		}
+		if (commandCodeEnabled) {
+			return { view: commandCodeQuota, waitingForQuota: false, waitingText: null };
+		}
+		return undefined;
 	})();
 
 	const hasContextData = contextPercent != null;
@@ -2789,7 +3100,6 @@ function NarratorPanelBody({
 		relaxedPlanForced,
 		relaxedPlanMutation,
 		isAskInPassing: narrator.isAskInPassing,
-		chapterId: narrator.chapterId,
 		promoteMutation,
 		handlePromote,
 	});
@@ -2800,13 +3110,15 @@ function NarratorPanelBody({
 	const mobileToolbarMeasurementKey = [
 		i18n.resolvedLanguage,
 		toolbarBadgeCounts.backgroundTasks,
+		toolbarBadgeCounts.backgroundWork,
+		toolbarBadgeCounts.backgroundServices,
 		toolbarBadgeCounts.browserSessions,
 		toolbarBadgeCounts.userChatUnread,
 		toolbarBadgeCounts.terminals,
 		renderLod,
 	].join(":");
 
-	return (
+	const body = (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
 			<ContentViewerEnvironmentProvider
 				value={contentViewerEnvironment}
@@ -2835,7 +3147,7 @@ function NarratorPanelBody({
 					    fixed title @ pretext W, then only tools that fit after it. */}
 					<NarratorHeaderLayout
 						titleFullWidth={headerTitleFullWidth}
-						showBack={!isWorkspacePreview && !onMinimize && !chapterId}
+						showBack={showLeadingChrome}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
@@ -2856,9 +3168,7 @@ function NarratorPanelBody({
 										overflow: "hidden",
 									}}
 								>
-									{!isWorkspacePreview &&
-										!onMinimize &&
-										!chapterId &&
+									{showLeadingChrome &&
 										(onBack ? (
 											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
 												<IconArrowLeft size={16} />
@@ -2888,7 +3198,7 @@ function NarratorPanelBody({
 																	params: { narratorId },
 																	search: workspaceId
 																		? { from: "workspace", workspaceId }
-																		: { from: "graph" },
+																		: undefined,
 																})
 															}
 														>
@@ -2942,6 +3252,7 @@ function NarratorPanelBody({
 								</div>
 								{!isWorkspacePreview && (
 									<HeaderToolbar
+										onOpenSavedRecordings={() => setSaveDumpOpened(true)}
 										narratorId={narratorId}
 										controller={toolbarController}
 										inlineControls={toolbarInlineControls}
@@ -2951,17 +3262,8 @@ function NarratorPanelBody({
 										archiveMutation={archiveMutation}
 										dock={dock}
 										mockStreamEnabled={mockStreamEnabled}
-										compatibilityEntry={
-											<Suspense fallback={null}>
-												<NarratorCompatibilityEntry
-													projectId={
-														workspaceContext?.contextProjectId ??
-														projectId ??
-														narrator?.contextProjectId
-													}
-												/>
-											</Suspense>
-										}
+										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
+										onOpenOutline={outlineEnabled ? openOutline : undefined}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}
@@ -3014,9 +3316,30 @@ function NarratorPanelBody({
 						</Stack>
 					</Modal>
 
+					{saveDumpOpened && (
+						<Suspense fallback={null}>
+							<SaveDumpModal
+								key={narratorId}
+								narratorId={narratorId}
+								opened={saveDumpOpened}
+								onClose={() => setSaveDumpOpened(false)}
+								saved={savedRecording?.narratorId === narratorId ? savedRecording : null}
+								onSaved={setSavedRecording}
+								onDeleted={(id) =>
+									setSavedRecording((previous) => (previous?.id === id ? null : previous))
+								}
+							/>
+						</Suspense>
+					)}
 					<CompactSummaryModal
 						target={compactSummaryModalTarget}
 						onClose={closeCompactSummaryModal}
+					/>
+
+					<NarratorProjectSettingsModal
+						projectId={compatibilityProjectId}
+						opened={compatibilityOpen}
+						onClose={() => setCompatibilityOpen(false)}
 					/>
 
 					<ContextThresholdSettingsModal
@@ -3099,9 +3422,9 @@ function NarratorPanelBody({
 															onSelectionResolverChange={setChunkSelectionResolver}
 															rowHandlers={vlistRowHandlers}
 															permCb={permCbWithAsyncQuestions}
-															hasChapter={hasChapter}
 															highlightMessageId={highlightMessageId}
 															highlightRequestId={highlightRequestId}
+															highlightNeedle={highlightNeedle}
 															tailFooter={messageListTailFooter}
 														/>
 													</Suspense>
@@ -3242,11 +3565,19 @@ function NarratorPanelBody({
 
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
+						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
+						attachedMedia={attachedMedia}
+						updateAttachedMedia={updateAttachedMedia}
+						attachmentsHydrating={attachmentsHydrating}
+						attachmentsRestoreFailed={attachmentsRestoreFailed}
+						onRetryAttachments={retryAttachmentRestore}
+						restoredAttachmentResources={restoredAttachmentResources}
 						updateAttachedImages={updateAttachedImages}
 						updateAttachedTextFiles={updateAttachedTextFiles}
+						reconcileDocumentAssets={reconcileDocumentAssets}
 						sendingState={sendingState}
 						cancelSending={cancelSending}
 						queueDeps={{
@@ -3262,7 +3593,6 @@ function NarratorPanelBody({
 							queuedCancelRef,
 							queuedRetryRef,
 						}}
-						chapterId={narrator.chapterId}
 						onOpenGitPanel={
 							isWorkspacePreview
 								? undefined
@@ -3270,7 +3600,6 @@ function NarratorPanelBody({
 									? () => dock.openToolPanel("git")
 									: () => setMobileToolPanel("git")
 						}
-						isChapterMerged={isChapterMerged}
 						statusBarInputs={{
 							ownsHorizontalSafeArea,
 							borderTop:
@@ -3309,6 +3638,8 @@ function NarratorPanelBody({
 								supported: tasksSupported,
 								buttonEnabled: tasksButtonEnabled,
 								runningCount: tasksRunningCount,
+								workCount: tasksWorkCount,
+								serviceCount: tasksServiceCount,
 								onOpenPanel: () => {
 									if (dock) dock.openToolPanel("tasks");
 									else setMobileTasksOpen(true);
@@ -3318,6 +3649,7 @@ function NarratorPanelBody({
 								allModels,
 								aggregations,
 								providerLabels,
+								settingsData,
 								defaultModelValue,
 								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
@@ -3328,12 +3660,30 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								balance: quotaBalance,
-								detailsText: quotaDetailsText,
-								hasDetailsPopover: hasQuotaDetailsPopover,
+								// Structured subscription quotas are rendered by the status bar, not this text slot.
+								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
+								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
+								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
+								sub2api: sub2ApiSubscriptionSnapshot
+									? {
+											snapshot: sub2ApiSubscriptionSnapshot,
+											queryFailed: providerBalanceQuery.isError,
+										}
+									: undefined,
+								opencode: opencodeQuotaProps,
+								panel: quotaPanelProps,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
+								...(tokenDanceQuota
+									? {
+											recharge: {
+												showButton: tokenDanceQuota.showRechargeButton,
+												showInDetails: tokenDanceQuota.showRechargeInDetails,
+												onOpen: openTokenDanceRecharge,
+											},
+										}
+									: {}),
 							},
 							relaxedPlan: {
 								enabled: relaxedPlanEnabled,
@@ -3363,7 +3713,7 @@ function NarratorPanelBody({
 							resolvedModelOption,
 							narratorReasoningEffort: narrator.reasoningEffort,
 							settingsData,
-							modelCardIndex,
+							modelCard,
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,
@@ -3393,6 +3743,7 @@ function NarratorPanelBody({
 							reflectionSettingsDisabled,
 						}}
 						composerRowProps={{
+							onAskSelection: askSelectionInPassing,
 							fileInputRef,
 							composerRef,
 							sendingRef,
@@ -3484,17 +3835,13 @@ function NarratorPanelBody({
 					    dock's `file` panel renders. */}
 					{internalFileViewerPath && (
 						<Drawer
-							opened
+							opened={fileDrawerVisible}
+							keepMounted
 							onClose={() => setInternalFileViewerPath(null)}
 							position="right"
 							size={isMobileViewport ? "100%" : 600}
-							// The viewer body already shows the base name; the title carries the
-							// full path so the drawer adds information rather than repeating it.
-							//
-							// `TruncatedPath` rather than `truncate`: it ellipsizes from the LEFT,
-							// so a deep path keeps the filename — the part that identifies the file —
-							// visible instead of clipping it and leaving only directories.
-							title={<TruncatedPath path={internalFileViewerPath} fw={600} />}
+							// The shared toolbar displays the full path; the host title names the file.
+							title={<TruncatedPath path={filePanelBaseName(internalFileViewerPath)} fw={600} />}
 							closeButtonProps={{ size: "sm" }}
 							styles={{
 								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -3520,18 +3867,32 @@ function NarratorPanelBody({
 									</Center>
 								}
 							>
-								<FileViewerContent
-									key={internalFileViewerPath}
+								<FilePanelContent
+									visible={fileDrawerVisible}
 									filePath={internalFileViewerPath}
 									narratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
 									selection={internalFileViewerTarget?.selection}
-									highlightRequestId={internalFileViewerTarget?.highlightRequestId}
+									navigationRequestId={internalFileViewerTarget?.highlightRequestId}
 									onOpenFileTarget={handleOpenReferencedFile}
+									onDirtyChange={onFileEditorDirtyChange}
+									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
 								/>
 							</Suspense>
 						</Drawer>
+					)}
+					{/* The outline's off-dock host: opened only when no dock took the place. */}
+					{outlineDrawer && (
+						<OutlineDrawerHost
+							state={outlineDrawer}
+							onChange={setOutlineDrawer}
+							onClose={() => setOutlineDrawer(null)}
+							onOpenSession={(sessionId) => {
+								setOutlineDrawer(null);
+								handleVlistViewSubagentSession(sessionId);
+							}}
+						/>
 					)}
 					{/*
 					 * Off-dock hosts for the entries that previously had NO mobile entry
@@ -3544,7 +3905,6 @@ function NarratorPanelBody({
 								kind={mobileToolPanel}
 								onClose={() => setMobileToolPanel(null)}
 								narratorId={narratorId}
-								chapterId={chapterId}
 								browserSessionCount={wsState.browserSessionCount}
 								browserVisualChange={wsState.browserVisualChange}
 								// Replaces the dock's `scrollToMessage` / `submitToNarrator` bridges,
@@ -3553,14 +3913,18 @@ function NarratorPanelBody({
 								// forward anything to the narrator. Forwarding goes through the SAME
 								// `forwardTextToNarrator` the dock bridge registers, so the mobile
 								// path preserves the in-progress draft and staged attachments too.
-								onJumpToMessage={(messageId) => {
+								onJumpToMessage={(messageId, options) => {
 									void scrollToMessageTarget({
 										domIds: [`msg-${messageId}`],
 										targetIds: [messageId],
 										highlightId: messageId,
+										needle: options?.needle,
 									});
 								}}
 								onForwardToNarrator={forwardTextToNarrator}
+								// Off-dock the tree's files open in this panel's internal
+								// viewer Drawer (defined whenever !dock && !isWorkspacePreview).
+								onOpenFile={handleOpenFilePanel}
 							/>
 							<BackgroundTasksDrawerHost
 								narratorId={narratorId}
@@ -3600,4 +3964,5 @@ function NarratorPanelBody({
 			/>
 		</PermEnterHintCtx.Provider>
 	);
+	return <OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>;
 }

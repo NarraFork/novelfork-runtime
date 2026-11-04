@@ -1,15 +1,26 @@
 import { notifications } from "@mantine/notifications";
+import { quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
-import { invalidateWorkspaceQueries } from "../../hooks/useGit";
-import { useNarratorWS } from "../../hooks/useNarratorWS";
+import { useCurrentUser } from "../../hooks/useAuth";
+import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
+import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
+import {
+	createPanelReconcileRestartScheduler,
+	type PanelConnectionState,
+	type PanelReconcileRestartScheduler,
+	panelConnectionRead,
+	reconcilePanelStatePages,
+	shouldFallbackPanelState,
+} from "../../lib/narrator-panel-state";
 import { statusRegistry } from "../../lib/status-registry";
 import {
 	contextSnapshotFields,
@@ -18,12 +29,14 @@ import {
 } from "./context-management/context-usage-state";
 import { localizeNarratorError } from "./error-localization";
 import { withQueueSubstatus } from "./header/narrator-status-bar";
+import { isForeignSubagentRow } from "./message/nested-rows";
 import type {
 	ContentBlock,
 	NarratorMsg,
 	PendingPermission,
 	PermissionCallbacks,
 } from "./narrator-panel-types";
+import { createNarratorWarningHandler, nativeMediaFallbackNotice } from "./narrator-warning";
 import {
 	reconcilePendingPermissions,
 	upsertPendingPermissionMap,
@@ -91,6 +104,8 @@ export interface RetryInfo {
  */
 export interface QuotaWaitInfo {
 	resumeAt: number | null;
+	/** Which plan the wait belongs to; absent from older servers (always Kimi). */
+	quotaProvider?: "kimi" | "opencode";
 }
 
 export interface PaymentRequiredInfo {
@@ -105,6 +120,7 @@ export interface PaymentRequiredInfo {
 export interface LeakedToolEvent {
 	phase: "recovered" | "unrecovered";
 	apiRequestId: string;
+	recordingRequestId?: string;
 	toolNames?: string[];
 	snippet?: string;
 }
@@ -140,6 +156,8 @@ interface InitialMessageStatus {
 export interface CompactProgressState extends ProgressSnapshot {
 	retryCount: number;
 	retryError?: string;
+	/** Provenance of the summary model's context window (`fallback` = unset). */
+	contextWindowSource?: string;
 }
 
 export interface UseNarratorPanelWSOptions {
@@ -172,6 +190,8 @@ export interface UseNarratorPanelWSOptions {
 		updatedBy: string | null;
 		sourceId: string | null;
 	}) => void;
+	/** Reconnect/page-load reconciles carry draft metadata only; the composer fetches the body when newer. */
+	onDraftMeta?: (meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) => void;
 	onQueuedNewNarratorCreated?: (newNarratorId: string) => void;
 }
 
@@ -329,10 +349,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		quotaProviderKey,
 		narratorSubstatus,
 		onDraftChanged,
+		onDraftMeta,
 		onQueuedNewNarratorCreated,
 	} = opts;
 	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
+	const { data: currentUser } = useCurrentUser();
+	const panelScope = JSON.stringify([currentUser?.id ?? null, narratorId]);
+	const connectionReconcileRef = useRef<PanelConnectionState | null>(null);
+	const activeReconcileRef = useRef<{
+		controller: AbortController;
+		promise: Promise<void>;
+		generation: number;
+		lifecycle: number;
+		bufferEpoch: number;
+	} | null>(null);
+	const reconcileRestartSchedulerRef = useRef<PanelReconcileRestartScheduler | null>(null);
+	const reconcilePanelStateRef = useRef<(fresh?: boolean) => Promise<void>>(async () => {});
+	const requestPanelReconcileRef = useRef<() => void>(() => {});
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const permissionDecisionsSupported =
 		narratorPermissionsCapability.supported && narratorPermissionsCapability.approveDeny;
@@ -356,6 +390,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	const bumpPermissionGeneration = useCallback(() => {
 		permissionGenerationRef.current += 1;
+		if (activeReconcileRef.current) requestPanelReconcileRef.current();
 	}, []);
 
 	// Writes pushed async-question transitions into the query cache that owns them.
@@ -386,11 +421,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	);
 
 	const replacePendingPermissions = useCallback(
-		(perms: PendingPermission[], generation: number, lifecycle: number) => {
+		(
+			perms: PendingPermission[],
+			generation: number,
+			lifecycle: number,
+			complete = true,
+			onDiscard?: () => void,
+		) => {
 			if (
 				permissionGenerationRef.current !== generation ||
 				permissionLifecycleRef.current !== lifecycle
 			) {
+				onDiscard?.();
 				return false;
 			}
 			setPendingPermsByRequestId((prev) => {
@@ -399,23 +441,52 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					permissionGenerationRef.current !== generation ||
 					permissionLifecycleRef.current !== lifecycle
 				) {
+					onDiscard?.();
 					return prev;
 				}
-				return reconcilePendingPermissions(prev, perms, resolvedPermissionIdsRef.current);
+				// A partial page must not erase permissions whose next page is still in flight.
+				const snapshot = complete
+					? perms
+					: [...new Map([...prev, ...perms.map((perm) => [perm.id, perm] as const)]).values()];
+				return reconcilePendingPermissions(prev, snapshot, resolvedPermissionIdsRef.current);
 			});
 			return true;
 		},
 		[],
 	);
 
-	// Reset the permission lifecycle when a Dockview panel is reused for another narrator.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId defines the lifecycle boundary.
+	// Reset the permission lifecycle when a Dockview panel changes narrator or account.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: panelScope defines the lifecycle boundary.
 	useEffect(() => {
+		connectionReconcileRef.current = null;
+		activeReconcileRef.current?.controller.abort();
+		activeReconcileRef.current = null;
 		permissionLifecycleRef.current += 1;
 		permissionGenerationRef.current += 1;
+		bufferEpochRef.current += 1;
 		resolvedPermissionIdsRef.current = new Set();
+		reconcileRestartSchedulerRef.current?.dispose();
+		const lifecycle = permissionLifecycleRef.current;
+		const userId = currentUser?.id ?? null;
+		reconcileRestartSchedulerRef.current = createPanelReconcileRestartScheduler(
+			() => {
+				void reconcilePanelStateRef.current(true);
+			},
+			() =>
+				permissionLifecycleRef.current === lifecycle &&
+				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) === userId,
+		);
 		setPendingPermsByRequestId(new Map());
-	}, [narratorId]);
+		setQueuedMessages([]);
+		return () => {
+			permissionLifecycleRef.current += 1;
+			bufferEpochRef.current += 1;
+			reconcileRestartSchedulerRef.current?.dispose();
+			reconcileRestartSchedulerRef.current = null;
+			activeReconcileRef.current?.controller.abort();
+			activeReconcileRef.current = null;
+		};
+	}, [panelScope]);
 
 	// --- Misc state (co-updated fields merged into reducer) ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
@@ -429,19 +500,30 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const bufferEpochRef = useRef(0);
 	const bumpBufferEpoch = useCallback(() => {
 		bufferEpochRef.current += 1;
+		if (activeReconcileRef.current) requestPanelReconcileRef.current();
 	}, []);
 	// Fetch the authoritative queue but only apply it when no WS buffer event
 	// superseded this request in the meantime.
 	const reconcileBufferedMessages = useCallback(() => {
 		const epochAtRequest = bufferEpochRef.current;
+		const lifecycle = permissionLifecycleRef.current;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 10_000);
+		const alive = () =>
+			!controller.signal.aborted &&
+			permissionLifecycleRef.current === lifecycle &&
+			(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) === (currentUser?.id ?? null);
 		api
-			.getBufferedMessages(narratorId)
+			.getBufferedMessages(narratorId, controller.signal)
 			.then((msgs) => {
-				if (bufferEpochRef.current !== epochAtRequest) return;
-				setQueuedMessages(msgs ?? []);
+				if (bufferEpochRef.current !== epochAtRequest || !alive()) return;
+				setQueuedMessages((previous) =>
+					bufferEpochRef.current === epochAtRequest && alive() ? (msgs ?? []) : previous,
+				);
 			})
-			.catch(() => {});
-	}, [narratorId]);
+			.catch(() => {})
+			.finally(() => clearTimeout(timer));
+	}, [narratorId, qc, currentUser?.id]);
 	const [statusState, dispatchStatus] = useReducer(statusReducer, {
 		substatus: [],
 		contextSnapshot: null,
@@ -850,7 +932,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearRetryIfActive();
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
+				// A subagent's row is dual-broadcast to this page too, tagged with
+				// `parentToolUseId` (see `isForeignSubagentRow`). Nothing derived from it may
+				// touch THIS conversation's state — most visibly it used to look like an
+				// assistant answer, so a subagent finishing its turn cleared this panel's
+				// queued-message and retry chips while the parent was still running.
+				if (isForeignSubagentRow(wsData.message, !!isSubagent)) return;
+				const blocks = messageBody(wsData.message);
 				const compactBlock = blocks.find(
 					(b: ContentBlock) =>
 						(b.type === "compact" && b.subtype !== "plan") || b.type === "segment_compact",
@@ -1176,7 +1264,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				const signature = JSON.stringify([
 					resolved.requestId,
 					resolved.composition?.generation,
-					resolved.inputCharacters,
 					resolved.occupiedTokens,
 					resolved.percentage,
 					resolved.contextWindow,
@@ -1253,19 +1340,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onModelUnavailableWaiting: (info) => {
 				// The narrator is parked on a self-recovering block: a NUG credential
-				// pool coming back, or a Kimi quota window resetting. Reflect the
+				// pool coming back, or a Kimi / OpenCode Go quota window resetting. Reflect the
 				// waiting status locally and surface a dismissible notice that says
 				// which of the two it is.
 				const isQuota = info.waitKind === "quota";
 				const substatus = isQuota ? "quota_exhausted" : "model_unavailable";
-				applyQuotaWaitInfo(isQuota ? { resumeAt: info.resumeAt ?? null } : null);
+				applyQuotaWaitInfo(
+					isQuota ? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider } : null,
+				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				notifications.show({
 					id: `model-unavailable-${narratorId}`,
-					title: t(isQuota ? "quotaExhaustedWaitingTitle" : "modelUnavailableWaitingTitle"),
+					title: t(isQuota ? "quotaExhaustedWaitingTitle" : "modelUnavailableWaitingTitle", {
+						provider: quotaProviderLabel(info.quotaProvider),
+					}),
 					message: isQuota
 						? t("quotaExhaustedWaitingDesc", {
 								model: info.model,
+								provider: quotaProviderLabel(info.quotaProvider),
 								resetAt: info.resumeAt
 									? formatFullLocaleDateTime(new Date(info.resumeAt), i18n.language)
 									: t("quotaExhaustedResetUnknown"),
@@ -1303,30 +1395,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBrowserSessionVisualChange: (sessionId) => {
 				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
 			},
-			onGitStatus: (data) => {
-				qc.setQueryData(["chapterGitStatus", data.chapterId], {
-					commitsAhead: data.commitsAhead,
-					baseBranch: data.baseBranch,
-					linesAdded: data.linesAdded,
-					linesRemoved: data.linesRemoved,
-				});
-				// Open Git panels have a workspace-scoped subscription. The legacy status
-				// event updates the chapter badge only; it must not reload every Git log.
-			},
-			onCommitSyncError: (event) => {
-				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });
-				invalidateWorkspaceQueries(qc, event.chapterId);
-				notifications.show({
-					title: t("commitSyncErrorTitle"),
-					message:
-						event.reason ??
-						event.message ??
-						event.error ??
-						event.code ??
-						t("commitSyncErrorFallback"),
-					color: "yellow",
-					autoClose: 5000,
-				});
+			onGitStatus: () => {
+				// The workspace bar reads workspace-keyed gitStatus queries; open Git panels
+				// additionally have their own workspace subscription. Double invalidation is
+				// idempotent.
+				invalidateGitStatusPushQueries(qc, narratorId);
 			},
 			onCompacting: () => {
 				dispatchStatus({
@@ -1343,7 +1416,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					},
 				});
 			},
-			onCompactProgress: ({ phase, thinkingChars, outputChars, retryCount, retryError }) => {
+			onCompactProgress: ({
+				phase,
+				thinkingChars,
+				outputChars,
+				retryCount,
+				retryError,
+				contextWindowSource,
+			}) => {
 				dispatchStatus({
 					type: "patch",
 					payload: {
@@ -1353,6 +1433,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							outputChars,
 							retryCount,
 							...(retryError ? { retryError } : {}),
+							...(contextWindowSource ? { contextWindowSource } : {}),
 						},
 					},
 				});
@@ -1415,33 +1496,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					autoClose: 8000,
 				});
 			},
-			onNarratorWarning: (info) => {
-				// Localize via the structured diagnostics so a retry toast explains the
-				// actual cause instead of echoing the provider's raw English text.
-				const localizedWarning =
-					localizeNarratorError(info.message, t, undefined, info.diagnostics) ?? info.message;
-				if (info.retryCount != null && info.maxRetries != null && info.delayMs != null) {
-					const ri = {
-						message: localizedWarning,
-						retryCount: info.retryCount,
-						maxRetries: info.maxRetries,
-						retryAt: Date.now() + info.delayMs,
-					};
-					retryInfoRef.current = ri;
-					setRetryInfo(ri);
-				}
-				notifications.show({
-					title: t("narratorRetrying"),
-					message: localizedWarning,
-					color: "yellow",
-					autoClose: 10000,
-				});
-			},
+			onNarratorWarning: createNarratorWarningHandler({
+				t,
+				localizeWarning: (info) =>
+					localizeNarratorError(info.message, t, undefined, info.diagnostics) ?? info.message,
+				setRetryInfo: (info) => {
+					retryInfoRef.current = info;
+					setRetryInfo(info);
+				},
+				notify: (notice) => notifications.show({ ...notice }),
+			}),
 			onLeakedToolCall: (info) => {
 				if (info.phase === "stream_captured") return;
 				setLeakedToolEvent({
 					phase: info.phase,
 					apiRequestId: info.apiRequestId,
+					recordingRequestId: info.recordingRequestId,
 					toolNames: info.toolNames,
 					snippet: info.snippet,
 				});
@@ -1477,10 +1547,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 			},
-			onSubagentWarning: (
-				subagentNarratorId: string,
-				info: { message: string; retryCount?: number; maxRetries?: number; delayMs?: number },
-			) => {
+			onSubagentWarning: (subagentNarratorId: string, info: NarratorWarningInfo) => {
+				const fallbackNotice = nativeMediaFallbackNotice(info, t);
+				if (fallbackNotice) {
+					notifications.show({ ...fallbackNotice });
+					return;
+				}
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
 				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
 					old
@@ -1528,49 +1600,125 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// Keep refs in sync
 	sendPermissionDecisionRef.current = sendPermissionDecision;
 
-	// --- Load pending permissions on mount/reconnect ---
-	const prevConnectedRef = useRef(false);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: fetch on mount and reconnect
-	useEffect(() => {
-		if (!connected && prevConnectedRef.current) {
-			prevConnectedRef.current = false;
-			return;
-		}
-		if (connected) prevConnectedRef.current = true;
+	// Ref-mirrored so the reconcile callback keeps its identity (its promise dedup
+	// depends on it) while always calling the latest handler.
+	const onDraftMetaRef = useRef(onDraftMeta);
+	onDraftMetaRef.current = onDraftMeta;
 
-		const permissionGeneration = permissionGenerationRef.current;
-		const permissionLifecycle = permissionLifecycleRef.current;
-		api
-			.getPendingPermissions(narratorId)
-			.then((perms) => {
-				replacePendingPermissions(perms, permissionGeneration, permissionLifecycle);
-			})
-			.catch(() => {});
-		reconcileBufferedMessages();
-	}, [narratorId, connected, reconcileBufferedMessages]);
+	// --- Initial REST is shared with the composer; every WS connection edge closes its event gap. ---
+	const reconcilePanelState = useCallback(
+		(fresh = false) => {
+			if (!fresh && activeReconcileRef.current) return activeReconcileRef.current.promise;
+			reconcileRestartSchedulerRef.current?.cancel();
+			if (fresh) activeReconcileRef.current?.controller.abort();
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), 15_000);
+			const generation = permissionGenerationRef.current;
+			const lifecycle = permissionLifecycleRef.current;
+			const bufferEpoch = bufferEpochRef.current;
+			const alive = () =>
+				!controller.signal.aborted &&
+				permissionLifecycleRef.current === lifecycle &&
+				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) ===
+					(currentUser?.id ?? null);
+			const onDiscard = () => {
+				if (alive()) requestPanelReconcileRef.current();
+			};
+			const applyBuffer = (messages: BufferMessageSummary[], complete = true) => {
+				if (!alive() || bufferEpochRef.current !== bufferEpoch) {
+					onDiscard();
+					return;
+				}
+				setQueuedMessages((previous) => {
+					if (!alive() || bufferEpochRef.current !== bufferEpoch) {
+						onDiscard();
+						return previous;
+					}
+					return complete
+						? messages
+						: [
+								...new Map(
+									[...previous, ...messages].map((message) => [message.id, message]),
+								).values(),
+							];
+				});
+			};
+			const promise = reconcilePanelStatePages(
+				(options) => api.getNarratorPanelState(narratorId, options),
+				(snapshot) => {
+					if (!alive()) return;
+					replacePendingPermissions(
+						snapshot.permissions,
+						generation,
+						lifecycle,
+						!snapshot.hasMore.permissions,
+						onDiscard,
+					);
+					applyBuffer(snapshot.buffer, !snapshot.hasMore.buffer);
+					// Draft metadata rides every page; the composer no-ops it unless it
+					// proves a live draft_changed was missed while disconnected.
+					onDraftMetaRef.current?.(snapshot.draft);
+				},
+				{ signal: controller.signal, fresh },
+			)
+				.catch(async (error) => {
+					if (!alive() || !shouldFallbackPanelState(error)) return;
+					// Independent fallbacks: a draft/network failure must never hide safety permissions.
+					await Promise.allSettled([
+						api.getPendingPermissions(narratorId, controller.signal).then((permissions) => {
+							if (alive())
+								replacePendingPermissions(permissions, generation, lifecycle, true, onDiscard);
+						}),
+						api
+							.getBufferedMessages(narratorId, controller.signal)
+							.then((messages) => applyBuffer(messages ?? [])),
+					]);
+				})
+				.finally(() => {
+					clearTimeout(timer);
+					if (activeReconcileRef.current?.controller === controller)
+						activeReconcileRef.current = null;
+				});
+			activeReconcileRef.current = { controller, promise, generation, lifecycle, bufferEpoch };
+			return promise;
+		},
+		[narratorId, replacePendingPermissions, qc, currentUser?.id],
+	);
+	reconcilePanelStateRef.current = reconcilePanelState;
+	requestPanelReconcileRef.current = () => {
+		const active = activeReconcileRef.current;
+		// A newer read already covers an older queued React updater's rejection.
+		if (
+			active &&
+			active.generation === permissionGenerationRef.current &&
+			active.lifecycle === permissionLifecycleRef.current &&
+			active.bufferEpoch === bufferEpochRef.current
+		)
+			return;
+		reconcileRestartSchedulerRef.current?.schedule();
+	};
+
+	useEffect(() => {
+		const transition = panelConnectionRead(connectionReconcileRef.current, panelScope, connected);
+		connectionReconcileRef.current = transition.state;
+		if (!transition.read) return;
+		if (transition.read === "fresh") {
+			bumpPermissionGeneration();
+			bumpBufferEpoch();
+		}
+		void reconcilePanelState(transition.read === "fresh");
+	}, [panelScope, connected, reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch]);
 
 	// --- Fallback polling for permissions ---
 	useEffect(() => {
 		if (narratorStatus !== "waiting" || pendingPermissions.length > 0) return;
-		let cancelled = false;
 		const poll = () => {
-			const permissionGeneration = permissionGenerationRef.current;
-			const permissionLifecycle = permissionLifecycleRef.current;
-			api
-				.getPendingPermissions(narratorId)
-				.then((perms) => {
-					if (cancelled) return;
-					replacePendingPermissions(perms, permissionGeneration, permissionLifecycle);
-				})
-				.catch(() => {});
+			void reconcilePanelState();
 		};
 		poll();
 		const timer = setInterval(poll, 5000);
-		return () => {
-			cancelled = true;
-			clearInterval(timer);
-		};
-	}, [narratorId, narratorStatus, pendingPermissions.length, replacePendingPermissions]);
+		return () => clearInterval(timer);
+	}, [narratorStatus, pendingPermissions.length, reconcilePanelState]);
 
 	// --- Mark "done" narrator as read ---
 	const hasUnreadSubstatus = substatus.includes("unread");

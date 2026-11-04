@@ -19,13 +19,14 @@ const initial: WorkspaceContext = {
 let current = initial;
 let invalidated = false;
 let streaming = false;
+let switchedWhileStreaming: boolean | undefined;
 let writes: string[] = [];
 let scenario: "switch-write" | "background-switch" | "device-switch" | "write" | "late-old" =
 	"switch-write";
 let backgroundResult: (() => { cwd: string; targetCwd: string | undefined }) | undefined;
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -56,6 +57,7 @@ const provider: ProviderAdapter = {
 										expectedRevision: 0,
 										requestId: "request",
 										target: { deviceId: "local", cwd: "/new" },
+										expectedWorktreeKey: "obsolete-wrong-key",
 									},
 					},
 					{
@@ -76,12 +78,17 @@ const provider: ProviderAdapter = {
 				],
 			};
 		}
+		// The switch runs as soon as its input is complete; the provider keeps the response
+		// open until it did, so the switch provably lands mid-stream.
+		if (scenario !== "write" && scenario !== "late-old") {
+			while (!invalidated) {
+				if (params.signal.aborted) throw new Error("Aborted");
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+		}
 		yield { text: "stream is still open" };
 		streaming = false;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -140,6 +147,7 @@ beforeEach(() => {
 	current = initial;
 	invalidated = false;
 	streaming = false;
+	switchedWhileStreaming = undefined;
 	writes = [];
 	backgroundResult = undefined;
 	scenario = "switch-write";
@@ -161,7 +169,7 @@ function config(context: WorkspaceContext): AgentConfig {
 		},
 		shouldStop: () => invalidated,
 		switchWorkingDirectory: async () => {
-			expect(streaming).toBe(false);
+			switchedWhileStreaming = streaming;
 			current = { ...initial, revision: 1, cwd: "/new", contextKey: "new" };
 			invalidated = true;
 			return { changed: true, previous: initial, current };
@@ -170,12 +178,52 @@ function config(context: WorkspaceContext): AgentConfig {
 }
 async function run(conf: AgentConfig) {
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(conf, "switch then write", [])) events.push(event);
+	for await (const event of agentLoop(conf, "switch then write", { rows: [] })) events.push(event);
 	return events;
 }
 
 describe("workspace switch pass barrier", () => {
-	test("SwitchDevice is a strict streaming barrier and leaves started background execution frozen", async () => {
+	test("switch schema hides obsolete worktree keys and strips them from historical calls", () => {
+		const schema = z.toJSONSchema(switchWorkingDirectoryTool.parameters);
+		expect(schema.properties).not.toHaveProperty("expectedWorktreeKey");
+		const input = {
+			expectedRevision: 0,
+			requestId: "request",
+			target: { deviceId: "local", cwd: "/new" },
+		};
+		expect(
+			switchWorkingDirectoryTool.parameters.parse({ ...input, expectedWorktreeKey: "wrong-key" }),
+		).toEqual(input);
+		expect(
+			switchWorkingDirectoryTool.parameters.safeParse({ ...input, expectedRevision: -1 }).success,
+		).toBe(false);
+	});
+	test("tool ignores obsolete keys, reports actual success and preserves failures as errors", async () => {
+		const input = {
+			expectedRevision: 0,
+			requestId: "request",
+			target: { deviceId: "local", cwd: "/new" },
+			expectedWorktreeKey: "wrong-key",
+		};
+		const result = { changed: true, previous: initial, current: { ...initial, cwd: "/new" } };
+		const switchDirectory = mock(async () => result);
+		const ctx = { switchWorkingDirectory: switchDirectory } as unknown as Parameters<
+			typeof switchWorkingDirectoryTool.execute
+		>[1];
+		const success = await switchWorkingDirectoryTool.execute(input, ctx);
+		expect(success.isError).not.toBe(true);
+		expect(JSON.parse(success.output)).toEqual(result);
+		expect(switchDirectory).toHaveBeenCalledWith({
+			expectedRevision: 0,
+			requestId: "request",
+			target: input.target,
+		});
+		switchDirectory.mockRejectedValueOnce(new Error("Workspace revision changed"));
+		const failure = await switchWorkingDirectoryTool.execute(input, ctx);
+		expect(failure.isError).toBe(true);
+		expect(failure.output).toBe("Workspace revision changed");
+	});
+	test("SwitchDevice runs mid-stream as a strict barrier and leaves started background execution frozen", async () => {
 		scenario = "device-switch";
 		const conf = config(initial);
 		conf.availableDevices = [
@@ -189,7 +237,7 @@ describe("workspace switch pass barrier", () => {
 			},
 		];
 		conf.setDefaultDevice = async () => {
-			expect(streaming).toBe(false);
+			switchedWhileStreaming = streaming;
 			current = {
 				...initial,
 				deviceId: "remote",
@@ -202,6 +250,7 @@ describe("workspace switch pass barrier", () => {
 			return true;
 		};
 		const events = await run(conf);
+		expect(switchedWhileStreaming).toBe(true);
 		expect(
 			events.filter((event) => event.type === "tool_result" && event.toolName === "SwitchDevice"),
 		).toMatchObject([{ isError: false }]);
@@ -210,7 +259,7 @@ describe("workspace switch pass barrier", () => {
 		expect(writes).toEqual([]);
 		expect(
 			events.filter((event) => event.type === "tool_result" && event.toolName === "Write"),
-		).toMatchObject([{ isError: true, metadata: { skippedForSoftStop: true } }]);
+		).toMatchObject([{ isError: true, metadata: { skippedForPassEnd: true } }]);
 		invalidated = false;
 		scenario = "write";
 		const next = config(current);
@@ -247,8 +296,9 @@ describe("workspace switch pass barrier", () => {
 		expect(backgroundResult?.()).toEqual({ cwd: "/old", targetCwd: "/old" });
 		expect(writes).toEqual([]);
 	});
-	test("Switch→Write in one response never eagerly writes or mixes cwd", async () => {
+	test("Switch→Write in one response switches mid-stream and never writes or mixes cwd", async () => {
 		const events = await run(config(initial));
+		expect(switchedWhileStreaming).toBe(true);
 		expect(
 			events.filter(
 				(event) =>
@@ -260,7 +310,7 @@ describe("workspace switch pass barrier", () => {
 		).toEqual([]);
 		expect(
 			events.filter((event) => event.type === "tool_result" && event.toolName === "Write"),
-		).toMatchObject([{ isError: true, metadata: { skippedForSoftStop: true } }]);
+		).toMatchObject([{ isError: true, metadata: { skippedForPassEnd: true } }]);
 		expect(current.revision).toBe(1);
 		expect(writes).toEqual([]);
 		expect(

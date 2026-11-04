@@ -23,6 +23,7 @@ const {
 	interruptNarrator,
 } = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const time = "2026-10-05T00:00:00.000Z";
 const narratorId = "question-runtime";
 
@@ -37,13 +38,46 @@ async function captureAwaitRequests(
 	const { agentLoop } = await import("../../lib/agent/loop");
 	const { toolRegistry } = await import("../../lib/agent/tool-registry");
 	const { awaitTool } = await import("../../lib/agent/tools/await");
+	const { projectHistory } = await import("../../lib/agent/projection");
 	const requests: Array<{ history: unknown[]; content: string; toolResults: unknown[] }> = [];
 	const storedOutputs: string[] = [];
 	const adopted: string[][] = [];
 	let turn = 0;
 	const adapter = {
 		formatTools: (tools: unknown) => tools,
-		buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+		// The loop's own rows, through the real first projection stage, in a minimal wire shape.
+		buildHistory: async (rows: import("../../lib/agent/provider").DbMessage[]) => {
+			const { turns } = await projectHistory(rows, { strict: false });
+			return {
+				history: turns.map((turn) =>
+					turn.kind === "input"
+						? {
+								role: "user",
+								content: turn.items.map((item) => ({ type: "text", text: item.text })),
+							}
+						: turn.kind === "assistant"
+							? {
+									role: "assistant",
+									content: turn.items
+										.map((item) => (item.kind === "text" ? item.text : ""))
+										.join(""),
+									toolUses: turn.items.flatMap((item) =>
+										item.kind === "tool_call"
+											? [{ toolUseId: item.wireId, name: item.name, input: item.input }]
+											: [],
+									),
+								}
+							: {
+									role: "user",
+									content: turn.results.map((result) => ({
+										type: "tool_result",
+										tool_use_id: result.wireId,
+										content: result.text,
+									})),
+								},
+				),
+			};
+		},
 		injectSystemPrompt: () => {},
 		async *chat(params: import("../../lib/agent/provider").ChatParams) {
 			params.onRequestStart?.();
@@ -67,30 +101,12 @@ async function captureAwaitRequests(
 				};
 			else yield { text: "done" };
 		},
-		formatToolResult: (toolUseId: string, output: string) => ({
-			type: "tool_result",
-			tool_use_id: toolUseId,
-			content: output,
-		}),
-		pushUserTurn: (
-			history: unknown[],
-			content: string,
-			_model: string,
-			results: unknown[] = [],
-		) => {
-			history.push({
-				role: "user",
-				content: [...(content ? [{ type: "text", text: content }] : []), ...results],
-			});
-		},
-		pushAssistantTurn: (history: unknown[], text: string, uses: unknown[]) => {
-			history.push({ role: "assistant", content: text, toolUses: uses });
-		},
 		generate: async () => "",
 	} as unknown as import("../../lib/agent/provider").ProviderAdapter;
-	const unregister = registerExternalProviderResolver((name) =>
-		name === "questionruntime" ? adapter : null,
-	);
+	const unregister = registerExternalProviderResolver({
+		resolve: (name) => (name === "questionruntime" ? adapter : null),
+		listReadiness: () => [],
+	});
 	toolRegistry.register(awaitTool);
 	try {
 		for await (const event of agentLoop(
@@ -114,7 +130,7 @@ async function captureAwaitRequests(
 				},
 			},
 			currentText,
-			[],
+			{ rows: [] },
 		)) {
 			if (event.type === "tool_result") storedOutputs.push(event.output);
 			if (event.type === "error") throw new Error(event.message);
@@ -185,6 +201,8 @@ async function seedQuestion() {
 		.values({ id: "ref-ask", narratorId, messageId: "ask", seq: 1 })
 		.run();
 	db.update(narrators).set({ nextSeq: 1 }).where(eq(narrators.id, narratorId)).run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	await backgroundOccupancyStore.flush();
 	db.insert(narratorToolCalls)
 		.values({
 			id: "question-call",
@@ -216,8 +234,10 @@ async function seedQuestion() {
 	).record;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
 	db.insert(narrators)
 		.values({
 			id: narratorId,
@@ -227,9 +247,18 @@ beforeEach(() => {
 			updatedAt: time,
 		})
 		.run();
+	backgroundOccupancyStore.refreshNarrator(narratorId);
+	await backgroundOccupancyStore.flush();
 });
-afterEach(() => activeNarrators.delete(narratorId));
-afterAll(() => sqlite.close());
+afterEach(async () => {
+	activeNarrators.delete(narratorId);
+	backgroundOccupancyStore.setRuntimeLive(narratorId, false);
+	await backgroundOccupancyStore.flush();
+});
+afterAll(() => {
+	backgroundOccupancyStore.resetForTests();
+	sqlite.close();
+});
 
 describe("async question receipt runtime adoption", () => {
 	test("scheduling needs a persisted user event and never creates a queue-only answer", async () => {
@@ -256,10 +285,19 @@ describe("async question receipt runtime adoption", () => {
 		const first = await drainInjectionsIntoHistory(active(), "en");
 		expect(first.text).toContain(text);
 		expect(first.text).toContain('kind="human"');
+		expect(first.parts).toEqual([{ text: first.text, messageId: "answer" }]);
+		expect(first.parts.map((part) => part.text).join("\n\n")).toBe(first.text);
 		const second = await drainInjectionsIntoHistory(active(), "en");
 		expect(second.text).not.toContain(text);
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 		expect(db.select().from(narratorBufferedMessages).get()?.state).toBe("materialized");
+	});
+	test("pending questions are not re-sent at tool boundaries; the system prompt lists them", async () => {
+		await seedQuestion();
+		const projected = await drainInjectionsIntoHistory(active(), "en");
+		expect(projected.text).not.toContain("Pick a cache");
+		expect(projected.parts).toEqual([]);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 	});
 	test("answer received during final generation is materialized for a fresh history pass", async () => {
 		const text = persistAnswer();
@@ -327,6 +365,8 @@ describe("async question receipt runtime adoption", () => {
 	test("unlinking the original shared request withdraws it while a fork retains its background row", async () => {
 		const question = await seedQuestion();
 		db.insert(narrators).values({ id: "fork", createdAt: time, updatedAt: time }).run();
+		backgroundOccupancyStore.refreshNarrator("fork");
+		await backgroundOccupancyStore.flush();
 		db.insert(narratorMessageRefs)
 			.values({ id: "fork-ask", narratorId: "fork", messageId: "ask", seq: 1 })
 			.run();
@@ -343,6 +383,8 @@ describe("async question receipt runtime adoption", () => {
 	test("a fork deleting inherited background does not withdraw the original actor's live question", async () => {
 		const question = await seedQuestion();
 		db.insert(narrators).values({ id: "fork", createdAt: time, updatedAt: time }).run();
+		backgroundOccupancyStore.refreshNarrator("fork");
+		await backgroundOccupancyStore.flush();
 		db.insert(narratorMessageRefs)
 			.values({ id: "fork-ask", narratorId: "fork", messageId: "ask", seq: 1 })
 			.run();
@@ -378,6 +420,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const { awaitTool } = await import("../../lib/agent/tools/await");
 		const wait = awaitTool.execute(
 			{ type: "question", id: question.id, timeout: 2000 },
@@ -453,6 +496,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const { answerAsyncQuestion } = await import("../narrator-question-service");
 		const answer = await answerAsyncQuestion(question.id, {
 			answers: { choice: "UNIQUE_MODEL_ANSWER" },
@@ -464,13 +508,20 @@ describe("async question receipt runtime adoption", () => {
 			expect(JSON.stringify(request).split("UNIQUE_MODEL_ANSWER")).toHaveLength(2);
 			expect(JSON.stringify(request)).toContain('kind=\\"human\\"');
 		}
-		const secondResults = evidence.requests[1].toolResults as Array<{ tool_use_id: string }>;
-		expect(secondResults.map((result) => result.tool_use_id)).toEqual(["await-1-0", "await-1-1"]);
-		expect(
-			(evidence.requests[2].toolResults as Array<{ tool_use_id: string }>).map(
-				(result) => result.tool_use_id,
-			),
-		).toEqual(["await-2-0"]);
+		// The previous step's results are the request's last tool-result turn, in call order.
+		const lastResultIds = (request: { history: unknown[] }) =>
+			(request.history as Array<{ content: unknown }>)
+				.map((turn) =>
+					Array.isArray(turn.content)
+						? (turn.content as Array<{ type?: string; tool_use_id?: string }>)
+								.filter((part) => part.type === "tool_result")
+								.map((part) => part.tool_use_id)
+						: [],
+				)
+				.filter((ids) => ids.length > 0)
+				.at(-1);
+		expect(lastResultIds(evidence.requests[1])).toEqual(["await-1-0", "await-1-1"]);
+		expect(lastResultIds(evidence.requests[2])).toEqual(["await-2-0"]);
 		expect(evidence.storedOutputs[0]).toContain("UNIQUE_MODEL_ANSWER");
 		expect(evidence.storedOutputs[1]).toContain("UNIQUE_MODEL_ANSWER");
 		expect(evidence.adopted[0]).not.toContain(answer.record.answerMessageId);
@@ -485,6 +536,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const { answerAsyncQuestion } = await import("../narrator-question-service");
 		const answer = await answerAsyncQuestion(question.id, {
 			answers: { choice: "PREVIOUSLY_CONSUMED_ANSWER" },
@@ -504,8 +556,19 @@ describe("async question receipt runtime adoption", () => {
 			expect(JSON.stringify(request).split("PREVIOUSLY_CONSUMED_ANSWER")).toHaveLength(2);
 			expect(JSON.stringify(request)).toContain('kind=\\"human\\"');
 		}
+		// Tool results now ride in the history; none of them repeats the consumed receipt.
 		for (const request of evidence.requests.slice(1))
-			expect(JSON.stringify(request.toolResults)).not.toContain("PREVIOUSLY_CONSUMED_ANSWER");
+			expect(
+				JSON.stringify(
+					(request.history as Array<{ content: unknown }>).flatMap((turn) =>
+						Array.isArray(turn.content)
+							? (turn.content as Array<{ type?: string }>).filter(
+									(part) => part.type === "tool_result",
+								)
+							: [],
+					),
+				),
+			).not.toContain("PREVIOUSLY_CONSUMED_ANSWER");
 		expect(
 			evidence.adopted.every((ids) => ids.includes(answer.record.answerMessageId as string)),
 		).toBe(true);
@@ -518,6 +581,7 @@ describe("async question receipt runtime adoption", () => {
 			abortController: new AbortController(),
 		} as ActiveNarrator;
 		activeNarrators.set(narratorId, running);
+		backgroundOccupancyStore.setRuntimeLive(narratorId, true);
 		const first = {
 			id: "event-sent",
 			text: '<sender kind="human" />\n{"answerMessageId":"event-sent","answer":"same answer"}',

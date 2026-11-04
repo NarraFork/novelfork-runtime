@@ -119,6 +119,8 @@ export interface DirEntry {
 
 /** Options for reading raw file bytes. */
 export interface ReadBytesOptions {
+	/** Byte offset; remote executors must negotiate fs.read.offset.v1. */
+	offset?: number;
 	/** Maximum number of bytes to return. Backend truncates beyond this. */
 	maxBytes?: number;
 	/**
@@ -133,10 +135,15 @@ export interface ReadBytesOptions {
 	timeoutMs?: number;
 }
 
-/** Result of reading raw file bytes. */
+/** Options for writing raw file bytes. */
 export interface WriteBytesOptions {
-	/** Canonical create/existing path authorized before the write. */
+	/** Create only a new leaf via a bound parent directory; never follow a replaced parent. */
+	exclusive?: boolean;
+	/** Canonical create/existing path authorized before the write. Required for exclusive writes. */
 	expectedResolvedPath?: string;
+	/** Exclusive creates enforce a single bounded deadline, including parent binding. */
+	signal?: AbortSignal;
+	timeoutMs?: number;
 }
 
 export interface ConditionalWriteBytesOptions {
@@ -301,8 +308,18 @@ export interface ExecutionBackend {
 	/** Feature-negotiated structured remote Git; absent on local/legacy backends. */
 	readonly supportsGitWorkspace?: boolean;
 	readonly supportsGitWorkspaceWatch?: boolean;
+	/** Status-only bounded scan. Legacy executors may still compute costly numstat. */
+	readonly supportsGitWorkspaceStatus?: boolean;
+	/** Independent bounded line-statistics read; never use status as a fallback. */
+	readonly supportsGitLineStats?: boolean;
 	/** Executor advertises the read-only commit preview operations. */
 	readonly supportsGitCommitPreview?: boolean;
+	/** Executor advertises the read-only branch listing. */
+	readonly supportsGitBranches?: boolean;
+	/** Executor advertises the `checkout` write operation. */
+	readonly supportsGitBranchSwitch?: boolean;
+	/** Executor advertises the `push`/`fetch` write operations. */
+	readonly supportsGitRemoteSync?: boolean;
 	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";
@@ -342,6 +359,11 @@ export interface ExecutionBackend {
 	/** Remove one file. Must be idempotent for a missing path and must not remove directories. */
 	removeFile(path: string): Promise<void>;
 	mkdirp(path: string): Promise<void>;
+	/** Atomically create only the final directory. False means EEXIST, never success. */
+	mkdirExclusive?(
+		path: string,
+		opts: FileMetadataOptions & { expectedResolvedPath: string },
+	): Promise<boolean>;
 	listDir(path: string): Promise<DirEntry[]>;
 	fileExists(path: string): Promise<boolean>;
 

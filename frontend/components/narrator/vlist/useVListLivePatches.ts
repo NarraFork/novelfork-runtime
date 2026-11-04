@@ -307,6 +307,7 @@ export function useVListLivePatches(
 				enqueue(
 					toolStartedPatch({
 						toolUseId,
+						...(meta?.blockId ? { blockId: meta.blockId } : {}),
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input ? { input } : {}),
@@ -360,6 +361,7 @@ export function useVListLivePatches(
 					toolUseId,
 					toolCompletedPatch({
 						toolUseId,
+						...(meta?.blockId ? { blockId: meta.blockId } : {}),
 						status,
 						output,
 						...(durationMs != null ? { durationMs } : {}),
@@ -396,9 +398,9 @@ export function useVListLivePatches(
 				// The patch walks loaded children too; parent pages must receive child receipts.
 				enqueue(sendDeliveryResolvedPatch({ toolUseId, targets, toolCallBinding, targetCount }));
 			},
-			onAwaitAgentResolved: (toolUseId, subagentNarratorId) => {
+			onAwaitAgentResolved: (toolUseId, subagentNarratorId, _parentToolUseId, subagentTitle) => {
 				if (!toolUseId || !subagentNarratorId) return;
-				enqueue(awaitAgentResolvedPatch({ toolUseId, subagentNarratorId }));
+				enqueue(awaitAgentResolvedPatch({ toolUseId, subagentNarratorId, subagentTitle }));
 			},
 
 			// The user took over a subagent, so this card's call is now blocked on a

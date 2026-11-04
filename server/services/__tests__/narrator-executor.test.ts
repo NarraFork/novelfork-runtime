@@ -27,9 +27,17 @@ describe("executeAgentLoop file-reference context", () => {
 		for (const cwd of ["/first/pass", "/second/pass"]) {
 			const config = { ...makeConfig(new AbortController().signal), cwd };
 			await executeAgentLoop(
-				{ config, userText: "", history: [], eventContext },
+				{ config, userText: "", history: { rows: [] }, eventContext },
 				{
-					eventSource: makeEventSource([{ type: "stream_text", text: "src/a.ts" }]),
+					eventSource: makeEventSource([
+						{
+							type: "stream_text",
+							blockRevision: 1,
+							blockTextOffset: 0,
+							blockId: "text-4",
+							text: "src/a.ts",
+						},
+					]),
 					processEventFn: async (_event, ctx) => {
 						expect(ctx.getFileReferenceContext?.()).toEqual({ deviceId: "local", cwd });
 						return null;
@@ -41,6 +49,28 @@ describe("executeAgentLoop file-reference context", () => {
 });
 
 describe("executeAgentLoop result handling", () => {
+	test("reasoning-only idle is a quiet natural stop without an assistant turn", async () => {
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(new AbortController().signal),
+				userText: "",
+				history: { rows: [] },
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{ type: "stream_reset" },
+					{ type: "done", reason: "reasoning_only_idle" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+		expect(result.hasError).toBe(false);
+		expect(result.reasoningOnlyIdle).toBe(true);
+		expect(result.completedNaturally).toBe(true);
+		expect(result.completedAssistantTurn).toBe(false);
+	});
+
 	test("handles an empty assistant turn", async () => {
 		const ac = new AbortController();
 
@@ -48,7 +78,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -71,7 +101,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -98,7 +128,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -120,7 +150,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -145,7 +175,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -174,7 +204,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -184,7 +214,13 @@ describe("executeAgentLoop result handling", () => {
 					{
 						type: "resumable_error",
 						message: "upstream stream error",
-						diagnostics: { schema: "narrafork.error-diagnostics.v1", resumable: true },
+						diagnostics: {
+							schema: "narrafork.error-diagnostics.v1",
+							resumable: true,
+							recordingRequestId: "interrupted-attempt",
+							apiRequestId: "interrupted-row",
+							requestId: "upstream-interrupted",
+						},
 					},
 				]),
 				processEventFn: async () => null,
@@ -193,6 +229,12 @@ describe("executeAgentLoop result handling", () => {
 
 		expect(result.interrupted).toBe(true);
 		expect(result.interruptedReason).toBe("resumable_error");
+		expect(result.interruptionError).toBe("upstream stream error");
+		expect(result.interruptionDiagnostics).toMatchObject({
+			recordingRequestId: "interrupted-attempt",
+			apiRequestId: "interrupted-row",
+			requestId: "upstream-interrupted",
+		});
 		expect(result.hasError).toBe(false);
 		expect(result.shouldReplayInterruptedToolResultTurn).toBe(false);
 	});
@@ -204,7 +246,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -232,7 +274,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -256,7 +298,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -283,7 +325,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -303,7 +345,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -326,7 +368,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -359,7 +401,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -389,7 +431,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -416,7 +458,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -444,7 +486,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -471,7 +513,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -509,7 +551,7 @@ describe("executeAgentLoop result handling", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 				hooks: {
 					onErrorCleanup: async (message) => {
@@ -541,7 +583,7 @@ describe("executeAgentLoop result handling", () => {
 				{
 					config: makeConfig(ac.signal),
 					userText: "",
-					history: [],
+					history: { rows: [] },
 					eventContext: {} as EventHandlerContext,
 				},
 				{
@@ -572,7 +614,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -599,7 +641,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 				hooks: {
 					onErrorCleanup: async (message) => {
@@ -643,7 +685,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{
@@ -680,7 +722,7 @@ describe("executeAgentLoop abort draining", () => {
 			{
 				config: makeConfig(ac.signal),
 				userText: "",
-				history: [],
+				history: { rows: [] },
 				eventContext: {} as EventHandlerContext,
 			},
 			{

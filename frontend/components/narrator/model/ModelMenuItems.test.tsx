@@ -109,6 +109,7 @@ async function render(
 		summaryModelValue?: string | null;
 		canFollowParent?: boolean;
 		inheritance?: SubagentModelInheritance | null;
+		extraProps?: Partial<Parameters<typeof ModelMenuItems>[0]>;
 	},
 ) {
 	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
@@ -136,6 +137,7 @@ async function render(
 									}}
 									defaultModelValue={options?.defaultModelValue}
 									summaryModelValue={options?.summaryModelValue}
+									{...options?.extraProps}
 									{...(withGlobalRoleActions
 										? {
 												onSetAsDefaultModel: (value: string) => setAsDefault.push(value),
@@ -203,9 +205,13 @@ describe("follow parent selection", () => {
 			},
 		});
 		const follow = button(label);
-		expect(follow.disabled).toBe(true);
+		// Current state renders as a selected row (checkmark + bold), not a disabled one.
+		expect(follow.disabled).toBe(false);
 		expect(follow.querySelector('[role="button"]')).toBeNull();
 		expect(host.textContent).not.toContain(FOLLOW_PARENT_MODEL);
+		// Clicking the already-current follow row is a no-op; concrete selection still works.
+		await act(async () => follow.click());
+		expect(selected).toEqual([]);
 		await act(async () => button("One").click());
 		expect(selected).toEqual(["a:one"]);
 	});
@@ -229,7 +235,7 @@ describe("follow parent selection", () => {
 		expect(host.textContent).toContain("Follow parent");
 		expect(host.textContent).toContain("One");
 		const follow = button("aOne");
-		expect(follow.disabled).toBe(true);
+		expect(follow.disabled).toBe(false);
 		expect(host.textContent).not.toContain(narratorLocale["inheritance.fallbackReason"]);
 	});
 
@@ -260,21 +266,93 @@ describe("follow parent selection", () => {
 });
 
 describe("catalog details access", () => {
-	test("metadata details work without billing prices and resolve follow-default to the actual model", async () => {
+	test("details live in the three-dot menu and resolve follow-default to the actual model", async () => {
 		const details: ModelOption[] = [];
 		await render("a:one", models, true, true, {
 			defaultModelValue: "a:two:opaque",
 			onShowPrice: (model) => details.push(model),
 		});
-		const controls = [
-			...host.querySelectorAll<HTMLElement>('[aria-label="Model metadata and prices"]'),
-		];
-		expect(controls).toHaveLength(3);
-		await act(async () => {
-			for (const control of controls) control.click();
-		});
+		expect(host.querySelector('[aria-label="Model metadata and prices"]')).toBeNull();
+		// Follow-default and the two concrete models; aggregations have no details.
+		const toggleCount = host.querySelectorAll("[aria-label='Model actions']").length;
+		expect(toggleCount).toBe(3);
+		for (let index = 0; index < toggleCount; index++) {
+			const toggle = host.querySelectorAll("[aria-label='Model actions']")[index];
+			await act(async () => {
+				toggle?.dispatchEvent(new window.Event("click", { bubbles: true }));
+			});
+			const item = buttons().find((entry) => entry.textContent === settingsLocale.catalog.details);
+			if (!item) throw new Error("Missing details action");
+			await act(async () => item.dispatchEvent(new window.Event("click", { bubbles: true })));
+		}
 		expect(details.map((model) => model.value)).toEqual(["a:two:opaque", "a:one", "a:two"]);
 		expect(selected).toEqual([]);
+	});
+});
+
+describe("provider group header", () => {
+	test("shows bars, balance, refresh and settings for provider groups only", async () => {
+		let refreshes = 0;
+		const opened: string[] = [];
+		await render("a:one", models, true, true, {
+			extraProps: {
+				providerBalances: { a: { text: "$12.50", tooltip: "Wallet: 12.5 USD" } },
+				providerActions: {
+					a: {
+						onRefresh: () => {
+							refreshes++;
+						},
+					},
+				},
+				onOpenProviderSettings: (prefix) => opened.push(prefix),
+			},
+		});
+		expect(host.querySelector("[data-provider-balance='a']")?.textContent).toBe("$12.50");
+		const refresh = host.querySelectorAll(`[aria-label='${narratorLocale.refreshProviderModels}']`);
+		const settings = host.querySelectorAll(`[aria-label='${narratorLocale.openProviderSettings}']`);
+		// Default and aggregation groups are not providers.
+		expect(refresh).toHaveLength(1);
+		expect(settings).toHaveLength(1);
+		await act(async () => {
+			refresh[0]?.dispatchEvent(new window.Event("click", { bubbles: true }));
+			settings[0]?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		expect(refreshes).toBe(1);
+		expect(opened).toEqual(["a"]);
+		expect(selected).toEqual([]);
+	});
+});
+
+describe("group ordering", () => {
+	test("pins default, summary, and aggregations, then sorts providers by label", async () => {
+		// zh-CN titles put 聚合 after every Latin provider label under the default
+		// collation, so this header position only holds when the group is pinned.
+		// Insertion order is scrambled and is neither prefix order nor label order.
+		await instance.changeLanguage("zh-CN");
+		const scrambled: ModelOption[] = [
+			{ value: "zeta:z1", label: "Z1", provider: "zeta" },
+			{ value: "__agg__:group", label: "Group", provider: "__agg__" },
+			{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
+			{ value: "codex:gpt", label: "gpt", provider: "codex" },
+			{ value: "__default__", label: "Follow default", provider: "__default__" },
+			{ value: "a:one", label: "One", provider: "a" },
+		];
+		await render("a:one", scrambled, true, true, {
+			extraProps: {
+				providerLabels: { a: "Provider A", codex: "Codex", zeta: "Zeta Gateway" },
+			},
+		});
+		const headers = Array.from(host.querySelectorAll(".mantine-Menu-label")).map(
+			(header) => header.textContent?.trim() ?? "",
+		);
+		expect(headers).toEqual([
+			narratorZhLocale.modelGroupDefault,
+			narratorZhLocale.modelGroupSummary,
+			narratorZhLocale.modelGroupAggregations,
+			"Codex",
+			"Provider A",
+			"Zeta Gateway",
+		]);
 	});
 });
 

@@ -1,3 +1,10 @@
+import {
+	GIT_BRANCH_NAME_MAX,
+	GIT_START_POINT_MAX,
+	isValidGitBranchName,
+	isValidGitRemoteName,
+	isValidGitStartPoint,
+} from "@shared/git-branches";
 import { GIT_COMMIT_SHA_PATTERN } from "@shared/git-commit-preview";
 import { z } from "zod";
 
@@ -91,10 +98,65 @@ export const gitCommitDiffQuerySchema = z.object({
 	oldPath: z.string().min(1).max(4096).optional(),
 });
 
+// === branch management ===
+
+/**
+ * A branch NAME, not a revision.
+ *
+ * Deliberately not `gitRef`: that pattern models revision syntax and therefore
+ * allows `~`, `^` and `@{}` (all illegal in a branch name), while it rejects legal
+ * non-ASCII names and `+`. It is also not `common.ts`'s `gitBranchName`, which is
+ * ASCII-only for the same reason. The server still runs
+ * `git check-ref-format --branch` before creating a ref, so this is the stricter
+ * of the two checks by construction.
+ */
+export const gitBranchNameSchema = z
+	.string()
+	.min(1)
+	.max(GIT_BRANCH_NAME_MAX)
+	.refine(isValidGitBranchName, "Invalid Git branch name");
+
+/** A remote name: no leading dash, no whitespace/control/ref punctuation. */
+export const gitRemoteNameSchema = z
+	.string()
+	.min(1)
+	.max(100)
+	.refine(isValidGitRemoteName, "Invalid Git remote");
+
+/**
+ * A checkout start point is a branch name or a revision.
+ *
+ * `gitRef` alone rejects `+` and non-ASCII, which are legal in `origin/功能` and
+ * `origin/feature+x` — the values the picker sends when it tracks a remote branch.
+ * Revisions such as `HEAD~2` stay accepted.
+ */
+export const gitStartPointSchema = z
+	.string()
+	.min(1)
+	.max(GIT_START_POINT_MAX)
+	.refine(isValidGitStartPoint, "Invalid Git start point");
+
+export const gitCheckoutSchema = z.object({
+	branch: gitBranchNameSchema,
+	create: z.boolean().optional(),
+	/** With `create`: the revision the new branch starts from (rev syntax allowed). */
+	startPoint: gitStartPointSchema.optional(),
+});
+
+export const gitPushSchema = z.object({
+	remote: gitRemoteNameSchema.optional(),
+	setUpstream: z.boolean().optional(),
+});
+
+export const gitFetchSchema = z.object({
+	remote: gitRemoteNameSchema.optional(),
+	prune: z.boolean().optional(),
+});
+
 // === modification view ===
 
 /**
- * Query for `GET /:chapterId/git/modifications`.
+ * Query for `GET /api/narrators/:narratorId/git/modifications`.
  *
  * Validated rather than forwarded raw because the failure mode is silent. `since`/`until`
  * are compared as STRINGS against `file_attributions.changed_at` (SQLite has no date type),
@@ -107,24 +169,36 @@ export const gitCommitDiffQuerySchema = z.object({
  * client-local offset, which the comparison handles because boundaries are normalized to
  * UTC before they reach it.
  */
-export const gitModificationsQuerySchema = z.object({
-	limit: z.coerce.number().int().min(1).max(2000).optional(),
-	since: z.iso.datetime({ offset: true }).optional(),
-	until: z.iso.datetime({ offset: true }).optional(),
-	/**
-	 * A narrator id, or the literal `"external"` selecting changes with no narrator at all.
-	 * Length-bounded rather than pattern-matched: ids are nanoid, whose alphabet includes
-	 * `-` and `_`, and short ids (8 chars) are as valid as the 21-char default.
-	 */
-	narratorId: z.union([z.literal("external"), z.string().trim().min(1).max(64)]).optional(),
-	scope: z.literal("uncommitted").optional(),
-	/**
-	 * Which projections to build. `byFile` omits the full timeline but includes a bounded
-	 * per-file event summary for the Git status hover card. Absent means "everything", so
-	 * an older client is unaffected.
-	 */
-	projection: z.enum(["all", "byFile"]).optional(),
-});
+export const gitModificationsQuerySchema = z
+	.object({
+		limit: z.coerce.number().int().min(1).max(2000).optional(),
+		since: z.iso.datetime({ offset: true }).optional(),
+		until: z.iso.datetime({ offset: true }).optional(),
+		/**
+		 * A narrator id, or the literal `"external"` selecting changes with no narrator at all.
+		 * Length-bounded rather than pattern-matched: ids are nanoid, whose alphabet includes
+		 * `-` and `_`, and short ids (8 chars) are as valid as the 21-char default.
+		 */
+		narratorId: z.union([z.literal("external"), z.string().trim().min(1).max(64)]).optional(),
+		scope: z.literal("uncommitted").optional(),
+		/**
+		 * Which projections to build. `byFile` omits the full timeline but includes a bounded
+		 * per-file event summary for the Git status hover card. Absent means "everything", so
+		 * an older client is unaffected.
+		 */
+		projection: z.enum(["all", "byFile"]).optional(),
+		/**
+		 * One Git-root-relative path for the hover card. It only selects an entry of the
+		 * server's own status; rename sources and cwd scopes are never accepted from clients.
+		 */
+		filePath: z.string().min(1).max(4096).optional(),
+	})
+	.refine(
+		(query) =>
+			query.filePath === undefined ||
+			(query.scope === "uncommitted" && query.projection === "byFile"),
+		{ message: "filePath requires scope=uncommitted and projection=byFile", path: ["filePath"] },
+	);
 
 // === commits list ===
 

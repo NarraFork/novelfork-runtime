@@ -10,6 +10,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../../lib/z-index";
+import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
 
 export interface CommandParam {
 	name: string;
@@ -93,6 +94,7 @@ export function CommandPopover({
 	visible,
 	onSelect,
 	onClose,
+	anchorRef,
 }: CommandPopoverProps) {
 	const { t } = useTranslation("narrator");
 	const computedScheme = useComputedColorScheme("dark");
@@ -141,6 +143,12 @@ export function CommandPopover({
 	const handleKeyDown = useCallback(
 		(e: KeyboardEvent) => {
 			if (!visible || visibleCommands.length === 0) return;
+			const anchor = anchorRef?.current;
+			if (
+				anchorRef &&
+				(!anchor || !e.target || !(e.target as Node).nodeType || !anchor.contains(e.target as Node))
+			)
+				return;
 
 			// The listener is capture-phase, so it sees the keystroke before the IME
 			// candidate list does. While a CJK query is being composed, Enter/Tab pick
@@ -177,15 +185,19 @@ export function CommandPopover({
 				onSelect(visibleCommands[selectedIndex]);
 			}
 		},
-		[visible, visibleCommands, selectedIndex, onSelect, onClose, query],
+		[visible, visibleCommands, selectedIndex, onSelect, onClose, query, anchorRef],
 	);
 
 	useEffect(() => {
 		if (visible) {
-			document.addEventListener("keydown", handleKeyDown, true);
-			return () => document.removeEventListener("keydown", handleKeyDown, true);
+			const doc = anchorRef?.current?.ownerDocument ?? document;
+			doc.addEventListener("keydown", handleKeyDown, true);
+			return () => doc.removeEventListener("keydown", handleKeyDown, true);
 		}
-	}, [visible, handleKeyDown]);
+	}, [visible, handleKeyDown, anchorRef]);
+
+	// List cap (240) plus the gap to the composer.
+	const popoverSide = useComposerPopoverSide(anchorRef, visible, 248);
 
 	if (!visible || visibleCommands.length === 0) return null;
 
@@ -196,10 +208,9 @@ export function CommandPopover({
 			withBorder
 			style={{
 				position: "absolute",
-				bottom: "100%",
+				...composerPopoverOffset(popoverSide),
 				left: 0,
 				right: 0,
-				marginBottom: 4,
 				maxHeight: 240,
 				overflow: "auto",
 				zIndex: Z.dropdown,
@@ -210,6 +221,8 @@ export function CommandPopover({
 				<UnstyledButton
 					key={`${cmd.type}-${cmd.name}`}
 					data-command-item
+					onPointerDown={(event) => event.preventDefault()}
+					onMouseDown={(event) => event.preventDefault()}
 					onClick={() => onSelect(cmd)}
 					onMouseEnter={() => setSelectedIndex(i)}
 					style={{

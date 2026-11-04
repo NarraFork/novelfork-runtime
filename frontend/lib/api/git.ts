@@ -1,8 +1,11 @@
+import type { GitBranches } from "@shared/git-branches";
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
+import type { GitLineStats } from "@shared/git-line-stats";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type {
 	WorktreeCreateRequest,
 	WorktreeCreateResult,
+	WorktreeListQuery,
 	WorktreeListResult,
 	WorktreePrepareRequest,
 	WorktreePrepareResult,
@@ -11,6 +14,7 @@ import type {
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
+export type { GitBranchEntry, GitBranches } from "@shared/git-branches";
 export type { GitWorkspace } from "@shared/git-workspace";
 
 /** A single `git log` row. `parents` comes from git `%P` (full parent SHAs; root = []). */
@@ -24,47 +28,38 @@ export interface GitLogEntry {
 	parents?: string[];
 }
 
-/** Strings remain the legacy chapter adapter; new callers carry a resolved workspace. */
-export type GitTarget =
-	| string
-	| {
-			narratorId: string;
-			workspaceKey: string;
-			repositoryKey?: string | null;
-			canWrite: boolean;
-			rootPath?: string | null;
-			chapterId?: string | null;
-	  };
+/** A narrator's resolved Git workspace. */
+export type GitTarget = {
+	narratorId: string;
+	workspaceKey: string;
+	repositoryKey?: string | null;
+	canWrite: boolean;
+	rootPath?: string | null;
+};
 
 export function gitTargetKey(target: GitTarget | null | undefined): string | undefined {
-	return typeof target === "string" ? target : target?.workspaceKey;
+	return target?.workspaceKey;
 }
 
 export function gitCanWrite(target: GitTarget): boolean {
-	return typeof target === "string" || target.canWrite;
+	return target.canWrite;
 }
 
 export function gitBasePath(target: GitTarget): string {
-	return typeof target === "string"
-		? `/chapters/${encodeURIComponent(target)}/git`
-		: `/narrators/${encodeURIComponent(target.narratorId)}/git`;
+	return `/narrators/${encodeURIComponent(target.narratorId)}/git`;
 }
 
 /** Pin reads too, so a late response cannot cache the new root under an old identity. */
 function gitReadPath(target: GitTarget, suffix: string): string {
 	const path = `${gitBasePath(target)}${suffix}`;
-	return typeof target === "string"
-		? path
-		: `${path}${suffix.includes("?") ? "&" : "?"}workspaceKey=${encodeURIComponent(target.workspaceKey)}`;
+	return `${path}${suffix.includes("?") ? "&" : "?"}workspaceKey=${encodeURIComponent(target.workspaceKey)}`;
 }
 
 function writeBody(target: GitTarget, body: object = {}): string {
-	if (typeof target !== "string" && (!target.workspaceKey || !target.canWrite)) {
+	if (!target.workspaceKey || !target.canWrite) {
 		throw new Error("Git workspace is read-only or unavailable");
 	}
-	return JSON.stringify(
-		typeof target === "string" ? body : { ...body, workspaceKey: target.workspaceKey },
-	);
+	return JSON.stringify({ ...body, workspaceKey: target.workspaceKey });
 }
 
 /** HTTP ceiling includes workspace probing plus the server's bounded Git/AI operation. */
@@ -77,11 +72,21 @@ function gitRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 // Reads are cancellable by React Query; writes are never retried automatically.
 export const gitApi = {
-	listNarratorWorktrees: (id: string, workspaceKey: string, signal?: AbortSignal) =>
-		gitRequest<WorktreeListResult>(
-			`/narrators/${encodeURIComponent(id)}/git/worktrees?workspaceKey=${encodeURIComponent(workspaceKey)}`,
+	listNarratorWorktrees: (
+		id: string,
+		workspaceKey: string,
+		signal?: AbortSignal,
+		query: WorktreeListQuery = {},
+	) => {
+		const params = new URLSearchParams({ workspaceKey });
+		for (const [key, value] of Object.entries(query)) {
+			if (value !== undefined) params.set(key, String(value));
+		}
+		return gitRequest<WorktreeListResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees?${params}`,
 			{ signal },
-		),
+		);
+	},
 	prepareNarratorWorktree: (id: string, input: WorktreePrepareRequest) =>
 		gitRequest<WorktreePrepareResult>(
 			`/narrators/${encodeURIComponent(id)}/git/worktrees/prepare`,
@@ -102,8 +107,15 @@ export const gitApi = {
 		gitRequest<GitWorkspace>(`/narrators/${encodeURIComponent(narratorId)}/git/workspace`, {
 			signal,
 		}),
-	getGitStatus: (target: GitTarget, signal?: AbortSignal) =>
-		gitRequest<ApiEntity>(gitReadPath(target, "/status"), { signal }),
+	getGitStatus: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
+		gitRequest<ApiEntity>(gitReadPath(target, fresh ? "/status?fresh=1" : "/status"), { signal }),
+	/** Full branch listing: local, remote-tracking, upstream tracking and worktrees. */
+	getGitBranches: (target: GitTarget, signal?: AbortSignal) =>
+		gitRequest<GitBranches>(gitReadPath(target, "/branches"), { signal }),
+	getGitLineStats: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
+		gitRequest<GitLineStats>(gitReadPath(target, fresh ? "/line-stats?fresh=1" : "/line-stats"), {
+			signal,
+		}),
 	getGitModifications: (
 		target: GitTarget,
 		opts?: {
@@ -111,6 +123,8 @@ export const gitApi = {
 			limit?: number;
 			cursor?: { changedAt: string; rowId: string };
 			projection?: "byFile" | "all";
+			/** Git-root-relative; the server accepts it only with uncommitted + byFile. */
+			filePath?: string;
 		},
 		signal?: AbortSignal,
 	) => {
@@ -118,6 +132,7 @@ export const gitApi = {
 		if (opts?.scope) params.set("scope", opts.scope);
 		if (opts?.limit) params.set("limit", String(opts.limit));
 		if (opts?.projection) params.set("projection", opts.projection);
+		if (opts?.filePath !== undefined) params.set("filePath", opts.filePath);
 		if (opts?.cursor) {
 			params.set("cursorAt", opts.cursor.changedAt);
 			params.set("cursorRowId", opts.cursor.rowId);
@@ -188,5 +203,25 @@ export const gitApi = {
 		gitRequest<{ message: string }>(`${gitBasePath(target)}/ai-commit-message`, {
 			method: "POST",
 			body: writeBody(target),
+		}),
+	/** Switch, create (`create` + `startPoint`), or track a remote branch by name. */
+	gitCheckoutBranch: (
+		target: GitTarget,
+		body: { branch: string; create?: boolean; startPoint?: string },
+	) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/checkout`, {
+			method: "POST",
+			body: writeBody(target, body),
+		}),
+	/** Never force-pushes: a rejected non-fast-forward comes back as git's own text. */
+	gitPushBranch: (target: GitTarget, body: { remote?: string; setUpstream?: boolean } = {}) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/push`, {
+			method: "POST",
+			body: writeBody(target, body),
+		}),
+	gitFetchRemote: (target: GitTarget, body: { remote?: string; prune?: boolean } = {}) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/fetch`, {
+			method: "POST",
+			body: writeBody(target, body),
 		}),
 };

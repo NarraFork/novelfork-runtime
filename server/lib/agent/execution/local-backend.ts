@@ -47,6 +47,11 @@ import type {
 	WriteBytesOptions,
 } from "./backend";
 import { LOCAL_DEVICE_ID } from "./backend";
+import {
+	exclusiveCreateOptions,
+	exclusiveLocalIo,
+	validateExclusiveCreateInput,
+} from "./exclusive-create";
 import { localPathSemantics } from "./path-semantics";
 
 // Inline source works in both development and compiled Bun binaries without a filesystem worker.
@@ -238,6 +243,7 @@ async function readOpenedFileWithLimit(
 	file: FileHandle,
 	maxBytes: number | undefined,
 	signal?: AbortSignal,
+	startOffset = 0,
 ): Promise<{ bytes: Uint8Array; probeTruncated: boolean }> {
 	if (maxBytes !== undefined) {
 		// Keep one probe byte beyond the caller-visible cap. This detects growth and
@@ -247,7 +253,7 @@ async function readOpenedFileWithLimit(
 		while (offset < buffer.byteLength) {
 			throwIfReadAborted(signal);
 			const length = Math.min(FILE_READ_CHUNK_BYTES, buffer.byteLength - offset);
-			const { bytesRead } = await file.read(buffer, offset, length, offset);
+			const { bytesRead } = await file.read(buffer, offset, length, startOffset + offset);
 			if (bytesRead === 0) break;
 			offset += bytesRead;
 		}
@@ -262,7 +268,7 @@ async function readOpenedFileWithLimit(
 	while (true) {
 		throwIfReadAborted(signal);
 		const chunk = new Uint8Array(FILE_READ_CHUNK_BYTES);
-		const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, total);
+		const { bytesRead } = await file.read(chunk, 0, chunk.byteLength, startOffset + total);
 		if (bytesRead === 0) break;
 		chunks.push(bytesRead === chunk.byteLength ? chunk : chunk.subarray(0, bytesRead));
 		total += bytesRead;
@@ -422,6 +428,13 @@ export class LocalBackend implements ExecutionBackend {
 	async readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult> {
 		throwIfReadAborted(opts?.signal);
 		const maxBytes = normalizeMaxBytes(opts?.maxBytes);
+		const offset = opts?.offset ?? 0;
+		if (
+			!Number.isSafeInteger(offset) ||
+			offset < 0 ||
+			(opts?.offset !== undefined && maxBytes === undefined)
+		)
+			throw new RangeError("Positional reads require a nonnegative safe offset and maxBytes");
 		const resolvedPath = await resolveCanonicalPath(path);
 		const expectedResolvedPath = opts?.expectedResolvedPath ?? resolvedPath;
 		if (!pathsEqualForOS(resolvedPath, expectedResolvedPath, process.platform)) {
@@ -436,14 +449,14 @@ export class LocalBackend implements ExecutionBackend {
 		const file = await open(resolvedPath, flags);
 		try {
 			const openedStat = await verifyOpenedFileIdentity(file, path, expectedResolvedPath);
-			const read = await readOpenedFileWithLimit(file, maxBytes, opts?.signal);
+			const read = await readOpenedFileWithLimit(file, maxBytes, opts?.signal, offset);
 			// Revalidate after the read so a final-entry or parent-directory swap that
 			// happened while bytes were in flight cannot be returned to the caller.
 			const finalStat = await verifyOpenedFileIdentity(file, path, expectedResolvedPath);
 			const totalSize = Math.max(openedStat.size, finalStat.size, read.bytes.byteLength);
 			return {
 				bytes: read.bytes,
-				truncated: read.probeTruncated || (maxBytes !== undefined && totalSize > maxBytes),
+				truncated: read.probeTruncated || (maxBytes !== undefined && totalSize > offset + maxBytes),
 				totalSize,
 				resolvedPath: expectedResolvedPath,
 			};
@@ -453,9 +466,20 @@ export class LocalBackend implements ExecutionBackend {
 	}
 
 	async writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void> {
-		// Legacy tools also need a last-mile budget before Bun.write can truncate a target.
-		await guardDiskWrite(opts?.expectedResolvedPath ?? path, bytes.byteLength);
 		const expectedResolvedPath = opts?.expectedResolvedPath;
+		if (opts?.exclusive) {
+			validateExclusiveCreateInput(path, bytes);
+			validateExclusiveCreateInput(expectedResolvedPath);
+			const budget = exclusiveCreateOptions(opts);
+			const identity = await this.resolvePathIdentity(path, budget);
+			if (!this.paths.equals(identity.canonicalPath, expectedResolvedPath))
+				throw new Error("File canonical identity changed before exclusive creation");
+			await guardDiskWrite(expectedResolvedPath, bytes.byteLength);
+			await exclusiveLocalIo.write(expectedResolvedPath, bytes, budget.signal);
+			return;
+		}
+		// Preserve ordinary Write semantics; only exclusive creates use the stricter primitive.
+		await guardDiskWrite(expectedResolvedPath ?? path, bytes.byteLength);
 		if (!expectedResolvedPath) {
 			await Bun.write(path, bytes);
 			return;
@@ -484,6 +508,19 @@ export class LocalBackend implements ExecutionBackend {
 
 	async mkdirp(path: string): Promise<void> {
 		mkdirSync(path, { recursive: true });
+	}
+
+	async mkdirExclusive(
+		path: string,
+		opts: FileMetadataOptions & { expectedResolvedPath: string },
+	): Promise<boolean> {
+		validateExclusiveCreateInput(path);
+		validateExclusiveCreateInput(opts.expectedResolvedPath);
+		const budget = exclusiveCreateOptions(opts);
+		const identity = await this.resolvePathIdentity(path, budget);
+		if (!this.paths.equals(identity.canonicalPath, opts.expectedResolvedPath))
+			throw new Error("Directory canonical identity changed before exclusive creation");
+		return exclusiveLocalIo.mkdir(opts.expectedResolvedPath, budget.signal);
 	}
 
 	/**
@@ -579,7 +616,9 @@ export class LocalBackend implements ExecutionBackend {
 	}
 
 	async grep(params: GrepParams): Promise<GrepResult> {
-		const rgPath = await resolveRgPath();
+		params.signal?.throwIfAborted();
+		const rgPath = await resolveRgPath(params.signal);
+		params.signal?.throwIfAborted();
 		if (rgPath) {
 			const rgArgs = buildRipgrepArgv(rgPath, params);
 			return this.runSearchProcess(rgArgs, params, { usedFallback: false });
@@ -625,6 +664,7 @@ export class LocalBackend implements ExecutionBackend {
 			stdout: "pipe",
 			stderr: "pipe",
 			signal: params.signal,
+			windowsHide: true,
 		});
 
 		let timedOut = false;
@@ -682,11 +722,18 @@ export class LocalBackend implements ExecutionBackend {
 		if (params.env) env = { ...env, ...params.env };
 
 		let spawnArgs: [string, string[], object];
+		// windowsHide：Windows 上不隐藏会让每次 Bash 工具调用都弹出控制台窗口。
 		if (shellInfo.loginWrap) {
 			spawnArgs = [
 				shellInfo.path,
 				["--login", "-c", params.command],
-				{ cwd: params.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				{
+					cwd: params.cwd,
+					env,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: false,
+					windowsHide: true,
+				},
 			];
 		} else if (shellInfo.type === "powershell") {
 			const psArgs = freshEnv
@@ -695,13 +742,25 @@ export class LocalBackend implements ExecutionBackend {
 			spawnArgs = [
 				shellInfo.path,
 				psArgs,
-				{ cwd: params.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				{
+					cwd: params.cwd,
+					env,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: false,
+					windowsHide: true,
+				},
 			];
 		} else if (freshEnv) {
 			spawnArgs = [
 				shellInfo.path,
 				["-l", "-c", params.command],
-				{ cwd: params.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+				{
+					cwd: params.cwd,
+					env,
+					stdio: ["ignore", "pipe", "pipe"],
+					detached: true,
+					windowsHide: true,
+				},
 			];
 		} else {
 			spawnArgs = [
@@ -713,6 +772,7 @@ export class LocalBackend implements ExecutionBackend {
 					env,
 					stdio: ["ignore", "pipe", "pipe"],
 					detached: !isWin,
+					windowsHide: true,
 				},
 			];
 		}
@@ -746,6 +806,7 @@ export class LocalBackend implements ExecutionBackend {
 			stdout: "pipe",
 			stderr: "pipe",
 			signal,
+			windowsHide: true,
 		});
 		const [stdout] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
 		return stdout;
@@ -758,6 +819,7 @@ export class LocalBackend implements ExecutionBackend {
 			stdout: "pipe",
 			stderr: "pipe",
 			signal: params.signal,
+			windowsHide: true,
 		});
 		const killProc = () => {
 			try {

@@ -70,6 +70,7 @@ import {
 	useBrowserLayoutEffect,
 } from "../lib/app-shell-scroll";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../lib/history-state";
+import { getNamespacesForPath } from "../lib/i18n";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import {
 	APP_SHELL_CLASSNAME,
@@ -90,8 +91,14 @@ import {
 import { installThemeColorSync } from "../lib/theme-color-sync";
 import { installWcoTracking } from "../lib/wco";
 import { BrandTitle } from "./common/BrandTitle";
+import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
+import { RoutePendingIndicator } from "./common/RouteChunkErrorBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
+import {
+	CreateNarratorLazyModal,
+	preloadCreateNarratorModal,
+} from "./narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
 import { HeaderSearchBox } from "./nav/HeaderSearchBox";
@@ -110,15 +117,10 @@ import { SystemMaintenanceBadge } from "./SystemMaintenanceBadge";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
+import { TokenDanceRecoveryHost } from "./settings/TokenDanceRecoveryHost";
 import { UpdateBadge } from "./UpdateBadge";
 import { VersionUpdateBanner } from "./VersionUpdateBanner";
 import { WSConnectionAlert } from "./WSConnectionAlert";
-
-const CreateNarratorModal = lazy(() =>
-	import("./narrator/CreateNarratorModal").then((m) => ({
-		default: m.CreateNarratorModal,
-	})),
-);
 
 const SetupWizard = lazy(() =>
 	import("./settings/SetupWizard").then((m) => ({
@@ -256,16 +258,14 @@ export function AuthenticatedLayout() {
 		queryFn: api.getSettings,
 		enabled: hasToken,
 	});
-	const requestDumpEnabled = settings?.agent?.requestDumpEnabled === true;
-	const requestDumpErrorsOnly = settings?.agent?.requestDumpErrorsOnly === true;
+	const requestEvidenceAutoPin = settings?.requestEvidence?.autoPin;
+	const requestEvidencePinning =
+		requestEvidenceAutoPin === "all" || requestEvidenceAutoPin === "errors";
 
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const previewLoginRedirect = useRouterState({
 		select: ({ location }) =>
-			location.pathname.startsWith("/git/narrators/") ||
-			location.pathname.startsWith("/git/chapters/")
-				? location.href
-				: undefined,
+			location.pathname.startsWith("/git/narrators/") ? location.href : undefined,
 	});
 	const appShellScrollKey = useAppShellHistoryEntryKey();
 	const appShellReady =
@@ -357,6 +357,7 @@ export function AuthenticatedLayout() {
 	const [createNarratorOpened, setCreateNarratorOpened] = useState(false);
 	const requireSetup = useSetupWizardGuard();
 	const openCreateNarrator = useCallback(() => {
+		preloadCreateNarratorModal();
 		if (!requireSetup()) return;
 		setCreateNarratorOpened(true);
 	}, [requireSetup]);
@@ -436,8 +437,8 @@ export function AuthenticatedLayout() {
 		);
 	}
 
-	const openRequestDumpSetting = () => {
-		navigate({ to: "/settings/agent", hash: "request-dump-enabled" });
+	const openRequestEvidenceSetting = () => {
+		navigate({ to: "/settings/agent", hash: "request-evidence" });
 	};
 
 	// Only session tabs are projected; persisted project visits are left untouched.
@@ -473,8 +474,6 @@ export function AuthenticatedLayout() {
 				openNav={openNav}
 				closeNav={closeNav}
 			/>
-			<WSConnectionAlert />
-			<VersionUpdateBanner />
 			<AppShell.Header ref={headerRef} style={APP_SHELL_SAFE_HEADER_STYLE}>
 				<HeaderPullToRefresh targetRef={headerRef} enabled={isTouchPointer && !wizardOpen} />
 				{wizardOpen && !opened && (
@@ -516,12 +515,12 @@ export function AuthenticatedLayout() {
 
 						<SystemMaintenanceBadge />
 						<UpdateBadge />
-						{requestDumpEnabled && (
+						{requestEvidencePinning && (
 							<Tooltip
 								label={t(
-									requestDumpErrorsOnly
-										? "requestDumpErrorsOnlyTooltip"
-										: "requestDumpEnabledTooltip",
+									requestEvidenceAutoPin === "errors"
+										? "requestEvidenceErrorsTooltip"
+										: "requestEvidenceAllTooltip",
 								)}
 								position="bottom"
 								withArrow
@@ -531,10 +530,10 @@ export function AuthenticatedLayout() {
 									color="orange"
 									size="xs"
 									leftSection={<IconAlertTriangle size={14} />}
-									onClick={openRequestDumpSetting}
+									onClick={openRequestEvidenceSetting}
 									style={{ flexShrink: 0 }}
 								>
-									{t("requestDumpEnabledBadge")}
+									{t("requestEvidencePinningBadge")}
 								</Button>
 							</Tooltip>
 						)}
@@ -548,7 +547,7 @@ export function AuthenticatedLayout() {
 								variant="subtle"
 								color="gray"
 								component="a"
-								href="https://github.com/Narrafork/narrafork-issue/issues"
+								href="https://github.com/NarraFork/NarraFork/issues"
 								target="_blank"
 								rel="noopener noreferrer"
 							>
@@ -705,6 +704,9 @@ export function AuthenticatedLayout() {
 														size={28}
 														variant="subtle"
 														color="gray"
+														onPointerEnter={preloadCreateNarratorModal}
+														onFocus={preloadCreateNarratorModal}
+														onPointerDown={preloadCreateNarratorModal}
 														onClick={(e: React.MouseEvent) => {
 															e.preventDefault();
 															e.stopPropagation();
@@ -862,7 +864,11 @@ export function AuthenticatedLayout() {
 				 */}
 				<GitMissingAlert />
 				<StartupRecoveryAlert />
-				<Outlet />
+				<Suspense fallback={<RoutePendingIndicator />}>
+					<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
+						<Outlet />
+					</I18nNamespaceGate>
+				</Suspense>
 			</AppShell.Main>
 
 			<Modal
@@ -885,20 +891,34 @@ export function AuthenticatedLayout() {
 
 			<SummaryModelPickerHost />
 			<ProviderBaseUrlFixHost />
+			<TokenDanceRecoveryHost />
 			<BrokenModelMigrationHost />
 			<PluginPermissionRequestHost />
 
-			{createNarratorOpened && (
-				<LazyOverlayBoundary resetKey={createNarratorOpened} label={t("newNarrator")}>
-					<Suspense fallback={null}>
-						<CreateNarratorModal
-							opened={createNarratorOpened}
-							onClose={() => setCreateNarratorOpened(false)}
-							onCreated={handleNarratorCreated}
-						/>
-					</Suspense>
-				</LazyOverlayBoundary>
-			)}
+			<CreateNarratorLazyModal
+				opened={createNarratorOpened}
+				onClose={() => setCreateNarratorOpened(false)}
+				onCreated={handleNarratorCreated}
+			/>
+
+			{/*
+			 * The two fixed top banners are rendered LAST on purpose.
+			 *
+			 * Under WCO the whole title-bar strip is ours and the header row is the
+			 * drag surface (`styles/wco.css`), so the banners paint over a draggable
+			 * rect. `-webkit-app-region` hit-testing is purely geometric, and the
+			 * browser folds the rects the page reported into one region *in list
+			 * order, later rects winning where they overlap* — the list being the
+			 * layout-tree order. A banner emitted before the header row therefore
+			 * loses its clicks to window dragging: only its own `no-drag` rect, seen
+			 * after the row's `drag` rect, can cancel it. The header clusters work
+			 * because they are children of the row and so are collected after it;
+			 * these banners are siblings, so their place in the tree is what decides.
+			 * Emitted after the header row *and* the navbar's WCO spacer, they are
+			 * collected last and stay clickable.
+			 */}
+			<WSConnectionAlert />
+			<VersionUpdateBanner />
 		</AppShellWithNavWidth>
 	);
 }

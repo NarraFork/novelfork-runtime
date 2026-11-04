@@ -5,15 +5,17 @@ import {
 	SESSION_STORE_LIMITS,
 	writeSession,
 } from "@frontend/lib/session-store";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { getDraftImageAttachmentKey } from "./draft-image-attachments";
 import { insertFileReference } from "./file-reference-input";
 import {
-	classifyDraftRevisionConflict,
+	canHydrateNarratorDraftFromMeta,
 	cleanupLegacyNarratorInputStorage,
 	getNarratorDraftStorageId,
 	getNarratorInputDraftKey,
 	getNarratorInputHistoryKey,
+	isAcknowledgedNarratorDraft,
 	MAX_LOCAL_DRAFT_MIRROR_CHARS,
 	persistNarratorInputDraft,
 	purgeLegacyNarratorInputStorage,
@@ -52,6 +54,94 @@ afterAll(() => {
 			value: originalSessionStorage,
 		});
 	}
+});
+
+describe("rich draft lifecycle", () => {
+	const doc: ComposerDocument = {
+		version: 1,
+		assets: [
+			{ id: "image-resource", kind: "image", name: "a.png", size: 1, mimeType: "image/png" },
+		],
+		paragraphs: [
+			{ children: [{ type: "attachment", id: "image-node", assetId: "image-resource" }] },
+		],
+	};
+	test("mirrors attachment-only layout with its acknowledged revision", () => {
+		const input = { ...composerDocumentText(doc), composerDocument: doc };
+		expect(
+			persistNarratorInputDraft("u", "n", input.text, 3, "now", input.fileReferences, input, doc),
+		).toBe(true);
+		const stored = readNarratorInputDraft("u", "n");
+		expect(stored.composerDocument).toEqual(doc);
+		expect(stored.syncedRevision).toBe(3);
+		expect(canHydrateNarratorDraftFromMeta(stored, { hasDraft: true, revision: 3 })).toBe(true);
+	});
+	test("layout-only changes cannot claim an older acknowledgement", () => {
+		const moved: ComposerDocument = { ...doc, paragraphs: [{ children: [] }, ...doc.paragraphs] };
+		const projection = composerDocumentText(moved);
+		persistNarratorInputDraft(
+			"u",
+			"n",
+			projection.text,
+			3,
+			"now",
+			[],
+			{ text: projection.text, fileReferences: [], composerDocument: doc },
+			moved,
+		);
+		expect(readNarratorInputDraft("u", "n").unsynced).toBe(true);
+	});
+	test("new server layout hydrates and a newer clear removes the old one", () => {
+		const local = {
+			text: "",
+			serverRevision: 1,
+			serverUpdatedAt: "then",
+			syncedRevision: 1,
+			composerDocument: doc,
+		};
+		const hydrated = resolveHydratedNarratorDraft({
+			local,
+			serverText: "",
+			serverComposerDocument: doc,
+			serverRevision: 2,
+			currentInput: "",
+			localChangedSinceRequest: false,
+		});
+		expect(hydrated.composerDocument).toEqual(doc);
+		const cleared = resolveHydratedNarratorDraft({
+			local,
+			serverText: "",
+			serverRevision: 2,
+			currentInput: "",
+			localChangedSinceRequest: false,
+		});
+		expect(cleared.composerDocument).toBeUndefined();
+	});
+	test("late hydrate preserves layout typed during the request", () => {
+		const current: ComposerDocument = {
+			...doc,
+			paragraphs: [
+				{
+					children: [{ type: "attachment", id: "different-occurrence", assetId: "image-resource" }],
+				},
+			],
+		};
+		const result = resolveHydratedNarratorDraft({
+			local: { text: "", serverRevision: 1, serverUpdatedAt: "then" },
+			serverText: "",
+			serverComposerDocument: doc,
+			serverRevision: 2,
+			currentInput: "",
+			currentComposerDocument: current,
+			localChangedSinceRequest: true,
+		});
+		expect(result.composerDocument).toEqual(current);
+	});
+	test("a stale projection drops the mirror rather than claiming lossless persistence", () => {
+		persistNarratorInputDraft("u", "n", "old", 1, "then");
+		expect(persistNarratorInputDraft("u", "n", "different", 1, "then", [], null, doc)).toBe(false);
+		expect(readNarratorInputDraft("u", "n").text).toBe("");
+	});
 });
 
 describe("narrator draft browser isolation", () => {
@@ -232,42 +322,81 @@ describe("storage id scoping", () => {
 	});
 });
 
-describe("narrator draft revision conflict classification", () => {
-	test("retries the latest request when the server revision came from the same editor", () => {
-		expect(
-			classifyDraftRevisionConflict({
-				requestSequence: 2,
-				latestSequence: 2,
-				requestSourceId: "source-a",
-				currentSourceId: "source-a",
-			}),
-		).toBe("retry");
+describe("acknowledged draft revision metadata", () => {
+	test("only a valid matching revision without dirty state is an acknowledged baseline", () => {
+		const local = { text: "", serverRevision: 0, syncedRevision: 0, serverUpdatedAt: null };
+		expect(isAcknowledgedNarratorDraft(local)).toBe(true);
+		expect(isAcknowledgedNarratorDraft({ ...local, unsynced: true })).toBe(false);
+		expect(isAcknowledgedNarratorDraft({ ...local, syncedRevision: undefined })).toBe(false);
+		expect(isAcknowledgedNarratorDraft({ ...local, serverRevision: null })).toBe(false);
+		for (const revision of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(
+				isAcknowledgedNarratorDraft({
+					...local,
+					serverRevision: revision,
+					syncedRevision: revision,
+				}),
+			).toBe(false);
+		}
 	});
 
-	test("ignores a stale request result instead of overriding newer sync state", () => {
-		expect(
-			classifyDraftRevisionConflict({
-				requestSequence: 1,
-				latestSequence: 2,
-				requestSourceId: "source-a",
-				currentSourceId: "source-b",
-			}),
-		).toBe("ignore");
+	test("an explicitly unknown dirty baseline retains an unsynced empty tombstone", () => {
+		persistNarratorInputDraft("user-a", "n1", "", 4, "t4", [], null);
+		const local = readNarratorInputDraft("user-a", "n1");
+		expect(local.unsynced).toBe(true);
+		expect(local.syncedRevision).toBeUndefined();
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: false, revision: 4 })).toBe(false);
 	});
 
-	test("reports a real conflict when another editor advanced the revision", () => {
+	test("edits before a server revision is known remain explicitly unsynced", () => {
+		persistNarratorInputDraft("user-a", "n1", "", null, null, [], {
+			text: "cleared locally",
+			fileReferences: [],
+		});
+		expect(readNarratorInputDraft("user-a", "n1").unsynced).toBe(true);
+		expect(readNarratorInputDraft("user-a", "n1").syncedRevision).toBeUndefined();
+	});
+
+	test("only an exact acknowledged text/reference snapshot skips a body read", () => {
+		const synced = { text: "ack", fileReferences: [] };
+		persistNarratorInputDraft("user-a", "n1", "ack", 4, "t4", [], synced);
+		const local = readNarratorInputDraft("user-a", "n1");
+		expect(local.syncedRevision).toBe(4);
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: true, revision: 4 })).toBe(true);
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: true, revision: 5 })).toBe(false);
+		expect(canHydrateNarratorDraftFromMeta(local, { hasDraft: false, revision: 4 })).toBe(false);
+		persistNarratorInputDraft("user-a", "n1", "dirty", 4, "t4", [], synced);
+		const dirty = readNarratorInputDraft("user-a", "n1");
+		expect(dirty.syncedRevision).toBeUndefined();
+		expect(dirty.unsynced).toBe(true);
+		expect(canHydrateNarratorDraftFromMeta(dirty, { hasDraft: true, revision: 4 })).toBe(false);
+	});
+
+	test("legacy base revisions without an acknowledgement cannot skip the body", () => {
+		persistNarratorInputDraft("user-a", "n1", "legacy", 4, "t4");
 		expect(
-			classifyDraftRevisionConflict({
-				requestSequence: 2,
-				latestSequence: 2,
-				requestSourceId: "source-a",
-				currentSourceId: "source-b",
+			canHydrateNarratorDraftFromMeta(readNarratorInputDraft("user-a", "n1"), {
+				hasDraft: true,
+				revision: 4,
 			}),
-		).toBe("conflict");
+		).toBe(false);
+	});
+
+	test("a stale unsynced clear yields to a newer server draft", () => {
+		const local = { text: "", serverRevision: 4, serverUpdatedAt: "t4", unsynced: true as const };
+		expect(
+			resolveHydratedNarratorDraft({
+				local,
+				serverText: "new elsewhere",
+				serverRevision: 5,
+				currentInput: "",
+				localChangedSinceRequest: false,
+			}),
+		).toEqual({ text: "new elsewhere" });
 	});
 });
 
-describe("narrator draft hydration conflict resolution", () => {
+describe("narrator draft hydration resolution", () => {
 	test("keeps unsynced local edits based on the current server revision", () => {
 		expect(
 			resolveHydratedNarratorDraft({
@@ -281,7 +410,7 @@ describe("narrator draft hydration conflict resolution", () => {
 				currentInput: "local unsynced",
 				localChangedSinceRequest: false,
 			}),
-		).toEqual({ text: "local unsynced", conflict: false });
+		).toEqual({ text: "local unsynced" });
 	});
 
 	test("accepts a newer server clear instead of resurrecting stale local text", () => {
@@ -293,10 +422,10 @@ describe("narrator draft hydration conflict resolution", () => {
 				currentInput: "stale text",
 				localChangedSinceRequest: false,
 			}),
-		).toEqual({ text: "", conflict: false });
+		).toEqual({ text: "" });
 	});
 
-	test("preserves input typed while the server request is in flight as a conflict", () => {
+	test("preserves input typed while the server request is in flight", () => {
 		expect(
 			resolveHydratedNarratorDraft({
 				local: { text: "before", serverRevision: 1, serverUpdatedAt: "updated-1" },
@@ -305,10 +434,10 @@ describe("narrator draft hydration conflict resolution", () => {
 				currentInput: "typed during request",
 				localChangedSinceRequest: true,
 			}),
-		).toEqual({ text: "typed during request", conflict: true });
+		).toEqual({ text: "typed during request" });
 	});
 
-	test("preserves a version-1 local draft for an explicit conflict decision", () => {
+	test("sets a version-1 local draft aside against a nonempty server", () => {
 		// A v1 envelope can still be present under the CURRENT storage id: the
 		// envelope version and the key shape moved independently, so the reader must
 		// keep honouring version 1 rather than assuming the id implies version 2.
@@ -332,7 +461,33 @@ describe("narrator draft hydration conflict resolution", () => {
 				currentInput: local.text,
 				localChangedSinceRequest: false,
 			}),
-		).toEqual({ text: "legacy local", conflict: true });
+		).toEqual({ text: "server", staleLocal: { text: "legacy local" } });
+		expect(
+			resolveHydratedNarratorDraft({
+				local,
+				serverText: "",
+				serverRevision: 4,
+				currentInput: local.text,
+				localChangedSinceRequest: false,
+			}),
+		).toEqual({ text: "legacy local" });
+	});
+
+	test("offers unsynced edits back when the server moved past their base", () => {
+		expect(
+			resolveHydratedNarratorDraft({
+				local: {
+					text: "typed on the old tab",
+					serverRevision: 1,
+					serverUpdatedAt: "updated-1",
+					unsynced: true,
+				},
+				serverText: "newer elsewhere",
+				serverRevision: 2,
+				currentInput: "typed on the old tab",
+				localChangedSinceRequest: false,
+			}),
+		).toEqual({ text: "newer elsewhere", staleLocal: { text: "typed on the old tab" } });
 	});
 });
 
@@ -375,7 +530,7 @@ describe("file references share the draft revision", () => {
 			serverUpdatedAt: "t2",
 		});
 	});
-	test("keeps metadata-only unsynced edits on the same CAS base", () => {
+	test("keeps metadata-only unsynced edits on the same revision", () => {
 		expect(
 			resolveHydratedNarratorDraft({
 				local: { text: "same", fileReferences: [ref], serverRevision: 7, serverUpdatedAt: null },
@@ -386,9 +541,9 @@ describe("file references share the draft revision", () => {
 				currentFileReferences: [ref],
 				localChangedSinceRequest: false,
 			}),
-		).toEqual({ text: "same", fileReferences: [ref], conflict: false });
+		).toEqual({ text: "same", fileReferences: [ref] });
 	});
-	test("metadata changed while loading conflicts even when the text is unchanged", () => {
+	test("metadata typed while loading survives even when the text is unchanged", () => {
 		expect(
 			resolveHydratedNarratorDraft({
 				local: { text: "same", serverRevision: 7, serverUpdatedAt: null },
@@ -399,9 +554,9 @@ describe("file references share the draft revision", () => {
 				currentFileReferences: [ref],
 				localChangedSinceRequest: true,
 			}),
-		).toEqual({ text: "same", fileReferences: [ref], conflict: true });
+		).toEqual({ text: "same", fileReferences: [ref] });
 	});
-	test("identical text and refs advanced elsewhere do not cause a false conflict", () => {
+	test("identical text and refs advanced elsewhere hydrate to the same content", () => {
 		expect(
 			resolveHydratedNarratorDraft({
 				local: { text: "same", serverRevision: 7, serverUpdatedAt: null },
@@ -411,8 +566,8 @@ describe("file references share the draft revision", () => {
 				currentInput: "same",
 				currentFileReferences: [ref],
 				localChangedSinceRequest: true,
-			}).conflict,
-		).toBe(false);
+			}),
+		).toEqual({ text: "same", fileReferences: [ref] });
 	});
 	test("a newer clear removes stale reference-only drafts", () => {
 		expect(
@@ -425,7 +580,7 @@ describe("file references share the draft revision", () => {
 				currentFileReferences: [ref],
 				localChangedSinceRequest: false,
 			}),
-		).toEqual({ text: "", conflict: false });
+		).toEqual({ text: "" });
 	});
 	test("old string-only envelopes restore no implicit #file references", () => {
 		writeSession(

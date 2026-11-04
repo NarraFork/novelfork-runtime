@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { isParentSelector } from "@shared/communication-tool";
+import { isGenUiReadAction } from "@shared/gen-ui-tool-policy";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
+	fileChangeExecutionSegments,
 	integrationAuthorities,
 	integrationCapabilityGrants,
 	integrationResourceBindings,
@@ -41,6 +43,11 @@ import {
 	FS_READ_ATOMIC_RESOLVED_PATH_FEATURE,
 	FS_STAT_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
+import {
+	getPermissionRecovery,
+	isRecoveredHumanPermission,
+	recoveryReflection,
+} from "../lib/agent/recovery-gate";
 import { detectShell } from "../lib/agent/shell";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import { isBashToolName } from "../lib/agent/tool-name";
@@ -51,6 +58,11 @@ import {
 	isKnowledgeReadAction,
 	KNOWLEDGE_MERGE_ACTION_SET,
 } from "../lib/agent/tools/knowledge-actions";
+import {
+	OUTLINE_EDIT_TOOL,
+	OUTLINE_READ_TOOL,
+	OUTLINE_SEARCH_TOOL,
+} from "../lib/agent/tools/outline-names";
 import {
 	EXIT_PLAN_MODE_FILE,
 	EXIT_PLAN_MODE_INLINE,
@@ -75,8 +87,9 @@ import {
 } from "../lib/context-characters";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
-import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import { isBotNarrator, isPlanModeTrait } from "../lib/narrator-utils";
 import {
 	type DeviceAccessPolicy,
 	intersectOAuthClientPolicies,
@@ -92,9 +105,13 @@ import {
 } from "../lib/plan-file-path";
 import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
+import { isTeamMember, type RuntimeSourceRow, teamRootOf } from "../lib/runtime-source";
 import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { RuntimePolicy } from "./agent-runtime/policy";
+import { isRuntimeToolNameAllowed } from "./subagent-tools";
+import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 export {
 	normalizeDangerReflectionLevel,
@@ -137,7 +154,6 @@ import { isTrustedReviewBoundary } from "./narrator-review-boundary";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
-	activeSubagentSettings,
 	isNarratorRuntimeBusy,
 	type PendingDangerReflection,
 	type PendingExecutionTarget,
@@ -221,7 +237,11 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "StructSed":
 		case "StructView":
 			return typeof input.file_path === "string" ? [input.file_path] : [];
+		case "CreateWorktree":
+		case "AttachWorktree":
+			return typeof input.destinationPath === "string" ? [input.destinationPath] : [];
 		case "ShareFile":
+		case "GenUI":
 			return typeof input.path === "string" ? [input.path] : [];
 		case "Glob":
 		case "Grep":
@@ -272,9 +292,7 @@ function resolvePermissionShellType(
 }
 
 function isRoutedPermissionTool(toolName: string): boolean {
-	// toolRegistry.get resolves legacy aliases, so a stale "Shell" name still
-	// finds the Bash definition and stays routed (i.e. still requires a frozen
-	// execution target). Special-casing the alias here is no longer needed.
+	// Registry lookup resolves aliases and keeps every routed tool on a frozen target.
 	return !!toolRegistry.get(toolName)?.executionRouting;
 }
 
@@ -449,16 +467,6 @@ function formatBlacklistReason(dir: DirectoryBlacklistRule, matchedPath: string)
 	const src = dir.source ? (BLACKLIST_SOURCE_LABELS[dir.source] ?? dir.source) : "unknown";
 	const level = dir.denyLevel === "denyAll" ? "block all access" : "block write access";
 	return `Blacklisted by ${src}-level rule: "${dir.path}" (${level}), matched path: ${matchedPath}`;
-}
-
-function getChapterGitPermissionIssues(bashAnalysis?: BashAnalysis): string[] {
-	return [...(bashAnalysis?.gitBranchViolations ?? []), ...(bashAnalysis?.gitBranchWarnings ?? [])];
-}
-
-function resolveChapterGitIssueDecision(effectiveMode: string): "allow" | "deny" | "ask" {
-	if (effectiveMode === "bypassPermissions") return "allow";
-	if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
-	return "ask";
 }
 
 function isSpecTasksPath(value: unknown): boolean {
@@ -792,7 +800,6 @@ export function resolvePermissionDecision(
 		permMode,
 		cwd,
 		bashAnalysis,
-		isChapter = false,
 		planFileId,
 		planFilePath: designatedPlanFilePath,
 		relaxedPlan = false,
@@ -809,6 +816,10 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = specError;
 		return "deny";
 	}
+	if (reviewReadOnlyBash && toolName === "Stop") {
+		if (meta) meta.blacklistReason = "Review mode cannot control running tasks.";
+		return "deny";
+	}
 	if (toolName === "Worktree") {
 		if (input.action !== "list" && input.action !== "create") {
 			if (meta)
@@ -819,6 +830,10 @@ export function resolvePermissionDecision(
 			if (meta) meta.blacklistReason = "Review mode: Worktree only supports the list action.";
 			return "deny";
 		}
+	}
+	if (reviewReadOnlyBash && (toolName === "CreateWorktree" || toolName === "AttachWorktree")) {
+		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
+		return "deny";
 	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
@@ -855,6 +870,12 @@ export function resolvePermissionDecision(
 	// Task queue maintenance is session metadata, not a project/worktree write. Keep it
 	// available in read-only/exploration flows just like the legacy TaskCreate/TodoWrite path.
 	if (isTaskStateMaintenanceTool(toolName, input)) return "allow";
+
+	// Outline writes touch no files: each is a commit recorded with this session as its author and
+	// can be reverted, so they need no approval. The tool decides where it may write: the acting
+	// person's write permission, and in read-only and strict plan mode only the session's own
+	// space. Under bypassPermissions the danger classification below still applies.
+	if (toolName === OUTLINE_EDIT_TOOL) return "allow";
 
 	const planFileCandidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
@@ -985,9 +1006,32 @@ export function resolvePermissionDecision(
 		return "allow";
 	}
 
-	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
-	if (isBashToolName(toolName) && chapterGitIssues.length > 0) {
-		return resolveChapterGitIssueDecision(effectiveMode);
+	// Review-tier `.git` writes sit above allowlists, acceptEdits and bypassPermissions so
+	// none of them can auto-allow. Under bypassPermissions handlePermission routes this
+	// "ask" to danger reflection when it is enabled.
+	const gitReviewReason = resolveGitInternalReviewReason(
+		toolName,
+		input,
+		cwd,
+		bashAnalysis,
+		context,
+		executionBackend,
+		executionTarget,
+	);
+	if (gitReviewReason) {
+		if (meta) meta.gitInternalReviewReason = gitReviewReason;
+		return effectiveMode === "readOnly" || effectiveMode === "dontAsk" ? "deny" : "ask";
+	}
+
+	// Showing existing files is read-only; an allowlist must never let create
+	// write files from a read-only/review/planning session.
+	if (
+		toolName === "GenUI" &&
+		!isGenUiReadAction(input.action) &&
+		(effectiveMode === "readOnly" || planMode || reviewReadOnlyBash)
+	) {
+		if (meta) meta.blacklistReason = "GenUI mutations require an implementation session.";
+		return "deny";
 	}
 
 	// A tool allowlist must not turn a read-only/strict-plan session into an
@@ -1251,6 +1295,7 @@ const ALWAYS_ALLOW_TOOLS = [
 	"EnterPlanMode",
 	"WebSearch",
 	"Await",
+	"Stop",
 	"Question",
 	"Skill",
 	"LearningGuide",
@@ -1278,10 +1323,13 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Glob",
 	"Grep",
 	"StructView",
+	"GenUI",
 ];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
 const READ_ONLY_TOOLS = [
+	"ListWorktrees",
+	"GetWorktreeOperation",
 	"Read",
 	"Grep",
 	"Glob",
@@ -1292,6 +1340,8 @@ const READ_ONLY_TOOLS = [
 	"KnowledgeSearch",
 	"KnowledgeRead",
 	"KnowledgeLibrary",
+	OUTLINE_READ_TOOL,
+	OUTLINE_SEARCH_TOOL,
 ];
 
 /**
@@ -1316,6 +1366,7 @@ const READ_ONLY_TOOLS = [
 function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
 	if (READ_ONLY_TOOLS.includes(toolName)) return true;
 	if (toolName === "Notification") return input.action === "list_channels";
+	if (toolName === "GenUI") return isGenUiReadAction(input.action);
 	if (toolName === "Worktree") return input.action === "list";
 	return toolName === "StructSed" && input.dry_run !== false;
 }
@@ -1351,6 +1402,8 @@ export interface PermissionDecisionMeta {
 	commandBlacklistReason?: string;
 	commandBlacklistDenyPrompt?: string;
 	planModeSoftDeny?: boolean;
+	/** Set when the call writes `.git` internals that need a review (see classifyGitInternalPath). */
+	gitInternalReviewReason?: string;
 }
 
 /**
@@ -1430,7 +1483,6 @@ export interface PermissionDecisionOpts {
 	permMode: string;
 	cwd: string;
 	bashAnalysis?: BashAnalysis;
-	isChapter?: boolean;
 	planFileId?: string;
 	/**
 	 * Resolved relative path of the designated plan file. Supplied by the caller
@@ -1550,21 +1602,144 @@ function areUnsafeCommandsWhitelistedForDanger(
 // ── Protected path checks (hard-deny, no bypass) ─────────
 
 /**
- * Tools whose `file_path` input is a write target.
+ * Tools whose extracted path input is a write target (including worktree destinations).
  *
  * Membership is SECURITY-RELEVANT in two places, and in both an omission fails open:
- * the `.git` write ban below, and the OAuth read-only device policy. A file-modifying
+ * the `.git` write tiers below, and the OAuth read-only device policy. A file-modifying
  * tool missing from this set gets neither check and is silently allowed through.
  */
-const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
+const WRITE_TOOLS = new Set([
+	"Write",
+	"Edit",
+	"NotebookEdit",
+	"StructSed",
+	"CreateWorktree",
+	"AttachWorktree",
+]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 
 function executionPathOS(backend?: ExecutionBackend): string {
 	return backend?.platform?.os ?? (process.platform === "win32" ? "windows" : "posix");
 }
 
-function isGitInternalPath(absPath: string, os: string): boolean {
-	return normalizePathForOS(absPath, os).split("/").includes(".git");
+// ── `.git` internals: three write tiers ─────────────────
+//
+// forbidden — git executes or trusts the content (hooks, config, object storage, gitdir
+//   redirects): hard deny in every mode, bypassPermissions included.
+// review    — git's own state (refs, index, HEAD, unknown files, a rebase todo that may run
+//   `exec` lines): never auto-allowed by allowlists or acceptEdits. It is a human prompt, or
+//   danger reflection under bypassPermissions when reflection is enabled.
+// editable  — files git hands to $EDITOR in ordinary workflows: an ordinary file write.
+
+type GitInternalPathTier = "forbidden" | "review" | "editable";
+
+/** Tools that write text into an existing path; any other write tool targeting `.git` is denied. */
+const GIT_CONTENT_WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
+const GIT_FORBIDDEN_DIRS = new Set(["hooks", "objects"]);
+const GIT_FORBIDDEN_FILES = new Set(["config", "config.worktree", "commondir", "gitdir"]);
+const GIT_EDITABLE_FILES = new Set([
+	"commit_editmsg",
+	"merge_msg",
+	"squash_msg",
+	"tag_editmsg",
+	"notes_editmsg",
+	"edit_description",
+	"rebase-merge/message",
+	"info/exclude",
+]);
+/** Todo lists whose `exec`/`x` lines git runs as shell commands on `--continue`. */
+const GIT_TODO_FILES = new Set(["rebase-merge/git-rebase-todo", "sequencer/todo"]);
+const GIT_TODO_EXEC_LINE = /^\s*(?:x|exec)(?:\s|$)/im;
+
+/**
+ * Segments below the first `.git` segment (lowercased), or null outside `.git`. Windows
+ * ignores trailing dots/spaces and `:stream` suffixes, so `config.` and `config::$DATA` are
+ * still `config` there.
+ */
+function gitInternalSegments(absPath: string, os: string): string[] | null {
+	const windows = os === "win32" || os === "windows";
+	const segments = normalizePathForOS(absPath, os)
+		.split("/")
+		.map((segment) => {
+			const lower = segment.toLowerCase();
+			return windows ? lower.replace(/:.*$/, "").replace(/[. ]+$/, "") : lower;
+		});
+	const index = segments.indexOf(".git");
+	return index < 0 ? null : segments.slice(index + 1);
+}
+
+/**
+ * Only a full-content Write is provably free of `exec` lines: an Edit or shell edit can
+ * splice one together from text already in the file.
+ */
+function isInertGitTodoWrite(toolName: string, input: Record<string, unknown>): boolean {
+	return (
+		toolName === "Write" &&
+		typeof input.content === "string" &&
+		!GIT_TODO_EXEC_LINE.test(input.content)
+	);
+}
+
+function classifyGitInternalPath(
+	absPath: string,
+	os: string,
+	toolName: string,
+	input: Record<string, unknown>,
+): GitInternalPathTier | null {
+	const rel = gitInternalSegments(absPath, os);
+	if (!rel) return null;
+	// The `.git` entry itself (directory, or a linked worktree's gitfile).
+	if (rel.length === 0) return "forbidden";
+	// A linked worktree's admin dir (.git/worktrees/<name>/) mirrors the main layout.
+	const local = rel[0] === "worktrees" && rel.length > 2 ? rel.slice(2) : rel;
+	// Ref names are user-chosen (a branch may be called `hooks`); refs stay reviewable.
+	if (local[0] !== "refs" && local[0] !== "logs") {
+		if (local.some((segment) => GIT_FORBIDDEN_DIRS.has(segment))) return "forbidden";
+		if (GIT_FORBIDDEN_FILES.has(local[local.length - 1])) return "forbidden";
+	}
+	const key = local.join("/");
+	if (GIT_EDITABLE_FILES.has(key)) return "editable";
+	if (GIT_TODO_FILES.has(key)) return isInertGitTodoWrite(toolName, input) ? "editable" : "review";
+	return "review";
+}
+
+/**
+ * Review-tier `.git` write targets of this call, as a reason string, or null. Forbidden
+ * targets are handled by resolveProtectedPathDeny before this runs.
+ */
+function resolveGitInternalReviewReason(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	bashAnalysis?: BashAnalysis,
+	executionContext?: ExecutionTargetContext | null,
+	executionBackend?: ExecutionBackend,
+	executionTarget?: Readonly<ToolExecutionTarget>,
+): string | null {
+	const targetOS = executionPathOS(executionContext?.backend ?? executionBackend);
+	if (GIT_CONTENT_WRITE_TOOLS.has(toolName)) {
+		if (isReadOnlyCall(toolName, input)) return null;
+		const filePath = extractToolPaths(toolName, input)[0] ?? "";
+		if (!filePath) return null;
+		const absPath = resolveProtectedTargetPath(
+			filePath,
+			cwd,
+			executionContext,
+			executionBackend,
+			executionTarget,
+		);
+		return classifyGitInternalPath(absPath, targetOS, toolName, input) === "review"
+			? `Write to .git internal file requires review: ${absPath}`
+			: null;
+	}
+	if (isBashToolName(toolName) && bashAnalysis?.hasWriteOperation) {
+		const paths = bashAnalysis.filePaths.filter(
+			(path) => classifyGitInternalPath(path, targetOS, toolName, input) === "review",
+		);
+		if (paths.length > 0)
+			return `Shell write operation targeting .git internals requires review: ${paths.join(", ")}`;
+	}
+	return null;
 }
 
 function resolveProtectedTargetPath(
@@ -1627,6 +1802,58 @@ function canonicalHostPath(path: string): string {
 	throw new Error("Host path identity budget exceeded");
 }
 
+/**
+ * A shell command token that reads/writes a NarraFork platform secret, or null.
+ *
+ * `extractPathArgs` only runs for PATH_COMMANDS and skips `-flag` args, so a read via
+ * jq/cat/type/sort/diff/… or `--file=<secret>` never lands in `bashAnalysis.filePaths`.
+ * This scans the already-resolved `filePaths` AND every token (plus the value half of
+ * `--flag=value`) of every command, resolving each against the target cwd with `~`
+ * expanded the way the shell would — so a literal secret path is caught whatever command
+ * reads it. Over-collection is harmless: only a token resolving inside the NarraFork home
+ * can match `isSecretPlatformPath`. Enforced for the local host target only, since the
+ * secrets belong to the NarraFork host.
+ */
+function findShellSecretPlatformPath(
+	analysis: BashAnalysis,
+	targetCwd: string,
+	targetPaths: TargetPathSemantics,
+): string | null {
+	const home = homedir();
+	const expandTilde = (value: string): string => {
+		if (value === "~") return home;
+		if (value.startsWith("~/") || value.startsWith("~\\")) return `${home}${value.slice(1)}`;
+		return value;
+	};
+	const isSecret = (resolvedPath: string): boolean => {
+		try {
+			return isSecretPlatformPath(resolvedPath);
+		} catch {
+			return false;
+		}
+	};
+	for (const resolvedPath of analysis.filePaths) {
+		if (isSecret(resolvedPath)) return resolvedPath;
+	}
+	for (const command of analysis.commands) {
+		for (const token of command.tokens.slice(1)) {
+			const candidates: string[] = [];
+			if (token.startsWith("-")) {
+				const eq = token.indexOf("=");
+				if (eq >= 0) candidates.push(token.slice(eq + 1));
+			} else {
+				candidates.push(token);
+			}
+			for (const candidate of candidates) {
+				if (!candidate || !/[/\\~]/.test(candidate)) continue;
+				const resolvedPath = targetPaths.resolve(targetCwd, expandTilde(candidate));
+				if (isSecret(resolvedPath)) return resolvedPath;
+			}
+		}
+	}
+	return null;
+}
+
 function resolveProtectedPathDeny(
 	toolName: string,
 	input: Record<string, unknown>,
@@ -1645,7 +1872,7 @@ function resolveProtectedPathDeny(
 		toolBaseCwd(backend ?? localBackend, cwd);
 	const targetPaths = executionContext?.paths ?? backend?.paths ?? localPathSemantics;
 	if (WRITE_TOOLS.has(toolName) || toolName === "Browser") {
-		const filePath = typeof input.file_path === "string" ? input.file_path : "";
+		const filePath = extractToolPaths(toolName, input)[0] ?? "";
 		if (!filePath || (toolName === "Browser" && input.action !== "screenshot")) return null;
 		const absPath = resolveProtectedTargetPath(
 			filePath,
@@ -1654,8 +1881,9 @@ function resolveProtectedPathDeny(
 			executionBackend,
 			executionTarget,
 		);
-		if (isGitInternalPath(absPath, targetOS)) {
-			return `Write to .git directory is forbidden: ${absPath}`;
+		const gitTier = classifyGitInternalPath(absPath, targetOS, toolName, input);
+		if (gitTier === "forbidden" || (gitTier && !GIT_CONTENT_WRITE_TOOLS.has(toolName))) {
+			return `Write to protected .git internals is forbidden: ${absPath}`;
 		}
 		// Only the host configuration is trusted to enable security switches. Reads and
 		// trusted settings APIs remain available; another device's same path is unrelated.
@@ -1685,8 +1913,8 @@ function resolveProtectedPathDeny(
 	if (isBashToolName(toolName) && bashAnalysis) {
 		if (bashAnalysis.hasWriteOperation) {
 			for (const p of bashAnalysis.filePaths) {
-				if (isGitInternalPath(p, targetOS)) {
-					return `Shell write operation targeting .git directory is forbidden: ${p}`;
+				if (classifyGitInternalPath(p, targetOS, toolName, input) === "forbidden") {
+					return `Shell write operation targeting protected .git internals is forbidden: ${p}`;
 				}
 			}
 		}
@@ -1697,6 +1925,15 @@ function resolveProtectedPathDeny(
 				executionContext.target.deviceId === LOCAL_DEVICE_ID &&
 				executionContext.paths.flavor !== "spec"
 			: executionBackend?.kind !== "remote";
+		// Application authorization guard, not an OS sandbox: a shell command that reads or
+		// writes a NarraFork platform secret is denied in EVERY permission mode
+		// (bypassPermissions included), because this runs before the mode shortcuts below.
+		if (isLocalTarget) {
+			const secretPath = findShellSecretPlatformPath(bashAnalysis, targetCwd, targetPaths);
+			if (secretPath) {
+				return `Shell access to NarraFork platform secrets is forbidden: ${secretPath}`;
+			}
+		}
 		if (projectGitPath && isLocalTarget) {
 			for (const cmd of bashAnalysis.commands) {
 				const cmdName = cmd.tokens[0];
@@ -1704,8 +1941,8 @@ function resolveProtectedPathDeny(
 				for (const arg of cmd.tokens.slice(1)) {
 					if (arg.startsWith("-")) continue;
 					const absArg = targetPaths.resolve(targetCwd, arg);
-					if (isGitInternalPath(absArg, targetOS)) {
-						return `Destructive operation on .git directory is forbidden: ${cmdName} ${absArg}`;
+					if (classifyGitInternalPath(absArg, targetOS, toolName, input) === "forbidden") {
+						return `Destructive operation on protected .git internals is forbidden: ${cmdName} ${absArg}`;
 					}
 					const structural = isStructuralPath(absArg, projectGitPath);
 					if (structural) {
@@ -2486,7 +2723,6 @@ function classifyShellDanger(
 		bashAnalysis,
 		commandWhitelist,
 	);
-	const chapterGitIssues = getChapterGitPermissionIssues(bashAnalysis);
 	for (const cmd of bashAnalysis.commands) {
 		const [name, ...args] = cmd.tokens;
 		if (name === "git") {
@@ -2550,20 +2786,6 @@ function classifyShellDanger(
 				);
 			}
 		}
-	}
-	if (chapterGitIssues.length > 0) {
-		return danger(
-			"Git command changes chapter branch/worktree state.",
-			[
-				"The command can switch, create, delete, rewrite, or otherwise move branch/worktree state outside the normal chapter workflow.",
-				"NarraFork may lose track of which chapter owns the resulting git state.",
-			],
-			[
-				"Prefer NarraFork chapter/fork/merge operations for branch and worktree changes.",
-				"If this git operation is intentional, confirm the exact target branch or worktree first.",
-			],
-			chapterGitIssues.map((issue) => `Chapter git issue: ${issue}`),
-		);
 	}
 	if (bashAnalysis.hasEnvInjection) {
 		return danger(
@@ -2646,7 +2868,7 @@ function classifyShellDanger(
 		return danger(
 			"Shell command accesses paths outside the current working directory.",
 			[
-				"The command may read or modify files outside this chapter/worktree boundary.",
+				"The command may read or modify files outside this worktree boundary.",
 				"Those files may not be covered by NarraFork snapshots or git recovery.",
 			],
 			[
@@ -2661,6 +2883,55 @@ function classifyShellDanger(
 }
 
 export function classifyDanger(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	bashAnalysis?: BashAnalysis,
+	whitelistDirs: WhitelistDir[] = [],
+	commandWhitelist: CommandWhitelistEntry[] = [],
+	skipReadOnlyConfirmations = false,
+	compiledPolicy?: CompiledExecutionPolicy,
+	executionContext?: ExecutionTargetContext | null,
+): DangerInfo | null {
+	const base = classifyToolDanger(
+		toolName,
+		input,
+		cwd,
+		bashAnalysis,
+		whitelistDirs,
+		commandWhitelist,
+		skipReadOnlyConfirmations,
+		compiledPolicy,
+		executionContext,
+	);
+	const gitReviewReason = resolveGitInternalReviewReason(
+		toolName,
+		input,
+		cwd,
+		bashAnalysis,
+		executionContext,
+	);
+	if (!gitReviewReason) return base;
+	// "high" so every enabled reflection level reflects; a critical base risk keeps its rank.
+	const severity = base?.severity === "critical" ? "critical" : "high";
+	return danger(
+		base?.severity === "critical" ? base.summary : `${toolName} writes git internal state.`,
+		[
+			"Hand-edited refs, index or HEAD can detach or lose commits without a git safety check.",
+			"A rebase/sequencer todo may contain exec lines that run shell commands on --continue.",
+			...(base?.consequences ?? []),
+		],
+		[
+			"Use the corresponding git command (update-ref, rebase --edit-todo, reset) instead.",
+			"For a rebase todo, write the full file with Write and no exec lines.",
+			...(base?.saferAlternatives ?? []),
+		],
+		[gitReviewReason, ...(base?.details ?? [])],
+		severity,
+	);
+}
+
+function classifyToolDanger(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd: string,
@@ -2812,6 +3083,33 @@ export function classifyDanger(
 		);
 	}
 
+	// Outline writes, like knowledge writes, touch no files, so the path heuristics below never
+	// flag them. Every one is a commit that can be reverted: adding and rewriting blocks is low,
+	// deleting or moving subtrees medium, so the standard level reflects on those.
+	if (toolName === OUTLINE_EDIT_TOOL) {
+		const edits = Array.isArray(input.edits) ? (input.edits as Array<Record<string, unknown>>) : [];
+		const restructures = edits.filter(
+			(edit) => edit && typeof edit === "object" && ("delete" in edit || "move" in edit),
+		).length;
+		return danger(
+			restructures > 0
+				? `OutlineEdit deletes or moves ${restructures} outline block(s) and their subtrees.`
+				: `OutlineEdit writes ${edits.length} edit(s) to the outline.`,
+			[
+				"Outline pages may be shared with the project; others read what is written there.",
+				restructures > 0
+					? "Deleting or moving a block takes everything under it along."
+					: "Added and rewritten blocks are attributed to this session.",
+			],
+			[
+				"Each OutlineEdit call is one commit that can be reverted from the outline timeline.",
+				"Write process notes to the session's own space (session/) when unsure.",
+			],
+			[`Tool: ${OUTLINE_EDIT_TOOL}`, `Edits: ${edits.length}`, `Deletes or moves: ${restructures}`],
+			restructures > 0 ? "medium" : "low",
+		);
+	}
+
 	// A dry run reads, so it earns no write-risk notice: warning about out-of-worktree writes
 	// for a preview that writes nothing is noise that dulls the real warnings.
 	if (isReadOnlyCall(toolName, input)) {
@@ -2827,7 +3125,7 @@ export function classifyDanger(
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
 			[
-				"The operation crosses the chapter/worktree boundary.",
+				"The operation crosses the worktree boundary.",
 				"External files may not be covered by project git history or NarraFork snapshots.",
 			],
 			[
@@ -2900,10 +3198,8 @@ export function shouldTriggerDangerReflection(
 	return dangerSeverityRank(danger.severity) >= dangerReflectionThreshold(level);
 }
 
-type PermissionScopeNarrator = {
+type PermissionScopeNarrator = RuntimeSourceRow & {
 	id?: string | null;
-	variant?: string | null;
-	parentNarratorId?: string | null;
 	permissionMode?: string | null;
 	relaxedPlan?: boolean | null;
 	previousPermissionMode?: string | null;
@@ -2969,7 +3265,7 @@ async function resolveSendAliasCandidate(
  * Resolve Send destinations for permission auto-allow rank checks.
  *
  * Parent is a first-class destination for a subagent: progress reports and
- * replyTo answers address the narrator that launched the child. Treating a
+ * answers address the narrator that launched the child. Treating a
  * primary parent as "not a valid target" made `shouldAutoAllowSendWithinScope`
  * always fail for child→parent Send, so those reports sat in `pending` until a
  * human approved them — often never, while the parent Agent/await held an
@@ -2982,10 +3278,8 @@ async function resolveSendTargetsForPermission(
 ): Promise<PermissionScopeNarrator[]> {
 	const selectors = sendSelectors(input);
 	if (selectors.length === 0) return [];
-	const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
-	const teamParentId = callerIsSubagent ? caller.parentNarratorId : callerId;
-	if (typeof teamParentId !== "string" || teamParentId.length === 0) return [];
-	const parentId: string = teamParentId;
+	const parentId = teamRootOf({ ...caller, id: callerId });
+	const callerIsSubagent = parentId !== callerId;
 
 	const resolved: PermissionScopeNarrator[] = [];
 	const seen = new Set<string>();
@@ -3001,7 +3295,7 @@ async function resolveSendTargetsForPermission(
 		// launching narrator by teamParentId so mixed target lists still work.
 		if (addressesParent) {
 			const parent = await narratorService.getById(parentId).catch(() => null);
-			if (!parent?.id || parent.id !== parentId || isSubagentVariant(parent.variant ?? "")) {
+			if (!parent?.id || parent.id !== parentId || teamRootOf(parent) !== parent.id) {
 				return [];
 			}
 			if (!seen.has(parent.id)) {
@@ -3012,12 +3306,7 @@ async function resolveSendTargetsForPermission(
 		}
 		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
 		if (direct) {
-			if (
-				!direct.id ||
-				!isSubagentVariant(direct.variant ?? "") ||
-				direct.parentNarratorId !== parentId ||
-				(callerIsSubagent && direct.id === callerId)
-			) {
+			if (!direct.id || !isTeamMember(direct, parentId) || direct.id === callerId) {
 				return [];
 			}
 			if (!seen.has(direct.id)) {
@@ -3027,20 +3316,14 @@ async function resolveSendTargetsForPermission(
 			continue;
 		}
 
-		const siblings = await narratorService.listSubagentsByParent(parentId);
+		const siblings = await narratorService.listTeamMembers(parentId);
 		const candidates = siblings.filter((s) => {
 			if (callerIsSubagent && s.id === callerId) return false;
 			return subagentMatchesSelector(s, selector);
 		});
 		if (candidates.length !== 1) return [];
 		const target = await narratorService.getById(candidates[0].id).catch(() => null);
-		if (
-			!target?.id ||
-			!isSubagentVariant(target.variant ?? "") ||
-			target.parentNarratorId !== parentId
-		) {
-			return [];
-		}
+		if (!target?.id || !isTeamMember(target, parentId)) return [];
 		if (!seen.has(target.id)) {
 			seen.add(target.id);
 			resolved.push(target);
@@ -3064,8 +3347,13 @@ export async function shouldAutoAllowSendWithinScope(
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
-		const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
-		const teamParentId = callerIsSubagent ? caller.parentNarratorId : null;
+		// A bot's message to a person is its only voice; asking approval for every reply
+		// would make it mute. Delivery re-reads the bot trait, so a non-bot never gets here
+		// to a successful send.
+		if (input.user !== undefined) return isBotNarrator(caller.traits);
+		const root = teamRootOf({ ...caller, id: narratorId });
+		const callerIsSubagent = root !== narratorId;
+		const teamParentId = callerIsSubagent ? root : null;
 		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
 		const selectors = sendSelectors(input);
 		const onlyAddressesParent =
@@ -4049,7 +4337,14 @@ export interface FinalToolPermissionCheck {
 	cwd?: string;
 	signal?: AbortSignal;
 	runtimeConstraint?: RuntimePermissionConstraint;
-	reviewReadOnlyBash?: boolean;
+	/**
+	 * Current capability ceiling for this actor. Resolved here when omitted — never the
+	 * pass snapshot — so an approval or tool history recorded under a wider ceiling
+	 * cannot start a tool the narrator may no longer use.
+	 */
+	runtimePolicy?: RuntimePolicy;
+	/** Execution principal of the run; ceilings are resolved for it. */
+	actingUserId?: string | null;
 }
 export interface FinalToolPermissionFence {
 	assertStillCurrent(): void;
@@ -4062,7 +4357,9 @@ function finalPermissionDeny(message: string): never {
 		"FINAL_TOOL_PERMISSION_DENIED",
 	);
 }
-function captureFinalOAuthAuthority(check: FinalToolPermissionCheck) {
+function captureFinalOAuthAuthority(
+	check: Pick<FinalToolPermissionCheck, "narratorId" | "runtimeConstraint">,
+) {
 	const constraint = check.runtimeConstraint;
 	if (!constraint) return null;
 	if (!constraint.oauthClientId || !constraint.grantId)
@@ -4231,13 +4528,146 @@ function captureFinalOAuthAuthority(check: FinalToolPermissionCheck) {
 	}
 	return { authority, client, provenance, snapshot, grants, devices, bindings };
 }
+
+/** Task cancellation has no routed context, but must fence live OAuth policy at dispatch. */
+export function createOAuthTaskControlFence(
+	narratorId: string,
+	runtimeConstraint: RuntimePermissionConstraint,
+): FinalToolPermissionFence {
+	const check = { narratorId, runtimeConstraint };
+	const revision = stableJson(captureFinalOAuthAuthority(check));
+	return {
+		assertStillCurrent() {
+			if (stableJson(captureFinalOAuthAuthority(check)) !== revision)
+				finalPermissionDeny("OAuth authorization changed before cancellation");
+		},
+	};
+}
+
+/** Server-owned audit metadata is not execution input, but only real Eval children may omit it. */
+function captureFinalInternalReadAuthority(call: {
+	id: string;
+	narratorId: string;
+	messageId: string;
+	toolUseId: string;
+	toolName: string;
+	attempt: number;
+	executionSegmentId: string | null;
+	persistedInput: string | null;
+}) {
+	if (call.toolName !== "Read") return null;
+	let input: Record<string, unknown> | undefined;
+	if (call.persistedInput !== null) {
+		try {
+			input = JSON.parse(call.persistedInput);
+		} catch {
+			finalPermissionDeny("invalid persisted input");
+		}
+	}
+	const internalId = /^internal_read_[A-Za-z0-9_-]{21}$/.test(call.toolUseId);
+	const hasMetadata = !!input && Object.hasOwn(input, "__internalRead");
+	if (!internalId && !hasMetadata) return null;
+	const metadata = input?.__internalRead;
+	if (
+		!internalId ||
+		!metadata ||
+		typeof metadata !== "object" ||
+		Array.isArray(metadata) ||
+		Object.keys(metadata).sort().join(",") !== "parentAttempt,parentToolCallId,sequence" ||
+		!("parentToolCallId" in metadata) ||
+		typeof metadata.parentToolCallId !== "string" ||
+		!("parentAttempt" in metadata) ||
+		!Number.isSafeInteger(metadata.parentAttempt) ||
+		(metadata.parentAttempt as number) < 1 ||
+		!("sequence" in metadata) ||
+		!Number.isSafeInteger(metadata.sequence) ||
+		(metadata.sequence as number) < 1 ||
+		!call.executionSegmentId
+	) {
+		finalPermissionDeny("untrusted internal Read audit metadata");
+	}
+	// Three indexed single-row reads, no parent input/output body and no unbounded lineage walk.
+	const childSegment = db
+		.select({
+			id: fileChangeExecutionSegments.id,
+			narratorId: fileChangeExecutionSegments.narratorId,
+			parentSegmentId: fileChangeExecutionSegments.parentSegmentId,
+			sourceToolCallId: fileChangeExecutionSegments.sourceToolCallId,
+			sourceExecutionAttempt: fileChangeExecutionSegments.sourceExecutionAttempt,
+		})
+		.from(fileChangeExecutionSegments)
+		.where(eq(fileChangeExecutionSegments.id, call.executionSegmentId))
+		.get();
+	const parent = db
+		.select({
+			id: narratorToolCalls.id,
+			narratorId: narratorToolCalls.narratorId,
+			messageId: narratorToolCalls.messageId,
+			toolName: narratorToolCalls.toolName,
+			attempt: narratorToolCalls.executionAttempt,
+			version: narratorToolCalls.executionIdentityVersion,
+			origin: narratorToolCalls.executionOriginToolCallId,
+			executionSegmentId: narratorToolCalls.executionSegmentId,
+			status: narratorToolCalls.status,
+			startedAt: narratorToolCalls.executionStartedAt,
+			operationId: narratorToolCalls.fileChangeOperationId,
+			decidedBy: narratorToolCalls.permissionDecidedBy,
+			decidedAt: narratorToolCalls.permissionDecidedAt,
+		})
+		.from(narratorToolCalls)
+		.where(eq(narratorToolCalls.id, metadata.parentToolCallId))
+		.get();
+	if (
+		!childSegment ||
+		childSegment.narratorId !== call.narratorId ||
+		childSegment.sourceToolCallId !== call.id ||
+		childSegment.sourceExecutionAttempt !== call.attempt ||
+		!parent ||
+		parent.narratorId !== call.narratorId ||
+		parent.messageId !== call.messageId ||
+		parent.toolName !== "Eval" ||
+		parent.attempt !== metadata.parentAttempt ||
+		parent.version !== 1 ||
+		parent.origin !== null ||
+		parent.status !== "running" ||
+		!parent.startedAt ||
+		parent.operationId !== null ||
+		!parent.decidedAt ||
+		!["auto", "user", "reflection"].includes(parent.decidedBy ?? "") ||
+		!parent.executionSegmentId ||
+		childSegment.parentSegmentId !== parent.executionSegmentId
+	) {
+		finalPermissionDeny("internal Read parent execution receipt is stale or untrusted");
+	}
+	const parentSegment = db
+		.select({
+			id: fileChangeExecutionSegments.id,
+			narratorId: fileChangeExecutionSegments.narratorId,
+			sourceToolCallId: fileChangeExecutionSegments.sourceToolCallId,
+			sourceExecutionAttempt: fileChangeExecutionSegments.sourceExecutionAttempt,
+		})
+		.from(fileChangeExecutionSegments)
+		.where(eq(fileChangeExecutionSegments.id, parent.executionSegmentId))
+		.get();
+	if (
+		!parentSegment ||
+		parentSegment.narratorId !== call.narratorId ||
+		parentSegment.sourceToolCallId !== parent.id ||
+		parentSegment.sourceExecutionAttempt !== parent.attempt
+	) {
+		finalPermissionDeny("internal Read parent segment does not prove the Eval attempt");
+	}
+	// Recapture this whole receipt on every synchronous final fence assertion.
+	return { metadata, childSegment, parent, parentSegment };
+}
 function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	const narrator = db
 		.select({
 			id: narrators.id,
-			chapterId: narrators.chapterId,
 			contextProjectId: narrators.contextProjectId,
 			parentNarratorId: narrators.parentNarratorId,
+			type: narrators.type,
+			runtimeRegistrationJson: narrators.runtimeRegistrationJson,
 			cwd: narrators.cwd,
 			workspaceRevision: narrators.workspaceRevision,
 			defaultDeviceId: narrators.defaultDeviceId,
@@ -4255,8 +4685,10 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 		.select({
 			id: narratorToolCalls.id,
 			narratorId: narratorToolCalls.narratorId,
+			messageId: narratorToolCalls.messageId,
 			toolUseId: narratorToolCalls.toolUseId,
 			toolName: narratorToolCalls.toolName,
+			executionSegmentId: narratorToolCalls.executionSegmentId,
 			attempt: narratorToolCalls.executionAttempt,
 			version: narratorToolCalls.executionIdentityVersion,
 			origin: narratorToolCalls.executionOriginToolCallId,
@@ -4303,13 +4735,14 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	) {
 		finalPermissionDeny("the exact tool attempt has no persisted approval");
 	}
+	const internalReadAuthority = captureFinalInternalReadAuthority(call);
 	const policy = executionPolicyRepository.loadNow(check.narratorId);
 	const policyRevision = executionPolicyRevision(policy);
 	const oauthAuthority = captureFinalOAuthAuthority(check);
 	const revision = createHash("sha256")
-		.update(stableJson({ narrator, call, policyRevision, oauthAuthority }))
+		.update(stableJson({ narrator, call, internalReadAuthority, policyRevision, oauthAuthority }))
 		.digest("hex");
-	return { narrator, call, policy, policyRevision, revision };
+	return { narrator, call, internalReadAuthority, policy, policyRevision, revision };
 }
 
 /** Read-only authorization gate. It never prompts, writes permission decisions or consumes receipts. */
@@ -4411,6 +4844,11 @@ export async function recheckFinalToolExecutionPermission(
 		} catch {
 			finalPermissionDeny("invalid persisted input");
 		}
+		if (before.internalReadAuthority) {
+			// Only the authenticated server audit field is omitted; every execution field stays bound.
+			const { __internalRead: _audit, ...executionInput } = persisted as Record<string, unknown>;
+			persisted = executionInput;
+		}
 		if (stableJson(persisted) !== stableJson(check.input))
 			finalPermissionDeny("approved input changed");
 	} else if (
@@ -4420,6 +4858,30 @@ export async function recheckFinalToolExecutionPermission(
 		!primaryInputPath
 	) {
 		finalPermissionDeny("approval input exceeds the bounded identity verification budget");
+	}
+	// Stop controls a persisted task, not the narrator's current filesystem/backend.
+	// Keep this out of path policy compilation and remote canonicalization entirely.
+	// The ceiling bounds every start, including approvals granted before it narrowed.
+	const runtimePolicy =
+		check.runtimePolicy ??
+		(await resolveNarratorRuntimePolicy(check.narratorId, check.actingUserId ?? null));
+	if (!isRuntimeToolNameAllowed(runtimePolicy, check.toolName))
+		finalPermissionDeny("tool is outside the current runtime capability ceiling");
+	const readOnlyGitShell = runtimePolicy.readOnlyGitShell;
+	if (check.toolName === "Stop") {
+		if (readOnlyGitShell) finalPermissionDeny("Review mode cannot control running tasks.");
+		const { authorizeStopTask } = await import("./stop-task-policy");
+		const targetFence = check.runtimeConstraint
+			? await authorizeStopTask(check.narratorId, check.input, check.runtimeConstraint)
+			: undefined;
+		const assertStillCurrent = () => {
+			check.signal?.throwIfAborted();
+			targetFence?.assertStillCurrent();
+			if (finalPermissionSnapshot(check).revision !== before.revision)
+				finalPermissionDeny("authorization changed before the tool body started");
+		};
+		assertStillCurrent();
+		return { assertStillCurrent };
 	}
 	const cwd = context?.target.cwd ?? check.cwd ?? before.narrator.cwd;
 	if (!cwd) finalPermissionDeny("missing execution directory");
@@ -4441,7 +4903,6 @@ export async function recheckFinalToolExecutionPermission(
 			check.input.command,
 			cwd,
 			resolvePermissionShellType(context?.backend),
-			!!before.narrator.chapterId,
 			context?.paths ?? localPathSemantics,
 		);
 		if (context) analysis = await canonicalizeShellAnalysisPaths(analysis, context, check.signal);
@@ -4535,13 +4996,25 @@ export async function recheckFinalToolExecutionPermission(
 			: constraint && (check.toolName === "KnowledgeCreate" || check.toolName === "KnowledgeEdit")
 				? "bypassPermissions"
 				: (constraint?.permissionMode ?? before.narrator.permissionMode ?? "default");
-	const review = check.reviewReadOnlyBash || before.narrator.variant === "subagent:review";
+	// Bash under a plain read-only ceiling (explore/plan delegates) is decided by the
+	// permission mode like any session; the delegate prompt is the read-only guard.
+	// Review keeps its strict, synchronous Git-only shell.
 	if (
-		review &&
+		(readOnlyGitShell || runtimePolicy.tools.readOnly) &&
 		!isTaskStateMaintenanceTool(check.toolName, check.input) &&
-		(WRITE_TOOLS.has(decisionTool) || check.toolName === "RequestPermissionRule")
+		((WRITE_TOOLS.has(decisionTool) && !isReadOnlyCall(decisionTool, decisionInput)) ||
+			check.toolName === "RequestPermissionRule" ||
+			(readOnlyGitShell &&
+				isBashToolName(check.toolName) &&
+				(!analysis ||
+					analysis.hasWriteOperation ||
+					analysis.nonWhitelisted.length > 0 ||
+					analysis.dangerousPatterns.length > 0 ||
+					analysis.hasEnvInjection)) ||
+			(["GenUI", "Notification", "ScheduledTask", "Worktree"].includes(check.toolName) &&
+				!isReadOnlyCall(check.toolName, check.input)))
 	)
-		finalPermissionDeny("review capability ceiling");
+		finalPermissionDeny("read-only capability ceiling");
 	const sendInScope =
 		check.toolName === "Send" &&
 		(await shouldAutoAllowSendWithinScope(check.narratorId, before.narrator, check.input));
@@ -4549,7 +5022,12 @@ export async function recheckFinalToolExecutionPermission(
 	if (check.toolName === "RequestPermissionRule") {
 		if (!context) finalPermissionDeny("missing dedicated rule request execution context");
 		await validatePermissionRuleRequestApproval(
-			{ narratorId: check.narratorId, toolUseId: check.toolUseId, binding: check.binding },
+			{
+				narratorId: check.narratorId,
+				toolUseId: check.toolUseId,
+				binding: check.binding,
+				actingUserId: check.actingUserId,
+			},
 			check.input,
 			context,
 		);
@@ -4566,7 +5044,6 @@ export async function recheckFinalToolExecutionPermission(
 					permMode: mode,
 					cwd,
 					bashAnalysis: analysis,
-					isChapter: !!before.narrator.chapterId,
 					compiledPolicy: policy,
 					executionContext: context,
 					projectGitPath: policy.projectGitPath ?? undefined,
@@ -4576,7 +5053,7 @@ export async function recheckFinalToolExecutionPermission(
 						: resolveEffectiveRelaxedPlan(mode, before.narrator.relaxedPlan),
 					planFileId: before.narrator.planFileId ?? undefined,
 					planFilePath: activeNarrators.get(check.narratorId)?._planFilePath,
-					reviewReadOnlyBash: review,
+					reviewReadOnlyBash: readOnlyGitShell,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
 				});
@@ -4737,13 +5214,14 @@ export async function handlePermission(
 		where: eq(narrators.id, narratorId),
 		columns: {
 			permissionMode: true,
-			chapterId: true,
 			relaxedPlan: true,
 			previousPermissionMode: true,
 			planFileId: true,
 			dangerReflectionOverride: true,
 			variant: true,
+			type: true,
 			parentNarratorId: true,
+			runtimeRegistrationJson: true,
 			traits: true,
 		},
 	});
@@ -4753,7 +5231,6 @@ export async function handlePermission(
 		? false
 		: resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
-	const isChapter = !!narrator?.chapterId;
 
 	if (toolName === "RequestPermissionRule") {
 		if (runtimeConstraint || reviewReadOnlyBash || !binding || !executionContext) {
@@ -4788,8 +5265,23 @@ export async function handlePermission(
 	// diagnostics must never be classified with the NarraFork host's shell/path semantics.
 	let bashAnalysis: BashAnalysis | undefined;
 	let shellAnalysisError: string | undefined;
+	// Legacy Bash control shapes remain recognized for persisted permission recovery.
 	const isBashControlOp =
 		isBashToolName(toolName) && !input.command && (input.await != null || input.stop != null);
+	const isStopControlOp = toolName === "Stop";
+	if (isStopControlOp && reviewReadOnlyBash) {
+		return { behavior: "deny", message: "Review mode cannot control running tasks." };
+	}
+	if (isStopControlOp && runtimeConstraint) {
+		try {
+			const { authorizeStopTask } = await import("./stop-task-policy");
+			const { task } = await authorizeStopTask(narratorId, input, runtimeConstraint);
+			// Freeze an alias to the checked task, so approval cannot cancel a retargeted alias.
+			effectiveInput = { type: task.type, id: task.id };
+		} catch (error) {
+			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
+		}
+	}
 	if (isBashToolName(toolName) && typeof input.command === "string") {
 		try {
 			const shellType = resolvePermissionShellType(executionContext?.backend);
@@ -4798,7 +5290,6 @@ export async function handlePermission(
 				input.command,
 				shellCwd,
 				shellType,
-				isChapter,
 				executionContext?.paths ?? localPathSemantics,
 			);
 			if (executionContext) {
@@ -4988,7 +5479,10 @@ export async function handlePermission(
 	// Deliberately decided BEFORE policy compilation: stop/await run no command and
 	// touch no path, so directory/command policy (and its compile failures) do not
 	// apply. OAuth-denied devices and review read-only mode are rejected above.
-	if (isBashControlOp) {
+	if (
+		(isBashControlOp || isStopControlOp) &&
+		!isRecoveredHumanPermission(getPermissionRecovery(options))
+	) {
 		await options?.onInputResolved?.(effectiveInput);
 		await db
 			.update(narratorToolCalls)
@@ -5032,6 +5526,13 @@ export async function handlePermission(
 			activeNarrators.get(narratorId)?._planFilePath,
 			{ narratorId, compiledPolicy },
 		);
+		if (
+			isRecoveredHumanPermission(getPermissionRecovery(options)) &&
+			typeof input.plan === "string" &&
+			input.plan !== resolved.input.plan
+		) {
+			return { behavior: "deny", message: "Plan changed while its approval was awaiting a user" };
+		}
 		effectiveInput = resolved.input;
 		exitPlanResolvedFromFile = resolved.resolvedFromFile;
 		exitPlanSource = resolved.ok ? resolved.planSource : undefined;
@@ -5067,7 +5568,6 @@ export async function handlePermission(
 					permMode: decisionPermMode,
 					cwd,
 					bashAnalysis,
-					isChapter,
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
@@ -5097,6 +5597,12 @@ export async function handlePermission(
 		bashNonWhitelisted: bashAnalysis?.nonWhitelisted,
 		bashHasWrite: bashAnalysis?.hasWriteOperation,
 	});
+
+	const restoredGate = getPermissionRecovery(options);
+	const restoredReflection = recoveryReflection(restoredGate);
+	// A durable human wait is not a new permission decision. Policy expansion after
+	// restart must never silently approve it; hard deny/fatal decisions remain enforced.
+	if (isRecoveredHumanPermission(restoredGate) && decision === "allow") decision = "ask";
 
 	const effectiveMode = getEffectivePermissionMode(
 		decisionPermMode,
@@ -5289,13 +5795,40 @@ export async function handlePermission(
 			decision: decisionPromise,
 		};
 	};
+	if (
+		restoredReflection?.type === "danger_reflection" &&
+		["running", "awaiting_user"].includes(restoredReflection.status) &&
+		(decision === "allow" || decision === "ask")
+	) {
+		const restoredDanger = restoredReflection.danger as DangerInfo | undefined;
+		if (
+			!restoredDanger ||
+			typeof restoredDanger.summary !== "string" ||
+			typeof restoredReflection.fingerprint !== "string"
+		) {
+			return { behavior: "deny", message: "Invalid persisted danger reflection" };
+		}
+		const pause = await startDangerReflectionPause(restoredDanger, restoredReflection.fingerprint, {
+			skipConfirmationCache: true,
+			planModeSoftDeny: restoredReflection.planModeSoftDeny === true,
+		});
+		if (pause?.behavior === "dangerReflection" && restoredReflection.status === "awaiting_user") {
+			await stopDangerReflectionLoop(pause.requestId, "Restored user-owned danger reflection");
+			options?.onAwaitingUserDecision?.();
+		}
+		if (pause) return pause;
+	}
 	// An external narrator under bypassPermissions reaches here with decision "ask" as well:
 	// there is nobody to ask, so reflection is its review path rather than a denial.
 	const oauthDangerReflectionCandidate =
 		oauthReflectsInsteadOfDenying && (decision === "allow" || decision === "ask");
+	// Review-tier `.git` writes ask even under bypassPermissions; reflection answers that
+	// review when enabled, otherwise it falls through to the human prompt.
+	const bypassReviewCandidate =
+		decision === "allow" || (decision === "ask" && !!permMeta.gitInternalReviewReason);
 	if (
 		(oauthDangerReflectionCandidate ||
-			(!runtimeConstraint && decision === "allow" && effectiveMode === "bypassPermissions")) &&
+			(!runtimeConstraint && bypassReviewCandidate && effectiveMode === "bypassPermissions")) &&
 		dangerReflectionLevel !== "off"
 	) {
 		const danger =
@@ -5365,12 +5898,10 @@ export async function handlePermission(
 	// Plan mode soft deny → ask the user once before falling back to auto-deny.
 	let promotedPlanSoftDeny = false;
 	if (decision === "deny") {
-		const hasChapterGitIssues = isChapter && getChapterGitPermissionIssues(bashAnalysis).length > 0;
 		const isPlanModeSoftDeny =
 			isPlanMode &&
 			!isRelaxedPlan &&
 			!permMeta.commandBlacklistReason &&
-			!hasChapterGitIssues &&
 			(permMeta.planModeSoftDeny || !permMeta.blacklistReason);
 		if (isPlanModeSoftDeny && !planModeAskedOnce.has(narratorId)) {
 			planModeAskedOnce.add(narratorId);
@@ -5458,7 +5989,6 @@ export async function handlePermission(
 				.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 			return { behavior: "deny", message: denyMsg };
 		}
-		const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
 		const isReadToolPathDenied =
 			(permMode === "readOnly" || isPlanMode) &&
 			(READ_ONLY_TOOLS.includes(toolName) ||
@@ -5468,23 +5998,18 @@ export async function handlePermission(
 					bashAnalysis.nonWhitelisted.length === 0 &&
 					!bashAnalysis.dangerousPatterns.length &&
 					!bashAnalysis.hasEnvInjection));
-		const denyMsg =
-			chapterGitIssues.length > 0
-				? `DENIED: Chapter mode restricts git branch/worktree operations. Issues: ${chapterGitIssues.join("; ")}. Use NarraFork chapter operations or request explicit permission in an interactive mode.`
-				: isReadToolPathDenied
-					? getToolMessage("permissionDeniedPathOutsideScope", locale)
-					: isPlanMode
-						? getToolMessage("permissionDeniedPlanMode", locale)
-						: permMode === "readOnly"
-							? getToolMessage("permissionDeniedReadOnly", locale)
-							: getToolMessage("permissionDeniedNonInteractive", locale);
-		const decisionReason = chapterGitIssues.length > 0 ? chapterGitIssues.join("; ") : undefined;
+		const denyMsg = isReadToolPathDenied
+			? getToolMessage("permissionDeniedPathOutsideScope", locale)
+			: isPlanMode
+				? getToolMessage("permissionDeniedPlanMode", locale)
+				: permMode === "readOnly"
+					? getToolMessage("permissionDeniedReadOnly", locale)
+					: getToolMessage("permissionDeniedNonInteractive", locale);
 		logger.debug("Permission auto-denied", {
 			narratorId,
 			toolName,
 			toolUseId,
 			permMode,
-			...(decisionReason ? { reason: decisionReason } : {}),
 		});
 		await db
 			.update(narratorToolCalls)
@@ -5493,7 +6018,6 @@ export async function handlePermission(
 				errorMessage: denyMsg,
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
-				...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 			})
 			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 		return {
@@ -5536,25 +6060,16 @@ export async function handlePermission(
 		}
 		decisionReason = parts.join("; ");
 	}
-	if (isChapter && bashAnalysis) {
-		const chapterGitParts: string[] = [];
-		if (bashAnalysis.gitBranchViolations.length > 0) {
-			chapterGitParts.push(`Chapter git issues: ${bashAnalysis.gitBranchViolations.join("; ")}`);
-		}
-		if (bashAnalysis.gitBranchWarnings.length > 0) {
-			chapterGitParts.push(`Chapter git warnings: ${bashAnalysis.gitBranchWarnings.join("; ")}`);
-		}
-		if (chapterGitParts.length > 0) {
-			const chapterGitMsg = chapterGitParts.join("; ");
-			decisionReason = decisionReason ? `${decisionReason}; ${chapterGitMsg}` : chapterGitMsg;
-		}
-	}
-
 	if (toolName === "Agent" && typeof input.workdir === "string" && input.workdir) {
 		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
 
+	if (permMeta.gitInternalReviewReason) {
+		decisionReason = decisionReason
+			? `${permMeta.gitInternalReviewReason}; ${decisionReason}`
+			: permMeta.gitInternalReviewReason;
+	}
 	if (promotedPlanSoftDeny) {
 		decisionReason = getToolMessage("planModeSoftDenyAskReason", locale);
 	}
@@ -5582,7 +6097,9 @@ export async function handlePermission(
 	// deadline up front so the timer, the request broadcast, and later reconnects
 	// all agree on the same countdown target.
 	const questionReflectionDeadline =
-		toolName === "AskUserQuestion" && shouldScheduleQuestionReflection(effectiveMode)
+		toolName === "AskUserQuestion" &&
+		!isRecoveredHumanPermission(restoredGate) &&
+		shouldScheduleQuestionReflection(effectiveMode)
 			? Date.now() + getQuestionReflectionTimeoutMs()
 			: undefined;
 
@@ -5753,10 +6270,18 @@ async function handlePermissionRuleRequest(args: {
 	try {
 		signal.throwIfAborted();
 		prepared = await preparePermissionRuleRequest(
-			{ narratorId, toolUseId, binding },
+			{
+				narratorId,
+				toolUseId,
+				binding,
+				actingUserId: activeNarrators.get(narratorId)?._currentUserId ?? null,
+			},
 			args.input,
 			context,
 		);
+		if (isRecoveredHumanPermission(getPermissionRecovery(options))) {
+			prepared = { ...prepared, automatic: false };
+		}
 		await options.onInputResolved?.(prepared.input);
 	} catch (error) {
 		return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
@@ -6003,134 +6528,6 @@ export interface ResolvePermissionOpts {
 
 type DangerReflectionDecidedBy = "reflection" | "user" | "auto" | `narrator:${string}`;
 
-/**
- * How approval feedback text reaches a SUBAGENT.
- *
- * ## Why subagents need their own path at all
- *
- * The primary-narrator path stashes the text in `pendingFeedback` (keyed by
- * narratorId) and arms `_feedbackSoftStop` on the `activeNarrators` entry; the
- * `[continuation-source: permission-feedback]` branch of `runAgentLoop` then
- * persists it as a real `role: "user"` turn and restarts the pass with it.
- *
- * A subagent has NO `activeNarrators` entry — a running subagent registers only in
- * `activeSubagentSettings` — so BOTH halves of that mechanism silently no-op for
- * one. The user could type feedback into the InlinePermission form rendered inside
- * the parent's SubagentCard, approve, and have the text vanish without a trace,
- * which is worse than offering no input box at all.
- *
- * ## Why a message and not a note on the tool result
- *
- * The subagent's equivalent of "stash payload + arm soft stop" is the buffered
- * message queue: `bufferSubagentUserMessage` enqueues the text AND requests the
- * next safe post-tool boundary (`shouldStopSubagentForBufferedMessage` is exactly
- * what the subagent loop passes as its `shouldStop`). The queue is drained by
- * `getAfterToolsInjections` (in-pass) or `consumeNextBufferedSubagentMessage`
- * (pass restart), and both persist it through `persistSubagentUserMessage`. So the
- * result is the same shape the primary path produces: a `role: "user"` turn.
- *
- * That is what the content IS. The user typed a turn ("go ahead, but watch out for
- * X"); routing it through `deliverInjection` instead would file it as a `sys`
- * injection row — lower weight for the model, attributed to the system rather than
- * to the person who wrote it, and rendered as a system card instead of their
- * message. Attaching it to the tool result would be worse still: it would arrive
- * as commentary on one call rather than as an instruction for what to do next.
- *
- * ## Why a seam and not a lazy import at the call site
- *
- * `mock.module` is process-wide in Bun: replacing `subagent-executor` for one test
- * file hands the replacement to every later file in the run, and that module holds
- * lazily-initialized queues other suites read. A seam the test installs and
- * restores keeps the blast radius inside the test.
- */
-export interface SubagentFeedbackDelivery {
-	/** Whether a subagent loop is currently running under this narrator id. */
-	isSubagentRunning: (narratorId: string) => boolean;
-	/**
-	 * Queue the text as the subagent's next user turn and request a safe stop.
-	 * Returns false when the queue refused it (full, or no running subagent).
-	 */
-	deliver: (
-		narratorId: string,
-		text: string,
-		options: { createdBy: string | null },
-	) => boolean | Promise<boolean>;
-}
-
-/** Lazily bound to the real subagent modules; replaced only by tests. */
-let subagentFeedbackDelivery: SubagentFeedbackDelivery | null = null;
-
-/**
- * Install a subagent feedback delivery implementation, returning the previous one
- * so a test can restore it. Pass `null` to fall back to the real subagent modules.
- */
-export function setSubagentFeedbackDelivery(
-	next: SubagentFeedbackDelivery | null,
-): SubagentFeedbackDelivery | null {
-	const previous = subagentFeedbackDelivery;
-	subagentFeedbackDelivery = next;
-	return previous;
-}
-
-/**
- * Whether this permission's feedback must take the subagent path.
- *
- * Kept synchronous so the primary-narrator branch stays exactly what it was: an
- * in-line `pendingFeedback.set` before `pending.resolve`, with no await inserted
- * between the two. `activeSubagentSettings` is registered for the whole span of a
- * subagent run, so this needs no database read on the decision path.
- */
-function isSubagentFeedbackRecipient(narratorId: string): boolean {
-	if (subagentFeedbackDelivery) return subagentFeedbackDelivery.isSubagentRunning(narratorId);
-	return activeSubagentSettings.has(narratorId);
-}
-
-/**
- * Queue approval feedback text as the subagent's next user turn.
- *
- * Failure is logged, not thrown: the permission has already been decided and the
- * approved tool is about to run, so raising here would fail a call the user allowed.
- */
-async function deliverSubagentPermissionFeedback(
-	narratorId: string,
-	text: string,
-	userId: string | null,
-): Promise<void> {
-	try {
-		let delivery = subagentFeedbackDelivery;
-		if (!delivery) {
-			const [{ bufferSubagentUserMessage }, { isTakenOver }] = await Promise.all([
-				import("./subagent-executor"),
-				import("./subagent-takeover"),
-			]);
-			delivery = {
-				isSubagentRunning: (id) => activeSubagentSettings.has(id),
-				deliver: async (id, message, options) =>
-					(
-						await bufferSubagentUserMessage(id, message, {
-							createdBy: options.createdBy,
-							// A taken-over subagent is driven by the user directly, so cutting
-							// short the turn they are steering would be wrong; the resume path
-							// drains the queue instead. Same rule every other subagent send obeys.
-							requestSoftStop: !isTakenOver(id),
-						})
-					).ok,
-			};
-		}
-		if (!(await delivery.deliver(narratorId, text, { createdBy: userId }))) {
-			logger.warn("Subagent permission feedback could not be queued", {
-				narratorId,
-				chars: text.length,
-			});
-		}
-	} catch (err) {
-		logger.error("Failed to deliver subagent permission feedback", {
-			narratorId,
-			error: String(err),
-		});
-	}
-}
-
 async function enableRelaxedPlanAfterPlanSoftDeny(
 	narratorId: string,
 	broadcastTargetId: string,
@@ -6345,12 +6742,9 @@ export async function resolvePermission(
 		// Carry the approver so the injected turn shows their avatar rather than an
 		// anonymous "you".
 		const feedbackUserId = decidedBy === "user" ? (userId ?? null) : null;
-		// A subagent has no `activeNarrators` entry, so `pendingFeedback` +
-		// `_feedbackSoftStop` would both be written into the void for one. Its
-		// equivalent is the buffered-message queue — see `SubagentFeedbackDelivery`.
-		const subagentFeedback =
-			approvalFeedback && isSubagentFeedbackRecipient(pending.narratorId) ? approvalFeedback : null;
-		if (approvalFeedback && !subagentFeedback) {
+		// One path for every session: the run adopts the text at its next safe boundary
+		// as the approver's own turn (`[continuation-source: permission-feedback]`).
+		if (approvalFeedback) {
 			pendingFeedback.set(pending.narratorId, {
 				toolUseId: pending.toolUseId,
 				feedbackText: approvalFeedback,
@@ -6386,16 +6780,13 @@ export async function resolvePermission(
 
 		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
 
-		// The ExitPlanMode exclusion is a PRIMARY-narrator rule and stays scoped to the
-		// primary branch: approving a plan already restarts the loop through
-		// `_planApprovedContinue`, which merges `pendingFeedback` into its own prompt, so
-		// arming a second stop would cut that restart short. Subagents have no plan mode
-		// at all (`subagent-tools.ts` admits neither EnterPlanMode nor ExitPlanMode, and
-		// `isPlanModeTrait` is never true for a subagent row), so the exclusion is
-		// vacuous on their path and is deliberately not carried over.
-		if (subagentFeedback) {
-			await deliverSubagentPermissionFeedback(pending.narratorId, subagentFeedback, feedbackUserId);
-		} else if (approvalFeedback && pending.toolName !== "ExitPlanMode") {
+		// Approving a plan already restarts the loop through `_planApprovedContinue`,
+		// which merges `pendingFeedback` into its own prompt, so arming a second stop
+		// would cut that restart short.
+		//
+		// A held run (the user drives it) is stopped at the same boundary: the feedback
+		// is the user's own next turn, exactly as for a session they drive directly.
+		if (approvalFeedback && pending.toolName !== "ExitPlanMode") {
 			const active = activeNarrators.get(pending.narratorId);
 			if (active?.alive) {
 				active._feedbackSoftStop = true;
@@ -6503,6 +6894,44 @@ export async function resolvePermissionOrDangerReflection(
 	decision: "allow" | "deny",
 	opts: ResolvePermissionOpts = {},
 ): Promise<boolean> {
+	// --no-auto-resume leaves durable approvals intact, but mounts no executing owner.
+	// An explicit human decision may restore this one owner's subtree, never unrelated work.
+	if (
+		!pendingPermissions.has(requestId) &&
+		!pendingDangerReflections.has(requestId) &&
+		(opts.decidedBy ?? "user") === "user"
+	) {
+		const { manuallyResumeRestartRecovery, pausedRestartToolCallForRequest } = await import(
+			"./restart-recovery-service"
+		);
+		const stored = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
+			columns: {
+				narratorId: true,
+				status: true,
+				executionStartedAt: true,
+				fileChangeOperationId: true,
+			},
+		});
+		if (
+			stored?.status === "pending" &&
+			stored.executionStartedAt == null &&
+			stored.fileChangeOperationId == null
+		) {
+			if (await manuallyResumeRestartRecovery(stored.narratorId)) {
+				const deadline = Date.now() + 2_000;
+				while (
+					!pendingPermissions.has(requestId) &&
+					!pendingDangerReflections.has(requestId) &&
+					Date.now() < deadline
+				) {
+					const { hasPendingTaskReflection } = await import("../lib/agent/tools/task-reflection");
+					if (hasPendingTaskReflection(requestId)) break;
+					await new Promise<void>((resolve) => setTimeout(resolve, 10));
+				}
+			}
+		}
+	}
 	if (pendingPermissions.has(requestId)) {
 		return resolvePermission(requestId, decision, opts);
 	}

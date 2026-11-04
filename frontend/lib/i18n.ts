@@ -18,12 +18,9 @@ export type SupportedLanguage = Locale;
 export const namespaces = [
 	"common",
 	"errors",
-	"chapters",
 	"containers",
 	"dashboard",
-	"explorations",
 	"git",
-	"graph",
 	"narrator",
 	"nav",
 	"learning",
@@ -34,6 +31,7 @@ export const namespaces = [
 	"terminal",
 	"routines",
 	"knowledge",
+	"outline",
 	"scheduledTasks",
 	"plugins",
 	"chat",
@@ -43,6 +41,7 @@ export type Namespace = (typeof namespaces)[number];
 
 const namespaceSet = new Set<string>(namespaces);
 const resourceCache = new Map<string, Promise<Record<string, unknown>>>();
+const namespaceSetCache = new Map<string, Promise<void>>();
 let initPromise: Promise<typeof i18n> | undefined;
 
 export function normalizeLanguage(lng: string | null | undefined): SupportedLanguage {
@@ -70,7 +69,8 @@ function normalizePathname(pathname: string): string {
  *
  * `AuthenticatedLayout` translates from `common` and `nav`, uses `settings` for
  * the setup-wizard return button, and always mounts `ProviderBaseUrlFixHost`,
- * which also translates from `settings`.
+ * which also translates from `settings`. The recent-tab tree additionally uses
+ * `narrator`, and its eager create-modal host uses `narrators` for the shell title.
  *
  * The shell renders ABOVE the route match, so the root route provides it with no
  * Suspense boundary of its own (TanStack only wraps non-root matches). If a
@@ -80,7 +80,14 @@ function normalizePathname(pathname: string): string {
  * "Something went wrong!" screen. Every authenticated path must therefore
  * preload these before the shell can render.
  */
-const APP_SHELL_NAMESPACES = ["common", "errors", "nav", "settings"] as const satisfies Namespace[];
+export const APP_SHELL_NAMESPACES = [
+	"common",
+	"errors",
+	"nav",
+	"settings",
+	"narrator",
+	"narrators",
+] as const satisfies Namespace[];
 
 /**
  * Public paths that render without the authenticated app shell.
@@ -102,8 +109,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 
 	// Private windows share auth/theme, not the navigation's translation bundles.
 	if (path === "/windows" || path.startsWith("/windows/")) {
-		const gitWindow =
-			path.startsWith("/windows/git/narrators/") || path.startsWith("/windows/git/chapters/");
+		const gitWindow = path.startsWith("/windows/git/narrators/");
 		if (gitWindow) return ["common", "errors", "git"];
 		// Panel/workspace windows render panels whose components each carry their own
 		// namespace (terminal, git, knowledge, …) — preload the full panel set.
@@ -117,6 +123,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 				"git",
 				"chat",
 				"knowledge",
+				"outline",
 				"plugins",
 			];
 		}
@@ -137,27 +144,17 @@ function getRouteNamespaces(path: string): Namespace[] {
 	if (path === "/") return ["common", "nav", "dashboard"];
 	if (path === "/projects") return ["common", "nav", "projects"];
 	if (path.startsWith("/projects/")) {
-		return [
-			"common",
-			"nav",
-			"projects",
-			"chapters",
-			"graph",
-			"narrator",
-			"settings",
-			"terminal",
-			"git",
-			"chat",
-		];
+		return ["common", "nav", "projects", "narrator", "settings", "terminal", "git", "chat"];
 	}
-	if (path.startsWith("/git/narrators/") || path.startsWith("/git/chapters/")) {
+	if (path.startsWith("/git/narrators/")) {
 		return ["git"];
 	}
 	if (path === "/messages") return ["common", "nav", "chat"];
 	if (path === "/narrators") return ["common", "nav", "narrators", "narrator", "chat"];
 	if (path === "/narrators/archived") return ["common", "nav", "narrators"];
+	// Sessions open outline panels beside them (and workspaces hold outline pages).
 	if (path.startsWith("/narrators/workspace/")) {
-		return ["common", "nav", "narrators", "narrator", "terminal", "git", "chat"];
+		return ["common", "nav", "narrators", "narrator", "terminal", "git", "chat", "outline"];
 	}
 	if (path.startsWith("/narrators/")) {
 		return [
@@ -165,11 +162,11 @@ function getRouteNamespaces(path: string): Namespace[] {
 			"nav",
 			"narrators",
 			"narrator",
-			"chapters",
 			"settings",
 			"terminal",
 			"git",
 			"chat",
+			"outline",
 		];
 	}
 	if (path === "/settings/providers" || path === "/settings/models" || path === "/settings/agent") {
@@ -199,12 +196,20 @@ function getRouteNamespaces(path: string): Namespace[] {
 		return ["common", "nav", "knowledge"];
 	}
 	if (path === "/search") return ["common", "nav", "search"];
+	// A page of an outline is a dock where sessions open beside it.
+	if (path.startsWith("/outline/") && path.split("/").length > 3) {
+		return ["common", "nav", "outline", "narrators", "narrator", "terminal", "git", "chat"];
+	}
+	if (path === "/outline" || path.startsWith("/outline/")) {
+		return ["common", "nav", "outline"];
+	}
 
 	return ["common", "nav"];
 }
 
-export function getInitialNamespaces(pathname: string): Namespace[] {
-	return getNamespacesForPath(pathname);
+export function getInitialNamespaces(_pathname: string): Namespace[] {
+	// Only global UI must block bootstrap. Route and shell gates load their own bundles.
+	return ["common", "errors"];
 }
 
 function normalizeNamespace(namespace: string): Namespace {
@@ -338,18 +343,27 @@ async function loadNamespaceBundle(
 	}
 }
 
-export async function ensureI18nNamespaces(ns: readonly Namespace[], lng?: string): Promise<void> {
-	const targetNamespaces = uniqueNamespaces(ns);
-	if (targetNamespaces.length === 0) return;
-
+export function ensureI18nNamespaces(ns: readonly Namespace[], lng?: string): Promise<void> {
+	const targetNamespaces = uniqueNamespaces(ns).sort();
 	const targetLanguage = normalizeLanguage(lng ?? i18n.resolvedLanguage ?? i18n.language);
-	const languages = getLocaleFallbackChain(targetLanguage);
+	const cacheKey = `${targetLanguage}:${targetNamespaces.join(",")}`;
+	const cached = namespaceSetCache.get(cacheKey);
+	if (cached) return cached;
 
-	await Promise.all(
+	const languages = getLocaleFallbackChain(targetLanguage);
+	const promise = Promise.all(
 		languages.flatMap((language) =>
 			targetNamespaces.map((namespace) => loadNamespaceBundle(language, namespace)),
 		),
-	);
+	)
+		.then(() => undefined)
+		.catch((error) => {
+			// A rejected render gate must be retryable after the boundary resets.
+			namespaceSetCache.delete(cacheKey);
+			throw error;
+		});
+	namespaceSetCache.set(cacheKey, promise);
+	return promise;
 }
 
 export async function changeAppLanguage(

@@ -21,6 +21,7 @@ mock.module("../../db", () => ({ db, sqlite }));
 const broadcasts: Array<{ narratorId: string; message: Record<string, unknown> }> = [];
 
 const { backgroundTaskService } = await import("../background-task-service");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 // Injected rather than `mock.module`d: the service caches its lazily-imported
 // broadcast fn, so whichever test file resolves it first wins for the whole
 // process. Another file mocking `narrator-ws` would silently swallow these frames
@@ -44,7 +45,9 @@ beforeEach(() => {
 	backgroundTaskService.resetListVersionsForTests();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	if (backgroundOccupancyStore.isReady) await flush();
+	backgroundTaskService.resetListVersionsForTests();
 	cleanDb(sqlite);
 });
 
@@ -66,6 +69,7 @@ async function seedParent(): Promise<void> {
 		createdAt: now,
 		updatedAt: now,
 	});
+	await backgroundOccupancyStore.start();
 }
 
 /** An owning transfer row, with optional progress figures. */
@@ -103,7 +107,21 @@ async function projectionOf(transferTaskId: string) {
 }
 
 async function flush(): Promise<void> {
-	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+	await backgroundOccupancyStore.flush();
+	for (let i = 0; i < 8; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+/**
+ * `createTransferTask` queues its list delta without awaiting it. Under CI load
+ * that frame can land after the test has already cleared `broadcasts`, and then
+ * it looks like the progress broadcast bumped the list version.
+ */
+async function waitForListDelta(): Promise<void> {
+	for (let i = 0; i < 50; i++) {
+		if (broadcasts.some((entry) => entry.message.type === "background_task_list_delta")) return;
+		await flush();
+	}
+	throw new Error("timed out waiting for the transfer projection list delta");
 }
 
 describe("transfer projection lifecycle", () => {
@@ -271,7 +289,7 @@ describe("restart recovery keeps the two halves in agreement", () => {
 		expect(row?.output).toBe(TRANSFER_RESTART_PAUSE_NOTICE);
 	});
 
-	test("a bash task still recovers as cancelled", async () => {
+	test("a bash task recovers as failed with unknown outcome and is not rerun", async () => {
 		// The transfer carve-out must not soften recovery for the kinds that really
 		// are destroyed by a restart: a dead child process has no resume path.
 		await seedParent();
@@ -281,7 +299,10 @@ describe("restart recovery keeps the two halves in agreement", () => {
 			command: "sleep 100",
 		});
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
-		expect((await backgroundTaskService.getById("bash-restart"))?.status).toBe("cancelled");
+		expect(await backgroundTaskService.getById("bash-restart")).toMatchObject({
+			status: "failed",
+			output: "Execution outcome unknown after restart; the command was not rerun.",
+		});
 	});
 
 	test("recovery does not emit a cancellation event for a paused transfer", async () => {
@@ -371,7 +392,7 @@ describe("live progress reaches the list without touching the delta sequence", (
 			transferTaskId: transferId,
 			title: "upload → app.apk",
 		});
-		await flush();
+		await waitForListDelta();
 		const versionsBefore = broadcasts
 			.filter((b) => b.message.type === "background_task_list_delta")
 			.map((b) => b.message.version);

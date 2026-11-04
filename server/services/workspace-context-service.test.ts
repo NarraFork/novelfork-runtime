@@ -6,7 +6,6 @@ import type { WorkspaceContext } from "@shared/workspace-context";
 import { Hono } from "hono";
 
 let row: Record<string, unknown>;
-let chapter: { worktreePath: string; projectId: string } | undefined;
 let root = "";
 let events: unknown[] = [];
 let failInstall = false;
@@ -19,7 +18,6 @@ mock.module("@server/db", () => ({
 		get: () => undefined,
 		query: {
 			narrators: { findFirst: findRow },
-			chapters: { findFirst: async () => chapter },
 			projects: { findFirst: async () => undefined },
 		},
 		update: () => ({
@@ -47,6 +45,17 @@ mock.module("./narrator-session", () => ({
 		if (active) active.cwd = cwd;
 	},
 }));
+const displayMessages: Array<{ narratorId: string; text: string }> = [];
+mock.module("./narrator-service", () => ({
+	narratorService: {
+		persistDisplayMessage: async (narratorId: string, text: string) => {
+			displayMessages.push({ narratorId, text });
+		},
+	},
+}));
+mock.module("../lib/i18n", () => ({
+	getUserLanguage: async () => "en",
+}));
 const { executionPolicyEngine } = await import("./execution-policy/engine");
 const { activeNarrators, pendingPermissions, reserveNarratorRevertAdmission } = await import(
 	"./narrator-session-state"
@@ -70,14 +79,14 @@ beforeEach(async () => {
 		workspaceRevision: 0,
 		workspaceContext: null,
 		defaultDeviceId: null,
-		chapterId: null,
 		contextProjectId: "same-project",
 		variant: "primary",
 		traits: [],
 		status: "idle",
+		apiConversationId: "stable-cache-identity",
 	};
-	chapter = undefined;
 	events = [];
+	displayMessages.length = 0;
 	failInstall = false;
 	policySpy = spyOn(executionPolicyEngine, "compile").mockResolvedValue({
 		evaluatePath: () => ({ decision: "allow" }),
@@ -162,8 +171,23 @@ describe("local authoritative workspace context", () => {
 		expect(row.workspaceRevision).toBe(1);
 		expect(row.workspaceContext).toEqual(result.current);
 		expect(row.contextProjectId).toBe("same-project");
+		expect(row.apiConversationId).toBe("stable-cache-identity");
 		expect(events).toHaveLength(1);
 		expect(await workspaceContextService.get("narrator")).toEqual(result.current);
+	});
+	test("manual HTTP cwd change writes the history reminder; agent switches skip it", async () => {
+		const result = await change();
+		expect(result.changed).toBe(true);
+		expect(displayMessages).toEqual([
+			{
+				narratorId: "narrator",
+				text: `Working directory updated: ${join(root, "old")} → ${join(root, "new")}`,
+			},
+		]);
+		// Unchanged switch must not spam a second card.
+		displayMessages.length = 0;
+		await change(join(root, "new"), 1);
+		expect(displayMessages).toEqual([]);
 	});
 	test("real concurrent service calls at one revision have a single winner", async () => {
 		await mkdir(join(root, "other"));
@@ -215,12 +239,6 @@ describe("local authoritative workspace context", () => {
 		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
 		expect(row.workspaceRevision).toBe(0);
 	});
-	test("chapter worktree cannot be crossed even for accessible non-Git paths", async () => {
-		row.chapterId = "chapter";
-		chapter = { worktreePath: join(root, "old"), projectId: "same-project" };
-		await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_UNSUPPORTED" });
-		expect(row.workspaceRevision).toBe(0);
-	});
 	test("M0 refuses historical file restoration after switching, before touching either directory", async () => {
 		await assertWorkspaceHistoryRevertSupported("narrator");
 		await change();
@@ -232,6 +250,8 @@ describe("local authoritative workspace context", () => {
 	test("agent switch commits while its own loop is running, leaving existing children bound", async () => {
 		const active = {
 			alive: true,
+			conversationId: "stable-cache-identity",
+			_persistedConversationId: "stable-cache-identity",
 			cwd: row.cwd,
 			_loopRunning: true,
 			abortController: new AbortController(),
@@ -258,6 +278,12 @@ describe("local authoritative workspace context", () => {
 			expect(active.cwd).toBe(join(root, "new"));
 			expect(child.cwd).toBe(join(root, "old"));
 			expect(active._workspacePassInvalidated).toBe(true);
+			expect(active.conversationId).toBe("stable-cache-identity");
+			expect(active._persistedConversationId).toBe("stable-cache-identity");
+			expect(active._resetUpstreamSessionOnNextRequest).toBeUndefined();
+			expect(row.apiConversationId).toBe("stable-cache-identity");
+			// Agent origin injects the pass-continuation text instead of a display card.
+			expect(displayMessages).toEqual([]);
 		} finally {
 			activeNarrators.delete("child");
 		}
@@ -308,6 +334,36 @@ describe("local authoritative workspace context", () => {
 		expect(active.abortController.signal.aborted).toBe(true);
 		expect((await workspaceContextService.get("narrator")).cwd).toBe(join(root, "new"));
 		expect(events).toEqual([]);
+	});
+	test.each([
+		false,
+		true,
+	])("HTTP ignores an obsolete mismatched worktree key (Git target: %s)", async (gitTarget) => {
+		const cwd = join(root, "new");
+		if (gitTarget) {
+			const process = Bun.spawn(["git", "init", "--quiet", cwd], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			expect(await process.exited).toBe(0);
+		}
+		const response = await app().request("/api/narrators/narrator/workspace-context/switch", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				expectedRevision: 0,
+				requestId: "obsolete-key",
+				target: { deviceId: "local", cwd },
+				expectedWorktreeKey: "wrong-current-worktree-key",
+			}),
+		});
+		expect(response.status).toBe(200);
+		const result = await response.json();
+		expect(result.changed).toBe(true);
+		expect(result.current.cwd).toBe(cwd);
+		expect(result.current.revision).toBe(1);
+		expect(Boolean(result.current.git)).toBe(gitTarget);
+		expect(row.cwd).toBe(cwd);
 	});
 	test("HTTP read, switch and legacy PATCH all use the actual service", async () => {
 		const router = app();

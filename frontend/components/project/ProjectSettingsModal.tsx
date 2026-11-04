@@ -1,9 +1,19 @@
-import { Button, Divider, Modal, Stack, Switch, Text, TextInput, Title } from "@mantine/core";
+import {
+	Alert,
+	Button,
+	Divider,
+	Modal,
+	Stack,
+	Text,
+	Textarea,
+	TextInput,
+	Title,
+} from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
-import { useUpdateProject } from "../../hooks/useProjects";
+import { useProject, useUpdateProject } from "../../hooks/useProjects";
 import { api } from "../../lib/api";
 import type {
 	CommandBlacklistRuleInput,
@@ -19,7 +29,6 @@ import { ProjectAccessPanel } from "./ProjectAccessPanel";
 
 interface ProjectSettingsModalProps {
 	projectId: string;
-	proxyDomain: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 	chapterSettings: any;
 	opened: boolean;
@@ -37,7 +46,6 @@ function normalizeRules<T extends { selector: ReturnType<typeof normalizeRuleTar
 
 export function ProjectSettingsModal({
 	projectId,
-	proxyDomain,
 	chapterSettings,
 	opened,
 	onClose,
@@ -46,6 +54,17 @@ export function ProjectSettingsModal({
 	const { t: ts } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
 	const update = useUpdateProject();
+	const project = useProject(projectId);
+	const [name, setName] = useState("");
+	const [description, setDescription] = useState("");
+	const [gitPath, setGitPath] = useState("");
+	useEffect(() => {
+		if (opened && project.data) {
+			setName(project.data.name ?? "");
+			setDescription(project.data.description ?? "");
+			setGitPath(project.data.gitPath ?? "");
+		}
+	}, [opened, project.data]);
 	const platform = usePlatform();
 	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
 	const { data: permissionDevices = [] } = useQuery({
@@ -54,21 +73,6 @@ export function ProjectSettingsModal({
 		staleTime: 30_000,
 		enabled: opened,
 	});
-	const [domain, setDomain] = useState(proxyDomain ?? "");
-	const normalized = domain.trim().toLowerCase();
-	const hasInvalidChars = /[^a-z0-9.-]/.test(normalized);
-	const hasConsecutiveDots = normalized.includes("..");
-	const validShape =
-		/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))+$/.test(
-			normalized,
-		);
-	const domainError =
-		normalized.length === 0
-			? null
-			: hasInvalidChars || hasConsecutiveDots || !validShape
-				? t("proxyDomainInvalid")
-				: null;
-
 	const cs =
 		typeof chapterSettings === "string"
 			? (() => {
@@ -92,11 +96,9 @@ export function ProjectSettingsModal({
 	const [commandBlacklist, setCommandBlacklist] = useState<CommandBlacklistRuleInput[]>(() =>
 		normalizeRules<CommandBlacklistRuleInput>(cs.commandBlacklist),
 	);
-	const [requireReview, setRequireReview] = useState<boolean>(cs.requireReviewBeforeMerge ?? false);
 
 	useEffect(() => {
 		if (opened) {
-			setDomain(proxyDomain ?? "");
 			const fresh =
 				typeof chapterSettings === "string"
 					? (() => {
@@ -111,23 +113,23 @@ export function ProjectSettingsModal({
 			setBlacklistDirs(normalizeRules<DirectoryBlacklistRuleInput>(fresh.blacklistDirs));
 			setCommandWhitelist(normalizeRules<CommandWhitelistRuleInput>(fresh.commandWhitelist));
 			setCommandBlacklist(normalizeRules<CommandBlacklistRuleInput>(fresh.commandBlacklist));
-			setRequireReview(fresh.requireReviewBeforeMerge ?? false);
 		}
-	}, [opened, proxyDomain, chapterSettings]);
+	}, [opened, chapterSettings]);
 
 	const handleSave = () => {
-		if (domainError) return;
+		if (!name.trim() || !gitPath.trim() || project.isError) return;
 		update.mutate(
 			{
 				id: projectId,
 				data: {
-					proxyDomain: normalized || null,
+					name: name.trim(),
+					description: description.trim(),
+					gitPath: gitPath.trim(),
 					chapterSettings: {
 						whitelistDirs,
 						blacklistDirs,
 						commandWhitelist,
 						commandBlacklist,
-						requireReviewBeforeMerge: requireReview,
 					},
 				},
 			},
@@ -138,17 +140,25 @@ export function ProjectSettingsModal({
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("settingsTitle")} size="lg">
 			<Stack>
+				{project.isError && <Alert color="red">{t("compatibility.unavailable")}</Alert>}
 				<TextInput
-					label={t("proxyDomain")}
-					description={t("proxyDomainDesc")}
-					placeholder="dev.example.com"
-					value={domain}
-					onChange={(e) => setDomain(e.currentTarget.value)}
-					error={domainError}
+					label={t("projectName")}
+					value={name}
+					required
+					onChange={(event) => setName(event.currentTarget.value)}
 				/>
-				<Text size="xs" c="dimmed">
-					{t("proxyDomainHint")}
-				</Text>
+				<Textarea
+					label={t("projectDescription")}
+					value={description}
+					onChange={(event) => setDescription(event.currentTarget.value)}
+				/>
+				<TextInput
+					label={t("repositoryPath")}
+					description={t("defaultDirectoryHint")}
+					value={gitPath}
+					required
+					onChange={(event) => setGitPath(event.currentTarget.value)}
+				/>
 
 				<Title order={5} mt="sm">
 					{t("projectWhitelistDirs")}
@@ -262,16 +272,12 @@ export function ProjectSettingsModal({
 					}
 				/>
 
-				<Title order={5} mt="sm">
-					{t("requireReviewBeforeMerge")}
-				</Title>
-				<Switch
-					label={t("requireReviewBeforeMergeDesc")}
-					checked={requireReview}
-					onChange={(e) => setRequireReview(e.currentTarget.checked)}
-				/>
-
-				<Button onClick={handleSave} loading={update.isPending} disabled={!!domainError}>
+				{update.isError && <Alert color="red">{update.error.message}</Alert>}
+				<Button
+					onClick={handleSave}
+					loading={update.isPending}
+					disabled={!name.trim() || !gitPath.trim() || project.isError || project.isLoading}
+				>
 					{tc("save")}
 				</Button>
 

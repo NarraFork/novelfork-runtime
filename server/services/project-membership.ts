@@ -12,16 +12,16 @@
  * otherwise left holding a UI full of things that will 404 on the next click.
  */
 
-import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
-import { aclGrants, chapters, narrators, projects, users } from "../db/schema";
+import { aclGrants, narrators, projects, users } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { broadcastToUser } from "../websocket/narrator-ws";
 import { recordAclEvent } from "./acl/acl-audit";
-import { canManageProject, type ProjectPrincipal } from "./project-acl";
+import { canManageProject, canWriteProject, type ProjectPrincipal } from "./project-acl";
 import { getRecentTabUserIds, pruneUnreadableProjectTabs } from "./recent-tabs-service";
 
 /** The three membership tiers, mirroring the generic capabilities. */
@@ -47,6 +47,8 @@ export interface ProjectAccessView {
 		avatarImageId: string | null;
 	} | null;
 	members: ProjectMemberView[];
+	/** Current project write access, including role grants; not inferred from the member list. */
+	canWrite: boolean;
 	/** Whether the requesting user may change any of the above. */
 	canManage: boolean;
 }
@@ -147,6 +149,7 @@ export async function getProjectAccess(
 				}
 			: null,
 		members: [...byUser.values()],
+		canWrite: await canWriteProject(row, principal),
 		canManage: await canManageProject(row, principal),
 	};
 }
@@ -412,29 +415,19 @@ async function pruneProjectTabsFor(userIds: string[], projectId: string): Promis
 async function usersWithTabsInProject(projectId: string): Promise<string[]> {
 	const found = new Set<string>(await getRecentTabUserIds("project", projectId));
 
-	// A project tab is not the only way in: chapter and session tabs point into the
-	// project too, and someone who only ever opened a chapter would otherwise keep a
-	// dead tab. Bounded by the project's own chapters/narrators, and only the ids are
-	// read — no large fields.
-	const chapterIds = (
-		await db
-			.select({ id: chapters.id })
-			.from(chapters)
-			.where(eq(chapters.projectId, projectId))
-			.limit(TAB_SCAN_ENTITY_LIMIT)
-	).map((row) => row.id);
-	for (const chapterId of chapterIds) {
-		for (const userId of await getRecentTabUserIds("chapter", chapterId)) found.add(userId);
-	}
-
+	// A project tab is not the only way in: session tabs point into the project too,
+	// and someone who only ever opened a session would otherwise keep a dead tab.
+	// Bounded by the project's own narrators, and only the ids are read — no large
+	// fields.
 	const narratorIds = (
 		await db
 			.select({ id: narrators.id })
 			.from(narrators)
 			.where(
-				chapterIds.length > 0
-					? or(eq(narrators.contextProjectId, projectId), inArray(narrators.chapterId, chapterIds))
-					: eq(narrators.contextProjectId, projectId),
+				or(
+					eq(narrators.contextProjectId, projectId),
+					sql`${narrators.id} in (select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId})`,
+				),
 			)
 			.limit(TAB_SCAN_ENTITY_LIMIT)
 	).map((row) => row.id);
@@ -446,7 +439,7 @@ async function usersWithTabsInProject(projectId: string): Promise<string[]> {
 }
 
 /**
- * Cap on how many chapters/narrators are scanned when hunting for stale tabs.
+ * Cap on how many narrators are scanned when hunting for stale tabs.
  *
  * This runs on a visibility change, not a hot path, but it must not turn into an
  * unbounded scan on a large project. Past the cap some dead tabs survive, which is a
@@ -467,6 +460,9 @@ async function announceProjectAccessChange(
 	reason: "visibility_changed" | "members_changed" | "owner_changed",
 	affectedUserIds: string[] = [],
 ): Promise<void> {
+	// Server-side caches of access decisions hear about every change, including a visibility
+	// change that names no affected users below.
+	eventBus.emit({ type: "project:access_changed", projectId, reason });
 	const recipients = new Set(affectedUserIds);
 	try {
 		for (const userId of recipients) {

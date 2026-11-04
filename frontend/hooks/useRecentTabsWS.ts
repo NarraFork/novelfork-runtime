@@ -17,7 +17,6 @@ export const RECENT_TABS_LIST_EVENT_TYPES = [
 	"presence_update",
 	"terminal_count_changed",
 	"background_task_count_changed",
-	"container_status_changed",
 	"draft_changed",
 	"goals_set",
 	"list_state_snapshot",
@@ -47,6 +46,10 @@ function dispatchListStateItem(
 				? state.substatus.filter((value): value is string => typeof value === "string")
 				: undefined,
 			turnStartedAt: typeof state.turnStartedAt === "string" ? state.turnStartedAt : undefined,
+			// Snapshot replay of the done-transition suppression flag (see
+			// sendListStateSnapshot server-side) — suppresses sound/PWA on resubscribe
+			// the same way the live status_change flag does.
+			...(state.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 		});
 	}
 	if (Array.isArray(state.viewers)) {
@@ -65,12 +68,8 @@ function dispatchListStateItem(
 		onUpdate(narratorId, {
 			type: "backgroundTaskCount",
 			activeBackgroundTaskCount: state.activeBackgroundTaskCount,
-		});
-	}
-	if ("containerStatus" in state) {
-		onUpdate(narratorId, {
-			type: "containerStatus",
-			containerStatus: state.containerStatus as NarratorListWSEvent["containerStatus"],
+			activeBackgroundWorkCount: state.activeBackgroundWorkCount as number | undefined,
+			activeBackgroundServiceCount: state.activeBackgroundServiceCount as number | undefined,
 		});
 	}
 	if (typeof state.hasDraft === "boolean") {
@@ -140,6 +139,7 @@ export function useRecentTabsWS(
 						status: data.status as string,
 						substatus: data.substatus as string[] | undefined,
 						turnStartedAt: data.turnStartedAt as string | undefined,
+						...(data.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 					});
 				} else if (data.type === "substatus_change") {
 					onUpdateRef.current(narratorId, {
@@ -167,11 +167,8 @@ export function useRecentTabsWS(
 					onUpdateRef.current(narratorId, {
 						type: "backgroundTaskCount",
 						activeBackgroundTaskCount: data.activeBackgroundTaskCount as number,
-					});
-				} else if (data.type === "container_status_changed") {
-					onUpdateRef.current(narratorId, {
-						type: "containerStatus",
-						containerStatus: data.containerStatus as NarratorListWSEvent["containerStatus"],
+						activeBackgroundWorkCount: data.activeBackgroundWorkCount as number | undefined,
+						activeBackgroundServiceCount: data.activeBackgroundServiceCount as number | undefined,
 					});
 				} else if (data.type === "draft_changed") {
 					onUpdateRef.current(narratorId, { type: "draft", hasDraft: !!data.hasDraft });

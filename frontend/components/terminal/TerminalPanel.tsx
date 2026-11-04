@@ -10,6 +10,7 @@ import {
 	useComputedColorScheme,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { IconClipboard, IconKeyboard } from "@tabler/icons-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
@@ -24,6 +25,7 @@ import { Z } from "../../lib/z-index";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { setupOsc52Handler } from "./osc52-handler";
 import { type Modifiers, TerminalAuxKeys } from "./TerminalAuxKeys";
+import { isHeadlessTerminalReply } from "./terminal-reply";
 import { getTerminalTheme } from "./terminal-theme";
 
 export const TERM_BG = "#1a1b26"; // Default fallback, actual bg comes from theme
@@ -139,10 +141,11 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const modsRef = useRef(mods);
 		modsRef.current = mods;
 
-		// Flag to suppress terminal response sequences from being sent back as input.
-		// When term.write() processes PTY output, xterm.js may synchronously fire
-		// onData with response sequences (DA, color queries, DECRPM, etc.).
-		// We set this flag during write() to distinguish those from real user input.
+		// xterm.js 5.5 parses the first write after user input synchronously and
+		// every other write on a later turn. This flag only covers that synchronous
+		// parse. Async DA / DSR / DECRPM / DECRQSS replies are dropped by shape in
+		// onData (`isHeadlessTerminalReply`); the server headless buffer already
+		// answered them. OSC color and focus reports are not in that set.
 		const writingRef = useRef(false);
 		const outputBufferRef = useRef<string[]>([]);
 		const outputBufferCharsRef = useRef(0);
@@ -465,11 +468,10 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			});
 
 			term.onData((data) => {
-				// During term.write() (PTY output processing), xterm.js may
-				// synchronously fire onData with terminal response sequences
-				// (DA, DSR, DECRPM, OSC color replies, etc.). These must not be
-				// sent back to the PTY or they appear as garbled text.
-				if (writingRef.current) return;
+				// Sync parse (flag) and async parse (shape) both produce replies the
+				// server buffer already wrote to the PTY. A second copy is read by
+				// the shell as typed input.
+				if (writingRef.current || isHeadlessTerminalReply(data)) return;
 
 				const m = modsRef.current;
 				let out = data;
@@ -799,15 +801,33 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		}, []);
 
 		const handlePasteFromClipboard = useCallback(() => {
-			navigator.clipboard
-				.readText()
-				.then((text) => {
-					if (text) write(text);
-				})
-				.catch(() => {});
+			const failPaste = () => {
+				notifications.show({
+					color: "yellow",
+					message: t("pasteFromClipboardUnavailable"),
+				});
+			};
+			// Plain HTTP cannot read the clipboard; keyboard paste still works via the
+			// terminal's native paste event and does not need the Clipboard API.
+			if (
+				typeof navigator === "undefined" ||
+				typeof navigator.clipboard?.readText !== "function" ||
+				(typeof window !== "undefined" && window.isSecureContext === false)
+			) {
+				failPaste();
+			} else {
+				navigator.clipboard
+					.readText()
+					.then((text) => {
+						if (text) write(text);
+					})
+					.catch(() => {
+						failPaste();
+					});
+			}
 			setPastePopover(null);
 			termRef.current?.focus();
-		}, [write]);
+		}, [write, t]);
 
 		const handleSendCtrlV = useCallback(() => {
 			write("\x16");

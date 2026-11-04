@@ -18,7 +18,7 @@ import {
 	contextCharacterPercent,
 } from "@shared/context-composition";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -28,6 +28,7 @@ export const CONTEXT_COLORS: Record<ContextCategory, string> = {
 	toolDefinition: "violet",
 	user: "blue",
 	assistant: "teal",
+	reasoning: "cyan",
 	toolCall: "orange",
 	toolResult: "yellow",
 	attachment: "pink",
@@ -39,7 +40,16 @@ export function contextTokenShare(
 	totalChars: number,
 	totalTokens?: number | null,
 ): number | null {
-	if (totalTokens == null || !Number.isFinite(totalTokens) || totalTokens < 0) return null;
+	if (
+		totalTokens == null ||
+		!Number.isFinite(totalTokens) ||
+		totalTokens < 0 ||
+		!Number.isFinite(totalChars) ||
+		totalChars <= 0 ||
+		!Number.isFinite(chars) ||
+		chars < 0
+	)
+		return null;
 	return (totalTokens * contextCharacterPercent(chars, totalChars)) / 100;
 }
 
@@ -53,16 +63,12 @@ export function ContextCompositionView({
 	data,
 	totalTokens,
 	snapshot,
-	onLoadMore,
-	loadingMore,
 	mode: controlledMode,
 	onModeChange,
 }: {
 	data: ContextComposition;
 	totalTokens?: number | null;
 	snapshot?: ContextUsageSnapshot | null;
-	onLoadMore?: () => void;
-	loadingMore?: boolean;
 	mode?: string;
 	onModeChange?: (value: string) => void;
 }) {
@@ -82,21 +88,16 @@ export function ContextCompositionView({
 			offset += segment.chars;
 			return { ...segment, key };
 		});
-	const usage = snapshot ?? data.usage;
-	const occupiedTokens = usage ? usage.occupiedTokens : totalTokens;
-	const calibrated =
-		usage?.composition?.generation === data.generation &&
-		data.generation != null &&
-		(!snapshot || snapshot.requestId === data.usage?.requestId) &&
-		usage?.inputCharacters != null &&
-		usage.inputCharacters.totalChars > 0;
-	const totalChars = calibrated
-		? (usage.inputCharacters?.totalChars ?? data.totalChars)
-		: data.totalChars;
-	const describe = (category: ContextCategory, chars: number) =>
-		`${t(`contextComposition.categories.${category}`)} · ${formatContextTokens(calibrated ? contextTokenShare(chars, totalChars, usage.occupiedTokens) : null)} · ${contextCharacterPercent(chars, totalChars).toFixed(1)}%`;
-	const unloadedChars =
-		mode === "sequence" && data.nextCursor ? Math.max(0, data.totalChars - offset) : 0;
+	const validTokens = (tokens?: number | null): tokens is number =>
+		tokens != null && Number.isFinite(tokens) && tokens >= 0;
+	/** Occupancy is whichever number is known to be newest; the live snapshot leads. */
+	const occupiedTokens = [snapshot?.occupiedTokens, data.usage?.occupiedTokens, totalTokens].find(
+		validTokens,
+	);
+	const describe = (category: ContextCategory, chars: number) => {
+		const tokens = contextTokenShare(chars, data.totalChars, occupiedTokens);
+		return `${t(`contextComposition.categories.${category}`)} · ${tokens == null ? "—" : `≈${formatContextTokens(tokens)}`} · ${contextCharacterPercent(chars, data.totalChars).toFixed(1)}%`;
+	};
 	return (
 		<Stack gap="sm">
 			<Group justify="space-between">
@@ -141,7 +142,7 @@ export function ContextCompositionView({
 								aria-label={label}
 								onClick={() => setSelected({ category: segment.category, chars: segment.chars })}
 								style={{
-									width: `${contextCharacterPercent(segment.chars, totalChars)}%`,
+									width: `${contextCharacterPercent(segment.chars, data.totalChars)}%`,
 									flexShrink: 0,
 									height: "100%",
 									border: 0,
@@ -153,28 +154,6 @@ export function ContextCompositionView({
 						</Tooltip>
 					);
 				})}
-				{unloadedChars > 0 && (
-					<Tooltip label={t("contextComposition.loadMore")}>
-						<Box
-							component="button"
-							type="button"
-							data-testid="context-composition-more"
-							aria-label={t("contextComposition.loadMore")}
-							disabled={loadingMore}
-							onClick={onLoadMore}
-							style={{
-								width: `${contextCharacterPercent(unloadedChars, totalChars)}%`,
-								border: 0,
-								padding: 0,
-								cursor: "pointer",
-								background: "var(--mantine-color-default-hover)",
-								color: "var(--mantine-color-text)",
-							}}
-						>
-							…
-						</Box>
-					</Tooltip>
-				)}
 			</Box>
 			{selected && (
 				<Text size="xs" role="status">
@@ -187,23 +166,19 @@ export function ContextCompositionView({
 					if (!item || item.chars <= 0) return null;
 					const label = describe(category, item.chars);
 					return (
-						<Button
-							key={category}
-							variant="light"
-							size="compact-xs"
-							color={CONTEXT_COLORS[category]}
-							onClick={() => setSelected({ category, chars: item.chars })}
-						>
-							{label}
-						</Button>
+						<Tooltip key={category} label={label} withArrow>
+							<Button
+								variant="light"
+								size="compact-xs"
+								color={CONTEXT_COLORS[category]}
+								onClick={() => setSelected({ category, chars: item.chars })}
+							>
+								{label}
+							</Button>
+						</Tooltip>
 					);
 				})}
 			</Group>
-			{mode === "sequence" && data.nextCursor && (
-				<Button variant="subtle" size="xs" loading={loadingMore} onClick={onLoadMore}>
-					{t("contextComposition.loadMore")}
-				</Button>
-			)}
 		</Stack>
 	);
 }
@@ -223,33 +198,15 @@ export function ContextCompositionPanel({
 	const qc = useQueryClient();
 	const [mode, setMode] = useState("category");
 	const queryKey = ["contextComposition", narratorId];
-	const query = useInfiniteQuery({
+	const query = useQuery({
 		queryKey,
-		initialPageParam: undefined as string | undefined,
-		queryFn: ({ signal, pageParam }) => getContextComposition(narratorId, signal, pageParam),
-		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		queryFn: ({ signal }) => getContextComposition(narratorId, signal),
 		enabled: opened,
 		staleTime: 0,
 		retry: false,
-		refetchInterval: (state) => (state.state.data?.pages[0]?.pending ? 300 : false),
+		refetchInterval: (state) => (state.state.data?.pending ? 300 : false),
 	});
-	const pages = query.data?.pages;
-	const first = pages?.[0];
-	const mixedGeneration = Boolean(
-		first && pages?.some((page) => page.generation !== first.generation),
-	);
-	useEffect(() => {
-		if (mixedGeneration)
-			void qc.resetQueries({ queryKey: ["contextComposition", narratorId], exact: true });
-	}, [mixedGeneration, qc, narratorId]);
-	const data =
-		first && !mixedGeneration
-			? {
-					...first,
-					segments: pages?.flatMap((page) => page.segments) ?? [],
-					nextCursor: pages?.at(-1)?.nextCursor ?? null,
-				}
-			: undefined;
+	const data = query.data;
 	return (
 		<Stack gap="sm" data-testid="context-composition-panel">
 			<Group justify="space-between">
@@ -284,8 +241,6 @@ export function ContextCompositionPanel({
 					snapshot={snapshot}
 					mode={mode}
 					onModeChange={setMode}
-					onLoadMore={() => void query.fetchNextPage()}
-					loadingMore={query.isFetchingNextPage}
 				/>
 			)}
 		</Stack>

@@ -16,10 +16,9 @@ import {
 	type RecentTabsSection,
 	type RecentTabType,
 } from "@shared/recent-tabs";
-import { and, asc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
 import { db } from "../db";
 import {
-	chapters,
 	narrators,
 	userPreferences,
 	userRecentTabs,
@@ -62,7 +61,11 @@ type WorkspacePanelInsert = typeof workspacePanels.$inferInsert;
  */
 export type WorkspacePanelMembershipWrite =
 	| { action: "insert"; row: WorkspacePanelInsert }
-	| { action: "remove"; panelId: string };
+	| { action: "remove"; panelId: string }
+	| { action: "removeByNarrator"; workspaceId: string; narratorId: string }
+	// Undo restore of a cascade-removed row. Conflict-tolerant: a re-added panel
+	// for the same narrator (new row id) must not abort the whole tab restore.
+	| { action: "insertIfAbsent"; row: WorkspacePanelInsert };
 
 interface UndoEntry {
 	token: string;
@@ -71,6 +74,12 @@ interface UndoEntry {
 	revision: number;
 	tabs: PersistedRecentTab[];
 	deferredWorkspaceIds: string[];
+	/**
+	 * Membership row removed alongside a grouped narrator tab close. Re-inserted
+	 * on undo so the restored tab's workspace actually contains the panel again —
+	 * the tab-list snapshot alone cannot express that half of the state.
+	 */
+	panelRow?: WorkspacePanelInsert;
 }
 
 interface PendingWorkspaceCleanup {
@@ -83,6 +92,12 @@ interface PendingWorkspaceCleanup {
 interface MutationOptions {
 	removedCount?: number;
 	undoTabs?: PersistedRecentTab[];
+	/**
+	 * Membership row captured at removal time, stored with the undo entry so
+	 * `restoreRecentTabs` can re-insert it. Only meaningful together with
+	 * `undoTabs`; discarded otherwise.
+	 */
+	undoPanelRow?: WorkspacePanelInsert;
 	workspaceIdsToDelete?: string[];
 	deferredWorkspaceIds?: string[];
 	/**
@@ -188,6 +203,19 @@ export async function runExpiredRecentTabsWorkspaceCleanup(now = Date.now()): Pr
 			),
 		);
 		removed += existingRows.length;
+		// Same contract as the route DELETE: a device holding one of these open gets
+		// a navigation signal instead of a 404 on its next refetch.
+		for (const row of existingRows) {
+			try {
+				broadcastToUser(cleanup.userId, {
+					type: "workspace_changed",
+					workspaceId: row.id,
+					reason: "deleted",
+				});
+			} catch (error) {
+				logger.warn("workspace deletion broadcast failed", { workspaceId: row.id, error });
+			}
+		}
 	}
 	scheduleNextWorkspaceCleanup();
 	return removed;
@@ -217,7 +245,6 @@ function tabSection(type: RecentTabType): RecentTabsSection {
 
 function getTabNarratorId(tab: PersistedRecentTab): string | undefined {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId;
 	return undefined;
 }
 
@@ -229,11 +256,10 @@ function normalizeLegacyTab(value: unknown): PersistedRecentTab | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const raw = value as Record<string, unknown>;
 	const rawType = raw.type === "session" ? "narrator" : raw.type;
-	// "group" (chat-group) tabs are dropped: the feature was removed, so such a
-	// tab would render without a target route. The enum itself stays so historical
-	// rows still decode; they are filtered out on read (see readRows).
+	// "group" (chat-group) and "chapter" tabs are dropped: both features were removed,
+	// so such a tab would render without a target route. The enum itself stays so
+	// historical rows still decode; they are filtered out on read (see readRows).
 	if (
-		rawType !== "chapter" &&
 		rawType !== "narrator" &&
 		rawType !== "project" &&
 		rawType !== "workspace" &&
@@ -431,12 +457,12 @@ function rowToTab(row: RecentTabRow): PersistedRecentTab {
 }
 
 /**
- * Chat groups were removed, but historical `type = "group"` rows are still in the
- * table (the enum is kept so they decode). They have no route to open, so every
- * read path excludes them at the SQL level — inside the query, so cursor/hasMore
- * math on the paginated path stays consistent.
+ * Chat groups and chapters were removed, but historical `type = "group"` / `"chapter"`
+ * rows are still in the table (the enum is kept so they decode). They have no route to
+ * open, so every read path excludes them at the SQL level — inside the query, so
+ * cursor/hasMore math on the paginated path stays consistent.
  */
-const EXCLUDE_REMOVED_TAB_TYPES = ne(userRecentTabs.type, "group");
+const EXCLUDE_REMOVED_TAB_TYPES = notInArray(userRecentTabs.type, ["group", "chapter"]);
 
 function readRows(userId: string): RecentTabRow[] {
 	return db
@@ -716,7 +742,7 @@ function writeLegacyShadowInTransaction(
  * Apply a caller-declared workspace-panel membership write.
  *
  * Declared locally — never received as a callback — so its synchronous body is
- * visible to the transaction-atomicity gate. Both shapes are single statements;
+ * visible to the transaction-atomicity gate. Every shape is a single statement;
  * a throw here (e.g. the workspace/narrator unique index) aborts the enclosing
  * transaction and rolls the tab rows and revision bump back with it.
  */
@@ -727,6 +753,21 @@ function applyPanelMembershipInTransaction(
 ): void {
 	if (write.action === "insert") {
 		tx.insert(workspacePanels).values(write.row).run();
+		return;
+	}
+	if (write.action === "insertIfAbsent") {
+		tx.insert(workspacePanels).values(write.row).onConflictDoNothing().run();
+		return;
+	}
+	if (write.action === "removeByNarrator") {
+		tx.delete(workspacePanels)
+			.where(
+				and(
+					eq(workspacePanels.workspaceId, write.workspaceId),
+					eq(workspacePanels.narratorId, write.narratorId),
+				),
+			)
+			.run();
 		return;
 	}
 	tx.delete(workspacePanels).where(eq(workspacePanels.id, write.panelId)).run();
@@ -823,24 +864,39 @@ function diffOperations(
 	before: PersistedRecentTab[],
 	after: PersistedRecentTab[],
 ): RecentTabsOperation[] {
-	const beforeByKey = new Map(before.map((tab, index) => [tabKey(tab), { tab, index }]));
+	const beforeByKey = new Map(before.map((tab) => [tabKey(tab), tab]));
 	const afterKeys = new Set(after.map(tabKey));
 	const operations: RecentTabsOperation[] = [];
 	for (const tab of before) {
 		const key = tabKey(tab);
 		if (!afterKeys.has(key)) operations.push({ type: "remove", key });
 	}
-	for (let index = 0; index < after.length; index++) {
-		const tab = after[index];
-		const key = tabKey(tab);
-		const previous = beforeByKey.get(key);
-		const anchors = operationAnchors(after, index);
-		if (!previous || JSON.stringify(previous.tab) !== JSON.stringify(tab)) {
-			operations.push({ type: "upsert", key, tab, ...anchors });
-			continue;
+	// Each section is a separate paginated client window. Cross-section neighbors
+	// cannot position a row in that window, even when every page is loaded.
+	for (const section of ["projects", "work"] as const) {
+		const sectionTabs = after.filter((tab) => tabSection(tab.type) === section);
+		const currentKeys = before
+			.filter((tab) => tabSection(tab.type) === section && afterKeys.has(tabKey(tab)))
+			.map(tabKey);
+		for (let index = 0; index < sectionTabs.length; index++) {
+			const tab = sectionTabs[index];
+			const key = tabKey(tab);
+			const previous = beforeByKey.get(key);
+			const anchors = operationAnchors(sectionTabs, index);
+			if (!previous || JSON.stringify(previous) !== JSON.stringify(tab)) {
+				operations.push({ type: "upsert", key, tab, ...anchors });
+			} else if (currentKeys[index] !== key) {
+				operations.push({ type: "move", key, ...anchors });
+			}
+			// Compare with the order AFTER earlier operations, not the original list:
+			// moving a block's head also displaces neighbors whose old predecessor did
+			// not change. Omitting those moves makes replay diverge from persisted order.
+			if (currentKeys[index] !== key) {
+				const previousIndex = currentKeys.indexOf(key);
+				if (previousIndex >= 0) currentKeys.splice(previousIndex, 1);
+				currentKeys.splice(index, 0, key);
+			}
 		}
-		const previousKey = previous.index > 0 ? tabKey(before[previous.index - 1]) : null;
-		if (previousKey !== anchors.afterKey) operations.push({ type: "move", key, ...anchors });
 	}
 	return operations;
 }
@@ -894,6 +950,7 @@ function persistMutationLocked(
 
 	const revision = baseRevision + 1;
 	const now = new Date().toISOString();
+	const deletedWorkspaceIds: string[] = [];
 	db.transaction((tx) => {
 		applyRowDiffInTransaction(tx, userId, after, oldRows, now);
 		// Before the meta/revision write so a throw from the membership write aborts
@@ -905,10 +962,18 @@ function persistMutationLocked(
 			.run();
 		writeLegacyShadowInTransaction(tx, userId, after, now);
 		const workspaceIds = [...new Set(options.workspaceIdsToDelete ?? [])];
-		if (workspaceIds.length > 0) {
-			tx.delete(workspaces)
-				.where(and(eq(workspaces.userId, userId), inArray(workspaces.id, workspaceIds)))
-				.run();
+		for (const workspaceId of workspaceIds) {
+			// Existence checked first so the broadcast below only names rows that were
+			// actually deleted here — the route DELETE may already have removed the
+			// row (and announced it) on the way in.
+			const existing = tx
+				.select({ id: workspaces.id })
+				.from(workspaces)
+				.where(and(eq(workspaces.userId, userId), eq(workspaces.id, workspaceId)))
+				.get();
+			if (!existing) continue;
+			tx.delete(workspaces).where(eq(workspaces.id, workspaceId)).run();
+			deletedWorkspaceIds.push(workspaceId);
 		}
 	});
 
@@ -930,6 +995,7 @@ function persistMutationLocked(
 			revision,
 			tabs: options.undoTabs.map(cloneTab),
 			deferredWorkspaceIds,
+			...(options.undoPanelRow ? { panelRow: options.undoPanelRow } : {}),
 		});
 		scheduleDeferredWorkspaceCleanup({
 			token,
@@ -938,6 +1004,16 @@ function persistMutationLocked(
 			workspaceIds: deferredWorkspaceIds,
 		});
 		result.undoToken = token;
+	}
+	// Announce workspace rows this mutation deleted so any device holding one open
+	// navigates away instead of refetching into a 404. Committed above; the frame
+	// is an invalidation signal, so it must not fail the mutation.
+	for (const workspaceId of deletedWorkspaceIds) {
+		try {
+			broadcastToUser(userId, { type: "workspace_changed", workspaceId, reason: "deleted" });
+		} catch (error) {
+			logger.warn("workspace deletion broadcast failed", { workspaceId, error });
+		}
 	}
 	broadcastDelta(userId, result);
 	return result;
@@ -1096,6 +1172,26 @@ function insertNewTab(
 	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
 }
 
+/** 列表里看不见的叙述者（ModelTrace 舱）也不进侧边栏。 */
+function withoutHiddenNarratorTabs(inputs: RecentTabUpsertInput[]): RecentTabUpsertInput[] {
+	const narratorIds = inputs
+		.filter((input) => input.type === "narrator" || input.type === "subagent")
+		.map((input) => input.id);
+	if (narratorIds.length === 0) return inputs;
+	const hidden = new Set(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(inArray(narrators.id, narratorIds), eq(narrators.hiddenFromLists, true)))
+			.all()
+			.map((row) => row.id),
+	);
+	if (hidden.size === 0) return inputs;
+	return inputs.filter(
+		(input) => (input.type !== "narrator" && input.type !== "subagent") || !hidden.has(input.id),
+	);
+}
+
 export async function upsertRecentTabsBatch(
 	userId: string,
 	inputs: RecentTabUpsertInput[],
@@ -1103,14 +1199,18 @@ export async function upsertRecentTabsBatch(
 	if (inputs.length === 0 || inputs.length > RECENT_TABS_WS_BATCH_SIZE) {
 		throw new ValidationError(`Recent-tabs batch must contain 1-${RECENT_TABS_WS_BATCH_SIZE} tabs`);
 	}
+	const visible = withoutHiddenNarratorTabs(inputs);
 	return userPreferencesLock.acquire(userId, async () => {
 		const baseRevision = ensureMigratedLocked(userId);
+		if (visible.length === 0) {
+			return { changed: false, baseRevision, revision: baseRevision, operations: [] };
+		}
 		const oldRows = readRows(userId);
 		const before = oldRows.map(rowToTab);
 		let after = before.map(cloneTab);
 		const orderedInputs = [
-			...inputs.filter((input) => input.type === "workspace" && !input.workspaceId),
-			...inputs.filter((input) => input.type !== "workspace" || !!input.workspaceId),
+			...visible.filter((input) => input.type === "workspace" && !input.workspaceId),
+			...visible.filter((input) => input.type !== "workspace" || !!input.workspaceId),
 		];
 		for (const input of orderedInputs) after = applyRecentTabUpsert(after, input);
 		return persistMutationLocked(userId, oldRows, before, after, baseRevision);
@@ -1182,18 +1282,80 @@ export async function applyWorkspaceMembershipProjection(
 	});
 }
 
+/**
+ * Remove one recent tab.
+ *
+ * `storeUndo` is opt-in and must only be set for a user-initiated close (the
+ * DELETE route behind swipe / context-menu / middle-click). Cascade cleanups
+ * (`removeTabFromAllUsers`, unreadable-project purge, archive) must leave it
+ * false: they would otherwise overwrite the user's pending undo token with a
+ * snapshot that points at already-deleted entities.
+ */
 export async function removeRecentTab(
 	userId: string,
 	type: RecentTabType,
 	id: string,
+	options: { storeUndo?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
-	return mutate(userId, (tabs) => {
+	// Closing a workspace child's own narrator tab removes its membership with
+	// it: the panel row is the membership authority, and a closed tab that left
+	// the row behind would linger as a panel in every open view of that
+	// workspace (and be re-synced back by the membership projection).
+	let removedMembership: { workspaceId: string; narratorId: string } | undefined;
+	const result = await mutate(userId, (tabs) => {
 		const key = `${type}:${id}`;
 		const index = tabs.findIndex((tab) => tabKey(tab) === key);
 		if (index < 0) return { tabs };
 		if (type !== "workspace") {
+			// Snapshot BEFORE the splice — after it the removed tab is gone and the
+			// undo entry would restore an already-empty slot.
+			const undoTabs = options.storeUndo ? tabs.map(cloneTab) : undefined;
+			const removed = tabs[index];
 			tabs.splice(index, 1);
-			return { tabs };
+			if ((type === "narrator" || type === "subagent") && removed.workspaceId) {
+				removedMembership = { workspaceId: removed.workspaceId, narratorId: id };
+				// Release the narrator's OTHER tabs from the group too —
+				// `removeWorkspacePanel`'s projection does the same for the reverse
+				// direction, and leaving them grouped would point at a workspace that
+				// no longer contains their narrator.
+				const formerWorkspaceId = removed.workspaceId;
+				for (const tab of tabs) {
+					if (tab.workspaceId === formerWorkspaceId && getTabNarratorId(tab) === id) {
+						delete tab.workspaceId;
+					}
+				}
+				// Capture the membership row while it still exists so a tab-list undo
+				// can re-insert it — otherwise the restored tab would point at a
+				// workspace that no longer contains the narrator.
+				const undoPanelRow = undoTabs
+					? db
+							.select()
+							.from(workspacePanels)
+							.where(
+								and(
+									eq(workspacePanels.workspaceId, formerWorkspaceId),
+									eq(workspacePanels.narratorId, id),
+								),
+							)
+							.get()
+					: undefined;
+				return {
+					tabs,
+					options: {
+						removedCount: 1,
+						...(undoTabs ? { undoTabs } : {}),
+						...(undoPanelRow ? { undoPanelRow } : {}),
+						panelMembership: { action: "removeByNarrator", ...removedMembership },
+					},
+				};
+			}
+			return {
+				tabs,
+				options: {
+					removedCount: 1,
+					...(undoTabs ? { undoTabs } : {}),
+				},
+			};
 		}
 		const range = workspaceGroupRange(tabs, index);
 		const children = tabs.slice(range.start + 1, range.end + 1).map((child) => {
@@ -1202,8 +1364,20 @@ export async function removeRecentTab(
 			return released;
 		});
 		tabs.splice(range.start, range.end - range.start + 1, ...children);
+		// Workspace dissolve also tears down the workspace entity and its panels, which a
+		// tab-list undo cannot restore — so no undo token is stored here.
 		return { tabs, options: { workspaceIdsToDelete: [id] } };
 	});
+	if (removedMembership) {
+		// Open workspace views close the panel on this signal; the sidebar itself
+		// is already covered by the tab delta above.
+		broadcastToUser(userId, {
+			type: "workspace_changed",
+			workspaceId: removedMembership.workspaceId,
+			reason: "membership",
+		});
+	}
+	return result;
 }
 
 function extractMovedGroup(
@@ -1440,7 +1614,7 @@ export async function restoreRecentTabs(
 			if (baseRevision !== entry.revision) {
 				undoByUser.delete(userId);
 				throw new AppError(
-					"Recent-tabs changed after clear; the undo snapshot can no longer be restored",
+					"Recent-tabs changed after the removal; the undo snapshot can no longer be restored",
 					409,
 					RECENT_TABS_UNDO_CONFLICT_CODE,
 				);
@@ -1448,9 +1622,29 @@ export async function restoreRecentTabs(
 			const oldRows = readRows(userId);
 			const before = oldRows.map(rowToTab);
 			const after = normalizeAndLimitTabs(entry.tabs.map(cloneTab)).tabs;
-			const result = persistMutationLocked(userId, oldRows, before, after, baseRevision);
+			// Re-insert the membership row the close cascaded away, in the same
+			// transaction as the tab rows: the restored tab would otherwise group
+			// under a workspace that no longer contains the narrator.
+			const result = persistMutationLocked(
+				userId,
+				oldRows,
+				before,
+				after,
+				baseRevision,
+				entry.panelRow
+					? { panelMembership: { action: "insertIfAbsent", row: entry.panelRow } }
+					: {},
+			);
 			undoByUser.delete(userId);
 			cancelDeferredWorkspaceCleanup(entry.token);
+			if (entry.panelRow) {
+				// Symmetric with the close: open workspace views re-add the panel.
+				broadcastToUser(userId, {
+					type: "workspace_changed",
+					workspaceId: entry.panelRow.workspaceId,
+					reason: "membership",
+				});
+			}
 			return result;
 		});
 	}
@@ -1632,6 +1826,8 @@ export async function getRuntimePatches(
 			hasDraft: tab.hasDraft ?? false,
 			activeTerminalCount: tab.activeTerminalCount ?? 0,
 			activeBackgroundTaskCount: tab.activeBackgroundTaskCount ?? 0,
+			activeBackgroundWorkCount: tab.activeBackgroundWorkCount ?? 0,
+			activeBackgroundServiceCount: tab.activeBackgroundServiceCount ?? 0,
 			viewers: tab.viewers ?? [],
 			viewerCount: tab.viewerCount ?? 0,
 			containerStatus: tab.containerStatus ?? null,
@@ -1749,14 +1945,14 @@ export async function syncNarratorTitleToRecentTabs(
  * Drop the recent tabs a user may no longer open, after losing access to a project.
  *
  * Recent tabs are persisted server-side, so revoking membership otherwise leaves the
- * removed member staring at tabs for that project's chapters and sessions, each of
+ * removed member staring at tabs for that project's sessions, each of
  * which 404s when clicked. The tab list is the one place where a stale entry survives
  * the authorization change.
  *
  * Deliberately re-checks the ACL per tab instead of matching on `projectId`:
- *   - project tabs carry the id directly, but chapter/narrator/subagent/group tabs do
- *     not, and reimplementing that resolution here would duplicate the ancestor chain;
- *   - a user removed from a project may still legitimately reach a chapter inside it
+ *   - project tabs carry the id directly, but narrator/subagent tabs do not, and
+ *     reimplementing that resolution here would duplicate the ancestor chain;
+ *   - a user removed from a project may still legitimately reach a session inside it
  *     (an explicit narrator grant, or a public project), and matching on the id alone
  *     would wrongly delete tabs that still work.
  *
@@ -1793,16 +1989,10 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 		let owningProject: string | null = null;
 		if (tab.type === "project") {
 			owningProject = tab.id;
-		} else if (tab.type === "chapter") {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, tab.id),
-				columns: { projectId: true },
-			});
-			owningProject = chapter?.projectId ?? null;
 		} else if (tab.type === "narrator" || tab.type === "subagent") {
 			const narrator = await db.query.narrators.findFirst({
 				where: eq(narrators.id, tab.id),
-				columns: { chapterId: true, contextProjectId: true },
+				columns: { id: true, contextProjectId: true },
 			});
 			owningProject = narrator ? await resolveNarratorProjectId(narrator) : null;
 		}
@@ -1816,7 +2006,7 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 
 /** Remove an entity only from users selected by the authoritative membership index. */
 export async function removeTabFromAllUsers(
-	tabType: "chapter" | "narrator" | "project",
+	tabType: "narrator" | "project",
 	tabId: string,
 ): Promise<void> {
 	for (const userId of await getRecentTabUserIds(tabType, tabId)) {

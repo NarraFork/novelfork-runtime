@@ -13,6 +13,12 @@
  * Shared types are the single source for classification, measurement and paint.
  */
 
+import { toolOutputImages } from "../agent-protocol/tool-output";
+import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
+import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
+import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
+import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
+import { outlineAddressPath, outlineCommitPath } from "../outline-links";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -102,6 +108,8 @@ export interface ToolMediaRef {
 	filePath?: string;
 	/** An uploaded image id → fetched via /api/uploads/:narratorId/:imageId. */
 	imageId?: string;
+	/** Upload owner retained across narrator forks; the upload endpoint enforces access. */
+	uploadNarratorId?: string;
 	/** Filename (alt text / image viewer title). */
 	filename?: string;
 	/** Optional size (KB) + format label shown above an image read. */
@@ -445,6 +453,13 @@ export interface ToolMetaRow {
 	mono?: boolean;
 	/** Turns the text into an external link. Height-neutral. */
 	href?: string;
+	/**
+	 * Identity line (an Await card's resolved child session): one reserved row of
+	 * monospace text, drawn by the render layer with its "open session" button.
+	 * Never wraps — the content is a bounded `slug · id` pair, so a fixed-height
+	 * block keeps it out of the text measurer entirely.
+	 */
+	identity?: string;
 	/** Badge chips on this row (mode, action, size, expiry). */
 	badges?: ToolStructuredBadge[];
 	/** Interactive controls on this row (download / copy link). */
@@ -484,6 +499,43 @@ export type ToolSectionLabel =
 	| "plan"
 	| "error";
 
+export interface ToolGenUiDetail {
+	kind: "gen-ui";
+	file: GenUiFileReference | null;
+	publicSummary?: boolean;
+	historyUnavailable?: boolean;
+	/**
+	 * Inline markup of a `render` call, growing while its input streams. Named `text`,
+	 * `live` and `contentPx` on purpose: those are the fields the measure cache already
+	 * folds into a row's revision, so each chunk repaints and the reserved height is keyed.
+	 */
+	text?: string;
+	live?: boolean;
+	/** Reserved body height: a pure function of the declared size, never a measurement. */
+	contentPx?: number;
+	title?: string;
+	kit?: GenUiKitNotice;
+	/**
+	 * The runtime the finished call was validated against. Old UI keeps rendering with it
+	 * after the workspace later gains (or loses) a project kit; absent while streaming.
+	 */
+	runtime?: "builtin" | "project";
+	/** Identity of the host-owned state above, which arrives after the input does. */
+	revision?: string;
+	/**
+	 * Set while a `wait: true` render holds its call open: the card's submit answers that
+	 * call instead of sending a chat message.
+	 */
+	formToolUseId?: string;
+	/** The `render` call's id: every frame drawing it shares what the reader entered. */
+	stateKey?: string;
+	/**
+	 * When a `show` call put its app in the chat. The card runs the app in place, and only
+	 * the most recent app starts without a click.
+	 */
+	appShownAt?: string;
+}
+
 /** A body a section can host: every leaf kind EXCEPT `sections` (no nesting). */
 export type ToolSectionBody =
 	| ToolCappedDetail
@@ -491,7 +543,8 @@ export type ToolSectionBody =
 	| ToolErrorDetail
 	| ToolSpecTasksDetail
 	| ToolMetaRowsDetail
-	| ToolAskDetail;
+	| ToolAskDetail
+	| ToolGenUiDetail;
 
 /** One labelled section inside a multi-part detail. */
 export interface ToolDetailSection {
@@ -771,10 +824,13 @@ export type ClassifyToolDetailInput = ClassifyToolDetailFields &
 	({ toolUseId: string; previewId?: never } | { previewId: string; toolUseId?: never });
 
 interface ClassifyToolDetailFields {
+	/** Actual visible historical row; COW copies have a new PK but unchanged output metadata. */
+	toolCallId?: string;
 	/** Explicit producer-supplied attempt identity; never inferred from a viewport index. */
 	occurrence?: string | number;
 	toolName: string;
 	category: string;
+	publicSummary?: string;
 	status?: string | null;
 	inputJson?: unknown;
 	outputJson?: unknown;
@@ -844,8 +900,101 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			? toolInputFieldView(input.inputJson)
 			: input.inputJson;
 	const output = toolOutputValue(input.outputJson, metadata);
+	if (
+		toolName === "GenUI" &&
+		(input.publicSummary === GEN_UI_PUBLIC_SUMMARY_CODE ||
+			output === GEN_UI_PUBLIC_SUMMARY ||
+			asObject(output)?.text === GEN_UI_PUBLIC_SUMMARY)
+	) {
+		return single("gen-ui", {
+			kind: "gen-ui",
+			file: null,
+			publicSummary: true,
+		});
+	}
+	// Only host-owned metadata is a file reference; never promote tool input or output text.
+	const uiRef = toolName === "GenUI" ? metadata?.genUi : null;
+	const uiFile = readGenUiFileReference(uiRef);
+	const uiKit =
+		toolName === "GenUI" ? (readGenUiKitNotice(metadata?.genUiKit) ?? undefined) : undefined;
+	const uiDrawnWith = asObject(metadata?.genUiInline)?.kit;
+	const uiRuntime: "builtin" | "project" | undefined =
+		toolName === "GenUI" && (uiDrawnWith === "builtin" || uiDrawnWith === "project")
+			? uiDrawnWith
+			: undefined;
+	const uiKitFields = {
+		...(uiKit ? { kit: uiKit } : {}),
+		...(uiRuntime ? { runtime: uiRuntime } : {}),
+		...(uiKit || uiRuntime
+			? {
+					revision: `${uiRuntime ?? ""}:${uiKit?.state ?? ""}:${uiKit?.request?.id ?? ""}:${uiKit?.request?.state ?? ""}`,
+				}
+			: {}),
+	};
+	const uiShowMeta = toolName === "GenUI" ? asObject(metadata?.genUiShow) : undefined;
+	const uiShow =
+		uiShowMeta?.version === 1 &&
+		typeof uiShowMeta.shownAt === "string" &&
+		!Number.isNaN(Date.parse(uiShowMeta.shownAt))
+			? { shownAt: uiShowMeta.shownAt, size: uiShowMeta.size }
+			: null;
+	const uiInput = toolName === "GenUI" ? asObject(fields) : undefined;
+	// A call that failed, was refused or was stopped drew nothing the reader should take
+	// for an answer: its status and error text are the body instead.
+	const uiUnusable = isFailStatus(status) || status === "denied" || status === "cancelled";
+	// `render` carries its UI in its own input, so the card exists from the first streamed
+	// chunk.
+	const uiInline: ToolDetailData | null =
+		typeof uiInput?.source === "string" &&
+		(uiInput.action === undefined || uiInput.action === "render") &&
+		!uiUnusable
+			? single("gen-ui", {
+					kind: "gen-ui",
+					file: null,
+					text: uiInput.source,
+					contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiInput.size)],
+					...(typeof uiInput.title === "string" ? { title: uiInput.title.slice(0, 80) } : {}),
+					...(!isTerminalToolStatus(status) && input.isStreaming === true ? { live: true } : {}),
+					...uiKitFields,
+					...(typeof input.toolUseId === "string" ? { stateKey: input.toolUseId } : {}),
+					...(uiInput.wait === true &&
+					status != null &&
+					!isTerminalToolStatus(status) &&
+					typeof input.toolUseId === "string"
+						? {
+								formToolUseId: input.toolUseId,
+								revision: `${uiKitFields.revision ?? ""}:form`,
+							}
+						: {}),
+				})
+			: null;
+	const uiDetail: ToolDetailData | null = uiInline
+		? uiInline
+		: uiRef
+			? single("gen-ui", {
+					kind: "gen-ui",
+					// Select the visible copy, not an origin PK retained in immutable tool output.
+					// The server checks both visibility and the copy's trusted provenance column.
+					file: uiFile && input.toolCallId ? { ...uiFile, toolCallId: input.toolCallId } : uiFile,
+					...(uiShow && uiFile
+						? {
+								appShownAt: uiShow.shownAt,
+								contentPx: GEN_UI_INLINE_HEIGHTS[readGenUiInlineSize(uiShow.size)],
+							}
+						: {}),
+					...(metadata?.fileChangeHistoryUnavailable === true ? { historyUnavailable: true } : {}),
+					...uiKitFields,
+				})
+			: // A kit build the user must confirm is something to act on, not text to read.
+				uiKit?.request && !uiUnusable
+				? single("gen-ui", { kind: "gen-ui", file: null, ...uiKitFields })
+				: null;
 	const base = withErrorSection(
-		classifyByCategory(toolName, category, status, fields, output, metadata, input),
+		toolName === "GenUI"
+			? uiInput?.action === "inspect"
+				? classifyGenUiInspection(output)
+				: (uiDetail ?? sections([textSection("output.main", output, "output")]))
+			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
 		input.outputJson,
 	);
@@ -857,6 +1006,28 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
 		})),
 	};
+}
+
+/** Inspection screenshots use the existing private upload lane, not diagnostic metadata URLs. */
+function classifyGenUiInspection(output: unknown): ToolDetailData | null {
+	return sections([
+		textSection("output.main", output, "output"),
+		...toolOutputImages(output).flatMap((image, index) => {
+			if (!("uploadNarratorId" in image) || !image.imageId || !image.uploadNarratorId) return [];
+			const source = `output._images.${index}` as const;
+			return [
+				section(
+					source,
+					undefined,
+					capped(source, "media", {
+						format: "media",
+						contentPx: MEDIA_IMAGE_CONTENT_PX,
+						media: { imageId: image.imageId, uploadNarratorId: image.uploadNarratorId },
+					}),
+				),
+			];
+		}),
+	]);
 }
 
 /** Resolve each field once: current delta > settled stream fields > formal input. */
@@ -983,7 +1154,7 @@ function classifyByCategory(
 			]);
 		}
 		case "await":
-			return classifyAwait(inputJson, outputJson, metadata);
+			return classifyAwait(inputJson, outputJson, metadata, status);
 		case "send":
 			return classifySend(inputJson, outputJson, metadata, input.labels, status);
 		case "ask":
@@ -1013,6 +1184,8 @@ function classifyByCategory(
 			return classifyBrowser(status, inputJson, outputJson, metadata);
 		case "knowledge":
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
+		case "outline":
+			return classifyOutline(toolName, inputJson, outputJson, metadata);
 		case "contextAsk":
 			return classifyContextAsk(inputJson, outputJson, metadata, status);
 		case "workspace":
@@ -1051,6 +1224,7 @@ function metaRows(rows: Array<ToolMetaRow | null>): ToolMetaRowsDetail | null {
 		(r): r is ToolMetaRow =>
 			r !== null &&
 			(r.text.length > 0 ||
+				(r.identity?.length ?? 0) > 0 ||
 				(r.badges?.length ?? 0) > 0 ||
 				(r.actions?.length ?? 0) > 0 ||
 				r.progress != null),
@@ -2122,39 +2296,59 @@ function classifyAwait(
 	inputJson: unknown,
 	outputJson: unknown,
 	metadata: Record<string, unknown> | null,
+	status?: string | null,
 ): ToolDetailData | null {
 	const rawOutput = resolveDisplayText(outputJson);
 	const awaitType = extractField(inputJson, "type") || (metadata?.awaitType as string) || "task";
 	const output = awaitType === "agent" ? stripAwaitAgentEnvelope(rawOutput) : rawOutput;
 	const isBash = awaitType === "bash";
-	// Badge row + waitFor / subagent lines (the chunked AwaitDetail header).
-	const targetId = extractField(inputJson, "id", "task_id", "taskId");
+	// While waiting on an agent, the server forwards the child's live output char
+	// count as a bare numeric `_streamingOutput` (the ContextAsk convention). It
+	// also arrives AS the output body — `toolOutputValue` folds the stream payload
+	// in when no real output exists — so detect exactly that fold and paint the
+	// counter instead of a lone number. A real (terminal) result never matches:
+	// `liveChars` is gated to non-terminal statuses.
+	const liveChars = isTerminalToolStatus(status)
+		? null
+		: parseLiveOutputChars(metadata?._streamingOutput);
+	const streamPayload = readLeafText(metadata?._streamingOutput);
+	const outputIsLiveCount =
+		liveChars != null && streamPayload !== undefined && output === streamPayload;
+	// Identity row (the ONLY meta row an agent wait keeps): the resolved child
+	// narrator id in copyable monospace. The badge row it replaces repeated the
+	// type, target, status and timeout — every one of them already on the header
+	// line — and Mantine's uppercase badge text corrupted the mixed-case id.
 	const resolvedId = metadata ? readLeafText(metadata.resolvedId) : undefined;
-	const awaitStatus = metadata ? readLeafText(metadata.status) : undefined;
 	const subagentId = metadata ? readLeafText(metadata.subagentId) : undefined;
+	const transportId = metadata ? readLeafText(metadata._awaitAgentNarratorId) : undefined;
+	const title = metadata
+		? (readLeafText(metadata.targetTitle) ?? readLeafText(metadata._awaitAgentTitle))
+		: undefined;
+	const label = metadata ? readLeafText(metadata.targetLabel) : undefined;
+	// The slug joins only when it says something the header does not: the header
+	// already headlines the title (or the slug itself when no title exists yet).
+	const slugPart = title && label && label !== title ? `${label} · ` : "";
+	const identityId = subagentId ?? resolvedId ?? transportId;
 	const waitForText = extractField(inputJson, "wait_for_text");
 	const header = metaRows([
-		badgeRow(
-			chips([
-				chip(awaitType, "indigo"),
-				chip(targetId, "gray"),
-				chip(resolvedId ? `→ ${resolvedId}` : undefined, "blue"),
-				chip(awaitStatus, awaitStatus === "failed" ? "red" : "green"),
-				chip(formatTimeoutLabel(extractNumericField(inputJson, "timeout")), "gray"),
-			]),
-		),
+		identityId ? { text: "", identity: `${slugPart}${identityId}` } : null,
 		waitForText ? { text: `wait_for: "${waitForText}"`, mono: true, dimmed: true } : null,
-		subagentId ? pathRow(`subagent: ${subagentId}`) : null,
 	]);
 	return sections([
 		section("meta.await", undefined, header),
-		textSection("output.main", outputJson, isBash ? "output" : "result", {
-			cap: isBash ? "term" : "code",
-			contentLines: countLines(output),
-			text: output,
-			// Non-bash await results are markdown in the chunked card.
-			...(isBash ? {} : { format: "markdown" as const }),
-		}),
+		outputIsLiveCount
+			? section("output.main", "result", {
+					kind: "structured",
+					badgeRows: 0,
+					bodyLines: [`${liveChars} chars`],
+				})
+			: textSection("output.main", outputJson, isBash ? "output" : "result", {
+					cap: isBash ? "term" : "code",
+					contentLines: countLines(output),
+					text: output,
+					// Non-bash await results are markdown in the chunked card.
+					...(isBash ? {} : { format: "markdown" as const }),
+				}),
 	]);
 }
 
@@ -3104,12 +3298,18 @@ function classifyKnowledge(
 		for (let i = 0; i < visible; i++) {
 			const r = asObject(results[i]) ?? {};
 			const id = readLeafText(r.id) ?? "";
+			// Standalone personal results have no global entry page: they open their own.
+			const personalId = readLeafText(r.personalEntryId);
 			const title = readLeafText(r.title) ?? (id || "entry");
 			const tags = stringArray(r.tags);
 			const snippet = readLeafText(r.snippet) ?? "";
 			entries.push({
 				title,
-				...(id ? { href: knowledgeEntryHref(id) } : {}),
+				...(personalId
+					? { href: knowledgePersonalEntryHref(personalId) }
+					: id
+						? { href: knowledgeEntryHref(id) }
+						: {}),
 				badges: chips([
 					...tags.slice(0, 6).map((tag) => chip(`#${tag}`, "grape")),
 					chip(r.isPersonal === true ? "personal" : undefined, "cyan"),
@@ -3130,14 +3330,16 @@ function classifyKnowledge(
 		const body = resolveDisplayText(outputJson);
 		const entryId =
 			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
+		const personalId = personalEntryIdOf(metadata, inputJson);
+		const href = knowledgeHref(entryId, personalId);
 		const title = (metadata ? readLeafText(metadata.title) : undefined) ?? "";
 		const tags = stringArray(metadata?.tags);
 		const keywords = stringArray(metadata?.keywords);
 		const header = metaRows([
-			title || entryId
+			title || entryId || personalId
 				? {
-						text: title || entryId,
-						...(entryId ? { href: knowledgeEntryHref(entryId) } : {}),
+						text: title || entryId || personalId || "",
+						...(href ? { href } : {}),
 						badges: chips([
 							chip(metadata?.isPersonal === true ? "personal" : undefined, "cyan"),
 							chip(metadata?.behindMain === true ? "behind main" : undefined, "orange"),
@@ -3167,8 +3369,12 @@ function classifyKnowledge(
 		const entryId =
 			(metadata ? readLeafText(metadata.entryId) : undefined) || extractField(inputJson, "entryId");
 		const scope = (metadata ? readLeafText(metadata.scope) : undefined) ?? "";
+		const personalId = entryId ? undefined : personalEntryIdOf(metadata, inputJson);
+		const headerId = entryId || personalId;
 		const header = metaRows([
-			entryId ? { text: entryId, mono: true, href: knowledgeEntryHref(entryId) } : null,
+			headerId
+				? { text: headerId, mono: true, href: knowledgeHref(entryId, personalId) as string }
+				: null,
 			badgeRow(
 				chips([
 					chip(scope, "grape"),
@@ -3189,26 +3395,217 @@ function classifyKnowledge(
 	return classifyGeneric(inputJson, outputJson);
 }
 
+/**
+ * The outline tools. A read is a markdown outline (rendered as markdown, under a header naming
+ * the address, its space and size); a search lists its hits; an edit shows what it wrote (its
+ * input is kept whole, see `SKIP_INPUT_TRUNCATE_TOOLS`) and what came of it.
+ *
+ * Block addresses and the commit link to the outline (`outline-links.ts`): the read's address,
+ * each hit, each edit's target (the block the edit changed or created, from the result) and the
+ * edit's commit. The render layer opens them in an outline panel beside the session, and shows
+ * them as plain text where nothing can open them.
+ */
+function classifyOutline(
+	toolName: string,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const space = asObject(metadata?.space);
+	const spaceKey = space ? readLeafText(space.key) : undefined;
+	if (toolName === "OutlineSearch" && metadata && Array.isArray(metadata.results)) {
+		const results = metadata.results as unknown[];
+		const entries: ToolStructuredEntry[] = [];
+		for (const raw of results.slice(0, 50)) {
+			const r = asObject(raw) ?? {};
+			const address = readLeafText(r.address) ?? "";
+			const path = stringArray(r.path);
+			const snippet = readLeafText(r.snippet) ?? "";
+			const href = outlineAddressPath(address);
+			entries.push({
+				title: readLeafText(r.title) || address,
+				...(href ? { href } : {}),
+				...(address || path.length > 0
+					? { meta: [address, path.join(" › ")].filter(Boolean).join(" · ") }
+					: {}),
+				badges: chips([
+					chip(readLeafText(r.alias), "teal"),
+					chip(r.process === true ? "process" : undefined, "gray"),
+				]),
+				...(snippet ? { snippet: snippet.slice(0, 300) } : {}),
+			});
+		}
+		return single("output.results", {
+			kind: "structured",
+			badgeRows: 1,
+			badges: chips([chip(`${results.length} results`, "teal")]),
+			bodyLines: [],
+			entries,
+		});
+	}
+	if (toolName === "OutlineRead") {
+		const body = resolveDisplayText(outputJson);
+		const address = (metadata ? readLeafText(metadata.address) : undefined) || "";
+		const blocks = typeof metadata?.blocks === "number" ? metadata.blocks : undefined;
+		const asOf = typeof metadata?.asOf === "number" ? metadata.asOf : undefined;
+		const addressHref = outlineAddressPath(address);
+		const header = metaRows([
+			pathRow(address, addressHref ? { href: addressHref } : {}),
+			badgeRow(
+				chips([
+					chip(spaceKey, "teal"),
+					chip(blocks === undefined ? undefined : `${blocks} blocks`, "gray"),
+					chip(asOf === undefined ? undefined : `as of #${asOf}`, "yellow"),
+					chip(metadata?.truncated === true ? "more not shown" : undefined, "orange"),
+				]),
+			),
+		]);
+		return sections([
+			section("meta.read", undefined, header),
+			textSection("output.main", outputJson ?? "", undefined, {
+				cap: "knowledge",
+				contentLines: countLines(body) + 2,
+				text: body,
+				...(body ? { format: "markdown" as const } : {}),
+			}),
+		]);
+	}
+	if (toolName === "OutlineEdit") {
+		const edits = asObject(inputJson)?.edits;
+		// What each edit touched, once committed: one summary per edit, in order.
+		const done = Array.isArray(metadata?.edits) ? (metadata.edits as unknown[]) : [];
+		const lines: string[] = [];
+		if (Array.isArray(edits)) {
+			edits.forEach((raw, index) => {
+				const edit = asObject(raw);
+				if (!edit) return;
+				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
+				if (!kind) return;
+				const target = readLeafText(edit[kind]) ?? "";
+				const extra =
+					kind === "move"
+						? ` → ${readLeafText(edit.to) ?? ""}`
+						: kind === "set"
+							? setText(edit)
+							: "";
+				const result = asObject(done[index]);
+				const touched =
+					result?.op === kind
+						? kind === "add"
+							? stringArray(result.created)[0]
+							: readLeafText(result.address)
+						: undefined;
+				const href = outlineAddressPath(touched);
+				// Link text without code spans: the brackets of a markdown link must not be split.
+				const label = target.replace(/[[\]`]/g, "");
+				lines.push(
+					href && label
+						? `**${kind}** [${label}](${href})${extra}`
+						: `**${kind}** \`${target}\`${extra}`,
+				);
+				const text = readLeafText(
+					kind === "add" ? edit.markdown : kind === "replace" ? edit.text : undefined,
+				);
+				if (text) lines.push("", text, "");
+			});
+		}
+		const commit = asObject(metadata?.commit);
+		const seq = commit && typeof commit.seq === "number" ? commit.seq : undefined;
+		const commitHref = spaceKey && seq !== undefined ? outlineCommitPath(spaceKey, seq) : null;
+		const input = lines.join("\n").trim();
+		return sections([
+			section(
+				"meta.edit",
+				undefined,
+				metaRows([
+					badgeRow(
+						chips([
+							chip(spaceKey, "teal"),
+							chip(seq === undefined || commitHref ? undefined : `commit #${seq}`, "green"),
+						]),
+					),
+					commitHref ? pathRow(`commit #${seq}`, { href: commitHref, dimmed: false }) : null,
+				]),
+			),
+			input
+				? textSection("input.edits", inputJson, "input", {
+						cap: "knowledge",
+						contentLines: countLines(input) + 2,
+						text: input,
+						format: "markdown",
+					})
+				: null,
+			outputJson != null
+				? textSection("output.main", outputJson, "result", { format: "markdown" })
+				: null,
+		]);
+	}
+	return classifyGeneric(inputJson, outputJson);
+}
+
+function setText(edit: Record<string, unknown>): string {
+	const parts: string[] = [];
+	const checkbox = readLeafText(edit.checkbox);
+	if (checkbox !== undefined) parts.push(`checkbox ${JSON.stringify(checkbox)}`);
+	if ("assignee" in edit) parts.push(`assignee ${readLeafText(edit.assignee) ?? "none"}`);
+	if ("alias" in edit) parts.push(`alias ${readLeafText(edit.alias) ?? "none"}`);
+	return parts.length > 0 ? `: ${parts.join(", ")}` : "";
+}
+
 /** In-app link to a knowledge entry (the chunked EntryLink target). */
 function knowledgeEntryHref(entryId: string): string {
 	return `/knowledge/${entryId}`;
 }
 
-/**
- * ContextAsk's tool_output while the summary model is still streaming is a bare
- * cumulative character count (`onProgress` → `emitOutput(String(n))`), not a body.
- * Readers want that as a counter; painting it as markdown would show a lone number.
- */
-function contextAskLiveOutputChars(
+/** In-app link to a personal version (linked or standalone): its one page. */
+function knowledgePersonalEntryHref(personalEntryId: string): string {
+	return `/knowledge/mine/${personalEntryId}`;
+}
+
+function personalEntryIdOf(
 	metadata: Record<string, unknown> | null,
-	outputJson: unknown,
-): number | null {
-	const raw = readLeafText(metadata?._streamingOutput) ?? readLeafText(outputJson);
+	inputJson: unknown,
+): string | undefined {
+	return (
+		(metadata ? readLeafText(metadata.personalEntryId) : undefined) ||
+		extractField(inputJson, "personalEntryId") ||
+		undefined
+	);
+}
+
+/** A personal version opens its own page; otherwise the global entry's. */
+function knowledgeHref(
+	entryId: string | undefined,
+	personalEntryId: string | undefined,
+): string | undefined {
+	if (personalEntryId) return knowledgePersonalEntryHref(personalEntryId);
+	return entryId ? knowledgeEntryHref(entryId) : undefined;
+}
+
+/**
+ * The `tool_output` live-count convention: a running tool whose streamed
+ * "output" is a bare cumulative character count (ContextAsk's answer so far, a
+ * subagent's reply so far, an awaited child's reply so far) sends plain digits
+ * instead of a body. Readers want that as a counter; painting it as markdown
+ * would show a lone number.
+ */
+export function parseLiveOutputChars(value: unknown): number | null {
+	const raw = readLeafText(value);
 	if (raw === undefined) return null;
 	const trimmed = raw.trim();
 	if (!/^\d+$/.test(trimmed)) return null;
 	const n = Number(trimmed);
 	return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function contextAskLiveOutputChars(
+	metadata: Record<string, unknown> | null,
+	outputJson: unknown,
+): number | null {
+	// "First defined source wins", even when it is not numeric (a non-numeric
+	// streaming body must not fall through to the answer text).
+	const raw = readLeafText(metadata?._streamingOutput) ?? readLeafText(outputJson);
+	return parseLiveOutputChars(raw);
 }
 
 /**
@@ -3336,8 +3733,19 @@ function classifyWorkspace(
 		rows.push({ text: name ? `${name} · ${value}` : value, mono: true });
 	};
 	let handled = false;
-	if (toolName === "Worktree") {
-		if (readLeafText(args?.action) === "list") {
+	if (
+		[
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+		].includes(toolName)
+	) {
+		if (
+			toolName === "ListWorktrees" ||
+			(toolName === "Worktree" && readLeafText(args?.action) === "list")
+		) {
 			const list = workspaceObject(metadata?.workspaceWorktrees) ?? result;
 			if (Array.isArray(list?.entries)) {
 				rows.push({ text: text("workspaceList") });
@@ -3363,11 +3771,17 @@ function classifyWorkspace(
 							? text("workspaceFailed")
 							: outcome === "unknown"
 								? text("workspaceUnknown")
-								: text("workspaceCreate"),
+								: text(
+										toolName === "AttachWorktree"
+											? "workspaceAttach"
+											: toolName === "GetWorktreeOperation"
+												? "workspaceOperation"
+												: "workspaceCreate",
+									),
 			});
 			pathRow(
 				worktree?.path ?? args?.destinationPath,
-				worktree?.branch ?? workspaceObject(args?.branch)?.name,
+				worktree?.branch ?? args?.branchName ?? workspaceObject(args?.branch)?.name,
 			);
 			handled = ["created", "failed", "unknown"].includes(outcome ?? "");
 		}

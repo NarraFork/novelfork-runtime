@@ -25,16 +25,43 @@ const catchUpCursorSchema = z
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z
 		.object({
-			type: z.literal("git_workspace_subscribe"),
+			type: z.literal("editor_file_subscribe"),
 			subscriptionId: z.string().min(1).max(128),
-			narratorId: z.string().min(1).max(128).optional(),
-			chapterId: z.string().min(1).max(128).optional(),
-			workspaceKey: z.string().min(1).max(128).optional(),
+			narratorId: z.string().min(1).max(128),
+			docId: z.string().uuid(),
 		})
 		.strict(),
 	z
 		.object({
-			type: z.literal("git_workspace_unsubscribe"),
+			type: z.literal("editor_file_unsubscribe"),
+			subscriptionId: z.string().min(1).max(128),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("outline_page_subscribe"),
+			subscriptionId: z.string().min(1).max(128),
+			pageId: z.string().min(1).max(128),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("outline_page_unsubscribe"),
+			subscriptionId: z.string().min(1).max(128),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("git_workspace_subscribe"),
+			subscriptionId: z.string().min(1).max(128),
+			narratorId: z.string().min(1).max(128).optional(),
+			workspaceKey: z.string().min(1).max(128).optional(),
+			view: z.enum(["summary", "details"]).optional(),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.enum(["git_workspace_unsubscribe", "git_workspace_refresh"]),
 			subscriptionId: z.string().min(1).max(128),
 		})
 		.strict(),
@@ -44,12 +71,16 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			type: z.literal("subscribe"),
 			narratorIds: z.array(z.string().min(1)).max(RECENT_TABS_WS_BATCH_SIZE),
 			catchUpCursor: catchUpCursorSchema.optional(),
-			kind: z.enum(["list", "panel", "messages"]).optional(),
+			kind: z.enum(["list", "panel", "messages", "activity"]).optional(),
 			requestId: z.string().min(1).optional(),
+			downgrade: z.boolean().optional(),
 			// Client's last-known messageVersion for this narrator. When it matches
 			// the server version, the subscribe short-circuits to sync_ok instead of
 			// running a full catch-up query (see narrator-ws.ts subscribe handler).
 			version: z.number().int().min(0).optional(),
+			// Ignored: every subscription gets the block-keyed message protocol
+			// (docs/BLOCK_STORAGE-DESIGN.md §8.2). Clients loaded before P3d still send it.
+			protocol: z.union([z.literal(1), z.literal(2)]).optional(),
 		})
 		.strict(),
 	z.object({
@@ -65,11 +96,6 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		feedbackText: z.string().optional(),
 		compactAfter: z.boolean().optional(),
 		updatedPlan: z.string().optional(),
-	}),
-	z.object({
-		type: z.literal("merge_decision"),
-		mergeSessionId: z.string().min(1),
-		decision: z.enum(["continue", "cancel"]),
 	}),
 	z.object({
 		type: z.literal("buffer_message"),
@@ -161,7 +187,6 @@ export const terminalWsMessageSchema = z.preprocess(
 		z.object({
 			type: z.literal("create"),
 			requestId: z.string().min(1),
-			chapterId: z.string().min(1).optional(),
 			narratorId: z.string().min(1).optional(),
 			deviceId: z.string().min(1).optional(),
 			name: z.string().max(100).optional(),

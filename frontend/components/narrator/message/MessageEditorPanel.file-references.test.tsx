@@ -1,18 +1,33 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from "node:timers";
-import { MantineProvider } from "@mantine/core";
+import { Box, MantineProvider } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import {
+	type ComposerDocument,
+	type ComposerInlineNode,
+	composerDocumentText,
+} from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
+import { MAX_MEDIA_FILE_SIZE, type MediaRef } from "@shared/media-attachments";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { Editor } from "@tiptap/core";
+import { Slice } from "@tiptap/pm/model";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act, type ComponentProps, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { api, type BufferMessageSummary } from "../../../lib/api";
+import type { RevertActionPreview } from "../../../lib/api/narrators";
+import {
+	getPromptOptimizeTask,
+	resetPromptOptimizeTasksForTest,
+	startPromptOptimizeTask,
+} from "../../../lib/prompt-optimize-tasks";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
 import { ImageViewerContext } from "../../common/image-viewer-context";
+import { editorBodyPositions } from "../composer/InlineComposerEditor";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "../interaction/QueuedMessageRow";
 import {
 	QueuedMessagesPanel,
@@ -93,7 +108,23 @@ function installDom() {
 		removeEventListener() {},
 		dispatchEvent: () => false,
 	});
+	const selection = {
+		rangeCount: 0,
+		anchorNode: null,
+		focusNode: null,
+		anchorOffset: 0,
+		focusOffset: 0,
+		removeAllRanges() {},
+		addRange() {},
+		collapse() {},
+		extend() {},
+		setBaseAndExtent() {},
+	};
+	Object.defineProperty(window.document, "getSelection", { value: () => selection });
 	const overrides = {
+		innerHeight: 800,
+		innerWidth: 1200,
+		getSelection: () => selection,
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -151,6 +182,7 @@ async function render(child: ReactNode) {
 	});
 }
 function button(label: string) {
+	if (label.startsWith(`${en.removeFile}:`)) label = en.fileReferences.remove;
 	const found = Array.from(document.querySelectorAll("button")).find(
 		(item) => item.textContent?.trim() === label || item.getAttribute("aria-label") === label,
 	);
@@ -168,6 +200,7 @@ function editor(overrides: Partial<MessageEditorPanelProps> = {}) {
 		<MessageEditorPanel
 			messageRole="user"
 			messageId="message"
+			narratorId="narrator"
 			blocks={[
 				{ type: "file_reference", reference, snapshotText: "must not reach edit payload" },
 				{ type: "file_reference", reference: secondReference },
@@ -181,6 +214,8 @@ function editor(overrides: Partial<MessageEditorPanelProps> = {}) {
 
 beforeEach(async () => {
 	installDom();
+	spyOn(api, "getMessageComposerDocument").mockResolvedValue({});
+	spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({});
 	if (!i18n.isInitialized)
 		await i18n.use(initReactI18next).init({
 			lng: "en",
@@ -193,12 +228,29 @@ beforeEach(async () => {
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
-	// The query is disabled without a narratorId; seed the no-op preview so the
-	// submit tests cannot accidentally send a request or open a rollback dialog.
-	qc.setQueryData(["narrators", "", "edit-regenerate-preview", "message"], {
-		affectedFiles: [],
-		deletedMessageCount: 0,
-	});
+	// A reviewed plan that restores nothing and removes no later messages: submit
+	// tests go straight through without a rollback dialog.
+	spyOn(api, "previewRevertAction").mockImplementation(async (_narratorId, input) => ({
+		action: input.action,
+		executable: false,
+		historySummary: { deletedMessageCount: 0, deletedBlockCount: 0 },
+		plan: {
+			id: "noop-plan",
+			planHash: "noop-hash",
+			status: "prepared",
+			coverageComplete: true,
+			expectedFileCount: 0,
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			expired: false,
+			kind: "rollback_to_block",
+		} as RevertActionPreview["plan"],
+	}));
+	spyOn(api, "getRevertPlanFiles").mockResolvedValue({
+		items: [],
+		hasMore: false,
+		nextCursor: null,
+		executable: false,
+	} as Awaited<ReturnType<typeof api.getRevertPlanFiles>>);
 	registered = null;
 	host = document.createElement("div");
 	document.body.appendChild(host);
@@ -226,6 +278,8 @@ async function cleanupDom() {
 			else Reflect.deleteProperty(globalThis, key);
 		}
 		previousGlobals.clear();
+		resetPromptOptimizeTasksForTest();
+		mock.restore();
 	}
 }
 afterEach(cleanupDom);
@@ -250,18 +304,115 @@ test("fixture teardown cancels owned window/global timers and RAF before restori
 	}
 });
 
-// linkedom has no native textarea editing/default actions. Deliver beforeinput
-// through the DOM listener, then invoke React's installed change handler after
-// applying the browser's value/selection mutation (not the pure helper).
+// linkedom has no native editing defaults. Exercise the actual mounted Tiptap
+// transaction/history controller instead of the removed controlled textarea path.
+function inlineEditor() {
+	const element = document.querySelector<HTMLElement>(".ProseMirror") as
+		| (HTMLElement & { editor: Editor })
+		| null;
+	if (!element?.editor) throw new Error("Inline editor missing");
+	return element.editor;
+}
+function inlineDocument(): ComposerDocument {
+	const paragraphs: ComposerDocument["paragraphs"] = [];
+	inlineEditor().state.doc.forEach((paragraph) => {
+		const children: ComposerInlineNode[] = [];
+		paragraph.forEach((node) => {
+			if (node.isText) children.push({ type: "text", text: node.text ?? "" });
+			else if (node.type.name === "hardBreak") children.push({ type: "break" });
+			else children.push(node.attrs.value as ComposerInlineNode);
+		});
+		paragraphs.push({ children });
+	});
+	return { version: 1, paragraphs, assets: [] };
+}
+const harnesses = new WeakMap<
+	Editor,
+	{ textarea: HTMLTextAreaElement; props: ComponentProps<"textarea"> }
+>();
 function textareaProps() {
-	const textarea = document.querySelector("textarea");
-	if (!textarea) throw new Error("Textarea missing");
-	const key = Object.keys(textarea).find((key) => key.startsWith("__reactProps$"));
-	if (!key) throw new Error("React textarea props missing");
-	return {
-		textarea,
-		props: (textarea as unknown as Record<string, ComponentProps<"textarea">>)[key],
+	const editor = inlineEditor();
+	const cached = harnesses.get(editor);
+	if (cached) return cached;
+	let pending: string | undefined;
+	let range: { start: number; end: number; backward: boolean } | undefined;
+	const text = () => composerDocumentText(inlineDocument()).text;
+	const textarea = {
+		get value() {
+			return pending ?? text();
+		},
+		set value(value: string) {
+			pending = value;
+		},
+		selectionStart: 0,
+		selectionEnd: 0,
+		dispatchEvent(event: Event) {
+			range = {
+				start: this.selectionStart,
+				end: this.selectionEnd,
+				backward: (event as InputEvent).inputType?.includes("Backward") ?? false,
+			};
+			return true;
+		},
+	} as HTMLTextAreaElement;
+	const props: ComponentProps<"textarea"> = {
+		onChange: () => {
+			const previous = text();
+			const next = pending ?? previous;
+			let start = range?.start ?? textarea.selectionStart;
+			let end = range?.end ?? textarea.selectionEnd;
+			if (start === end && next.length < previous.length) {
+				if (range?.backward) start = Math.max(0, start - previous.length + next.length);
+				else end += previous.length - next.length;
+			}
+			const replacement = next.slice(start, next.length - (previous.length - end));
+			const positions = editorBodyPositions(editor.state.doc);
+			pending = undefined;
+			range = undefined;
+			editor.view.dispatch(
+				editor.state.tr.insertText(replacement, positions.toEditor(start), positions.toEditor(end)),
+			);
+		},
+		onCompositionStart: () => {
+			(editor.view as unknown as { input: { composing: boolean } }).input.composing = true;
+		},
+		onCompositionEnd: () => {
+			(editor.view as unknown as { input: { composing: boolean } }).input.composing = false;
+		},
+		onPaste: (event) => {
+			range = { start: textarea.selectionStart, end: textarea.selectionEnd, backward: false };
+			const files = Array.from(event.clipboardData.items).flatMap((item) => {
+				const file = item.getAsFile();
+				return file ? [file] : [];
+			});
+			if (files.length)
+				editor.view.someProp("handlePaste", (handler) =>
+					handler(
+						editor.view,
+						{ clipboardData: { files }, preventDefault() {} } as unknown as ClipboardEvent,
+						Slice.empty,
+					),
+				);
+		},
+		onKeyDown: (event) => {
+			if (editor.view.composing || event.nativeEvent.isComposing) return;
+			if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+				editor.commands.undo();
+				return;
+			}
+			const wrapper = editor.view.dom.closest("[data-inline-composer]");
+			if (!wrapper) throw new Error("Editor wrapper missing");
+			const key = Object.keys(wrapper).find((name) => name.startsWith("__reactProps$"));
+			if (!key) throw new Error("Editor React handlers missing");
+			const handlers = (wrapper as unknown as Record<string, ComponentProps<"div">>)[key];
+			handlers.onKeyDownCapture?.({ ...event, target: editor.view.dom } as unknown as Parameters<
+				NonNullable<typeof handlers.onKeyDownCapture>
+			>[0]);
+		},
 	};
+	const result = { textarea, props };
+	harnesses.set(editor, result);
+	return result;
 }
 async function editRange(
 	start: number,
@@ -444,16 +595,16 @@ describe("message reference attachment editor", () => {
 				false,
 		);
 		await render(editor({ onEditAndRegenerate: save, onClose: close }));
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
-		expect(document.body.textContent).toContain("#file:a.ts:5-5");
+		expect(document.body.textContent).toContain("a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:5-5");
 		expect(button(en.editSubmit).disabled).toBe(false);
 		expect(registered?.canSubmit).toBe(true);
 		await click(button(en.editSubmit));
-		expect(save.mock.calls[0][1]).toBe("");
-		expect(save.mock.calls[0][3]?.fileReferences).toEqual([reference, secondReference]);
+		expect(save.mock.calls[0][1]).toBe("#file:a.ts:2-2#file:a.ts:5-5");
+		expect(save.mock.calls[0][3]?.fileReferences).toMatchObject([reference, secondReference]);
 		expect(JSON.stringify(save.mock.calls[0][3])).not.toContain("snapshotText");
 		expect(close).not.toHaveBeenCalled();
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("removing one occurrence keeps the other selection, removing all disables pure-ref submit", async () => {
@@ -464,10 +615,44 @@ describe("message reference attachment editor", () => {
 		await render(editor({ onEditAndRegenerate: save }));
 		await click(button(`${en.removeFile}: a.ts`));
 		await click(button(en.editSubmit));
-		expect(save.mock.calls[0][3]?.fileReferences).toEqual([secondReference]);
+		expect(save.mock.calls[0][3]?.fileReferences).toMatchObject([secondReference]);
 		await click(button(`${en.removeFile}: a.ts`));
 		expect(button(en.editSubmit).disabled).toBe(true);
 		expect(registered?.canSubmit).toBe(false);
+	});
+
+	test("files dropped on editor controls join this message, never the outer drop zone", async () => {
+		const outer: boolean[] = [];
+		const drop = (target: Element, files: File[]) =>
+			act(async () => {
+				const event = new Event("drop", { bubbles: true, cancelable: true });
+				Object.defineProperty(event, "dataTransfer", { value: { types: ["Files"], files } });
+				target.dispatchEvent(event);
+				await flush();
+			});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		const zone = (child: ReactNode) => (
+			<Box onDrop={(event) => outer.push(event.defaultPrevented)}>{child}</Box>
+		);
+		await render(zone(editor({ initialText: "body", onEditAndRegenerate: save })));
+		const dropped = new File(["dropped"], "dropped.txt", { type: "text/plain" });
+		await drop(button(en.attachFile), [dropped]);
+		expect(outer).toEqual([true]);
+		expect(document.body.textContent).toContain("dropped.txt");
+		await click(button(en.editSubmit));
+		expect(save.mock.calls[0][3]?.newTextFiles).toEqual([dropped]);
+		// Outside the inline document (header, buttons) the drop is claimed but not imported.
+		await drop(button(en.editCancel), [new File(["x"], "stray.txt", { type: "text/plain" })]);
+		expect(outer).toEqual([true, true]);
+		expect(document.body.textContent).not.toContain("stray.txt");
+		await render(zone(editor({ messageRole: "assistant", initialText: "plain", blocks: [] })));
+		const textarea = document.querySelector("textarea");
+		if (!textarea) throw new Error("Assistant textarea missing");
+		await drop(textarea, [new File(["y"], "assistant.txt", { type: "text/plain" })]);
+		expect(outer).toEqual([true, true, true]);
 	});
 
 	test("removing all refs from a text message sends [] instead of restoring them", async () => {
@@ -480,6 +665,293 @@ describe("message reference attachment editor", () => {
 		await click(button(`${en.removeFile}: a.ts`));
 		await click(button(en.editSubmit));
 		expect(save.mock.calls[0][3]?.fileReferences).toEqual([]);
+	});
+
+	test.each([
+		["a plan that restores files", 1, 0],
+		["later messages that would be removed", 0, 2],
+	])("%s still asks for confirmation instead of submitting", async (_case, fileCount, messageCount) => {
+		spyOn(api, "previewRevertAction").mockImplementation(async (_narratorId, input) => ({
+			action: input.action,
+			executable: false,
+			historySummary: { deletedMessageCount: messageCount, deletedBlockCount: messageCount },
+			plan: {
+				id: "real-plan",
+				planHash: "real-hash",
+				status: "prepared",
+				coverageComplete: true,
+				expectedFileCount: fileCount,
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				expired: false,
+				kind: "rollback_to_block",
+			} as RevertActionPreview["plan"],
+		}));
+		spyOn(api, "getRevertPlanFiles").mockResolvedValue({
+			items: Array.from({ length: fileCount }, (_, index) => ({
+				fileKey: `file-${index}`,
+				identityJson: { deviceId: "local", displayPath: `/work/f${index}.ts` },
+				desiredStateJson: { kind: "present" },
+			})),
+			hasMore: false,
+			nextCursor: null,
+			executable: false,
+		} as unknown as Awaited<ReturnType<typeof api.getRevertPlanFiles>>);
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(editor({ initialText: "keep text", onEditAndRegenerate: save }));
+		await click(button(en.editSubmit));
+		expect(save).not.toHaveBeenCalled();
+		expect(document.body.textContent).toContain(en.editRevertConfirmTitle);
+	});
+});
+
+test("a pending optimization reaches both the remounted real editor and its submitted snapshot", async () => {
+	const original: ComposerDocument = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "original draft" }] }],
+		assets: [],
+	};
+	const retries: Array<() => void> = [];
+	const schedule = globalThis.setTimeout;
+	spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof schedule>) => {
+		if (args[1] === 250) {
+			retries.push(args[0] as () => void);
+			return 0;
+		}
+		return schedule(...args);
+	}) as typeof schedule);
+	startPromptOptimizeTask({
+		narratorId: "narrator",
+		messageId: "message",
+		text: "original draft",
+		snapshot: { document: original, selection: { start: 0, end: 0 }, token: "pending" },
+		style: "clarify",
+		withContext: false,
+		request: async () => ({ text: "optimized draft" }),
+	});
+	await flush();
+	const save = mock(
+		async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+			false,
+	);
+	await render(editor({ blocks: [], composerDocument: original, onEditAndRegenerate: save }));
+	await act(async () => {
+		for (const retry of retries.splice(0)) retry();
+		await flush();
+	});
+	expect(getPromptOptimizeTask("narrator::message")).toBeUndefined();
+	expect(composerDocumentText(inlineDocument()).text).toBe("optimized draft");
+	await click(button(en.editSubmit));
+	expect(save.mock.calls[0][1]).toBe("optimized draft");
+	expect(save.mock.calls[0][3]?.composerDocument?.paragraphs).toEqual([
+		{ children: [{ type: "text", text: "optimized draft" }] },
+	]);
+});
+describe("structured edit layout details", () => {
+	const owner = "layout-owner";
+	const layout: ComposerDocument = {
+		version: 1,
+		assets: [
+			{ id: "persisted-image", kind: "image", name: "image.png", size: 3, mimeType: "image/png" },
+		],
+		paragraphs: [
+			{
+				children: [
+					{ type: "text", text: " before " },
+					{ type: "attachment", id: "image-occurrence", assetId: "persisted-image" },
+					{ type: "quote", id: "quote-occurrence", label: "Source", text: "protected quote" },
+					{ type: "fileReference", id: reference.id, reference },
+					{ type: "text", text: " after " },
+				],
+			},
+		],
+	};
+	test("message details load only for editing and preserve mixed order, stable IDs and fullscreen controller", async () => {
+		spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("image", { headers: { "content-type": "image/png" } }),
+		);
+		const load = spyOn(api, "getMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [
+				{
+					imageId: "server-image",
+					filename: "image.png",
+					mediaType: "image/png",
+					size: 3,
+					uploadNarratorId: owner,
+				},
+			],
+			textFiles: [],
+		});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(
+			editor({
+				narratorId: owner,
+				initialText: "stale legacy body",
+				blocks: [
+					{
+						type: "image",
+						imageId: "stale-list-image",
+						filename: "stale-list-image.png",
+						previewUrl: "blob:test-image",
+					},
+					{ type: "file_reference", reference },
+				],
+				onEditAndRegenerate: save,
+			}),
+		);
+		expect(load).toHaveBeenCalledTimes(1);
+		expect(load.mock.calls[0].slice(0, 2)).toEqual([owner, "message"]);
+		const controller = inlineEditor();
+		const expand = document.querySelector(".tabler-icon-arrows-maximize")?.closest("button");
+		if (!expand) throw new Error("Fullscreen action missing");
+		await click(expand);
+		expect(inlineEditor()).toBe(controller);
+		expect(inlineDocument().paragraphs).toEqual(layout.paragraphs);
+		await click(button(en.editSubmit));
+		expect(save.mock.calls[0][1]).toBe(composerDocumentText(layout).text);
+		expect(save.mock.calls[0][3]?.composerDocument).toEqual(layout);
+		expect(save.mock.calls[0][3]?.keepImageIds).toEqual(["server-image"]);
+		expect(save.mock.calls[0][3]?.fileReferences).toEqual(
+			composerDocumentText(layout).fileReferences,
+		);
+		expect(load).toHaveBeenCalledTimes(1);
+	});
+	test("fullscreen edit Enter only newlines; ctrl+Enter still submits", async () => {
+		spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("image", { headers: { "content-type": "image/png" } }),
+		);
+		spyOn(api, "getMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [
+				{
+					imageId: "server-image",
+					filename: "image.png",
+					mediaType: "image/png",
+					size: 3,
+					uploadNarratorId: owner,
+				},
+			],
+			textFiles: [],
+		});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(
+			editor({ narratorId: owner, initialText: "stale legacy body", onEditAndRegenerate: save }),
+		);
+		const expand = document.querySelector(".tabler-icon-arrows-maximize")?.closest("button");
+		if (!expand) throw new Error("Fullscreen action missing");
+		await click(expand);
+		// 全屏编辑:Enter(无论是否按 Shift)只换行,不提交。
+		await editorKey("Enter");
+		expect(save).not.toHaveBeenCalled();
+		// mod+Enter 仍然提交。
+		await editorKey("Enter", true);
+		expect(save).toHaveBeenCalledTimes(1);
+	});
+	test("queued detail uses its own endpoint and forwards the unchanged layout with kept resources", async () => {
+		spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("image", { headers: { "content-type": "image/png" } }),
+		);
+		const load = spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [
+				{
+					imageId: "server-image",
+					filename: "image.png",
+					mediaType: "image/png",
+					size: 3,
+					uploadNarratorId: owner,
+				},
+			],
+			textFiles: [],
+		});
+		const save = mock(
+			async (_message: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(
+			queueRow({
+				narratorId: owner,
+				isEditing: true,
+				msg: {
+					id: "queued-layout",
+					text: "legacy",
+					imageCount: 1,
+					bufferedAt: "now",
+					images: [{ imageId: "stale-queue-image", filename: "image.png", mediaType: "image/png" }],
+				},
+				onSaveEdit: save,
+			}),
+		);
+		expect(load).toHaveBeenCalledTimes(1);
+		expect(load.mock.calls[0].slice(0, 2)).toEqual([owner, "queued-layout"]);
+		await editorKey("Enter");
+		expect(save.mock.calls[0][1]).toBe(composerDocumentText(layout).text);
+		expect(save.mock.calls[0][2].composerDocument).toEqual(layout);
+		expect(save.mock.calls[0][2].keepImageIds).toEqual(["server-image"]);
+		expect(save.mock.calls[0][2].keepTextFiles).toEqual([]);
+	});
+	test("legacy edits use body and references from the same detail snapshot, not stale rows", async () => {
+		spyOn(api, "getMessageComposerDocument").mockResolvedValue({
+			text: "latest body",
+			fileReferences: [],
+			images: [],
+			textFiles: [],
+		});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		await render(
+			editor({ narratorId: owner, initialText: "stale row body", onEditAndRegenerate: save }),
+		);
+		await click(button(en.editSubmit));
+		expect(save.mock.calls[0][1]).toBe("latest body");
+		expect(save.mock.calls[0][3]?.fileReferences).toEqual([]);
+		expect(save.mock.calls[0][3]?.keepImageIds).toEqual([]);
+	});
+	test("a rich layout without its same-snapshot resource detail cannot bind stale attachments", async () => {
+		spyOn(api, "getMessageComposerDocument").mockResolvedValue({ composerDocument: layout });
+		await render(editor({ narratorId: owner, initialText: "stale body" }));
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(button(en.editSubmit).disabled).toBe(true);
+	});
+	test("layout failure disables save until an explicit successful retry", async () => {
+		const load = spyOn(api, "getMessageComposerDocument").mockRejectedValue(
+			new Error("unavailable"),
+		);
+		await render(editor({ narratorId: owner, initialText: "must not overwrite unknown layout" }));
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(button(en.editSubmit).disabled).toBe(true);
+		expect(registered?.canSubmit).toBe(false);
+		load.mockResolvedValue({});
+		await click(button(en.documentRetry));
+		expect(document.querySelector(".ProseMirror")).not.toBeNull();
+		expect(button(en.editSubmit).disabled).toBe(false);
+		expect(load).toHaveBeenCalledTimes(2);
+	});
+	test("assistant editing remains plain text and does not load a composer layout", async () => {
+		const save = mock((_messageId: string, _text: string) => {});
+		await render(
+			editor({
+				messageRole: "assistant",
+				initialText: "plain assistant",
+				blocks: [],
+				onEditAssistantMessage: save,
+			}),
+		);
+		expect(document.querySelector("textarea")).not.toBeNull();
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(api.getMessageComposerDocument).not.toHaveBeenCalled();
+		await click(button(en.editAssistantSubmit));
+		expect(save).toHaveBeenCalledWith("message", "plain assistant");
 	});
 });
 
@@ -510,6 +982,380 @@ function queueRow(overrides: Partial<ComponentProps<typeof QueuedMessageRow>> = 
 		/>
 	);
 }
+
+describe("native media queued rows and manifest editing", () => {
+	beforeEach(() => {
+		previousGlobals.set(
+			"localStorage",
+			Object.getOwnPropertyDescriptor(globalThis, "localStorage"),
+		);
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+	});
+	const media: MediaRef[] = [
+		{
+			mediaId: "video-id",
+			filename: "clip.webm",
+			mediaType: "video/webm",
+			size: 32,
+			uploadNarratorId: "source-owner",
+		},
+		{
+			mediaId: "audio-id",
+			filename: "voice.wav",
+			mediaType: "audio/wav",
+			size: 60,
+			uploadNarratorId: "source-owner",
+		},
+	];
+	const documentFor = (refs: MediaRef[]): ComposerDocument => ({
+		version: 1,
+		assets: refs.map((ref, index) => ({
+			id: `media-${index}`,
+			kind: ref.mediaType.startsWith("audio/") ? "audio" : "video",
+			name: ref.filename,
+			size: ref.size,
+			mimeType: ref.mediaType,
+		})),
+		paragraphs: [
+			{
+				children: refs.map((_, index) => ({
+					type: "attachment",
+					id: `node-${index}`,
+					assetId: `media-${index}`,
+				})),
+			},
+		],
+	});
+	const messageFor = (refs: MediaRef[]): BufferMessageSummary => ({
+		id: "queue-media",
+		text: "",
+		bufferedAt: "now",
+		imageCount: 0,
+		media: refs,
+	});
+	async function selectMedia(files: File[]) {
+		const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+		if (!input) throw new Error("Attachment input missing");
+		Object.defineProperty(input, "files", { configurable: true, value: files });
+		await act(async () => {
+			input.dispatchEvent(new Event("change", { bubbles: true }));
+			await flush();
+		});
+	}
+	test("panel preserves source-owned audio/video previews and ignores media double-clicks for editing", async () => {
+		const fetch = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(async () => new Response("native bytes"), {
+				preconnect: globalThis.fetch.preconnect,
+			}),
+		);
+		const start = mock(() => {});
+		await render(
+			queuePanel({
+				narratorId: "fork-context",
+				queuedMessages: [messageFor(media)],
+				handleStartEditQueued: start,
+			}),
+		);
+		expect(fetch).not.toHaveBeenCalled();
+		expect(document.querySelectorAll("audio, video")).toHaveLength(0);
+		const loadButtons = Array.from(document.querySelectorAll("button")).filter(
+			(item) => item.textContent?.trim() === en.mediaPreviewLoad,
+		);
+		expect(loadButtons).toHaveLength(2);
+		for (const load of loadButtons) await click(load);
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(document.querySelectorAll("audio")).toHaveLength(1);
+		expect(document.querySelectorAll("video")).toHaveLength(1);
+		const urls = fetch.mock.calls.map(([url]) => String(url));
+		expect(
+			urls.some((url) =>
+				url.includes("/uploads/source-owner/media/audio-id?referencingNarratorId=fork-context"),
+			),
+		).toBe(true);
+		expect(
+			urls.some((url) =>
+				url.includes("/uploads/source-owner/media/video-id?referencingNarratorId=fork-context"),
+			),
+		).toBe(true);
+		await act(async () =>
+			document.querySelector("audio")?.dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(start).not.toHaveBeenCalled();
+	});
+
+	test("detail media overrides stale row state and actual chip removal/addition forwards native files", async () => {
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(async () => new Response("native bytes"), {
+				preconnect: globalThis.fetch.preconnect,
+			}),
+		);
+		const layout = documentFor(media);
+		spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [],
+			textFiles: [],
+			media,
+			text: composerDocumentText(layout).text,
+		});
+		const save = mock(
+			async (_msg: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(
+			queuePanel({
+				narratorId: "fork-context",
+				queuedMessages: [messageFor([{ ...media[0], mediaId: "stale" }])],
+				editingQueuedId: "queue-media",
+				handleSaveEditQueued: save,
+			}),
+		);
+		await editorKey("Enter");
+		expect(save.mock.calls[0][2].keepMediaIds).toEqual(["video-id", "audio-id"]);
+		expect(save.mock.calls[0][2].newTextFiles).toEqual([]);
+		const videoChip = document.querySelector('[data-composer-asset-id="media-0"]');
+		const remove = videoChip?.querySelectorAll("button")[1];
+		if (!remove) throw new Error("Media remove control missing");
+		await click(remove);
+		const added = new File(["native"], "new.webm", { type: "video/webm" });
+		await selectMedia([added]);
+		await editorKey("Enter");
+		const payload = save.mock.calls.at(-1)?.[2];
+		expect(payload?.keepMediaIds).toEqual(["audio-id"]);
+		expect(payload?.newMedia).toEqual([added]);
+		expect(payload?.newTextFiles).toEqual([]);
+		expect(payload?.composerDocument?.assets.map((asset) => asset.kind)).toEqual([
+			"audio",
+			"video",
+		]);
+		expect(media[1].uploadNarratorId).toBe("source-owner");
+	});
+
+	test("editing normalizes audio aliases and missing MIME without turning them into text attachments", async () => {
+		const layout = documentFor([]);
+		spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [],
+			textFiles: [],
+			media: [],
+			text: "",
+		});
+		const notify = spyOn(notifications, "show").mockReturnValue("notice");
+		const save = mock(
+			async (_msg: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(queueRow({ msg: messageFor([]), isEditing: true, onSaveEdit: save }));
+		const files = [
+			new File(["wav"], "alias.wav", { type: "audio/x-wav", lastModified: 101 }),
+			new File(["mp3"], "alias.mp3", { type: "audio/mp3", lastModified: 102 }),
+			new File(["m4a"], "alias.m4a", { type: "audio/x-m4a", lastModified: 103 }),
+			new File(["flac"], "missing.FLAC", { lastModified: 104 }),
+			new File(["generic"], "generic.WAV", {
+				type: "application/octet-stream",
+				lastModified: 105,
+			}),
+		];
+		await selectMedia([...files, new File(["unknown"], "unknown.wav", { type: "audio/unknown" })]);
+		await editorKey("Enter");
+		const payload = save.mock.calls.at(-1)?.[2];
+		expect(payload?.newMedia?.map((file) => file.type)).toEqual([
+			"audio/wav",
+			"audio/mpeg",
+			"audio/mp4",
+			"audio/flac",
+			"audio/wav",
+		]);
+		expect(payload?.newTextFiles).toEqual([]);
+		expect(payload?.composerDocument?.assets.map((asset) => [asset.kind, asset.name])).toEqual(
+			files.map((file) => ["audio", file.name]),
+		);
+		for (const [index, file] of (payload?.newMedia ?? []).entries()) {
+			expect(file.name).toBe(files[index].name);
+			expect(file.lastModified).toBe(files[index].lastModified);
+			expect(await file.text()).toBe(await files[index].text());
+		}
+		expect(notify).toHaveBeenCalledTimes(1);
+	});
+
+	test("ten kept media block an eleventh, removal creates room, invalid uploads never enter the manifest", async () => {
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(async () => new Response("native bytes"), {
+				preconnect: globalThis.fetch.preconnect,
+			}),
+		);
+		const refs = Array.from({ length: 10 }, (_, index) => ({
+			...media[1],
+			mediaId: `kept-${index}`,
+			filename: `voice-${index}.wav`,
+		}));
+		const layout = documentFor(refs);
+		spyOn(api, "getBufferedMessageComposerDocument").mockResolvedValue({
+			composerDocument: layout,
+			images: [],
+			textFiles: [],
+			media: refs,
+		});
+		const notify = spyOn(notifications, "show").mockReturnValue("notice");
+		const save = mock(
+			async (_msg: BufferMessageSummary, _text: string, _payload: QueuedEditPayload) => false,
+		);
+		await render(
+			queueRow({
+				narratorId: "fork-context",
+				msg: messageFor(refs),
+				isEditing: true,
+				onSaveEdit: save,
+			}),
+		);
+		const extra = new File(["native"], "extra.wav", { type: "audio/wav" });
+		await selectMedia([extra]);
+		await editorKey("Enter");
+		expect(save.mock.calls.at(-1)?.[2].newMedia).toEqual([]);
+		expect(notify).toHaveBeenCalled();
+		const remove = document
+			.querySelector('[data-composer-asset-id="media-0"]')
+			?.querySelectorAll("button")[1];
+		if (!remove) throw new Error("Media remove control missing");
+		await click(remove);
+		const oversized = new File(["x"], "large.wav", { type: "audio/wav" });
+		Object.defineProperty(oversized, "size", { value: MAX_MEDIA_FILE_SIZE + 1 });
+		await selectMedia([
+			new File([], "empty.wav", { type: "audio/wav" }),
+			new File(["x"], "bad.wav", { type: "audio/unknown" }),
+			oversized,
+			extra,
+		]);
+		await editorKey("Enter");
+		const payload = save.mock.calls.at(-1)?.[2];
+		expect(payload?.keepMediaIds).toHaveLength(9);
+		expect(payload?.newMedia).toEqual([extra]);
+		expect(payload?.composerDocument?.assets).toHaveLength(10);
+	});
+});
+
+describe("editable native media chip previews", () => {
+	beforeEach(() => qc.setQueryData(["settings"], {}));
+	async function activateMediaChip(element: Element) {
+		const event = new Event("click", { bubbles: true });
+		Object.defineProperty(event, "detail", { value: 0 });
+		await act(async () => {
+			element.dispatchEvent(event);
+			await flush();
+		});
+	}
+	beforeEach(() => {
+		previousGlobals.set(
+			"localStorage",
+			Object.getOwnPropertyDescriptor(globalThis, "localStorage"),
+		);
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: (key: string) => (key === "narrafork_token" ? "preview-session" : null) },
+		});
+	});
+	for (const kind of ["audio", "video"] as const) {
+		test(`local ${kind} chip opens native controls without decoding text and revokes its URL on close`, async () => {
+			const file = new File([new Uint8Array([0, 255, 1])], `${kind}.webm`, {
+				type: `${kind}/webm`,
+			});
+			const read = spyOn(file, "slice");
+			const createUrl = spyOn(URL, "createObjectURL").mockReturnValue(`blob:local-${kind}`);
+			const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+			const fetchMedia = spyOn(globalThis, "fetch").mockRejectedValue(
+				new Error("Unexpected network"),
+			);
+			await render(
+				editor({
+					blocks: [],
+					composerDocument: { version: 1, assets: [], paragraphs: [{ children: [] }] },
+				}),
+			);
+			const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+			if (!input) throw new Error("Attachment input missing");
+			Object.defineProperty(input, "files", { configurable: true, value: [file] });
+			await act(async () => {
+				input.dispatchEvent(new Event("change", { bubbles: true }));
+				await flush();
+			});
+			expect(document.querySelector(kind)).toBeNull();
+			const open = document.querySelector("[data-composer-asset-id] button");
+			if (!open) throw new Error("Media chip missing");
+			await activateMediaChip(open);
+			const player = document.querySelector(kind);
+			expect(player?.getAttribute("src")).toBe(`blob:local-${kind}`);
+			expect(player?.hasAttribute("controls")).toBe(true);
+			expect(document.querySelector("pre")).toBeNull();
+			expect(read).not.toHaveBeenCalled();
+			expect(createUrl).toHaveBeenCalledWith(file);
+			expect(fetchMedia.mock.calls.map(([url]) => String(url))).toEqual([]);
+			const close = document.querySelector('[role="dialog"] button');
+			if (!close) throw new Error("Preview close control missing");
+			await click(close);
+			expect(document.querySelector(kind)).toBeNull();
+			expect(revoke).toHaveBeenCalledWith(`blob:local-${kind}`);
+		});
+		test(`retained ${kind} chip loads an authorized source-owner blob in the referencing narrator context`, async () => {
+			const media = {
+				mediaId: `retained-${kind}`,
+				filename: `${kind}.webm`,
+				mediaType: `${kind}/webm`,
+				size: 3,
+				uploadNarratorId: "original-owner",
+			};
+			const layout: ComposerDocument = {
+				version: 1,
+				assets: [
+					{
+						id: "kept-media",
+						kind,
+						name: media.filename,
+						mimeType: media.mediaType,
+						size: media.size,
+					},
+				],
+				paragraphs: [
+					{ children: [{ type: "attachment", id: "kept-node", assetId: "kept-media" }] },
+				],
+			};
+			spyOn(URL, "createObjectURL").mockReturnValue(`blob:protected-${kind}`);
+			const revoke = spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+			const fetchMedia = spyOn(globalThis, "fetch").mockImplementation(
+				Object.assign(
+					async () => new Response("bytes", { headers: { "content-type": media.mediaType } }),
+					{ preconnect: globalThis.fetch.preconnect },
+				),
+			);
+			await render(
+				editor({
+					narratorId: "fork-context",
+					blocks: [{ type: kind, ...media }],
+					composerDocument: layout,
+				}),
+			);
+			expect(fetchMedia.mock.calls.map(([url]) => String(url))).toEqual([]);
+			const open = document.querySelector('[data-composer-asset-id="kept-media"] button');
+			if (!open) throw new Error("Retained media chip missing");
+			await activateMediaChip(open);
+			expect(fetchMedia).not.toHaveBeenCalled();
+			expect(document.querySelector(kind)).toBeNull();
+			await click(button(en.mediaPreviewLoad));
+			expect(fetchMedia).toHaveBeenCalledTimes(1);
+			const [url, options] = fetchMedia.mock.calls[0];
+			expect(String(url)).toContain(
+				`/uploads/original-owner/media/retained-${kind}?referencingNarratorId=fork-context`,
+			);
+			expect(new Headers(options?.headers).get("Authorization")).toBe("Bearer preview-session");
+			expect(document.querySelector(kind)?.getAttribute("src")).toBe(`blob:protected-${kind}`);
+			expect(document.querySelector(kind)?.hasAttribute("controls")).toBe(true);
+			const close = document.querySelector('[role="dialog"] button');
+			if (!close) throw new Error("Preview close control missing");
+			await click(close);
+			expect(document.querySelector(kind)).toBeNull();
+			expect(revoke).toHaveBeenCalledWith(`blob:protected-${kind}`);
+		});
+	}
+});
 
 describe("visible queued message collaboration details", () => {
 	const queued = {
@@ -567,7 +1413,7 @@ describe("visible queued message collaboration details", () => {
 		expect(document.querySelectorAll("[data-queue-image]")).toHaveLength(4);
 		expect(document.body.textContent).toContain("notes.txt");
 		expect(document.body.textContent).toContain("report.md");
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("remove is directly accessible and double-clicking it does not edit", async () => {
@@ -634,9 +1480,9 @@ describe("queued collaboration gesture and image integration", () => {
 		);
 		expect<string | null>(editingQueuedId).toBe(message.id);
 		await render(view());
-		expect(textareaProps().textarea.value).toBe(message.text);
+		expect(textareaProps().textarea.value).toBe(`${message.text}#file:a.ts:2-2`);
 		expect(document.querySelector("[data-queue-sender]")?.textContent).toContain("peer");
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("mode changes in flight block double-click editing and external removal", async () => {
@@ -788,7 +1634,7 @@ describe("inline queued message mode actions", () => {
 		expect(button(en.queuedSendUrgently).disabled).toBe(false);
 		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
 		expect(document.body.textContent).toContain(queued.text);
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("failed messages cannot urgently stop work before an explicit retry", async () => {
@@ -806,7 +1652,7 @@ describe("failed queued message retry UI", () => {
 		expect(document.body.textContent).toContain(en.queuedFailed);
 		expect(document.body.textContent).toContain("Provider refused request");
 		expect(document.body.textContent).toContain("Original input");
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 		expect(button(en.queuedRetry).disabled).toBe(false);
 		for (const state of ["queued", undefined] as const) {
 			await render(
@@ -881,7 +1727,7 @@ describe("failed queued message retry UI", () => {
 			expect(document.body.textContent).toContain("Retry network failure");
 			expect(document.body.textContent).toContain("Provider refused request");
 			expect(document.body.textContent).toContain("Original input");
-			expect(document.body.textContent).toContain("#file:a.ts:2-2");
+			expect(document.body.textContent).toContain("a.ts:2-2");
 			expect(notice).not.toHaveBeenCalled();
 			await click(retry);
 			expect(requests).toHaveLength(2);
@@ -910,7 +1756,7 @@ describe("failed queued message retry UI", () => {
 		await editRange(0, "Original input".length, "Changed draft");
 		await editorKey("Enter");
 		expect(save).toHaveBeenCalledTimes(1);
-		expect(textareaProps().textarea.value).toBe("Changed draft");
+		expect(textareaProps().textarea.value).toBe("Changed draft#file:a.ts:2-2");
 		expect(document.body.textContent).toContain("Provider refused request");
 		expect(retry).not.toHaveBeenCalled();
 	});
@@ -949,7 +1795,7 @@ describe("queued reference attachment editor", () => {
 		await render(
 			<QueuedAttachmentPreview images={[]} textFiles={[]} fileReferences={[reference]} />,
 		);
-		expect(document.body.textContent).toContain("#file:a.ts:2-2");
+		expect(document.body.textContent).toContain("a.ts:2-2");
 	});
 
 	test("queued pure references retain metadata and support occurrence deletion", async () => {
@@ -985,7 +1831,7 @@ describe("queued reference attachment editor", () => {
 		if (!save) throw new Error("Queued save button missing");
 		expect(save.disabled).toBe(false);
 		await click(save);
-		expect(payloads[0].fileReferences).toEqual([secondReference]);
+		expect(payloads[0].fileReferences).toMatchObject([secondReference]);
 		expect(cancel).not.toHaveBeenCalled();
 		await click(button(`${en.removeFile}: a.ts`));
 		expect(save.disabled).toBe(true);
@@ -1092,7 +1938,7 @@ describe("urgent dispatch real hook and panel", () => {
 				expect(urgent?.textContent).toContain(strings.queuedUrgentSending);
 				expect(urgent?.textContent).toContain("peer");
 				expect(urgent?.textContent).toContain("notes.txt");
-				expect(urgent?.textContent).toContain("#file:a.ts:2-2");
+				expect(urgent?.textContent).toContain("a.ts:2-2");
 				expect(urgent?.querySelectorAll("[data-queue-image]")).toHaveLength(2);
 				for (const image of ["one.png", "two.png"])
 					expect(urgent?.querySelector(`img[alt="${image}"]`)).not.toBeNull();
@@ -1239,16 +2085,22 @@ describe("real queued panel composition", () => {
 			// A buffer_set also replaces summary objects; this must not re-seed drafts.
 			messages = messages.map((message) => ({ ...message }));
 			await render(view());
-			expect(host?.querySelector("textarea")).not.toBeNull();
+			expect(host?.querySelector(".ProseMirror")).not.toBeNull();
 			expect(textareaProps().textarea.value).toBe("Unsaved body");
 			expect(textareaProps().textarea).toBe(textareaBefore);
 			expect(host?.querySelector('img[alt="draft.gif"]')).not.toBeNull();
 			expect(host?.textContent).toContain("draft.txt");
 			await editorKey("Enter");
 			expect(save).toHaveBeenCalledTimes(1);
-			expect(save.mock.calls[0][1]).toBe("Unsaved body");
+			// Attachments inserted after the body keep their position as placeholders.
+			expect(save.mock.calls[0][1]).toBe("Unsaved body[image #1: draft.gif][file #1: draft.txt]");
 			expect(save.mock.calls[0][2].newImages).toEqual([image]);
 			expect(save.mock.calls[0][2].newTextFiles).toEqual([textFile]);
+			// Attachments and text now share native history: first undo removes the
+			// single multi-file insertion, second undo restores the text transaction.
+			await editorKey("z", true);
+			expect(textareaProps().textarea.value).toBe("Unsaved body");
+			expect(host?.querySelector('img[alt="draft.gif"]')).toBeNull();
 			await editorKey("z", true);
 			expect(textareaProps().textarea.value).toBe("Original");
 			if (collapsedSingle) {
@@ -1263,7 +2115,7 @@ describe("real queued panel composition", () => {
 				editingQueuedId = null;
 				await render(view());
 				// Once editing ends, the unchanged user's collapsed preference takes effect.
-				expect(host?.querySelector("textarea")).toBeNull();
+				expect(host?.querySelector(".ProseMirror")).toBeNull();
 				expect(toggle.getAttribute("aria-expanded")).toBe("false");
 				expect(toggle.disabled).toBe(false);
 				expect(host?.textContent).not.toContain("New arrival");

@@ -4,11 +4,14 @@ import {
 	SESSION_STORE_LIMITS,
 	writeSession,
 } from "@frontend/lib/session-store";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import {
 	copyFileReferences,
+	type FileReferenceInput,
 	readFileReferences,
+	readInputComposerDocument,
 	sameFileReferenceInput,
 } from "./file-reference-input";
 
@@ -32,8 +35,13 @@ export const MAX_LOCAL_DRAFT_MIRROR_CHARS = 16_000;
 export interface StoredNarratorInputDraft {
 	text: string;
 	fileReferences?: FileReference[];
+	composerDocument?: ComposerDocument;
 	serverRevision: number | null;
 	serverUpdatedAt: string | null;
+	/** Present only when this exact text/reference snapshot was acknowledged by the server. */
+	syncedRevision?: number;
+	/** Dirty snapshots keep their revision base but cannot claim that their content is synchronized. */
+	unsynced?: true;
 }
 
 interface StoredNarratorInputDraftEnvelope extends StoredNarratorInputDraft {
@@ -49,19 +57,15 @@ interface LegacyStoredNarratorInputDraftEnvelope {
 export interface ResolvedNarratorDraft {
 	text: string;
 	fileReferences?: FileReference[];
-	conflict: boolean;
+	composerDocument?: ComposerDocument;
 }
 
-export type DraftRevisionConflictAction = "ignore" | "retry" | "conflict";
-
-export function classifyDraftRevisionConflict(options: {
-	requestSequence: number;
-	latestSequence: number;
-	requestSourceId: string;
-	currentSourceId: string | null;
-}): DraftRevisionConflictAction {
-	if (options.requestSequence !== options.latestSequence) return "ignore";
-	return options.currentSourceId === options.requestSourceId ? "retry" : "conflict";
+export interface HydratedNarratorDraft extends ResolvedNarratorDraft {
+	/**
+	 * This device's unsynced draft, set aside because the server moved on since it
+	 * was written. Offered back to the user instead of being pushed automatically.
+	 */
+	staleLocal?: ResolvedNarratorDraft;
 }
 
 function emptyStoredDraft(): StoredNarratorInputDraft {
@@ -223,11 +227,22 @@ export function readNarratorInputDraft(
 			return drop();
 		}
 		const fileReferences = readFileReferences(parsed.fileReferences, parsed.text);
+		const composerDocument = readInputComposerDocument(
+			parsed.composerDocument,
+			parsed.text,
+			fileReferences,
+		);
 		return {
 			text: parsed.text,
 			...(fileReferences.length ? { fileReferences } : {}),
+			...(composerDocument ? { composerDocument } : {}),
 			serverRevision: parsed.serverRevision ?? null,
 			serverUpdatedAt: parsed.serverUpdatedAt ?? null,
+			...(typeof parsed.syncedRevision === "number" &&
+			parsed.syncedRevision === parsed.serverRevision
+				? { syncedRevision: parsed.syncedRevision }
+				: {}),
+			...(parsed.unsynced === true ? { unsynced: true as const } : {}),
 		};
 	} catch {
 		return emptyStoredDraft();
@@ -252,6 +267,9 @@ export function persistNarratorInputDraft(
 	serverRevision: number | null,
 	serverUpdatedAt: string | null,
 	fileReferences: FileReference[] = [],
+	// undefined: legacy/unknown snapshot; null: explicitly unsynced, including a clear.
+	syncedInput?: FileReferenceInput | null,
+	composerDocument?: ComposerDocument,
 ): boolean {
 	const id = getNarratorDraftStorageId(userId, narratorId);
 	if (text.length > MAX_LOCAL_DRAFT_MIRROR_CHARS) {
@@ -267,12 +285,27 @@ export function persistNarratorInputDraft(
 		removeSession("narrator-draft", id);
 		return false;
 	}
-	const envelope: StoredNarratorInputDraftEnvelope = {
-		version: INPUT_DRAFT_STORAGE_VERSION,
+	const document = readInputComposerDocument(composerDocument, text, references);
+	// A supplied but invalid layout must not be acknowledged or silently mirrored as lossless.
+	if (composerDocument && !document) {
+		removeSession("narrator-draft", id);
+		return false;
+	}
+	const input = {
 		text,
 		fileReferences: references,
+		...(document ? { composerDocument: document } : {}),
+	};
+	const envelope: StoredNarratorInputDraftEnvelope = {
+		version: INPUT_DRAFT_STORAGE_VERSION,
+		...input,
 		serverRevision,
 		serverUpdatedAt,
+		...(syncedInput !== undefined
+			? syncedInput && serverRevision != null && sameFileReferenceInput(input, syncedInput)
+				? { syncedRevision: serverRevision }
+				: { unsynced: true as const }
+			: {}),
 	};
 	const serialized = JSON.stringify(envelope);
 	if (serialized.length > SESSION_STORE_LIMITS.MAX_VALUE_CHARS) {
@@ -297,56 +330,102 @@ export function persistNarratorInputDraft(
 		"narrator-draft",
 		id,
 		serialized,
-		text || references.length ? "durable" : "disposable",
+		text || references.length || document?.assets.length ? "durable" : "disposable",
 	);
 	return true;
+}
+
+/** A revision alone is a sync base, not proof that the local contents were acknowledged. */
+export function isAcknowledgedNarratorDraft(local: StoredNarratorInputDraft): boolean {
+	return (
+		!local.unsynced &&
+		local.syncedRevision != null &&
+		Number.isInteger(local.syncedRevision) &&
+		local.syncedRevision >= 0 &&
+		local.syncedRevision === local.serverRevision
+	);
+}
+
+/** Metadata can skip a full body read only for an acknowledged local content snapshot. */
+export function canHydrateNarratorDraftFromMeta(
+	local: StoredNarratorInputDraft,
+	meta: { hasDraft: boolean; revision: number },
+): boolean {
+	return (
+		isAcknowledgedNarratorDraft(local) &&
+		local.serverRevision === meta.revision &&
+		meta.hasDraft ===
+			!!(local.text || local.fileReferences?.length || local.composerDocument?.assets.length)
+	);
 }
 
 export function resolveHydratedNarratorDraft(options: {
 	local: StoredNarratorInputDraft;
 	serverText: string;
 	serverFileReferences?: FileReference[];
+	serverComposerDocument?: ComposerDocument;
 	serverRevision: number;
 	currentInput: string;
 	currentFileReferences?: FileReference[];
+	currentComposerDocument?: ComposerDocument;
 	localChangedSinceRequest: boolean;
-}): ResolvedNarratorDraft {
-	const local = {
-		text: options.local.text,
-		fileReferences: readFileReferences(options.local.fileReferences, options.local.text),
+}): HydratedNarratorDraft {
+	const input = (text: string, refs: unknown, doc: unknown): FileReferenceInput => {
+		const fileReferences = readFileReferences(refs, text);
+		const composerDocument = readInputComposerDocument(doc, text, fileReferences);
+		return { text, fileReferences, ...(composerDocument ? { composerDocument } : {}) };
 	};
-	const server = {
-		text: options.serverText,
-		fileReferences: readFileReferences(options.serverFileReferences, options.serverText),
-	};
-	const current = {
-		text: options.currentInput,
-		fileReferences: readFileReferences(options.currentFileReferences, options.currentInput),
-	};
-	const result = (value: typeof local, conflict: boolean): ResolvedNarratorDraft => ({
+	const local = input(
+		options.local.text,
+		options.local.fileReferences,
+		options.local.composerDocument,
+	);
+	const server = input(
+		options.serverText,
+		options.serverFileReferences,
+		options.serverComposerDocument,
+	);
+	const current = input(
+		options.currentInput,
+		options.currentFileReferences,
+		options.currentComposerDocument,
+	);
+	const result = (value: typeof local): ResolvedNarratorDraft => ({
 		text: value.text,
 		...(value.fileReferences.length ? { fileReferences: value.fileReferences } : {}),
-		conflict,
+		...(value.composerDocument ? { composerDocument: value.composerDocument } : {}),
 	});
-	if (options.localChangedSinceRequest) {
-		return result(
-			current,
-			!sameFileReferenceInput(current, server) &&
-				options.local.serverRevision !== options.serverRevision,
-		);
-	}
+	/*
+	 * Local keystrokes always win hydration. The draft is a per-user scratchpad:
+	 * whatever was typed here is fresher than any server version, and once the
+	 * local text overwrites the server the replaced version stays restorable
+	 * from the server's undo slot — so there is never anything to arbitrate.
+	 */
+	if (options.localChangedSinceRequest) return result(current);
 	if (options.local.serverRevision === options.serverRevision) {
 		// Text AND references share one revision; metadata-only changes are edits too.
-		return result(local, false);
+		return result(local);
 	}
+	const hasContent = (value: FileReferenceInput) =>
+		!!(value.text || value.fileReferences.length || value.composerDocument?.assets.length);
 	if (
-		options.local.serverRevision === null &&
-		(local.text || local.fileReferences.length) &&
+		(options.local.unsynced || options.local.serverRevision === null) &&
 		!sameFileReferenceInput(local, server)
 	) {
-		// Version-1 browser storage has no trustworthy base revision.
-		return result(local, true);
+		/*
+		 * The local copy was never acknowledged AND the server moved past its base:
+		 * another tab or device wrote since. Pushing it now would silently replace
+		 * that newer draft (an old phone tab reopening and wiping the desktop's
+		 * text), so the server version is shown and the local one is only offered.
+		 *
+		 * Version-1 storage and edits made before the first load have no base at
+		 * all. Against an empty server there is nothing to overwrite, so they are
+		 * still kept as before.
+		 */
+		if (options.local.serverRevision === null && !hasContent(server) && hasContent(local))
+			return result(local);
+		return hasContent(local) ? { ...result(server), staleLocal: result(local) } : result(server);
 	}
 	// A newer server clear tombstone removes both text and references.
-	return result(server, false);
+	return result(server);
 }

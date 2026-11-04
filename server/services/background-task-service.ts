@@ -4,6 +4,8 @@ import {
 	BACKGROUND_TASK_LIST_MAX_PAGE_SIZE,
 	BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS,
 	BACKGROUND_TASK_LIST_PAGE_SIZE,
+	type BackgroundTaskActiveCounts,
+	type BackgroundTaskKind,
 	type BackgroundTaskListDelta,
 	type BackgroundTaskListItem,
 	type BackgroundTaskListPage,
@@ -16,7 +18,6 @@ import {
 	and,
 	asc,
 	type Column,
-	count,
 	desc,
 	eq,
 	getTableColumns,
@@ -24,7 +25,6 @@ import {
 	inArray,
 	like,
 	lt,
-	lte,
 	ne,
 	notExists,
 	notInArray,
@@ -35,13 +35,16 @@ import { db } from "../db";
 import { backgroundTasks, deviceTransferTasks, narrators, narratorToolCalls } from "../db/schema";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import type { ToolCallBinding, ToolExecutionTarget } from "../lib/agent/types";
+import { narratorTraitsLock } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { parseSubstatus } from "../lib/narrator-utils";
+import { parseSubstatus, parseTraits } from "../lib/narrator-utils";
+import { teamMembersWhere } from "../lib/runtime-source";
 import { escapeLikeNeedle } from "../lib/sql-like";
+import type { RunBindingInput, RunDeliverTo } from "../lib/validators/runtime-registration";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
 import {
 	getRuntimePublicationService,
@@ -54,6 +57,7 @@ import {
 import { resolveRuntimeQueueBackend } from "./agent-runtime/runtime-queue-port";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
 
 // === Types ===
@@ -403,6 +407,16 @@ class BackgroundTaskService {
 		this.listVersions = hotSafe("narrafork:bg-task:listVersions", () => new Map<string, number>());
 		this._broadcastFn = null;
 		this._livenessFn = null;
+		backgroundOccupancyStore.subscribe("background-task-list", (parentIds) => {
+			for (const parentId of parentIds) {
+				void this.broadcastListDelta(parentId, { invalidate: true }).catch((error) => {
+					logger.warn("Failed to broadcast maintained background occupancy", {
+						parentNarratorId: parentId,
+						error: String(error),
+					});
+				});
+			}
+		});
 		runtimePublication.setLegacyRuntimeAdmissionReader("bash", (source) => {
 			if (!this.abortControllers.has(source.taskId) && !this.killHandlers.has(source.taskId))
 				return undefined;
@@ -429,6 +443,7 @@ class BackgroundTaskService {
 	/** Reset the tracked versions. Test-only — production relies on the epoch. */
 	resetListVersionsForTests(): void {
 		this.listVersions.clear();
+		backgroundOccupancyStore.resetForTests();
 	}
 
 	/**
@@ -474,23 +489,28 @@ class BackgroundTaskService {
 		parentNarratorId: string,
 		delta: Omit<BackgroundTaskListDelta, "listEpoch" | "version" | "activeCount">,
 	): Promise<void> {
+		// Recovery can mutate tasks before the explicit startup rebuild. Its
+		// subscriber publishes the baseline afterwards; never bootstrap from a frame.
+		if (!backgroundOccupancyStore.isReady) return;
 		const fn = await this.getBroadcastFn();
 		if (!fn) return;
-		let activeCount = 0;
+		let counts: BackgroundTaskActiveCounts;
 		try {
-			activeCount = await this.countActiveByParent(parentNarratorId);
+			counts = await this.countActiveKindsByParent(parentNarratorId);
 		} catch (err) {
 			logger.warn("Failed to count active background tasks for list delta", {
 				parentNarratorId,
 				error: err instanceof Error ? err.message : String(err),
 			});
+			// Unknown is not zero: preserve the last known occupancy and version.
+			return;
 		}
 		fn(parentNarratorId, {
 			type: "background_task_list_delta",
 			narratorId: parentNarratorId,
 			listEpoch: BACKGROUND_TASK_LIST_EPOCH,
 			version: this.bumpListVersion(parentNarratorId),
-			activeCount,
+			...counts,
 			...delta,
 		});
 		// Separate tiny frame for count-only consumers (sidebar badges, narrator
@@ -499,8 +519,12 @@ class BackgroundTaskService {
 		fn(parentNarratorId, {
 			type: "background_task_count_changed",
 			narratorId: parentNarratorId,
-			activeBackgroundTaskCount: activeCount,
+			activeBackgroundTaskCount: counts.activeCount,
+			activeBackgroundWorkCount: counts.activeWorkCount,
+			activeBackgroundServiceCount: counts.activeServiceCount,
 		});
+		// The maintenance subscriber invalidates affected old/new ancestors once
+		// per published batch; row frames must not walk or refresh them again.
 	}
 
 	/**
@@ -511,7 +535,26 @@ class BackgroundTaskService {
 	 */
 	private async broadcastTaskUpsert(parentNarratorId: string, taskId: string): Promise<void> {
 		try {
-			const [unified] = await this.listItemsByIds([taskId]);
+			// Callers may supply either the task id or its subagent narrator id.
+			// Prefer a direct task match, and keep both lookups in the requested parent.
+			let [unified] = await this.listItemsByIds(parentNarratorId, [taskId]);
+			if (!unified) {
+				const projection = await db
+					.select({ id: backgroundTasks.id })
+					.from(backgroundTasks)
+					.where(
+						and(
+							eq(backgroundTasks.parentNarratorId, parentNarratorId),
+							eq(backgroundTasks.type, "agent"),
+							eq(backgroundTasks.subagentNarratorId, taskId),
+						),
+					)
+					.limit(1)
+					.get();
+				if (projection) {
+					[unified] = await this.listItemsByIds(parentNarratorId, [projection.id]);
+				}
+			}
 			const item =
 				unified ?? (await this.listLegacyRows(parentNarratorId, { ids: [taskId], limit: 1 }))[0];
 			if (!item) {
@@ -530,7 +573,10 @@ class BackgroundTaskService {
 
 	/** Fire-and-forget wrapper for the synchronous mark* paths. */
 	private queueTaskUpsert(parentNarratorId: string, taskId: string): void {
-		void this.broadcastTaskUpsert(parentNarratorId, taskId);
+		backgroundOccupancyStore.refreshTask(taskId);
+		if (backgroundOccupancyStore.isReady) {
+			void this.broadcastTaskUpsert(parentNarratorId, taskId);
+		}
 	}
 
 	/**
@@ -573,12 +619,16 @@ class BackgroundTaskService {
 	 * rendering the row's last stored status — a taken-over task reads "cancelled"
 	 * for the entire manual continuation.
 	 *
+	 * Accepts a task id or subagent narrator id; the broadcaster resolves the latter
+	 * to its agent projection within this parent before publishing the row.
+	 *
 	 * Exposed rather than left private because the caller that knows a continuation
 	 * started/ended is the subagent runner, and the alternative (having the runner
 	 * touch the row just to trigger a broadcast) would overwrite the terminal
 	 * version guard `finalizeResumedAgentTask` relies on.
 	 */
 	notifyDerivedStatusChanged(parentNarratorId: string, taskId: string): void {
+		backgroundOccupancyStore.refreshNarrator(taskId);
 		this.queueTaskUpsert(parentNarratorId, taskId);
 	}
 
@@ -647,6 +697,7 @@ class BackgroundTaskService {
 		id: string;
 		parentNarratorId: string;
 		command: string;
+		backgroundKind?: BackgroundTaskKind;
 		toolUseId?: string;
 		/** Exact, already-claimed execution. Omitted by legacy/direct callers. */
 		toolCallBinding?: ToolCallBinding;
@@ -673,6 +724,7 @@ class BackgroundTaskService {
 				id: opts.id,
 				parentNarratorId: opts.parentNarratorId,
 				type: "bash",
+				backgroundKind: opts.backgroundKind ?? "task",
 				status: "running",
 				command: opts.command,
 				toolUseId: opts.toolUseId ?? null,
@@ -709,6 +761,7 @@ class BackgroundTaskService {
 			logicalRunId: publicationRun.logicalRunId,
 			parentNarratorId: opts.parentNarratorId,
 			type: "bash",
+			backgroundKind: opts.backgroundKind ?? "task",
 			status: "running",
 			command: opts.command,
 			toolUseId: opts.toolUseId ?? null,
@@ -755,15 +808,28 @@ class BackgroundTaskService {
 		return row as BackgroundTaskRecord;
 	}
 
-	async createAgentTask(opts: {
+	async createAgentTask(input: {
 		id: string;
-		parentNarratorId: string;
 		subagentNarratorId: string;
 		subagentType: string;
-		toolUseId?: string;
 		alias?: string;
 		title?: string;
+		/**
+		 * Relations of the run this task projects (new run, or a re-registration on adopt).
+		 * Its destination is the task's parent and card.
+		 */
+		binding: RunBindingInput & { deliverTo: RunDeliverTo };
 	}): Promise<BackgroundTaskRecord> {
+		const opts = {
+			...input,
+			// A task projection is exactly a destination reached through the task row.
+			binding: {
+				...input.binding,
+				deliverTo: { ...input.binding.deliverTo, viaTask: true as const },
+			},
+			parentNarratorId: input.binding.deliverTo.narratorId,
+			toolUseId: input.binding.deliverTo.toolUseId,
+		};
 		const now = new Date().toISOString();
 		const pub = getRuntimePublicationService();
 
@@ -843,14 +909,8 @@ class BackgroundTaskService {
 		}
 
 		// ── New task: atomic run + task projection ───────────────────────
-		// startAgentRun handles BOTH cases internally: if the narrator already
-		// has a logicalRunId it reuses it; otherwise it creates a new run.
-		// With taskRow, the background_tasks INSERT is in the SAME section as
-		// the slot reservation — no double logical-run creation.
-		// On PG: one withPgRetry composite transaction.
-		// On SQLite: startAgentRun wraps runAtomicWrite; taskRow is accepted
-		// but the SQLite wrapper ignores it (callers insert via their own
-		// runAtomicWrite for backward compat with the sync path).
+		// One registration section: an actor with a pre-registered undelivered run
+		// adopts it, otherwise a new run starts; the task row commits with it.
 		const taskRow: Omit<typeof backgroundTasks.$inferInsert, "logicalRunId"> = {
 			id: opts.id,
 			parentNarratorId: opts.parentNarratorId,
@@ -869,20 +929,12 @@ class BackgroundTaskService {
 			createdAt: now,
 			updatedAt: now,
 		};
-		const publicationRun = await pub.startAgentRun({
+		const { binding } = await pub.startRun({
 			narratorId: opts.subagentNarratorId,
-			parentNarratorId: opts.parentNarratorId,
+			binding: opts.binding,
 			taskRow,
 		});
-		// On SQLite, startAgentRun ignores taskRow — insert the task row
-		// in the legacy sync path.
-		if (pub.backend === "sqlite") {
-			runAtomicWrite(db, "background-task.createAgentTask", (tx) => {
-				tx.insert(backgroundTasks)
-					.values({ ...taskRow, logicalRunId: publicationRun.logicalRunId })
-					.run();
-			});
-		}
+		const publicationRun = { logicalRunId: binding.logicalRunId };
 		this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 		this.queueTaskUpsert(opts.parentNarratorId, opts.id);
 		this.maybeCleanup();
@@ -1180,15 +1232,25 @@ class BackgroundTaskService {
 			const task = write(tx);
 			if (!task || task.type === "transfer" || deferPublication) return task;
 			const run = taskPublicationRun(task);
+			const resultRef = runtimePublication.persistResult(
+				run,
+				fullOutput ?? task.output ?? "(no output)",
+				tx,
+			);
+			if (
+				task.type === "bash" &&
+				task.backgroundKind === "service" &&
+				task.status === "cancelled"
+			) {
+				// Explicit service stop settles Await and the list without scheduling a new parent turn.
+				runtimePublication.store.consumeAwaitedTerminal(run, tx);
+				return task;
+			}
 			runtimePublication.commit(
 				{
 					...run,
 					eventKind: publicationEvent(task.status),
-					resultRef: runtimePublication.persistResult(
-						run,
-						fullOutput ?? task.output ?? "(no output)",
-						tx,
-					),
+					resultRef,
 					summary: `[System] Background ${task.type} "${task.title ?? task.alias ?? task.id}" (ID: ${task.alias ?? task.id}) ${task.status}. Use Await({ type: "${task.type}", id: "${task.alias ?? task.id}" }) to read the stored result.`,
 				},
 				tx,
@@ -1607,6 +1669,55 @@ class BackgroundTaskService {
 
 	// ── Query ───────────────────────────────────────────────────────────
 
+	/**
+	 * Project a narrator as running background work: the narrator fields (and the
+	 * `background` trait) that Await, Stop, TeamStatus and the task drawer read beside
+	 * its task row. Under narratorTraitsLock with a fresh read, because `traits` is a
+	 * whole-column JSON array: writing an earlier copy would drop any trait written since.
+	 */
+	async markNarratorRunning(narratorId: string): Promise<void> {
+		await narratorTraitsLock.acquire(narratorId, async () => {
+			const current = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { traits: true },
+			});
+			await db
+				.update(narrators)
+				.set({
+					isBackground: true,
+					backgroundStatus: "running",
+					backgroundResult: null,
+					backgroundCompletedAt: null,
+					traits: [...new Set([...parseTraits(current?.traits), "background"])],
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId));
+		});
+		backgroundOccupancyStore.refreshNarrator(narratorId);
+	}
+
+	/** The narrator side of an ended task projection (its row was settled separately). */
+	async markNarratorTerminal(
+		narratorId: string,
+		status: "completed" | "failed" | "cancelled",
+		result: string,
+		where?: { logicalRunId: string },
+	): Promise<void> {
+		await db
+			.update(narrators)
+			.set({
+				backgroundStatus: status,
+				backgroundResult: result,
+				backgroundCompletedAt: new Date().toISOString(),
+			})
+			.where(
+				where
+					? and(eq(narrators.id, narratorId), eq(narrators.logicalRunId, where.logicalRunId))
+					: eq(narrators.id, narratorId),
+			);
+		backgroundOccupancyStore.refreshNarrator(narratorId);
+	}
+
 	async getById(taskId: string): Promise<BackgroundTaskRecord | null> {
 		if (resolveRuntimeQueueBackend() === "postgres") {
 			// PG path: route through the named bounded read in the publication facade.
@@ -1804,6 +1915,12 @@ class BackgroundTaskService {
 	 */
 	async listTeamBashTasks(input: {
 		parentNarratorIds: string[];
+		/**
+		 * Also include tasks started by every member of this root's team. Membership is
+		 * resolved by a subquery inside the same statement, so a team with thousands of
+		 * members never expands into thousands of bound parameters.
+		 */
+		teamRootId?: string;
 		/** Max rows returned in total (running + terminal tail). */
 		limit: number;
 		/** Max terminal rows included when no `query` is given. */
@@ -1818,14 +1935,20 @@ class BackgroundTaskService {
 		omittedCapped: boolean;
 	}> {
 		const parentIds = [...new Set(input.parentNarratorIds)].filter(Boolean);
-		if (parentIds.length === 0) return { tasks: [], omitted: 0, omittedCapped: false };
+		const teamRootId = input.teamRootId || undefined;
+		if (parentIds.length === 0 && !teamRootId) {
+			return { tasks: [], omitted: 0, omittedCapped: false };
+		}
 
 		const limit = Math.max(1, Math.trunc(input.limit));
 		const needle = escapeLikeNeedle(input.query);
-		const scope = [
-			inArray(backgroundTasks.parentNarratorId, parentIds),
-			eq(backgroundTasks.type, "bash"),
-		];
+		const owners = or(
+			parentIds.length > 0 ? inArray(backgroundTasks.parentNarratorId, parentIds) : undefined,
+			teamRootId
+				? sql`${backgroundTasks.parentNarratorId} IN (SELECT ${narrators.id} FROM ${narrators} WHERE ${teamMembersWhere(teamRootId)})`
+				: undefined,
+		);
+		const scope = [owners, eq(backgroundTasks.type, "bash")];
 		if (needle) {
 			const like = `%${needle}%`;
 			const match = or(
@@ -1913,6 +2036,15 @@ class BackgroundTaskService {
 		return this.reconcileSummaries(await this.listByParents(parentIds));
 	}
 
+	/** Read the maintained active closure; never discover historical descendants here. */
+	private async descendantOccupancy(rootIds: string[]): Promise<{
+		childCounts: Map<string, number>;
+		occupied: Set<string>;
+	}> {
+		await backgroundOccupancyStore.flush();
+		return backgroundOccupancyStore.snapshot(rootIds);
+	}
+
 	/**
 	 * Reconcile persisted task rows against current narrator state.
 	 *
@@ -1941,7 +2073,7 @@ class BackgroundTaskService {
 			}));
 		}
 
-		const [narratorRows, childRows] = await Promise.all([
+		const [narratorRows, { childCounts }] = await Promise.all([
 			db
 				.select({
 					id: narrators.id,
@@ -1954,25 +2086,9 @@ class BackgroundTaskService {
 				.from(narrators)
 				.where(inArray(narrators.id, agentIds))
 				.all(),
-			db
-				.select({
-					parentNarratorId: backgroundTasks.parentNarratorId,
-					value: count(),
-				})
-				.from(backgroundTasks)
-				.where(
-					and(
-						inArray(backgroundTasks.parentNarratorId, agentIds),
-						eq(backgroundTasks.status, "running"),
-					),
-				)
-				.groupBy(backgroundTasks.parentNarratorId)
-				.all(),
+			this.descendantOccupancy(agentIds),
 		]);
 		const narratorState = new Map(narratorRows.map((row) => [row.id, row]));
-		const childCounts = new Map(
-			childRows.map((row) => [row.parentNarratorId, Number(row.value) || 0]),
-		);
 
 		return tasks.map((task) => {
 			const subagentNarratorId =
@@ -2136,6 +2252,7 @@ class BackgroundTaskService {
 		return {
 			id: summary.id,
 			type: summary.type,
+			backgroundKind: summary.type === "bash" ? (summary.backgroundKind ?? "task") : "task",
 			status: summary.status,
 			effectiveStatus: summary.effectiveStatus,
 			currentNarratorStatus: summary.currentNarratorStatus,
@@ -2163,7 +2280,10 @@ class BackgroundTaskService {
 	 * Fetch specific rows as list items (used by the delta broadcaster).
 	 * Bounded by the caller; never called with an unbounded id set.
 	 */
-	private async listItemsByIds(taskIds: string[]): Promise<BackgroundTaskListItem[]> {
+	private async listItemsByIds(
+		parentNarratorId: string,
+		taskIds: string[],
+	): Promise<BackgroundTaskListItem[]> {
 		const ids = [...new Set(taskIds)].filter(Boolean);
 		if (ids.length === 0) return [];
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
@@ -2175,7 +2295,12 @@ class BackgroundTaskService {
 				>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
 			})
 			.from(backgroundTasks)
-			.where(inArray(backgroundTasks.id, ids))
+			.where(
+				and(
+					eq(backgroundTasks.parentNarratorId, parentNarratorId),
+					inArray(backgroundTasks.id, ids),
+				),
+			)
 			.all();
 		const summaries = await this.reconcileSummaries(rows);
 		return this.applyLiveness(summaries.map((summary) => this.toListItem(summary)));
@@ -2192,7 +2317,7 @@ class BackgroundTaskService {
 	 *
 	 * Rows that ALSO have a unified task row are excluded. This is not only about
 	 * old data: every background subagent alive today writes both
-	 * (`narrators.is_background = 1` in subagent-runner/subagent-detach, then
+	 * (`narrators.is_background = 1` in subagent-runner/agent-runtime/run, then
 	 * `createAgentTask` with the same id), so without this the current path yields
 	 * each running subagent twice — double-counting `activeCount`, halving the
 	 * effective page size, and letting the legacy projection (no alias, no
@@ -2210,6 +2335,11 @@ class BackgroundTaskService {
 			omitOutput?: boolean;
 		},
 	): Promise<BackgroundTaskListItem[]> {
+		if (opts.activeOnly) await backgroundOccupancyStore.flush();
+		const activeIds = opts.activeOnly
+			? backgroundOccupancyStore.getActiveLegacyIds(parentNarratorId, opts.limit)
+			: null;
+		if (activeIds?.length === 0) return [];
 		const conditions = [
 			eq(narrators.parentNarratorId, parentNarratorId),
 			// Execution mode is temporary, not membership: user continuations clear
@@ -2219,18 +2349,19 @@ class BackgroundTaskService {
 				db
 					.select({ one: sql`1` })
 					.from(backgroundTasks)
-					.where(eq(backgroundTasks.id, narrators.id)),
+					.where(
+						or(
+							eq(backgroundTasks.id, narrators.id),
+							and(
+								eq(backgroundTasks.type, "agent"),
+								eq(backgroundTasks.subagentNarratorId, narrators.id),
+							),
+						),
+					),
 			),
 		];
 		if (opts.ids) conditions.push(inArray(narrators.id, opts.ids));
-		if (opts.activeOnly)
-			conditions.push(
-				or(
-					eq(narrators.backgroundStatus, "running"),
-					inArray(narrators.status, ["working", "waiting"]),
-					like(narrators.substatus, '%"taken_over"%'),
-				),
-			);
+		if (activeIds) conditions.push(inArray(narrators.id, activeIds));
 		const cursorCondition = opts.cursor
 			? listCursorCondition(opts.cursor, narrators.createdAt, narrators.id)
 			: undefined;
@@ -2259,8 +2390,10 @@ class BackgroundTaskService {
 			.limit(opts.limit)
 			.all();
 
+		const { childCounts } = await this.descendantOccupancy(rows.map((row) => row.id));
 		return this.applyLiveness(
 			rows.map((row) => {
+				const activeChildTaskCount = childCounts.get(row.id) ?? 0;
 				const status =
 					row.backgroundStatus ??
 					(row.status === "working" || row.status === "waiting" ? "running" : "completed");
@@ -2271,17 +2404,22 @@ class BackgroundTaskService {
 					currentNarratorBackgroundStatus: row.backgroundStatus,
 					currentNarratorSubstatus: row.substatus,
 					currentNarratorErrorMessage: row.errorMessage,
+					activeChildTaskCount,
 				});
 				const chars = Number(row.backgroundResultChars) || 0;
 				const preview = toListPreview(row.backgroundResult);
 				return {
 					id: row.id,
 					type: "agent" as const,
+					backgroundKind: "task" as const,
 					status,
 					effectiveStatus,
 					currentNarratorStatus: row.status,
-					activeChildTaskCount: 0,
-					canCancelActiveWork: status === "running" || effectiveStatus === "continued",
+					activeChildTaskCount,
+					canCancelActiveWork:
+						isCancellableTaskStatus(status) ||
+						effectiveStatus === "continued" ||
+						activeChildTaskCount > 0,
 					command: null,
 					exitCode: null,
 					toolUseId: null,
@@ -2306,10 +2444,30 @@ class BackgroundTaskService {
 
 	private async listUnifiedItems(
 		parentNarratorId: string,
-		opts: { cursor?: BackgroundTaskListCursor; limit: number; activeOnly?: boolean },
+		opts: {
+			cursor?: BackgroundTaskListCursor;
+			limit: number;
+			activeOnly?: boolean;
+			serviceOnly?: boolean;
+			omitOutput?: boolean;
+		},
 	): Promise<BackgroundTaskListItem[]> {
 		const conditions = [eq(backgroundTasks.parentNarratorId, parentNarratorId)];
-		if (opts.activeOnly) conditions.push(eq(backgroundTasks.status, "running"));
+		if (opts.activeOnly) {
+			await backgroundOccupancyStore.flush();
+			const activeIds = backgroundOccupancyStore.getActiveTaskIds(parentNarratorId, {
+				serviceOnly: opts.serviceOnly,
+				limit: opts.limit,
+			});
+			if (activeIds.length === 0) return [];
+			conditions.push(inArray(backgroundTasks.id, activeIds));
+		}
+		if (opts.serviceOnly) {
+			conditions.push(
+				eq(backgroundTasks.type, "bash"),
+				eq(backgroundTasks.backgroundKind, "service"),
+			);
+		}
 		const cursorCondition = opts.cursor
 			? listCursorCondition(opts.cursor, backgroundTasks.createdAt, backgroundTasks.id)
 			: undefined;
@@ -2317,9 +2475,11 @@ class BackgroundTaskService {
 		const rows = await db
 			.select({
 				...columns,
-				output: sql<
-					string | null
-				>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+				output: opts.omitOutput
+					? sql<string | null>`null`
+					: sql<
+							string | null
+						>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
 			})
 			.from(backgroundTasks)
 			.where(cursorCondition ? and(...conditions, cursorCondition) : and(...conditions))
@@ -2345,279 +2505,93 @@ class BackgroundTaskService {
 	 * per frame only to return their count.
 	 */
 	async countActiveByParent(parentNarratorId: string): Promise<number> {
-		const active = await this.listActiveItems(parentNarratorId, { omitOutput: true });
-		return active.items.length;
+		return (await this.countActiveKindsByParent(parentNarratorId)).activeCount;
+	}
+
+	async countActiveKindsByParent(parentNarratorId: string): Promise<BackgroundTaskActiveCounts> {
+		return (
+			(await this.countActiveKindsByParentBatch([parentNarratorId])).get(parentNarratorId) ?? {
+				activeCount: 0,
+				activeWorkCount: 0,
+				activeServiceCount: 0,
+			}
+		);
 	}
 
 	/**
 	 * Batch variant of `countActiveByParent` for list surfaces (RecentTabs
 	 * snapshot, GET /api/narrators) that render one badge per narrator.
 	 *
-	 * The per-parent candidate cap is applied in SQL via a window function: the
-	 * `type='agent'` predicate matches every historical agent row forever, so
-	 * capping in JS after an uncapped read would materialize a narrator's whole
-	 * agent history on the main thread. Reconcile + liveness semantics are shared
-	 * with the single-parent path so a sidebar badge and the panel badge can
-	 * never disagree, and the result is capped at BACKGROUND_TASK_ACTIVE_LIMIT
-	 * per parent for the same reason `listActiveItems` truncates.
+	 * Counts come from the same maintained graph as single-parent and list reads.
+	 * Only the returned work/service counts are capped; terminal history is never
+	 * queried or ranked to answer a badge request.
 	 */
 	async countActiveByParentBatch(parentNarratorIds: string[]): Promise<Map<string, number>> {
-		const counts = new Map<string, number>();
-		const ids = [...new Set(parentNarratorIds.filter((id) => typeof id === "string" && id))];
-		if (ids.length === 0) return counts;
-
-		const cap = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
-		const candidateSq = db
-			.select({
-				id: backgroundTasks.id,
-				parentNarratorId: backgroundTasks.parentNarratorId,
-				type: backgroundTasks.type,
-				status: backgroundTasks.status,
-				subagentNarratorId: backgroundTasks.subagentNarratorId,
-				rn: sql<number>`ROW_NUMBER() OVER (PARTITION BY ${backgroundTasks.parentNarratorId} ORDER BY ${backgroundTasks.createdAt} DESC, ${backgroundTasks.id} DESC)`.as(
-					"rn",
-				),
-			})
-			.from(backgroundTasks)
-			.where(
-				and(
-					inArray(backgroundTasks.parentNarratorId, ids),
-					or(
-						eq(backgroundTasks.status, "running"),
-						eq(backgroundTasks.status, "paused"),
-						eq(backgroundTasks.type, "agent"),
-					),
-				),
-			)
-			.as("candidates");
-		const candidateRows = await db
-			.select({
-				id: candidateSq.id,
-				parentNarratorId: candidateSq.parentNarratorId,
-				type: candidateSq.type,
-				status: candidateSq.status,
-				subagentNarratorId: candidateSq.subagentNarratorId,
-			})
-			.from(candidateSq)
-			.where(lte(candidateSq.rn, cap))
-			.all();
-
-		// Reconcile agent rows against their subagent narrators' current state —
-		// same inputs as reconcileSummaries, but count-only (no list items built).
-		const agentIds = [
-			...new Set(
-				candidateRows
-					.filter((row) => row.type === "agent")
-					.map((row) => row.subagentNarratorId ?? row.id),
-			),
-		];
-		const narratorState = new Map<
-			string,
-			{
-				status: string;
-				isBackground: boolean | null;
-				backgroundStatus: string | null;
-				substatus: string | null;
-				errorMessage: string | null;
-			}
-		>();
-		const childCounts = new Map<string, number>();
-		if (agentIds.length > 0) {
-			const [narratorRows, childRows] = await Promise.all([
-				db
-					.select({
-						id: narrators.id,
-						status: narrators.status,
-						isBackground: narrators.isBackground,
-						backgroundStatus: narrators.backgroundStatus,
-						substatus: narrators.substatus,
-						errorMessage: narrators.errorMessage,
-					})
-					.from(narrators)
-					.where(inArray(narrators.id, agentIds))
-					.all(),
-				db
-					.select({
-						parentNarratorId: backgroundTasks.parentNarratorId,
-						value: count(),
-					})
-					.from(backgroundTasks)
-					.where(
-						and(
-							inArray(backgroundTasks.parentNarratorId, agentIds),
-							eq(backgroundTasks.status, "running"),
-						),
-					)
-					.groupBy(backgroundTasks.parentNarratorId)
-					.all(),
-			]);
-			for (const row of narratorRows) narratorState.set(row.id, row);
-			for (const row of childRows) {
-				if (row.parentNarratorId) childCounts.set(row.parentNarratorId, Number(row.value) || 0);
-			}
-		}
-
-		const isLive = await this.getLivenessFn();
-		// Same overlay as applyLiveness, minus transfer progress (which never
-		// changes whether a row counts as active).
-		const liveEffectiveStatus = (row: {
-			type: string;
-			status: string;
-			subagentNarratorId: string | null;
-			id: string;
-			effectiveStatus: string;
-		}): string => {
-			if (!isLive || row.type !== "agent") return row.effectiveStatus;
-			if (!isLive(row.subagentNarratorId ?? row.id)) return row.effectiveStatus;
-			if (row.effectiveStatus === "taken_over") return "taken_over";
-			return row.status === "running" ? "running" : "continued";
-		};
-
-		for (const row of candidateRows) {
-			const subagentNarratorId = row.type === "agent" ? (row.subagentNarratorId ?? row.id) : null;
-			const currentNarrator = subagentNarratorId
-				? (narratorState.get(subagentNarratorId) ?? null)
-				: null;
-			const effectiveStatus = liveEffectiveStatus({
-				...row,
-				effectiveStatus: resolveBackgroundTaskEffectiveStatus({
-					taskStatus: row.status,
-					currentNarratorStatus: currentNarrator?.status ?? null,
-					currentNarratorIsBackground: currentNarrator?.isBackground,
-					currentNarratorBackgroundStatus: currentNarrator?.backgroundStatus,
-					currentNarratorSubstatus: currentNarrator?.substatus,
-					currentNarratorErrorMessage: currentNarrator?.errorMessage,
-					activeChildTaskCount: subagentNarratorId ? (childCounts.get(subagentNarratorId) ?? 0) : 0,
-				}),
-			});
-			if (isBackgroundTaskActiveStatus(effectiveStatus as BackgroundTaskEffectiveStatus)) {
-				counts.set(row.parentNarratorId, (counts.get(row.parentNarratorId) ?? 0) + 1);
-			}
-		}
-
-		// Legacy active rows (subagent narrators without a background_tasks row),
-		// same predicate and reconcile as listLegacyRows with activeOnly: true.
-		// Their set is bounded by reality (activeOnly filters to running-ish
-		// rows), so no window cap is needed. Note the single-parent path applies
-		// `LIMIT cap` to this stream BEFORE the active filter, so a pathological
-		// parent with 200+ running-ish legacy rows could undercount there while
-		// this batch path counts them all (then caps the total) — the batch badge
-		// is the more accurate one in that case, and legacy rows are pre-unified
-		// history that new subagents never produce, so the divergence cannot grow.
-		const legacyRows = await db
-			.select({
-				id: narrators.id,
-				parentNarratorId: narrators.parentNarratorId,
-				status: narrators.status,
-				isBackground: narrators.isBackground,
-				backgroundStatus: narrators.backgroundStatus,
-				substatus: narrators.substatus,
-				errorMessage: narrators.errorMessage,
-			})
-			.from(narrators)
-			.where(
-				and(
-					inArray(narrators.parentNarratorId, ids),
-					or(eq(narrators.isBackground, true), like(narrators.variant, "subagent:%")),
-					notExists(
-						db
-							.select({ one: sql`1` })
-							.from(backgroundTasks)
-							.where(eq(backgroundTasks.id, narrators.id)),
-					),
-					or(
-						eq(narrators.backgroundStatus, "running"),
-						inArray(narrators.status, ["working", "waiting"]),
-						like(narrators.substatus, '%"taken_over"%'),
-					),
-				),
-			)
-			.all();
-		for (const row of legacyRows) {
-			if (!row.parentNarratorId) continue;
-			const status =
-				row.backgroundStatus ??
-				(row.status === "working" || row.status === "waiting" ? "running" : "completed");
-			const effectiveStatus = liveEffectiveStatus({
-				id: row.id,
-				type: "agent",
-				status,
-				subagentNarratorId: row.id,
-				effectiveStatus: resolveBackgroundTaskEffectiveStatus({
-					taskStatus: status as BackgroundTaskRecord["status"],
-					currentNarratorStatus: row.status,
-					currentNarratorIsBackground: row.isBackground,
-					currentNarratorBackgroundStatus: row.backgroundStatus,
-					currentNarratorSubstatus: row.substatus,
-					currentNarratorErrorMessage: row.errorMessage,
-				}),
-			});
-			if (isBackgroundTaskActiveStatus(effectiveStatus as BackgroundTaskEffectiveStatus)) {
-				counts.set(row.parentNarratorId, (counts.get(row.parentNarratorId) ?? 0) + 1);
-			}
-		}
-
-		// Match listActiveItems truncation: the badge never exceeds the active limit.
-		for (const [parentId, value] of counts) {
-			if (value > BACKGROUND_TASK_ACTIVE_LIMIT) counts.set(parentId, BACKGROUND_TASK_ACTIVE_LIMIT);
-		}
-		return counts;
+		const counts = await this.countActiveKindsByParentBatch(parentNarratorIds);
+		return new Map(
+			[...counts]
+				.filter(([, value]) => value.activeCount > 0)
+				.map(([id, value]) => [id, value.activeCount]),
+		);
 	}
 
-	/**
-	 * The active set: every row whose reconciled status is still doing work.
-	 *
-	 * Candidates are the `running` rows plus all agent rows (only agent rows can
-	 * derive `continued`/`child_running`), capped at the active limit + 1 so the
-	 * caller can report truncation instead of silently under-counting.
-	 *
-	 * With `omitOutput` the rows come back without any preview text — valid only
-	 * for callers that just count them, never for the ones that serve `activeTasks`.
-	 */
+	/** Batch badges are a materialized read, independent of terminal task history. */
+	async countActiveKindsByParentBatch(
+		parentNarratorIds: string[],
+	): Promise<Map<string, BackgroundTaskActiveCounts>> {
+		const ids = [...new Set(parentNarratorIds.filter((id) => typeof id === "string" && id))];
+		if (ids.length === 0) return new Map();
+		await backgroundOccupancyStore.flush();
+		return backgroundOccupancyStore.snapshot(ids).counts;
+	}
+
+	/** Load bounded, already-maintained active IDs; never rank historical agent rows. */
 	private async listActiveItems(
 		parentNarratorId: string,
 		opts?: { omitOutput?: boolean },
 	): Promise<{ items: BackgroundTaskListItem[]; truncated: boolean }> {
 		const limit = BACKGROUND_TASK_ACTIVE_LIMIT + 1;
+		await backgroundOccupancyStore.flush();
+		const activeIds = backgroundOccupancyStore.getActiveTaskIds(parentNarratorId, {
+			serviceOnly: false,
+			limit,
+		});
 		const { output: _output, ...columns } = getTableColumns(backgroundTasks);
-		const [candidateRows, legacyActive] = await Promise.all([
-			db
-				.select({
-					...columns,
-					output: opts?.omitOutput
-						? sql<string | null>`null`
-						: sql<
-								string | null
-							>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
-				})
-				.from(backgroundTasks)
-				.where(
-					and(
-						eq(backgroundTasks.parentNarratorId, parentNarratorId),
-						or(
-							eq(backgroundTasks.status, "running"),
-							// A paused transfer is still active work (see
-							// isBackgroundTaskActiveStatus). Omitting it here would make the
-							// candidate set disagree with the predicate that filters it,
-							// which is the silent kind of bug: the row simply never appears.
-							eq(backgroundTasks.status, "paused"),
-							eq(backgroundTasks.type, "agent"),
-						),
-					),
-				)
-				.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-				.limit(limit)
-				.all(),
+		const [candidateRows, legacyActive, serviceActive] = await Promise.all([
+			activeIds.length === 0
+				? Promise.resolve([])
+				: db
+						.select({
+							...columns,
+							output: opts?.omitOutput
+								? sql<string | null>`null`
+								: sql<
+										string | null
+									>`substr(${backgroundTasks.output}, 1, ${LIST_OUTPUT_PREVIEW_CHARS + 1})`,
+						})
+						.from(backgroundTasks)
+						.where(
+							and(
+								eq(backgroundTasks.parentNarratorId, parentNarratorId),
+								inArray(backgroundTasks.id, activeIds),
+							),
+						)
+						.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+						.limit(limit)
+						.all(),
 			this.listLegacyRows(parentNarratorId, {
 				limit,
 				activeOnly: true,
 				omitOutput: opts?.omitOutput,
 			}),
+			this.listUnifiedItems(parentNarratorId, {
+				limit,
+				activeOnly: true,
+				serviceOnly: true,
+				omitOutput: opts?.omitOutput,
+			}),
 		]);
 		const summaries = await this.reconcileSummaries(candidateRows);
-		// Liveness BEFORE the filter: a terminal row whose loop is running again is
-		// exactly the `continued` case the active set exists to surface, and filtering
-		// on the persisted status first would drop it.
 		const unifiedActive = await this.applyLiveness(
 			summaries.map((summary) => this.toListItem(summary)),
 		);
@@ -2625,10 +2599,14 @@ class BackgroundTaskService {
 			.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus))
 			.concat(legacyActive.filter((item) => isBackgroundTaskActiveStatus(item.effectiveStatus)))
 			.sort(compareBackgroundTaskListItemsDesc);
-		const truncated = items.length > BACKGROUND_TASK_ACTIVE_LIMIT;
 		return {
-			items: truncated ? items.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT) : items,
-			truncated,
+			items: [
+				...items.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
+				...serviceActive.slice(0, BACKGROUND_TASK_ACTIVE_LIMIT),
+			].sort(compareBackgroundTaskListItemsDesc),
+			truncated:
+				items.length > BACKGROUND_TASK_ACTIVE_LIMIT ||
+				serviceActive.length > BACKGROUND_TASK_ACTIVE_LIMIT,
 		};
 	}
 
@@ -2668,12 +2646,22 @@ class BackgroundTaskService {
 		const tasks = hasMore ? merged.slice(0, limit) : merged;
 		const last = tasks.at(-1);
 
+		// The first page already has the bounded active snapshot. A second async
+		// count read could combine newer counts with older rows and a stale version.
+		const serviceCount = active.items.filter(
+			(item) => item.type === "bash" && item.backgroundKind === "service",
+		).length;
+		const counts = isFirstPage
+			? {
+					activeCount: active.items.length,
+					activeWorkCount: active.items.length - serviceCount,
+					activeServiceCount: serviceCount,
+				}
+			: await this.countActiveKindsByParent(parentNarratorId);
 		return {
 			listEpoch: BACKGROUND_TASK_LIST_EPOCH,
 			version: this.getListVersion(parentNarratorId),
-			activeCount: isFirstPage
-				? active.items.length
-				: await this.countActiveByParent(parentNarratorId),
+			...counts,
 			...(isFirstPage ? { activeTasks: active.items, activeTruncated: active.truncated } : {}),
 			tasks,
 			nextCursor:
@@ -2754,9 +2742,17 @@ class BackgroundTaskService {
 
 	// ── Operations ──────────────────────────────────────────────────────
 
-	async cancel(taskId: string): Promise<boolean> {
+	/** Synchronous signal for process-exit handlers racing with cancellation publication. */
+	isCancellationRequested(taskId: string): boolean {
+		return this.abortControllers.get(taskId)?.signal.aborted ?? false;
+	}
+
+	async cancel(taskId: string, options?: { assertAuthorized?: () => void }): Promise<boolean> {
 		const task = await this.getById(taskId);
 		if (!task || task.status !== "running") return false;
+		// getById yields: recheck trusted authority after it and before ANY cancellation
+		// side effect. Authorization failures must propagate, never be swallowed as kill errors.
+		options?.assertAuthorized?.();
 
 		const ctrl = this.abortControllers.get(taskId);
 		if (ctrl) {
@@ -3000,17 +2996,52 @@ class BackgroundTaskService {
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<WaitResult> {
+		const deadline = Date.now() + timeoutMs;
+		// Terminal intent commits before idle, but a waiter must observe the complete
+		// finalizer (including visible status), not its intermediate task-row commit.
+		const afterFinalizer = async (result: WaitResult): Promise<WaitResult> => {
+			if (result.publicationRun?.producerKind !== "agent" || !result.terminalResultReceived)
+				return result;
+			const { getRunControl } = await import("./agent-runtime/ownership");
+			const run = getRunControl(taskId);
+			if (run?.logicalRunId !== result.publicationRun.logicalRunId) return result;
+			// Keep the caller's original cancellation and budget during this last,
+			// bounded wait too; a blocked status write must not strand Await.
+			return new Promise<WaitResult>((resolve) => {
+				const cleanup = () => {
+					clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
+				};
+				const onAbort = () => {
+					cleanup();
+					resolve({ status: "aborted", output: this.getOutputBuffer(taskId) });
+				};
+				const timer = setTimeout(
+					() => {
+						cleanup();
+						resolve({ status: "timeout", output: this.getOutputBuffer(taskId) });
+					},
+					Math.max(0, deadline - Date.now()),
+				);
+				signal?.addEventListener("abort", onAbort, { once: true });
+				void run.terminal.then(() => {
+					cleanup();
+					resolve(result);
+				});
+				if (signal?.aborted) onAbort();
+			});
+		};
 		// Check if already done
 		const task = await this.getById(taskId);
 		if (task && task.status !== "running") {
-			return {
+			return afterFinalizer({
 				status: toWaitStatus(task.status),
 				output: task.output,
 				...terminalWaitReceipt(task),
-			};
+			});
 		}
 
-		return new Promise<WaitResult>((resolve) => {
+		const result = await new Promise<WaitResult>((resolve) => {
 			let settled = false;
 			let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -3108,6 +3139,7 @@ class BackgroundTaskService {
 					// Live lifecycle listeners remain authoritative if the recheck fails.
 				});
 		});
+		return afterFinalizer(result);
 	}
 
 	async waitForText(
@@ -3410,7 +3442,37 @@ class BackgroundTaskService {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			return this.recoverStaleTasksAfterRestart(protectedTaskIds, scanned.at(-1)?.id);
 		};
+		// A failed source transaction may have left a same-run terminal checkpoint.
+		// Finish it through the one run finalizer before the generic stale-task path
+		// can replace the answer with a synthetic restart cancellation.
+		const restoredTerminals = new Set<string>();
+		for (const task of scanned) {
+			if (task.type !== "agent" || !task.logicalRunId || protectedTaskIds.has(task.id)) continue;
+			const checkpoint = await db.query.narrators.findFirst({
+				where: eq(narrators.id, task.subagentNarratorId ?? task.id),
+				columns: { id: true, logicalRunId: true, backgroundCompletedAt: true, substatus: true },
+			});
+			if (
+				checkpoint?.logicalRunId !== task.logicalRunId ||
+				!checkpoint.backgroundCompletedAt ||
+				!parseSubstatus(checkpoint.substatus).includes(`terminal_run:${task.logicalRunId}`)
+			)
+				continue;
+			const { startNarratorRun } = await import("./agent-runtime/run");
+			const handle = await startNarratorRun({
+				narratorId: checkpoint.id,
+				locale: "en",
+				text: "",
+				recovered: true,
+				resumeRunId: task.logicalRunId,
+			});
+			if (handle.started) await handle.completion;
+			// A live owner or failed commit retains its reservation/checkpoint; never
+			// fall through and publish a different terminal for the same run.
+			restoredTerminals.add(task.id);
+		}
 		const staleTasks = scanned
+			.filter((task) => !restoredTerminals.has(task.id))
 			// Only an agent row can be protected — see the note above on why a bash row
 			// has no resume path to protect.
 			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));
@@ -3538,7 +3600,9 @@ class BackgroundTaskService {
 				.where(inArray(narrators.id, narratorIds));
 		}
 
+		backgroundOccupancyStore.refreshNarrators(narratorIds);
 		for (const task of staleTasks) {
+			backgroundOccupancyStore.refreshTask(task.id);
 			this.cleanupRuntime(task.id);
 			// A paused transfer emits NOTHING here. The `cancelled` event is what
 			// unblocks a waiting `Await`, and answering "cancelled" for a transfer that
@@ -3652,6 +3716,7 @@ class BackgroundTaskService {
 				logicalRunId: backgroundTasks.logicalRunId,
 				parentNarratorId: backgroundTasks.parentNarratorId,
 				type: backgroundTasks.type,
+				subagentNarratorId: backgroundTasks.subagentNarratorId,
 			})
 			.from(backgroundTasks)
 			.where(
@@ -3734,8 +3799,11 @@ class BackgroundTaskService {
 			),
 		);
 
-		for (const taskId of deletableIds) {
-			this.cleanupRuntime(taskId);
+		for (const row of deletable) {
+			backgroundOccupancyStore.refreshTask(row.id);
+			if (row.type === "agent")
+				backgroundOccupancyStore.refreshNarrator(row.subagentNarratorId ?? row.id);
+			this.cleanupRuntime(row.id);
 		}
 
 		// Tell each affected parent's subscribers which rows disappeared. A reap the
@@ -3767,10 +3835,18 @@ class BackgroundTaskService {
 
 	/** Broadcast cleanup deltas to affected parent narrators (shared by PG and SQLite paths). */
 	private broadcastCleanupDelta(
-		rows: ReadonlyArray<{ id: string; parentNarratorId: string; type: string }>,
+		rows: ReadonlyArray<{
+			id: string;
+			parentNarratorId: string;
+			type: string;
+			subagentNarratorId?: string | null;
+		}>,
 	): void {
 		const byParent = new Map<string, string[]>();
 		for (const row of rows) {
+			backgroundOccupancyStore.refreshTask(row.id);
+			if (row.type === "agent")
+				backgroundOccupancyStore.refreshNarrator(row.subagentNarratorId ?? row.id);
 			const ids = byParent.get(row.parentNarratorId);
 			if (ids) ids.push(row.id);
 			else byParent.set(row.parentNarratorId, [row.id]);

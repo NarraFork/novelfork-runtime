@@ -90,7 +90,14 @@ async function installDom(): Promise<() => void> {
  * past a 5px threshold, so the state under test is read after a
  * threshold-crossing pointermove.
  */
-async function captureDrag(opts: { toolKind?: string; surfaceId?: string } = {}) {
+async function captureDrag(
+	opts: {
+		toolKind?: string;
+		surfaceId?: string;
+		resourceId?: string;
+		largeFileConfirmed?: boolean;
+	} = {},
+) {
 	const React = await import("react");
 	const { createRoot } = await import("react-dom/client");
 	const { flushSync } = await import("react-dom");
@@ -108,7 +115,13 @@ async function captureDrag(opts: { toolKind?: string; surfaceId?: string } = {})
 			props,
 			"__terminal__",
 			"tool",
-			opts.toolKind ? { toolKind: opts.toolKind } : undefined,
+			opts.toolKind
+				? {
+						toolKind: opts.toolKind,
+						resourceId: opts.resourceId,
+						largeFileConfirmed: opts.largeFileConfirmed,
+					}
+				: undefined,
 		);
 		return null;
 	}
@@ -264,6 +277,20 @@ describe("usePanelGeometryReady", () => {
 });
 
 describe("usePanelHeaderDrag", () => {
+	it("preserves panel consent through a header drag", async () => {
+		for (const largeFileConfirmed of [true, false, undefined]) {
+			const state = await captureDrag({
+				toolKind: "file",
+				resourceId: "/large.ts",
+				largeFileConfirmed,
+			});
+			if (!state) throw new Error("drag state missing");
+			expect(state.resourceId).toBe("/large.ts");
+			if (largeFileConfirmed) expect(state.largeFileConfirmed).toBe(true);
+			else expect(state.largeFileConfirmed).toBeFalsy();
+		}
+	});
+
 	it("carries panelId so the surface treats the drop as moving THIS panel", async () => {
 		const state = await captureDrag({ toolKind: "terminal" });
 		expect(state?.panelId).toBe("ndock-terminal");
@@ -272,8 +299,6 @@ describe("usePanelHeaderDrag", () => {
 	});
 
 	it("forwards the panel kind, so a consumer can rebuild it elsewhere", async () => {
-		// The canvas uses this to tear the panel out into its own node without parsing
-		// `panelId`'s `ndock-<kind>` shape, which is an implementation detail.
 		const state = await captureDrag({ toolKind: "terminal" });
 		expect(state?.toolKind).toBe("terminal");
 	});

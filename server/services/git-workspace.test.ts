@@ -1,38 +1,59 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	mkdtemp,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { GitBranches } from "@shared/git-branches";
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
+import type { GitLineStats } from "@shared/git-line-stats";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { chapters, narrators, projects, remoteDevices, users } from "../db/schema";
+import { narrators, projects, remoteDevices, userGitIdentities, users } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { getHome } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
-import { gitRoutes, narratorGitRoutes } from "../routes/git";
-import { commitSyncService } from "./commit-sync-service";
+import { narratorGitRoutes } from "../routes/git";
 import { compileExecutionPolicy } from "./execution-policy/compiler";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import type { ExecutionTargetContext } from "./execution-policy/types";
 import { recordAttribution } from "./file-attribution-service";
 import { gitDiscoveryCache } from "./git-discovery-cache";
+import * as lineStatsService from "./git-line-stats";
+import { clearGitLineStatsCache } from "./git-line-stats-cache";
 import { gitService, withGitRequestContext } from "./git-service";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
-import { gitPathPolicyAllows } from "./git-workspace-access";
+import {
+	authorizeGitDestinationForPrincipal,
+	authorizeGitTargetForPrincipal,
+	gitPathPolicyAllows,
+} from "./git-workspace-access";
 import { GitAccessScan } from "./git-workspace-access-scan";
+import type { NarratorPrincipal } from "./narrator-acl";
 import { getNarratorGitSummary } from "./narrator-git-summary";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
+import { FileWorktreeJournal } from "./narrator-worktree-journal";
+import { narratorWorktreeService } from "./narrator-worktree-runtime";
+import { NarratorWorktreeService } from "./narrator-worktree-service";
+import { cacheLocalWorkspaceContext, workspaceContextService } from "./workspace-context-service";
 
 // The singleton starts asynchronously; await it before a fixture captures its handle.
 const { db } = await import("../db");
 
 let root: string, repo: string, owner: string, narratorId: string;
 const scanProjectIds: string[] = [];
-const scanChapterIds: string[] = [];
 const now = () => new Date().toISOString();
 async function git(cwd: string, ...args: string[]) {
 	const r = await safeSpawn({
@@ -90,7 +111,6 @@ function app(user = owner) {
 			),
 	);
 	result.route("/narrators", narratorGitRoutes);
-	result.route("/chapters", gitRoutes);
 	return result;
 }
 async function request(suffix: string, body?: unknown, id = narratorId, user = owner) {
@@ -124,22 +144,399 @@ async function project(path: string) {
 	return id;
 }
 
+describe("missing checkout durable worktree listing", () => {
+	const signal = () => new AbortController().signal;
+	const actor = () => ({ userId: owner, isAdmin: false });
+	async function deletedCheckout(cache = true) {
+		const current = join(root, "deleted-checkout");
+		await git(repo, "worktree", "add", "-b", "deleted-checkout", current);
+		await db.update(narrators).set({ cwd: current }).where(eq(narrators.id, narratorId));
+		if (cache) {
+			await authorizeGitTargetForPrincipal(actor(), { narratorId }, "read", signal());
+			const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+			expect(row?.workspaceContext?.git?.repositoryPath).toBe(join(repo, ".git"));
+		}
+		await rm(current, { recursive: true, force: true });
+		activeNarrators.delete(narratorId);
+		return current;
+	}
+	test("standalone persisted identity survives lost runtime; list and switch to main or sibling", async () => {
+		const sibling = join(root, "surviving-checkout");
+		await git(repo, "worktree", "add", "-b", "surviving-checkout", sibling);
+		const missing = await deletedCheckout();
+		const context = await workspaceContextService.get(narratorId);
+		expect(context.cwd).toBe(missing);
+		const ordinary = await authorizeGitTargetForPrincipal(
+			actor(),
+			{ narratorId },
+			"read",
+			signal(),
+		);
+		expect(ordinary.workspace).toMatchObject({
+			state: "missing_directory",
+			capabilities: { read: false, write: false },
+		});
+		// Recreate the service with empty in-memory pagination state; only SQLite
+		// carries checkout identity across runtimes.
+		const freshRuntime = new NarratorWorktreeService<NarratorPrincipal>({
+			authorize: (principal, id, need, abort) =>
+				authorizeGitTargetForPrincipal(principal, { narratorId: id }, need, abort),
+			authorizeList: (principal, id, _need, abort) =>
+				authorizeGitTargetForPrincipal(principal, { narratorId: id }, "read", abort, false, true),
+			principalKey: (principal) => principal.userId,
+			journal: new FileWorktreeJournal(join(root, "fresh-journal")),
+			withRevision: (_id, _revision, action) => action(),
+			withRepositoryLock: (_key, action) => action(),
+		});
+		const list = await freshRuntime.list(
+			actor(),
+			narratorId,
+			{ workspaceKey: context.git?.workspaceKey },
+			signal(),
+		);
+		expect(list.entries.map((entry) => entry.path)).toContain(repo);
+		expect(list.entries.map((entry) => entry.path)).toContain(sibling);
+		expect(list.capabilities.create).toBe(false);
+		await expect(
+			narratorWorktreeService.list(actor(), narratorId, { workspaceKey: "wrong-source" }, signal()),
+		).rejects.toThrow();
+		for (const cwd of [sibling, repo]) {
+			const previous = await workspaceContextService.get(narratorId);
+			const result = await workspaceContextService.switch(
+				narratorId,
+				{
+					expectedRevision: previous.revision,
+					requestId: generateId(),
+					target: { deviceId: "local", cwd },
+				},
+				{ origin: "http", userId: owner },
+			);
+			expect(result.current.cwd).toBe(cwd);
+		}
+	});
+	test("no cache, invalid common directory and revoked actor fail closed", async () => {
+		await deletedCheckout(false);
+		await expect(
+			narratorWorktreeService.list(actor(), narratorId, { workspaceKey: "unknown" }, signal()),
+		).rejects.toThrow();
+		// Discover another surviving checkout to populate a real durable cache.
+		await db.update(narrators).set({ cwd: repo }).where(eq(narrators.id, narratorId));
+		const context = await workspaceContextService.get(narratorId);
+		await rm(repo, { recursive: true, force: true });
+		await expect(
+			narratorWorktreeService.list(
+				actor(),
+				narratorId,
+				{ workspaceKey: context.git?.workspaceKey },
+				signal(),
+			),
+		).rejects.toThrow();
+		await expect(
+			narratorWorktreeService.list(
+				{ userId: "revoked-user", isAdmin: false },
+				narratorId,
+				{ workspaceKey: context.git?.workspaceKey },
+				signal(),
+			),
+		).rejects.toThrow();
+	});
+	test("discovery with reordered Git fields does not rewrite the workspace cache", async () => {
+		await workspaceContextService.get(narratorId);
+		const snapshot = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		const context = snapshot?.workspaceContext;
+		if (!snapshot || !context?.git) throw new Error("Fixture workspace absent");
+		const reordered = {
+			...context,
+			git: {
+				rootPath: context.git.rootPath,
+				repositoryPath: context.git.repositoryPath,
+				workspaceKey: context.git.workspaceKey,
+				repositoryKey: context.git.repositoryKey,
+			},
+		};
+		expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(context));
+		expect(await cacheLocalWorkspaceContext(narratorId, snapshot, reordered)).toBe(true);
+		const stored = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		expect(JSON.stringify(stored?.workspaceContext)).toBe(JSON.stringify(context));
+	});
+	test("late discovery CAS cannot overwrite a committed cwd/revision transition", async () => {
+		const snapshot = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		if (!snapshot) throw new Error("Fixture narrator absent");
+		const discovered = await workspaceContextService.get(narratorId);
+		const other = await newRepo("switch-winner");
+		const switched = await workspaceContextService.switch(
+			narratorId,
+			{
+				expectedRevision: discovered.revision,
+				requestId: generateId(),
+				target: { deviceId: "local", cwd: other },
+			},
+			{ origin: "http", userId: owner },
+		);
+		expect(await cacheLocalWorkspaceContext(narratorId, snapshot, discovered)).toBe(false);
+		expect(await workspaceContextService.get(narratorId)).toEqual(switched.current);
+	});
+	test("authoritative probes refresh the cache after main repository move and worktree repair", async () => {
+		const current = join(root, "repaired-checkout");
+		await git(repo, "worktree", "add", "-b", "repaired-checkout", current);
+		await db.update(narrators).set({ cwd: current }).where(eq(narrators.id, narratorId));
+		await authorizeGitTargetForPrincipal(actor(), { narratorId }, "read", signal());
+		const previous = await workspaceContextService.get(narratorId);
+		const moved = join(root, "moved-main");
+		await rename(repo, moved);
+		await git(moved, "worktree", "repair", current);
+		const ready = await authorizeGitTargetForPrincipal(actor(), { narratorId }, "read", signal());
+		expect(ready.workspace.state).toBe("ready");
+		const refreshed = await workspaceContextService.get(narratorId);
+		expect(refreshed.revision).toBe(previous.revision);
+		expect(refreshed.git?.repositoryPath).toBe(join(moved, ".git"));
+		expect(refreshed.git?.repositoryKey).not.toBe(previous.git?.repositoryKey);
+		await rm(current, { recursive: true });
+		const list = await narratorWorktreeService.list(
+			actor(),
+			narratorId,
+			{ workspaceKey: refreshed.git?.workspaceKey },
+			signal(),
+		);
+		expect(list.entries.map((entry) => entry.path)).toContain(moved);
+	});
+	test("a former chapter session without a directory cannot persist the main repository as execution cwd", async () => {
+		const projectId = await project(repo);
+		scanProjectIds.push(projectId);
+		// No cwd and no `standalone` trait: the chapter that supplied its directory is gone.
+		await db
+			.update(narrators)
+			.set({ contextProjectId: projectId, cwd: null, traits: [] })
+			.where(eq(narrators.id, narratorId));
+		await expect(workspaceContextService.get(narratorId)).rejects.toMatchObject({
+			code: "WORKSPACE_DIRECTORY_REQUIRED",
+		});
+		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+		expect(row?.workspaceContext).toBeNull();
+		const resolved = await authorizeGitTargetForPrincipal(
+			actor(),
+			{ narratorId },
+			"read",
+			signal(),
+		);
+		expect(resolved.workspace.state).toBe("missing_directory");
+		expect(resolved.workspace.rootPath).toBeNull();
+	});
+	test("legacy standalone cache can verify a surviving recorded Git root", async () => {
+		const cwd = join(repo, "deleted-subdirectory");
+		await mkdir(cwd);
+		await db.update(narrators).set({ cwd }).where(eq(narrators.id, narratorId));
+		const context = await workspaceContextService.get(narratorId);
+		delete context.git?.repositoryPath;
+		await db
+			.update(narrators)
+			.set({ workspaceContext: context })
+			.where(eq(narrators.id, narratorId));
+		await rm(cwd, { recursive: true });
+		const list = await narratorWorktreeService.list(
+			actor(),
+			narratorId,
+			{ workspaceKey: context.git?.workspaceKey },
+			signal(),
+		);
+		expect(list.entries.map((entry) => entry.path)).toContain(repo);
+	});
+	test("legacy cache recovers only from verified associated project, not guessed parent paths", async () => {
+		const projectId = await project(repo);
+		scanProjectIds.push(projectId);
+		await db
+			.update(narrators)
+			.set({ contextProjectId: projectId })
+			.where(eq(narrators.id, narratorId));
+		await deletedCheckout();
+		const context = await workspaceContextService.get(narratorId);
+		delete context.git?.repositoryPath;
+		await db
+			.update(narrators)
+			.set({ workspaceContext: context })
+			.where(eq(narrators.id, narratorId));
+		const list = await narratorWorktreeService.list(
+			actor(),
+			narratorId,
+			{ workspaceKey: context.git?.workspaceKey },
+			signal(),
+		);
+		expect(list.entries.map((entry) => entry.path)).toContain(repo);
+		await db.update(projects).set({ ownerUserId: null }).where(eq(projects.id, projectId));
+		await expect(
+			narratorWorktreeService.list(
+				actor(),
+				narratorId,
+				{ workspaceKey: context.git?.workspaceKey },
+				signal(),
+			),
+		).rejects.toThrow();
+		await db.update(projects).set({ ownerUserId: owner }).where(eq(projects.id, projectId));
+		await db.update(narrators).set({ contextProjectId: null }).where(eq(narrators.id, narratorId));
+		await expect(
+			narratorWorktreeService.list(
+				actor(),
+				narratorId,
+				{ workspaceKey: context.git?.workspaceKey },
+				signal(),
+			),
+		).rejects.toThrow();
+	});
+});
+
+describe("worktree destination authorization", () => {
+	async function linkedSource() {
+		await mkdir(join(repo, ".worktrees"));
+		const current = join(repo, ".worktrees", "current");
+		await git(repo, "worktree", "add", "-b", "current", current);
+		await db.update(narrators).set({ cwd: current }).where(eq(narrators.id, narratorId));
+		return { current, destination: join(repo, ".worktrees", "next") };
+	}
+
+	test("checks a sibling target's policy, including narrower grants and read-only access", async () => {
+		const { current, destination } = await linkedSource();
+		const actor = { userId: owner, isAdmin: false };
+		await authorizeGitDestinationForPrincipal(
+			actor,
+			narratorId,
+			destination,
+			"write",
+			new AbortController().signal,
+		);
+		for (const mode of ["blacklist", "nested-blacklist", "narrow", "readonly"] as const) {
+			const compile = spyOn(executionPolicyEngine, "compile").mockImplementation(
+				async (id, context) => ({
+					...compileExecutionPolicy(
+						{
+							directoryWhitelist:
+								mode === "narrow" || mode === "readonly"
+									? [
+											{
+												ruleType: "directoryWhitelist",
+												enabled: true,
+												selector: { kind: "host" },
+												source: "narrator",
+												path: mode === "narrow" ? current : destination,
+												pathKey: mode === "narrow" ? current : destination,
+												pathFlavor: "posix",
+												accessLevel: mode === "narrow" ? "readWrite" : "readOnly",
+											},
+										]
+									: [],
+							directoryBlacklist:
+								mode === "blacklist" || mode === "nested-blacklist"
+									? [
+											{
+												ruleType: "directoryBlacklist",
+												enabled: true,
+												selector: { kind: "host" },
+												source: "narrator",
+												path: mode === "blacklist" ? destination : join(destination, "secret"),
+												pathKey: destination,
+												pathFlavor: "posix",
+												denyLevel: "denyWrite",
+											},
+										]
+									: [],
+							commandWhitelist: [],
+							commandBlacklist: [],
+						},
+						context,
+					),
+					narratorId: id,
+					ownerNarratorId: id,
+					projectId: null,
+					projectGitPath: null,
+					revision: "test",
+				}),
+			);
+			try {
+				await expect(
+					authorizeGitDestinationForPrincipal(
+						actor,
+						narratorId,
+						destination,
+						"write",
+						new AbortController().signal,
+					),
+				).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+				if (mode === "readonly")
+					await authorizeGitDestinationForPrincipal(
+						actor,
+						narratorId,
+						destination,
+						"read",
+						new AbortController().signal,
+					);
+			} finally {
+				compile.mockRestore();
+			}
+		}
+	});
+
+	test("does not inherit source permission over another protected project's target", async () => {
+		const { destination } = await linkedSource();
+		const projectId = await project(destination);
+		scanProjectIds.push(projectId);
+		await db.update(projects).set({ ownerUserId: null }).where(eq(projects.id, projectId));
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				{ userId: owner, isAdmin: false },
+				narratorId,
+				destination,
+				"read",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+	});
+
+	test("preserves secret-directory and fail-closed OAuth provenance checks", async () => {
+		const { destination } = await linkedSource();
+		const actor = { userId: owner, isAdmin: false };
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				actor,
+				narratorId,
+				join(getHome(), ".ssh", "new"),
+				"read",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+		await db
+			.update(narrators)
+			.set({ oauthPolicySnapshotJson: {} })
+			.where(eq(narrators.id, narratorId));
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				actor,
+				narratorId,
+				destination,
+				"read",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "OAUTH_RUNTIME_FORBIDDEN" });
+	});
+
+	test("rejects canonical aliases rather than granting their symlink target", async () => {
+		const { destination } = await linkedSource();
+		await symlink(join(repo, ".worktrees"), join(repo, "alias"));
+		await expect(
+			authorizeGitDestinationForPrincipal(
+				{ userId: owner, isAdmin: false },
+				narratorId,
+				join(repo, "alias", "next"),
+				"write",
+				new AbortController().signal,
+			),
+		).rejects.toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+		expect(destination).toContain(".worktrees");
+	});
+});
+
 async function commitPreviewFixture() {
 	const projectId = await project(repo);
 	scanProjectIds.push(projectId);
 	await db.update(projects).set({ visibility: "public" }).where(eq(projects.id, projectId));
-	const chapterId = generateId();
-	scanChapterIds.push(chapterId);
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Commit preview",
-		branch: "main",
-		baseBranch: "main",
-		worktreePath: repo,
-		createdAt: now(),
-		updatedAt: now(),
-	});
 	const reader = generateId();
 	await db
 		.insert(users)
@@ -152,10 +549,9 @@ async function commitPreviewFixture() {
 	return {
 		reader,
 		projectId,
-		chapterId,
 		workspaceKey: ws.workspaceKey as string,
 		sha: await git(repo, "rev-parse", "HEAD"),
-		bases: [`/narrators/${narratorId}/git`, `/chapters/${chapterId}/git`],
+		bases: [`/narrators/${narratorId}/git`],
 	};
 }
 
@@ -171,13 +567,21 @@ beforeEach(async () => {
 		gitEmail: "acting@example.invalid",
 		createdAt: now(),
 	});
+	// The reusable identity table is authoritative; legacy profile fields are
+	// only startup migration input and this user is created after startup.
+	await db.insert(userGitIdentities).values({
+		id: generateId(),
+		userId: owner,
+		name: "Acting User",
+		email: "acting@example.invalid",
+		isDefault: true,
+		createdAt: now(),
+	});
 	narratorId = await newNarrator(repo);
 });
 afterEach(async () => {
 	activeNarrators.delete(narratorId);
 	setRemoteBackendResolver(null);
-	if (scanChapterIds.length)
-		await db.delete(chapters).where(inArray(chapters.id, scanChapterIds.splice(0)));
 	if (scanProjectIds.length)
 		await db.delete(projects).where(inArray(projects.id, scanProjectIds.splice(0)));
 	await rm(root, { recursive: true, force: true });
@@ -210,36 +614,44 @@ describe("Git workspace discovery", () => {
 		expect(a.workspaceKey).not.toBe(b.workspaceKey);
 		expect(b.rootPath).toBe(linked);
 	});
-	test("context project fallback and explicit cwd override preserve chapter attribution", async () => {
+	test("context project fallback and explicit cwd override", async () => {
 		const projectId = await project(repo);
-		const chapterId = generateId();
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
-			title: "Chapter",
-			branch: "main",
-			baseBranch: "main",
-			worktreePath: repo,
-			createdAt: now(),
-			updatedAt: now(),
+		const context = await newNarrator(null, {
+			contextProjectId: projectId,
+			traits: ["standalone"],
 		});
-		const context = await newNarrator(null, { contextProjectId: projectId });
 		expect((await workspace(context)).rootPath).toBe(repo);
 		const other = await newRepo("other");
-		await db.update(narrators).set({ chapterId, cwd: other }).where(eq(narrators.id, narratorId));
+		await db
+			.update(narrators)
+			.set({ contextProjectId: projectId, cwd: other })
+			.where(eq(narrators.id, narratorId));
 		const ws = await workspace();
 		expect(ws.rootPath).toBe(other);
-		expect(ws.chapterId).toBeUndefined();
-		const record = spyOn(commitSyncService, "recordCommit");
 		await writeFile(join(other, "new.txt"), "new\n");
 		expect((await request("stage", { all: true, workspaceKey: ws.workspaceKey })).status).toBe(200);
 		expect(
 			(await request("commit", { message: "separate repo", workspaceKey: ws.workspaceKey })).status,
 		).toBe(200);
-		expect(record).not.toHaveBeenCalled();
-		record.mockRestore();
-		const legacy = await app().request(`/chapters/${chapterId}/git/workspace`);
-		expect(((await legacy.json()) as GitWorkspace).rootPath).toBe(repo);
+		expect(await git(other, "log", "-1", "--format=%s")).toBe("separate repo");
+		expect(await git(repo, "log", "-1", "--format=%s")).toBe("baseline");
+	});
+	test("a former chapter session without a directory is unavailable, while a project session keeps the project directory", async () => {
+		const projectId = await project(repo);
+		await db
+			.update(narrators)
+			.set({ contextProjectId: projectId, cwd: null, traits: [] })
+			.where(eq(narrators.id, narratorId));
+		const missing = await workspace();
+		expect(missing.state).toBe("missing_directory");
+		expect(missing.rootPath).toBeNull();
+		expect(missing.cwd).toBe("");
+		expect(missing.capabilities).toEqual({ read: false, write: false });
+		await db
+			.update(narrators)
+			.set({ traits: ["standalone"] })
+			.where(eq(narrators.id, narratorId));
+		expect((await workspace()).rootPath).toBe(repo);
 	});
 	test("running local session cwd wins over stale persisted configuration", async () => {
 		const other = await newRepo("active");
@@ -261,7 +673,7 @@ describe("Git workspace discovery", () => {
 });
 
 describe("Git workspace project scan pagination", () => {
-	async function fixtures(mode: "unrelated" | "lexical" | "chapter", foreign = false) {
+	async function fixtures(mode: "unrelated" | "lexical", foreign = false) {
 		const unrelated = join(root, "unrelated");
 		await mkdir(unrelated);
 		const values = Array.from({ length: 300 }, (_, index) => ({
@@ -277,23 +689,6 @@ describe("Git workspace project scan pagination", () => {
 		// Small inserts avoid SQLite parameter limits as well as oversized test transactions.
 		for (let start = 0; start < values.length; start += 50)
 			await db.insert(projects).values(values.slice(start, start + 50));
-		if (mode === "chapter") {
-			for (const [index, row] of values.entries()) {
-				const id = `scan-chapter-${owner}-${String(index).padStart(4, "0")}`;
-				scanChapterIds.push(id);
-				await db.insert(chapters).values({
-					id,
-					projectId: row.id,
-					title: "Scan chapter",
-					branch: `scan-${index}`,
-					baseBranch: "main",
-					worktreePath: repo,
-					status: "active",
-					createdAt: now(),
-					updatedAt: now(),
-				});
-			}
-		}
 		return values[values.length - 1].id;
 	}
 
@@ -329,50 +724,80 @@ describe("Git workspace project scan pagination", () => {
 		expect((await workspace()).state).toBe("access_denied");
 	});
 
-	for (const mode of ["lexical", "chapter"] as const) {
-		test(`${mode} associations paginate completely and enforce the final private project`, async () => {
-			const lastId = await fixtures(mode, true);
-			expect((await workspace()).state).toBe("ready");
-			await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, lastId));
-			expect((await workspace()).state).toBe("access_denied");
-		});
-	}
+	test("lexical associations paginate completely and enforce the final private project", async () => {
+		const lastId = await fixtures("lexical", true);
+		expect((await workspace()).state).toBe("ready");
+		await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, lastId));
+		expect((await workspace()).state).toBe("access_denied");
+	});
 });
 
 describe("authenticated Git management", () => {
-	test("legacy chapter routes retain their existing no-workspace-key contract", async () => {
-		const projectId = await project(repo);
-		const chapterId = generateId();
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
-			title: "Legacy Git",
-			branch: "main",
-			baseBranch: "main",
-			worktreePath: repo,
-			createdAt: now(),
-			updatedAt: now(),
+	test("independent line statistics keep section counts and invalidate after staging", async () => {
+		const ws = await workspace();
+		await writeFile(join(repo, "seed.txt"), "seed\nstaged\n");
+		await git(repo, "add", "seed.txt");
+		await writeFile(join(repo, "seed.txt"), "seed\nstaged\nunstaged\n");
+		await writeFile(join(repo, "new.txt"), "one\ntwo\n");
+		const suffix = `line-stats?workspaceKey=${ws.workspaceKey}`;
+		const response = await request(suffix);
+		expect(response.status).toBe(200);
+		const stats = (await response.json()) as GitLineStats;
+		expect(stats).toMatchObject({ linesAdded: 4, linesRemoved: 0, complete: true });
+		expect(stats.files.find((file) => file.path === "seed.txt")).toMatchObject({
+			stagedLinesAdded: 1,
+			unstagedLinesAdded: 1,
 		});
-		await writeFile(join(repo, "seed.txt"), "legacy route\n");
-		const status = await app().request(`/chapters/${chapterId}/git/status`);
-		expect(status.status).toBe(200);
-		expect(((await status.json()) as { hasChanges: boolean }).hasChanges).toBe(true);
-		const stage = await app().request(`/chapters/${chapterId}/git/stage`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ files: ["seed.txt"] }),
+		expect((await request("stage", { all: true, workspaceKey: ws.workspaceKey })).status).toBe(200);
+		const staged = (await (await request(suffix)).json()) as GitLineStats;
+		expect(staged.linesAdded).toBe(4);
+		expect(staged.files.every((file) => file.unstagedLinesAdded === 0)).toBe(true);
+		expect((await request("line-stats?workspaceKey=obsolete")).status).toBe(409);
+	});
+
+	test("slow or failed statistics never hold up lightweight status", async () => {
+		clearGitLineStatsCache();
+		let started!: () => void;
+		const startedPromise = new Promise<void>((resolve) => {
+			started = resolve;
 		});
-		expect(stage.status).toBe(200);
-		const diff = await app().request(`/chapters/${chapterId}/git/diff?file=seed.txt&staged=true`);
-		expect(diff.status).toBe(200);
-		expect(((await diff.json()) as { diff: string }).diff).toContain("legacy route");
-		const commit = await app().request(`/chapters/${chapterId}/git/commit`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ message: "legacy route" }),
+		let fail!: (error: Error) => void;
+		const statsRead = spyOn(lineStatsService, "getGitLineStats").mockImplementation(() => {
+			started();
+			return new Promise<GitLineStats>((_resolve, reject) => {
+				fail = reject;
+			});
 		});
-		expect(commit.status).toBe(200);
-		expect(await git(repo, "log", "-1", "--format=%s")).toBe("legacy route");
+		let pending: Promise<Response> | undefined;
+		try {
+			pending = request("line-stats");
+			await startedPromise;
+			const status = await request("status");
+			expect(status.status).toBe(200);
+			expect(await status.json()).not.toHaveProperty("linesAdded");
+			fail(new Error("statistics failed"));
+			expect((await pending).status).toBe(500);
+			expect((await request("status")).status).toBe(200);
+		} finally {
+			fail?.(new Error("cleanup"));
+			await pending;
+			statsRead.mockRestore();
+			clearGitLineStatsCache();
+		}
+	});
+
+	test("cached line statistics are still authorized on each request", async () => {
+		await writeFile(join(repo, "new.txt"), "one\n");
+		expect((await request("line-stats")).status).toBe(200);
+		const reader = generateId();
+		await db
+			.insert(users)
+			.values({ id: reader, username: reader, passwordHash: "fixture", createdAt: now() });
+		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(404);
+		await db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, narratorId));
+		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(200);
+		await db.update(narrators).set({ visibility: "private" }).where(eq(narrators.id, narratorId));
+		expect((await request("line-stats", undefined, narratorId, reader)).status).toBe(404);
 	});
 
 	test("full standalone write flow and acting user commit identity", async () => {
@@ -428,6 +853,9 @@ describe("authenticated Git management", () => {
 			"stash",
 			"reset",
 			"ai-commit-message",
+			"checkout",
+			"push",
+			"fetch",
 		])
 			expect(
 				(await request(suffix, { workspaceKey: ws.workspaceKey, all: true }, narratorId, reader))
@@ -452,7 +880,6 @@ describe("authenticated Git management", () => {
 			repositoryKey: null,
 		});
 		expect(deniedWorkspace.projectId).toBeUndefined();
-		expect(deniedWorkspace.chapterId).toBeUndefined();
 		expect((await request("status", undefined, privateNarrator, stranger)).status).toBe(403);
 	});
 	test("traversal, drive paths, metadata and directory symlinks are rejected", async () => {
@@ -557,6 +984,80 @@ describe("authenticated Git management", () => {
 	});
 });
 
+describe("branch management routes", () => {
+	test("GET branches reports the current branch and its refs", async () => {
+		const ws = await workspace();
+		await git(repo, "branch", "side");
+		const response = await request(`branches?workspaceKey=${ws.workspaceKey}`);
+		expect(response.status).toBe(200);
+		const listing = (await response.json()) as GitBranches;
+		expect(listing.branch).toBe("main");
+		expect(listing.detached).toBe(false);
+		expect(listing.headSha).toBe(await git(repo, "rev-parse", "HEAD"));
+		expect(listing.local.map((entry) => entry.name)).toEqual(["main", "side"]);
+		expect(listing.remote).toEqual([]);
+		expect(listing.remotes).toEqual([]);
+		expect(listing.defaultRemote).toBeNull();
+	});
+
+	test("a stale or missing workspace key never reaches the branch operations", async () => {
+		// A write without a key cannot be attributed to a workspace at all.
+		expect((await request("checkout", { branch: "side" })).status).toBe(400);
+		expect((await request("push", {})).status).toBe(400);
+		expect((await request("fetch", {})).status).toBe(400);
+		// A key pinned to a different target is rejected before any Git runs.
+		expect((await request("checkout", { branch: "side", workspaceKey: "obsolete" })).status).toBe(
+			409,
+		);
+	});
+
+	test("checkout creates a branch and returns the refreshed status", async () => {
+		const ws = await workspace();
+		const response = await request("checkout", {
+			branch: "feature/http",
+			create: true,
+			workspaceKey: ws.workspaceKey,
+		});
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as { status: { branch: string } };
+		expect(body.status.branch).toBe("feature/http");
+		expect(await git(repo, "symbolic-ref", "--short", "HEAD")).toBe("feature/http");
+		// Switching back to an existing local branch needs no `create`.
+		expect(
+			(
+				await request("checkout", {
+					branch: "main",
+					workspaceKey: ws.workspaceKey,
+				})
+			).status,
+		).toBe(200);
+		expect(await git(repo, "symbolic-ref", "--short", "HEAD")).toBe("main");
+		// A rejected name is a validation error, not a git failure.
+		expect(
+			(
+				await request("checkout", {
+					branch: "bad..name",
+					workspaceKey: ws.workspaceKey,
+				})
+			).status,
+		).toBe(400);
+	});
+
+	test("push and fetch without a configured remote fail before touching the network", async () => {
+		const ws = await workspace();
+		const push = await request("push", { workspaceKey: ws.workspaceKey });
+		expect(push.status).toBe(422);
+		expect(((await push.json()) as { code: string }).code).toBe("GIT_NO_REMOTE");
+		const fetchRemote = await request("fetch", { workspaceKey: ws.workspaceKey });
+		expect(fetchRemote.status).toBe(422);
+		expect(((await fetchRemote.json()) as { code: string }).code).toBe("GIT_NO_REMOTE");
+		// A remote name the repository does not have is refused, not passed to git.
+		expect(
+			(await request("fetch", { remote: "elsewhere", workspaceKey: ws.workspaceKey })).status,
+		).toBe(400);
+	});
+});
+
 describe("commit preview routes", () => {
 	test("read-only viewers preview both domains without changing HEAD, index bytes or working files", async () => {
 		const f = await commitPreviewFixture();
@@ -566,9 +1067,8 @@ describe("commit preview routes", () => {
 		await writeFile(join(repo, "untracked.txt"), "untracked draft\n");
 		const indexBefore = await readFile(join(repo, ".git", "index"));
 		for (const base of f.bases) {
-			// The narrator path is pinned; the chapter adapter retains its keyless contract.
-			const params = new URLSearchParams();
-			if (base.startsWith("/narrators/")) params.set("workspaceKey", f.workspaceKey);
+			// The narrator path is pinned to its workspace.
+			const params = new URLSearchParams({ workspaceKey: f.workspaceKey });
 			const metadata = await app(f.reader).request(`${base}/commits/${f.sha}?${params}`);
 			expect(metadata.status).toBe(200);
 			const detail = (await metadata.json()) as GitCommitDetail;
@@ -775,19 +1275,7 @@ test("a pre-cancelled modifications request starts no remote Git RPC", async () 
 	expect(calls).toBe(0);
 });
 
-test("a pre-cancelled chapter request returns no history and starts no Git probe", async () => {
-	const projectId = await project(repo);
-	const chapterId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Cancelled chapter",
-		branch: "main",
-		baseBranch: "main",
-		worktreePath: repo,
-		createdAt: now(),
-		updatedAt: now(),
-	});
+test("a pre-cancelled local request returns no history and starts no Git probe", async () => {
 	const stranger = generateId();
 	await db.insert(users).values({
 		id: stranger,
@@ -814,7 +1302,7 @@ test("a pre-cancelled chapter request returns no history and starts no Git probe
 	const spawn = spyOn(Bun, "spawn");
 	try {
 		const response = await app().request(
-			new Request(`http://localhost/chapters/${chapterId}/git/modifications?scope=uncommitted`, {
+			new Request(`http://localhost/narrators/${narratorId}/git/modifications?scope=uncommitted`, {
 				signal: AbortSignal.abort(),
 			}),
 		);
@@ -830,7 +1318,7 @@ test("a pre-cancelled chapter request returns no history and starts no Git probe
 		expect(JSON.stringify(body)).not.toContain("private/secret.txt");
 
 		const historyOnly = await app().request(
-			new Request(`http://localhost/chapters/${chapterId}/git/modifications`, {
+			new Request(`http://localhost/narrators/${narratorId}/git/modifications`, {
 				signal: AbortSignal.abort(),
 			}),
 		);
@@ -906,6 +1394,71 @@ test("sibling-directory observations include other narrators but redact private 
 		expect(JSON.stringify(body)).not.toContain("PRIVATE ACTOR TITLE");
 		expect(JSON.stringify(body)).not.toContain("PRIVATE TOOL ID");
 		expect(JSON.stringify(body)).not.toContain(privateActor);
+	}
+});
+
+test("a single-file read covers only that file, its rename source and sibling cwd history", async () => {
+	const actorCwd = join(repo, "packages", "a");
+	await mkdir(actorCwd, { recursive: true });
+	await git(repo, "mv", "seed.txt", "renamed.txt");
+	await writeFile(join(repo, "other.txt"), "other\n");
+	await recordAttribution({
+		deviceId: "local",
+		workspacePath: repo,
+		filePath: "seed.txt",
+		narratorId,
+		action: "edit",
+	});
+	await recordAttribution({
+		deviceId: "local",
+		workspacePath: actorCwd,
+		filePath: "../../renamed.txt",
+		narratorId,
+		action: "edit",
+	});
+	await recordAttribution({
+		deviceId: "local",
+		workspacePath: repo,
+		filePath: "other.txt",
+		narratorId,
+		action: "write",
+	});
+	const response = await request(
+		"modifications?scope=uncommitted&projection=byFile&filePath=renamed.txt",
+	);
+	expect(response.status).toBe(200);
+	const body = (await response.json()) as {
+		byFile: { filePath: string; changeCount: number }[];
+		currentDiff: { byFile: { filePath: string }[] };
+		timeline?: unknown;
+	};
+	expect(body.timeline).toBeUndefined();
+	expect(body.byFile.map((file) => [file.filePath, file.changeCount])).toEqual([
+		["renamed.txt", 2],
+	]);
+	expect(body.currentDiff.byFile.map((file) => file.filePath)).toEqual(["renamed.txt"]);
+
+	const clean = await request(
+		"modifications?scope=uncommitted&projection=byFile&filePath=seed.txt",
+	);
+	expect(clean.status).toBe(200);
+	const cleanBody = (await clean.json()) as { byFile: unknown[]; hasMore: boolean };
+	expect(cleanBody.byFile).toEqual([]);
+	expect(cleanBody.hasMore).toBe(false);
+});
+
+test("a single-file read rejects unscoped, absolute, escaping and .git paths", async () => {
+	const base = "modifications?scope=uncommitted&projection=byFile&filePath=";
+	for (const suffix of [
+		"modifications?scope=uncommitted&filePath=seed.txt",
+		"modifications?projection=byFile&filePath=seed.txt",
+		`${base}${encodeURIComponent("../outside.txt")}`,
+		`${base}${encodeURIComponent("/etc/passwd")}`,
+		`${base}${encodeURIComponent(".git/config")}`,
+		`${base}${encodeURIComponent("a\0b")}`,
+		base,
+	]) {
+		expect((await request(suffix)).status).toBe(400);
 	}
 });
 

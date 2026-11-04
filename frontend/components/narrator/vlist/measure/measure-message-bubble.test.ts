@@ -169,6 +169,97 @@ describe("measureMessageBubble — user", () => {
 		expect(bodyHeight).toBe(c.BODY_LINE_HEIGHT * 3);
 	});
 
+	it("stacks attachments placed after all text below the body", async () => {
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text: "look[image #1: a.png]",
+				attachments: [{ type: "image", imageId: "i", filename: "a.png", width: 40, height: 20 }],
+			},
+			440,
+		);
+		expect(r.blocks.map((block) => (block.kind === "fixed" ? block.tag : block.kind))).toEqual([
+			"code",
+			"user-image",
+		]);
+	});
+
+	it("flows interleaved quotes and attachments inline with the text", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const text =
+			"> [quote] first @@m:msg1234\n> one\n\n怎样算？\n> [quote] second\n> two\n\n怎样算[image #1: a.png]";
+		const r = measureMessageBubble(
+			{
+				role: "user",
+				text,
+				attachments: [{ type: "image", imageId: "i", filename: "a.png", width: 40, height: 20 }],
+			},
+			440,
+		);
+		const block = r.blocks.find(
+			(candidate) => candidate.kind === "fixed" && candidate.tag === "user-inline-flow",
+		);
+		if (block?.kind !== "fixed") throw new Error("Expected an inline flow block");
+		const flow = block as unknown as {
+			data: { lines: Array<Array<{ text?: string; atom?: number }>>; atoms: unknown[] };
+		};
+		expect(r.blocks).toHaveLength(1);
+		expect(flow.data.atoms).toHaveLength(3);
+		// One line: quote, text, quote, text, image — the projection's line padding is gone.
+		expect(flow.data.lines).toHaveLength(1);
+		expect(flow.data.lines[0].map((fragment) => fragment.text ?? fragment.atom)).toEqual([
+			0,
+			"怎样算？",
+			1,
+			"怎样算",
+			2,
+		]);
+		const c = MEASURE_MESSAGE_CONSTANTS;
+		expect(r.height).toBe(
+			c.USER_BUBBLE_PADDING * 2 +
+				c.USER_HEADER_HEIGHT +
+				c.USER_HEADER_BODY_GAP +
+				c.BODY_LINE_HEIGHT,
+		);
+	});
+
+	it("shows sent quotes as chips and leaves the typed body", async () => {
+		const { measureMessageBubble, MEASURE_MESSAGE_CONSTANTS } = await import(
+			"./measure-message-bubble"
+		);
+		const body = "what does this mean?";
+		const stored = `> [quote] short explanation @@m:msg1234\n> short explanation of the quote chip\n\n${body}`;
+		const quoted = measureMessageBubble({ role: "user", text: stored }, 440);
+		const plain = measureMessageBubble({ role: "user", text: body }, 440);
+		const chips = quoted.blocks.find(
+			(block) => block.kind === "fixed" && block.tag === "user-quote-chips",
+		);
+		expect(chips?.kind).toBe("fixed");
+		if (chips?.kind !== "fixed") return;
+		const storedQuotes = chips.data?.quotes as { label: string; anchor: string | null }[];
+		expect(storedQuotes[0]?.label).toBe("short explanation");
+		expect(storedQuotes[0]?.anchor).toBe("m:msg1234");
+		expect(chips.height).toBe(MEASURE_MESSAGE_CONSTANTS.USER_QUOTE_CHIP_HEIGHT);
+		expect(quoted.height - plain.height).toBe(
+			MEASURE_MESSAGE_CONSTANTS.USER_QUOTE_CHIP_HEIGHT +
+				MEASURE_MESSAGE_CONSTANTS.USER_ATTACHMENT_GAP,
+		);
+		const quotedBody = quoted.blocks.find((block) => block.kind === "code");
+		expect(JSON.stringify(quotedBody)).not.toContain("[quote]");
+		expect(JSON.stringify(quotedBody)).not.toContain("@@");
+		const onlyQuote = measureMessageBubble(
+			{
+				role: "user",
+				text: "> [quote] hello there @@m:msg1234\n> hello there\n\n",
+			},
+			440,
+		);
+		expect(onlyQuote.blocks.some((block) => block.kind === "code")).toBe(false);
+	});
+
 	it("shrink-wraps: narrow content uses less than full width", async () => {
 		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const r = measureMessageBubble({ role: "user", text: "hi" }, 1000);
@@ -556,7 +647,7 @@ describe("measureMessageBubble — user attachments", () => {
 		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const plain = measureMessageBubble({ role: "user", text: "hi" }, 1000);
 		const withUnknown = measureMessageBubble(
-			{ role: "user", text: "hi", attachments: [{ type: "video" }] },
+			{ role: "user", text: "hi", attachments: [{ type: "unknown_attachment" }] },
 			1000,
 		);
 		expect(withUnknown.height).toBe(plain.height);

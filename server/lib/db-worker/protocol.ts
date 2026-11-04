@@ -21,36 +21,53 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type {
+	BlockBackfillSliceParams,
+	BlockIndexQueueSliceParams,
+	BlockProjectionSliceParams,
+	BlockReindexSliceParams,
+	BlockVerifySliceParams,
+} from "./block-backfill-query";
+import type {
+	DisplayPageMessagesParams,
+	PostgresDisplayPageMessagesParams,
+} from "./display-page-protocol";
+
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
 	| "storageScanContext"
 	| "storageScanTables"
-	| "usageHistoryQuery"
-	| "searchQuery";
+	| "storageScanSerial"
+	| "storageScanCleanupSummaries"
+	| "storageScanSessionPreview"
+	| "selectRows"
+	| "displayPageMessages"
+	| "displayPageMessagesPostgres"
+	| "blockBackfillSlice"
+	| "blockVerifySlice"
+	| "blockReindexSlice"
+	| "blockIndexQueueSlice"
+	| "blockProjectionSlice";
 
-/** Shared search budgets; importing these must never bootstrap a database. */
-export const SEARCH_QUERY_MAX_SQL_BYTES = 64 * 1024;
-export const SEARCH_QUERY_MAX_PARAMS_BYTES = 128 * 1024;
-export const SEARCH_QUERY_MAX_PARAMS = 256;
-export const SEARCH_QUERY_MAX_ROWS = 10_000;
-export const SEARCH_QUERY_MAX_BYTES = 4 * 1024 * 1024;
+/** Shared read-query budgets; importing these must never bootstrap a database. */
+export const SELECT_ROWS_MAX_SQL_BYTES = 64 * 1024;
+export const SELECT_ROWS_MAX_PARAMS_BYTES = 128 * 1024;
+export const SELECT_ROWS_MAX_PARAMS = 256;
+export const SELECT_ROWS_MAX_ROWS = 10_000;
+export const SELECT_ROWS_MAX_BYTES = 4 * 1024 * 1024;
 
 /** Internal server-built SELECT (optionally WITH); never caller-provided SQL. */
-export interface SearchQueryParams {
-	kind: "searchQuery";
+export interface SelectRowsParams {
+	kind: "selectRows";
 	sql: string;
 	params: Array<string | number | null>;
 	maxRows: number;
 }
 
-/** Internal, server-built SELECT only. Never accepts SQL from an HTTP caller. */
-export interface UsageHistoryQueryParams {
-	kind: "usageHistoryQuery";
-	sql: string;
-	params: Array<string | number | null>;
-	/** Selected field names in Drizzle selection order. */
+/** Rows in selection order; `columns` are the SQL result names (possibly duplicated). */
+export interface SelectRowsResult {
 	columns: string[];
-	maxRows: number;
+	rows: unknown[][];
 }
 
 export interface StorageScanContextParams {
@@ -73,6 +90,133 @@ export interface StorageScanTablesParams {
 	kind: "storageScanTables";
 	/** The shard: which tables this worker should measure. */
 	tableNames: string[];
+	/**
+	 * Schema and dbstat snapshot from `storageScanContext`.
+	 *
+	 * When present the shard must not run `dbstat` again. Absent only for older callers and tests;
+	 * the worker then loads context itself.
+	 */
+	context?: StorageScanContextResult;
+}
+
+/** One read-only connection measures every table. Used when sharded workers cannot run. */
+export interface StorageScanSerialParams {
+	kind: "storageScanSerial";
+	mainBytes: number;
+}
+
+export interface StorageScanCleanupRelation {
+	tableName: string;
+	alias: string;
+	narratorColumn: string;
+	countAs?: "toolCalls" | "apiRequests";
+}
+
+/**
+ * Cleanup-candidate byte totals. The narrator id lists are already decided on the main
+ * thread; this task only runs the aggregates.
+ */
+export interface StorageScanCleanupSummariesParams {
+	kind: "storageScanCleanupSummaries";
+	archivedNarratorIds: string[];
+	staleNarratorIds: string[];
+	relations: StorageScanCleanupRelation[];
+	toolCallCutoffIso: string;
+}
+
+/** Hard task budgets, including duplicated ids across the total and sample groups. */
+export const SESSION_PREVIEW_MAX_SAMPLES = 10;
+export const SESSION_PREVIEW_MAX_ID_ENTRIES = 10_000;
+export const SESSION_PREVIEW_MAX_ID_LENGTH = 64;
+export const SESSION_PREVIEW_MAX_RELATIONS = 32;
+export const SESSION_PREVIEW_MAX_RELATION_FIELD_LENGTH = 64;
+
+export interface StorageScanSessionPreviewParams {
+	kind: "storageScanSessionPreview";
+	narratorIds: string[];
+	sampleNarratorIds: string[][];
+	relations: StorageScanCleanupRelation[];
+}
+
+export class SessionPreviewBudgetError extends Error {
+	readonly code = "DATABASE_CLEANUP_PREVIEW_BUDGET_EXCEEDED";
+
+	constructor(detail: string) {
+		super(`Session cleanup preview ${detail}`);
+		this.name = "SessionPreviewBudgetError";
+	}
+}
+
+/** Pure preflight on both sides of postMessage; reject, never truncate a deletion plan. */
+export function assertSessionPreviewBudget(params: StorageScanSessionPreviewParams): void {
+	if (
+		!Array.isArray(params.sampleNarratorIds) ||
+		params.sampleNarratorIds.length > SESSION_PREVIEW_MAX_SAMPLES
+	) {
+		throw new SessionPreviewBudgetError("sample limit exceeded");
+	}
+	if (
+		!Array.isArray(params.narratorIds) ||
+		!Array.isArray(params.relations) ||
+		params.relations.length > SESSION_PREVIEW_MAX_RELATIONS
+	) {
+		throw new SessionPreviewBudgetError("relation or id list limit exceeded");
+	}
+	let idEntries = params.narratorIds.length;
+	for (const ids of params.sampleNarratorIds) {
+		if (!Array.isArray(ids)) throw new SessionPreviewBudgetError("invalid sample id list");
+		idEntries += ids.length;
+	}
+	if (idEntries > SESSION_PREVIEW_MAX_ID_ENTRIES) {
+		throw new SessionPreviewBudgetError("id entry limit exceeded");
+	}
+	for (const ids of [params.narratorIds, ...params.sampleNarratorIds]) {
+		for (const id of ids) {
+			if (typeof id !== "string" || id.length > SESSION_PREVIEW_MAX_ID_LENGTH) {
+				throw new SessionPreviewBudgetError("id length limit exceeded");
+			}
+		}
+	}
+	for (const relation of params.relations) {
+		if (!relation || typeof relation !== "object") {
+			throw new SessionPreviewBudgetError("invalid relation");
+		}
+		for (const field of [relation.tableName, relation.alias, relation.narratorColumn]) {
+			if (typeof field !== "string" || field.length > SESSION_PREVIEW_MAX_RELATION_FIELD_LENGTH) {
+				throw new SessionPreviewBudgetError("relation field length limit exceeded");
+			}
+		}
+		if (
+			relation.countAs !== undefined &&
+			relation.countAs !== "toolCalls" &&
+			relation.countAs !== "apiRequests"
+		) {
+			throw new SessionPreviewBudgetError("invalid relation counter");
+		}
+	}
+}
+
+export interface StorageScanSessionPreviewResult {
+	aggregate: {
+		narrators: number;
+		messages: number;
+		toolCalls: number;
+		apiRequests: number;
+		approxBytes: number;
+	};
+	sampleBytes: number[];
+}
+
+export interface StorageScanByteSummary {
+	count: number;
+	approxBytes: number;
+	oldestAt: string | null;
+}
+
+export interface StorageScanCleanupSummariesResult {
+	archivedApproxBytes: number;
+	staleApproxBytes: number;
+	toolCalls: StorageScanByteSummary;
 }
 
 export interface StorageScanTablesResult {
@@ -103,10 +247,19 @@ export interface StorageScanTablesResult {
 }
 
 export type DbReadTaskParams =
+	| BlockBackfillSliceParams
+	| BlockVerifySliceParams
+	| BlockReindexSliceParams
+	| BlockIndexQueueSliceParams
+	| BlockProjectionSliceParams
 	| StorageScanContextParams
 	| StorageScanTablesParams
-	| UsageHistoryQueryParams
-	| SearchQueryParams;
+	| StorageScanSerialParams
+	| StorageScanCleanupSummariesParams
+	| StorageScanSessionPreviewParams
+	| SelectRowsParams
+	| DisplayPageMessagesParams
+	| PostgresDisplayPageMessagesParams;
 
 export interface DbWorkerRequest {
 	type: "task";
@@ -119,7 +272,12 @@ export interface DbWorkerShutdown {
 	type: "shutdown";
 }
 
-export type DbWorkerInbound = DbWorkerRequest | DbWorkerShutdown;
+export interface DbWorkerCancel {
+	type: "cancel";
+	requestId: string;
+}
+
+export type DbWorkerInbound = DbWorkerRequest | DbWorkerShutdown | DbWorkerCancel;
 
 export interface DbWorkerReady {
 	type: "ready";
@@ -146,6 +304,8 @@ export interface DbWorkerFailure {
 	type: "error";
 	requestId: string;
 	message: string;
+	/** Task-specific fail-closed diagnostics; never contains raw JSON. */
+	code?: string;
 }
 
 export type DbWorkerOutbound = DbWorkerReady | DbWorkerProgress | DbWorkerSuccess | DbWorkerFailure;

@@ -2,14 +2,9 @@
 // in databases not yet migrated to the new status+substatus model.
 export const STALE_SESSION_STATUSES = new Set(["idle", "done", "error", "interrupted"]);
 
-export type DatabaseCleanupTarget =
-	| "archivedSessions"
-	| "staleSessions"
-	| "apiRequestDumps"
-	| "toolCallPayloads";
+export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
-	| "chapterBound"
 	| "runningTerminal"
 	| "backgroundRunning"
 	| "nonArchived"
@@ -19,7 +14,6 @@ export type DatabaseCleanupBlockedReasonCode =
 export interface NarratorCleanupRecord {
 	id: string;
 	parentNarratorId: string | null;
-	chapterId: string | null;
 	type: string;
 	variant: string;
 	traits: string[] | null;
@@ -53,9 +47,7 @@ export interface CleanupPlanBlockedRoot {
 	blockingStatus: string;
 }
 
-type NarratorCleanupTarget =
-	| Exclude<DatabaseCleanupTarget, "apiRequestDumps">
-	| "scheduledSessions";
+type NarratorCleanupTarget = DatabaseCleanupTarget | "scheduledSessions";
 
 export interface BuildNarratorCleanupPlanOptions {
 	staleCutoffIso?: string;
@@ -83,9 +75,6 @@ function getEligibilityResult(
 	narrator: NarratorCleanupRecord,
 	ctx: EligibilityContext,
 ): EligibilityResult {
-	if (narrator.chapterId) {
-		return { ok: false, reasonCode: "chapterBound" };
-	}
 	if (ctx.runningTerminalIds.has(narrator.id)) {
 		return { ok: false, reasonCode: "runningTerminal" };
 	}
@@ -157,9 +146,8 @@ function hasSelectedAncestor(
 
 function isRootCandidate(target: NarratorCleanupTarget, narrator: NarratorCleanupRecord): boolean {
 	if (narrator.variant !== "primary") return false;
-	// Task cleanup reports chapter/running roots as blocked, rather than hiding them.
+	// Task cleanup reports running roots as blocked, rather than hiding them.
 	if (target === "scheduledSessions") return true;
-	if (narrator.chapterId !== null) return false;
 	if (target === "archivedSessions") {
 		return narrator.status === "archived";
 	}

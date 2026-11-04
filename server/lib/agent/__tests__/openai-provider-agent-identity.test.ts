@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { RequestRecording } from "@shared/request-recording";
 import type { OpenAIProviderConfig } from "../../settings";
 import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams } from "../provider";
@@ -91,7 +92,19 @@ describe("OpenAIProvider HTTP dump", () => {
 				};
 				return response;
 			}) as unknown as typeof fetch;
-			const dump = new ApiRequestDumpCollector();
+			const chunks: string[] = [];
+			const metas: Record<string, unknown>[] = [];
+			const recording: RequestRecording = {
+				requestId: `openai-${stop}`,
+				pin: () => {},
+				request: () => {},
+				responseMeta: (meta) => metas.push(meta),
+				responseChunk: (chunk) =>
+					chunks.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)),
+				frame: () => {},
+				finish: () => {},
+			};
+			const dump = new ApiRequestDumpCollector(recording);
 			const iterator = new OpenAIProvider(AGENT_IDENTITY_CONFIG).chat(
 				minimalChatParams({ requestDump: dump }),
 			);
@@ -103,8 +116,8 @@ describe("OpenAIProvider HTTP dump", () => {
 				await iterator.next();
 				await iterator.return(undefined);
 			}
-			expect(dump.snapshot().response?.bodyText).toContain(raw);
-			expect(dump.snapshot().response?.bodyIncomplete).toBe(stop !== "done");
+			expect(chunks.join("")).toContain(raw);
+			expect(Object.assign({}, ...metas).bodyIncomplete).toBe(stop !== "done");
 			expect(reads).toBe(stop === "consumer" ? 1 : 2);
 			if (stop === "consumer") expect(cancelled).toBe(true);
 		});
@@ -159,11 +172,13 @@ describe("OpenAIProvider offline reflection request shape", () => {
 		});
 
 		for (const content of ["parent request", "danger reflection prompt"]) {
-			const iterator = provider.chat({
-				...base,
-				content,
-				requestDump: new ApiRequestDumpCollector(),
-			})[Symbol.asyncIterator]();
+			const iterator = provider
+				.chat({
+					...base,
+					content,
+					requestDump: new ApiRequestDumpCollector(),
+				})
+				[Symbol.asyncIterator]();
 			await expect(iterator.next()).rejects.toThrow("offline verification");
 		}
 

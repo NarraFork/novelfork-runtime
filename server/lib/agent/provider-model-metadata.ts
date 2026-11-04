@@ -1,18 +1,20 @@
-import type { ModelMetadata } from "@shared/model-catalog/schema/catalog";
+import type { ModelProfile } from "@shared/model-catalog/profile";
 import {
 	clampReasoningEffort,
+	migrateLegacyReasoningEffort,
 	REASONING_EFFORT_VALUES,
 	type ReasoningEffort,
 } from "@shared/reasoning-effort";
-import { getEffectiveModelCard, getEffectiveModelMetadata } from "../model-catalog";
+import { getEffectiveModelCard, getEffectiveModelProfile } from "../model-catalog";
+import { visitNativeMedia } from "./native-media";
 
-export function effectiveProviderMetadata(model: string): ModelMetadata {
-	return getEffectiveModelMetadata(model).metadata;
+export function effectiveModelProfile(model: string): ModelProfile {
+	return getEffectiveModelProfile(model);
 }
 
 /** Explicit requests replace defaults, but never exceed a declared model ceiling. */
 export function resolveOutputTokenLimit(
-	metadata: ModelMetadata,
+	profile: Pick<ModelProfile, "maxOutputTokens">,
 	requested?: number,
 	fallback?: number,
 ): number | undefined {
@@ -20,7 +22,7 @@ export function resolveOutputTokenLimit(
 		typeof value === "number" && Number.isFinite(value) && value > 0
 			? Math.max(1, Math.floor(value))
 			: undefined;
-	const limit = positive(metadata.limits?.maxOutputTokens);
+	const limit = positive(profile.maxOutputTokens);
 	const desired = positive(requested) ?? positive(fallback);
 	return desired === undefined ? limit : limit === undefined ? desired : Math.min(desired, limit);
 }
@@ -109,10 +111,11 @@ export function resolveOutputTokenBudget(
 
 /** Metadata validates semantic levels; adapters retain ownership of the wire mapping. */
 export function resolveMetadataReasoning(
-	metadata: ModelMetadata,
+	profile: Pick<ModelProfile, "reasoning">,
 	requested?: string,
+	model?: string,
 ): string | undefined {
-	const reasoning = metadata.reasoning;
+	const reasoning = profile.reasoning;
 	if (reasoning?.supported === false) return undefined;
 	let effort = requested ?? reasoning?.defaultLevel ?? undefined;
 	if (!effort) return undefined;
@@ -125,12 +128,31 @@ export function resolveMetadataReasoning(
 				? reasoning.defaultLevel
 				: levels?.[0];
 	if (!effort) return undefined;
+	// An explicitly declared empty tier list is a positive claim — "this model has no
+	// selectable thinking intensity" — not missing information. Gateway-discovered
+	// metadata reports exactly this (`effortLevels: []`), and the upstream then rejects
+	// any named tier with `reasoning effort "xhigh" is not supported by model metadata`.
+	// Returning undefined drops the effort from the request instead. An explicit "none"
+	// already returned above, so "turn thinking off" keeps working. `Array.isArray`
+	// keeps the three states apart: [] = no tiers, null = declared unknown, absent =
+	// never declared (both of the latter keep the caller's tier).
+	if (Array.isArray(reasoning?.levels) && reasoning.levels.length === 0) return undefined;
 	if (levels?.length && !levels.includes(effort)) {
 		const known = levels.filter((level): level is ReasoningEffort =>
 			REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
 		);
-		if (known.length && REASONING_EFFORT_VALUES.includes(effort as ReasoningEffort))
-			return clampReasoningEffort(effort as ReasoningEffort, known);
+		if (known.length && REASONING_EFFORT_VALUES.includes(effort as ReasoningEffort)) {
+			// Only migrate the old UI value against preset tiers. Gateway and local
+			// declarations are authoritative, not an invitation to apply vendor aliases.
+			const card = model ? getEffectiveModelCard(model) : undefined;
+			const source = card?.provenance.reasoning_effort_levels?.layer;
+			const legacyModel =
+				source === "preset-model" || source === "preset-variant" ? card?.modelId : undefined;
+			return clampReasoningEffort(
+				migrateLegacyReasoningEffort(legacyModel, effort as ReasoningEffort, known),
+				known,
+			);
+		}
 		return reasoning?.defaultLevel && levels.includes(reasoning.defaultLevel)
 			? reasoning.defaultLevel
 			: levels[0];
@@ -138,14 +160,20 @@ export function resolveMetadataReasoning(
 	return effort;
 }
 
-/** Validate only actual image inputs, never image-generation outputs or tool schemas. */
+/** Validate actual image/audio/video inputs, never generated output metadata or tool schemas. */
 export function assertModelInputModalities(
 	model: string,
 	values: unknown,
-	metadata = effectiveProviderMetadata(model),
+	profile: Pick<ModelProfile, "inputModalities"> = effectiveModelProfile(model),
 ): void {
-	const inputs = metadata.modalities?.input;
+	const inputs = profile.inputModalities;
 	if (!Array.isArray(inputs)) return;
+	visitNativeMedia(values, (_value, modality) => {
+		if (!inputs.includes(modality))
+			throw new Error(
+				`Model ${model} does not support ${modality} input according to its effective metadata.`,
+			);
+	});
 	const visit = (value: unknown): void => {
 		if (!value || typeof value !== "object") return;
 		if (Array.isArray(value)) {

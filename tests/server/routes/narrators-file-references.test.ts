@@ -1,23 +1,34 @@
 import { describe, expect, mock, test } from "bun:test";
 import { getFileReferenceSnapshots } from "@server/lib/agent/file-reference-projection";
-import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
+import {
+	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
+	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "@server/lib/composer-document";
+import { AppError, catalogError, NotFoundError, ValidationError } from "@server/lib/errors";
 import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
 } from "@server/lib/file-reference-input";
 import {
+	bufferQueueModeSchema,
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	sendMessageSchema,
 	updateBufferedMessageSchema,
 	updateNarratorDraftSchema,
 } from "@server/lib/validators/narrators";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import {
 	type FileReference,
 	type FileReferenceSnapshot,
 	fileReferenceMessageForDisplay,
 	MAX_FILE_REFERENCE_TEXT_BYTES,
 } from "@shared/file-reference";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -27,9 +38,9 @@ import { type Context, Hono } from "hono";
 // Execute the actual route bodies with injected boundaries. Importing the giant
 // router would initialize DB/migrations and agent services; this harness imports
 // neither, and does not globally mock modules used by other test suites.
-const source = await Bun.file(
-	new URL("../../../server/routes/narrators.ts", import.meta.url),
-).text();
+const source = await Bun.file(new URL("../../../server/routes/narrators.ts", import.meta.url))
+	.text()
+	.then((text) => text.replaceAll("\r\n", "\n"));
 function section(start: string, end: string) {
 	const from = source.indexOf(start);
 	const to = source.indexOf(end, from + start.length);
@@ -44,12 +55,11 @@ const routeCode = [
 	section("async function resolveEditedFileReferences(", "// Edit an assistant message's text"),
 	section(
 		'narratorRoutes.post("/:id/edit-message/:messageId"',
-		"/**\n * Resolve the authoritative buffer queue",
+		"/** Primary and subagent user queues are projections of the same durable mailbox. */",
 	),
-	section("interface LocatedBufferedMessage", "// Remove a single queued buffered message"),
+	section("interface LocatedBufferedMessage", "/** Called under start admission"),
 ]
 	.join("\n")
-	.replaceAll('import("../services/narrator-subagent")', "Promise.resolve(subagentQueue)")
 	.replaceAll("export async function", "async function");
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(routeCode);
 
@@ -79,8 +89,8 @@ interface QueueItem {
 function fixture(
 	options: { busy?: boolean; subagent?: boolean; compact?: boolean; user?: string } = {},
 ) {
+	// Every session — delegated or not — has the same one durable mailbox.
 	const queue: QueueItem[] = [];
-	const subqueue: QueueItem[] = [];
 	const captures: Array<{
 		narratorId: string;
 		userId: string;
@@ -111,8 +121,14 @@ function fixture(
 		storedMessages.push(message);
 		return message;
 	}
-	const send = mock(async (...args: unknown[]) =>
-		storedMessage("sent", args[1] as string, args[10] as FileReferenceSnapshot[] | undefined),
+	interface AcceptedInput {
+		composerDocument?: ComposerDocument;
+		fileReferences?: FileReferenceSnapshot[];
+		images?: Array<{ imageId: string }>;
+		queueOnly?: boolean;
+	}
+	const send = mock(async (_id: string, text: string, input: AcceptedInput) =>
+		storedMessage("sent", text, input.fileReferences),
 	);
 	// Simulate additional internal fields so the route's summary-only contract is
 	// tested against accidental future additions to a service result.
@@ -125,22 +141,6 @@ function fixture(
 		userMessage: { id: "edited", contentJson: state.existing },
 	};
 	const edit = mock(async (..._args: unknown[]) => editResult);
-	const resume = mock(async (input: unknown) => {
-		const data = input as {
-			prompt?: string;
-			editContent?: string;
-			fileReferences?: FileReferenceSnapshot[];
-			editFileReferences?: FileReferenceSnapshot[];
-		};
-		return {
-			started: true,
-			userMessage: storedMessage(
-				"sub-user",
-				data.prompt ?? data.editContent ?? "",
-				data.fileReferences ?? data.editFileReferences,
-			),
-		};
-	});
 	const capture = async (
 		narratorId: string,
 		userId: string,
@@ -152,12 +152,12 @@ function fixture(
 		if (signal.aborted) throw new ValidationError("Reference capture aborted");
 		return refs.map((ref) => snapshot(ref, state.sourceText));
 	};
-	const push = mock(async (...args: unknown[]) => {
-		if (state.queueFull) return { ok: false, full: true };
+	const push = mock(async (_id: string, text: string, input: AcceptedInput) => {
+		if (state.queueFull) throw new ValidationError("Buffer queue full");
 		queue.push({
 			id: "queued",
-			text: args[1] as string,
-			fileReferences: (args[9] ?? []) as FileReferenceSnapshot[],
+			text,
+			fileReferences: input.fileReferences ?? [],
 		});
 		return { ok: true, id: "queued", bufferedAt: "now" };
 	});
@@ -175,31 +175,12 @@ function fixture(
 			return true;
 		},
 	);
-	const updateSub = mock(
-		(
-			_id: string,
-			mid: string,
-			text: string,
-			opts: { fileReferences?: FileReferenceSnapshot[] },
-		) => {
-			const item = subqueue.find((entry) => entry.id === mid);
-			if (!item) return false;
-			item.text = text;
-			if (opts.fileReferences !== undefined) item.fileReferences = opts.fileReferences;
-			return true;
-		},
-	);
-	const pushSub = mock(
-		(_id: string, text: string, opts: { fileReferences?: FileReferenceSnapshot[] }) => {
-			subqueue.push({ id: "sub-queued", text, fileReferences: opts.fileReferences ?? [] });
-			return { ok: true, id: "sub-queued", bufferedAt: "now" };
-		},
-	);
+
 	const draftUpdate = mock(async (...args: unknown[]) => ({
 		previousHasDraft: false,
 		hasDraft: true,
 		text: args[2],
-		fileReferences: args[5] ?? [],
+		fileReferences: args[4] ?? [],
 		revision: 2,
 		updatedBy: args[0],
 		updatedAt: "now",
@@ -222,20 +203,37 @@ function fixture(
 	const bindings = {
 		narratorRoutes: routes,
 		fileReferenceRoutes: child,
+		requestRecordingRoutes: new Hono(),
 		requireNarratorAccess: acl,
+		AppError,
 		ValidationError,
 		NotFoundError,
+		catalogError,
+		// Spec sessions: the outline-only /goal refusals stay out of the way.
+		resolveTaskBackend: async () => "spec",
+		isOutlineSessionGoal: async () => false,
 		parseFileReferenceInput,
+		parseOptionalComposerDocument,
+		bindComposerDocumentReferences,
+		bindComposerMediaProjection,
+		restoreMultipartComposerText,
+		validateComposerAssets,
+		validateComposerProjection,
 		replaceFileReferenceSnapshots,
 		getFileReferenceSnapshots,
+		// Block reads off: bodies read from the column, as before block storage.
+		bodyColumns: (columns?: Record<string, boolean>) => (columns ? { columns } : {}),
+		fillBody: <T>(row: T) => row,
 		fileReferenceMessageForDisplay,
 		sendMessageSchema,
+		bufferQueueModeSchema,
 		updateBufferedMessageSchema,
 		editAndRegenerateJsonSchema,
 		editAssistantMessageSchema,
 		updateNarratorDraftSchema,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
+		MAX_MEDIA_ATTACHMENTS,
 		MAX_NARRATOR_ATTACHMENT_BYTES: 128 * 1024 * 1024,
 		validateTextFile: () => {},
 		validateUploadedImage: () => {},
@@ -254,9 +252,9 @@ function fixture(
 		isCompactInProgress: () => !!options.compact,
 		isSubagentVariant: (variant: string) => variant === "subagent",
 		isLoopRunning: () => !!options.busy,
+		isExecutionSuspended: () => false,
 		isNarratorRuntimeBusy: () => !!options.busy,
 		reconcileRunningStatus: async () => {},
-		awaitCompactCompletion: async () => {},
 		requestBufferedMessageSoftStop: () => {},
 		resolveCommand: async (message: string) => {
 			if (message.startsWith("/goal")) return { resolved: true, specGoal: true, objective: "work" };
@@ -273,21 +271,20 @@ function fixture(
 			skillName: "sample",
 			content: "skill instructions",
 		}),
-		sendMessage: send,
+		acceptUserMessage: async (id: string, text: string, input: AcceptedInput) => {
+			if (options.busy || input.queueOnly) {
+				const queued = await push(id, text, input);
+				return { buffered: true, ...queued };
+			}
+			return { buffered: false, userMsg: await send(id, text, input) };
+		},
 		editAndRegenerate: edit,
 		editAssistantMessage: edit,
 		restoreAssistantMessage: edit,
-		resumeSubagent: resume,
 		prepareHistoryRewrite: mock(async () => {}),
-		pushBufferedMessage: push,
 		updateBufferedMessage: update,
-		getBufferedMessages: () => queue,
-		subagentQueue: {
-			bufferSubagentUserMessage: pushSub,
-			getSubagentBufferedMessages: () => subqueue,
-			isTakenOver: () => true,
-			updateSubagentBufferedMessage: updateSub,
-		},
+		getBufferedMessagesAsync: async () => queue,
+		withNarratorWorkAdmission: async (_id: string, work: () => Promise<unknown>) => work(),
 		toBufferSummary: (items: QueueItem[]) =>
 			items.map((item) => ({
 				...item,
@@ -339,12 +336,11 @@ function fixture(
 		c.set("user", { sub: options.user ?? "actual-sender", role: "user", iat: 0, exp: 9999999999 });
 		await next();
 	});
-	app.onError((error) =>
-		Response.json(
-			{ error: error.message },
-			{ status: error instanceof AppError ? error.statusCode : 500 },
-		),
-	);
+	app.onError((error) => {
+		// Missing injected bindings are harness bugs, not expected HTTP failures.
+		if (!(error instanceof AppError)) throw error;
+		return Response.json({ error: error.message, code: error.code }, { status: error.statusCode });
+	});
 	app.route("/api/narrators", routes);
 	const request = (path: string, body: unknown, method = "POST", signal?: AbortSignal) =>
 		app.request(`/api/narrators/session/${path}`, {
@@ -361,17 +357,13 @@ function fixture(
 		storedMessages,
 		editResult,
 		queue,
-		subqueue,
 		captures,
 		deletedImages,
 		events,
 		send,
 		edit,
-		resume,
 		push,
-		pushSub,
 		update,
-		updateSub,
 		draftUpdate,
 		acl,
 		rewrite: bindings.prepareHistoryRewrite,
@@ -386,13 +378,54 @@ function multipart(message = "", refs: unknown = [reference]) {
 }
 
 describe("file reference HTTP sends", () => {
+	test.each([
+		[false, false],
+		[true, false],
+		[false, true],
+		[true, true],
+	])("composer projection precedes reference capture (multipart=%s, mismatch=%s)", async (form, mismatch) => {
+		const f = fixture();
+		const composerDocument: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "Inspect " },
+						{ type: "fileReference", id: "inline-ref", reference },
+					],
+				},
+			],
+		};
+		const projection = composerDocumentText(composerDocument);
+		const message = projection.text + (mismatch ? " altered" : "");
+		const body = { message, fileReferences: projection.fileReferences, composerDocument };
+		const multipartBody = new FormData();
+		multipartBody.set("message", message);
+		multipartBody.set("fileReferences", JSON.stringify(projection.fileReferences));
+		multipartBody.set("composerDocument", JSON.stringify(composerDocument));
+		const response = await f.request("messages", form ? multipartBody : body);
+		expect(response.status).toBe(mismatch ? 400 : 201);
+		if (mismatch) {
+			expect(f.captures).toHaveLength(0);
+			expect(f.send).not.toHaveBeenCalled();
+		} else {
+			expect(f.captures).toHaveLength(1);
+			expect(f.send.mock.calls[0][2]).toMatchObject({
+				composerDocument,
+				fileReferences: projection.fileReferences.map((ref) => snapshot(ref, "freshly read bytes")),
+			});
+		}
+	});
 	test("multipart references alone count as content without images or text files", async () => {
 		const f = fixture();
 		const form = new FormData();
 		form.set("fileReferences", JSON.stringify([reference]));
 		expect((await f.request("messages", form)).status).toBe(201);
-		expect(f.send.mock.calls[0][2]).toEqual([]);
-		expect(f.send.mock.calls[0][10]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.send.mock.calls[0][2].images).toEqual([]);
+		expect(f.send.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 	});
 	test.each([
 		false,
@@ -411,7 +444,9 @@ describe("file reference HTTP sends", () => {
 			refs: [reference],
 		});
 		expect(f.captures[0].signal).toBeInstanceOf(AbortSignal);
-		expect(f.send.mock.calls[0][10]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.send.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 		expect(f.deletedImages).toEqual([]);
 	});
 	test.each([
@@ -422,7 +457,9 @@ describe("file reference HTTP sends", () => {
 		expect((await f.request("messages", { message: "", fileReferences: [reference] })).status).toBe(
 			202,
 		);
-		expect(f.push.mock.calls[0][9]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.push.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 		f.state.sourceText = "changed after acceptance";
 		expect(f.queue[0].fileReferences[0].snapshotText).toBe("freshly read bytes");
 		expect(f.captures).toHaveLength(1);
@@ -433,8 +470,14 @@ describe("file reference HTTP sends", () => {
 		expect((await f.request("messages", { message: "", fileReferences: [reference] })).status).toBe(
 			busy ? 202 : 201,
 		);
-		const payload = busy ? f.pushSub.mock.calls[0][2] : f.resume.mock.calls[0][0];
+		// Same admission as any session: delivered now when idle, queued when busy.
+		const payload = busy ? f.push.mock.calls[0][2] : f.send.mock.calls[0][2];
 		expect(payload).toMatchObject({ fileReferences: [snapshot(reference, "freshly read bytes")] });
+		if (busy) {
+			f.state.sourceText = "changed after acceptance";
+			expect(f.queue[0].fileReferences[0].snapshotText).toBe("freshly read bytes");
+		}
+		expect(f.captures).toHaveLength(1);
 	});
 	test.each([
 		"/new other",
@@ -456,7 +499,9 @@ describe("file reference HTTP sends", () => {
 		expect((await f.request("messages", { message, fileReferences: [reference] })).status).toBe(
 			201,
 		);
-		expect(f.send.mock.calls[0][10]).toEqual([snapshot(reference, "freshly read bytes")]);
+		expect(f.send.mock.calls[0][2].fileReferences).toEqual([
+			snapshot(reference, "freshly read bytes"),
+		]);
 	});
 	test.each([
 		false,
@@ -524,11 +569,7 @@ describe("HTTP file reference display boundaries", () => {
 				const internalSnapshots = getFileReferenceSnapshots(f.storedMessages[0].contentJson);
 				expect(internalSnapshots).toHaveLength(4);
 				expect(internalSnapshots).toEqual(refs.map((ref) => snapshot(ref, f.state.sourceText)));
-				const accepted = subagent
-					? (f.resume.mock.calls[0][0] as { fileReferences: FileReferenceSnapshot[] })
-							.fileReferences
-					: f.send.mock.calls[0][10];
-				expect(accepted).toEqual(internalSnapshots);
+				expect(f.send.mock.calls[0][2].fileReferences).toEqual(internalSnapshots);
 			});
 		}
 	}
@@ -539,18 +580,17 @@ describe("HTTP file reference display boundaries", () => {
 	])("edit acknowledgement cannot expose internal user message snapshots (subagent=%s)", async (subagent) => {
 		const f = fixture({ subagent });
 		const response = await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
 			content: "edited text",
 			fileReferences: [reference],
 		});
 		expect(response.status).toBe(200);
 		const body = await response.json();
-		expect(body).toEqual(subagent ? { ok: true } : { ok: true, warnings: f.editResult.warnings });
+		expect(body).toEqual({ ok: true, warnings: f.editResult.warnings });
 		expect(JSON.stringify(body)).not.toContain("snapshotText");
 		expect(f.state.existing).toEqual([snapshot()]);
 		expect(f.editResult.contentJson).toEqual([snapshot()]);
-		if (subagent)
-			expect(getFileReferenceSnapshots(f.storedMessages[0].contentJson)).toEqual([snapshot()]);
-		else expect(f.edit.mock.calls[0][5]).toMatchObject({ fileReferences: [snapshot()] });
+		expect(f.edit.mock.calls[0][5]).toMatchObject({ fileReferences: [snapshot()] });
 	});
 
 	test.each([
@@ -566,6 +606,19 @@ describe("HTTP file reference display boundaries", () => {
 });
 
 describe("file reference edits", () => {
+	test("file restore without a reviewed plan refuses before capture or history interruption", async () => {
+		const f = fixture();
+		const response = await f.request("edit-and-regenerate/message", {
+			content: "changed",
+			fileReferences: [reference],
+		});
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect(f.captures).toHaveLength(0);
+		expect(f.rewrite).not.toHaveBeenCalled();
+		expect(f.edit).not.toHaveBeenCalled();
+	});
+
 	test.each([
 		false,
 		true,
@@ -573,22 +626,33 @@ describe("file reference edits", () => {
 		const f = fixture({ subagent });
 		f.state.captureError = new ValidationError("source was deleted");
 		expect(
-			(await f.request("edit-and-regenerate/message", { content: "", fileReferences: [reference] }))
-				.status,
+			(
+				await f.request("edit-and-regenerate/message", {
+					skipRevert: true,
+					content: "",
+					fileReferences: [reference],
+				})
+			).status,
 		).toBe(200);
 		expect(f.captures).toHaveLength(0);
-		if (subagent)
-			expect(f.resume.mock.calls[0][0]).toMatchObject({ editFileReferences: [snapshot()] });
-		else expect(f.edit.mock.calls[0][5]).toMatchObject({ fileReferences: [snapshot()] });
+		expect(f.edit.mock.calls[0][5]).toMatchObject({ fileReferences: [snapshot()] });
 	});
 	test("message omission preserves, [] deletes, and changed target is recaptured", async () => {
 		const f = fixture();
-		await f.request("edit-and-regenerate/message", { content: "text only" });
+		await f.request("edit-and-regenerate/message", { skipRevert: true, content: "text only" });
 		expect(f.edit.mock.calls[0][5]).toMatchObject({ fileReferences: undefined });
-		await f.request("edit-and-regenerate/message", { content: "text", fileReferences: [] });
+		await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
+			content: "text",
+			fileReferences: [],
+		});
 		expect(f.edit.mock.calls[1][5]).toMatchObject({ fileReferences: [] });
 		const changed = { ...reference, path: "/workspace/b.ts" };
-		await f.request("edit-and-regenerate/message", { content: "text", fileReferences: [changed] });
+		await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
+			content: "text",
+			fileReferences: [changed],
+		});
 		expect(f.captures[0].refs).toEqual([changed]);
 	});
 	test("unknown message refuses before capture or history interruption", async () => {
@@ -596,6 +660,7 @@ describe("file reference edits", () => {
 		expect(
 			(
 				await f.request("edit-and-regenerate/someone-elses-message", {
+					skipRevert: true,
 					content: "",
 					fileReferences: [reference],
 				})
@@ -607,7 +672,11 @@ describe("file reference edits", () => {
 	test("a foreign occurrence ID is captured, not borrowed from another message", async () => {
 		const f = fixture();
 		const other = { ...reference, id: "other-message-occurrence" };
-		await f.request("edit-and-regenerate/message", { content: "", fileReferences: [other] });
+		await f.request("edit-and-regenerate/message", {
+			skipRevert: true,
+			content: "",
+			fileReferences: [other],
+		});
 		expect(f.captures[0].refs).toEqual([other]);
 		expect(f.edit.mock.calls[0][5]).toMatchObject({
 			fileReferences: [snapshot(other, "freshly read bytes")],
@@ -617,6 +686,7 @@ describe("file reference edits", () => {
 		const f = fixture();
 		const form = new FormData();
 		form.set("content", "updated");
+		form.set("skipRevert", "true");
 		form.set("fileReferences", JSON.stringify([{ ...reference, id: "added" }]));
 		f.state.captureError = new ValidationError("Read denied");
 		expect((await f.request("edit-and-regenerate/message", form)).status).toBe(400);
@@ -626,8 +696,8 @@ describe("file reference edits", () => {
 		false,
 		true,
 	])("queue edit uses actual snapshots and permits reference-only text (subagent=%s)", async (subagent) => {
-		const f = fixture();
-		const queue = subagent ? f.subqueue : f.queue;
+		const f = fixture({ subagent });
+		const queue = f.queue;
 		queue.push({ id: "queued", text: "old", fileReferences: [snapshot()] });
 		f.state.captureError = new ValidationError("offline");
 		expect(
@@ -669,7 +739,7 @@ describe("file reference draft and ACL wiring", () => {
 		const f = fixture();
 		const result = await f.request(
 			"draft",
-			{ text: "", baseRevision: 1, sourceId: "tab", fileReferences: [reference] },
+			{ text: "", sourceId: "tab", fileReferences: [reference] },
 			"PUT",
 		);
 		expect(result.status).toBe(200);
@@ -678,8 +748,8 @@ describe("file reference draft and ACL wiring", () => {
 			"session",
 			"",
 			"tab",
-			1,
 			[reference],
+			undefined,
 		]);
 		expect(await result.json()).toMatchObject({ fileReferences: [reference] });
 		expect(f.events[0]).toMatchObject({ type: "draft_changed", fileReferences: [reference] });

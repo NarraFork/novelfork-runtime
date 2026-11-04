@@ -5,10 +5,10 @@
  *
  * ```jsonc
  * {
- *   "error": "Chapter not found: abc123",  // rendered English, always present
+ *   "error": "Project not found: abc123",  // rendered English, always present
  *   "code": "NOT_FOUND",                   // coarse, BEHAVIOUR-bearing code
  *   "messageCode": "RESOURCE_NOT_FOUND",   // fine-grained i18n key (optional)
- *   "messageParams": { "entity": "Chapter", "id": "abc123" }
+ *   "messageParams": { "entity": "Project", "id": "abc123" }
  * }
  * ```
  *
@@ -120,41 +120,28 @@ export const ERROR_CATALOG = {
 		en: "podman is not installed",
 	},
 
-	// --- git / merge -----------------------------------------------------------
+	// --- outline tasks (outline P2: sessions whose tasks live in the outline) -----------
+	/**
+	 * A Dynamic Spec task or note (a write, a reset, a plugin's task read) for a session whose tasks
+	 * live in the outline: neither the session nor its continuation look there any more.
+	 */
+	SPEC_IN_OUTLINE_SESSION: {
+		status: 409,
+		code: "SPEC_OUTLINE_SESSION",
+		en: "This session keeps its tasks in the outline, so its Dynamic Spec tasks and notes are not used. Only the behavior fence still applies.",
+	},
+	/** `/goal` in such a session: its outline form arrives with the task board. */
+	GOAL_IN_OUTLINE_SESSION: {
+		status: 409,
+		code: "SPEC_OUTLINE_SESSION",
+		en: "/goal is not available yet in sessions whose tasks live in the outline. Ask the agent to write the goal as a task instead.",
+	},
+
+	// --- git -------------------------------------------------------------------
 	GIT_AUTH_REQUIRED: {
 		status: 401,
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
-	},
-	GIT_TREE_MERGE_FAILED: {
-		status: 422,
-		code: "GIT_ERROR",
-		en: "Git tree merge failed: {detail}",
-	},
-	GIT_TREE_MERGE_FALLBACK_FAILED: {
-		status: 422,
-		code: "GIT_ERROR",
-		en: "Git {version} does not support {feature}. An automatic compatibility merge in a temporary directory was attempted but failed: {detail}. Check your Git installation and the temporary directory's permissions and available space, or install Git 2.40+ (for example, install it separately and add it to the server's PATH).",
-	},
-	GIT_TREE_MERGE_CONFLICTS_UNLISTED: {
-		status: 422,
-		code: "GIT_ERROR",
-		en: "Merge conflicts were detected, but their full scope or resolution cannot be verified automatically. Automatic application was refused. Resolve the conflicts manually.",
-	},
-	MERGE_DIRTY_SOURCE: {
-		status: 400,
-		code: "VALIDATION_ERROR",
-		en: "The source worktree has uncommitted changes. Commit or discard them before merging.",
-	},
-	MERGE_DIRTY_TARGET: {
-		status: 400,
-		code: "VALIDATION_ERROR",
-		en: "The target worktree has uncommitted changes. Commit or discard them before merging.",
-	},
-	MERGE_DIRTY_TRUNK: {
-		status: 400,
-		code: "VALIDATION_ERROR",
-		en: "The trunk worktree has uncommitted changes. Commit or discard them before merging.",
 	},
 
 	// --- auth / session --------------------------------------------------------
@@ -208,6 +195,86 @@ export const ERROR_CATALOG = {
 		code: "LOGIN_THROTTLED",
 		en: "Too many attempts. Please try again later.",
 	},
+
+	// --- storage data portability ----------------------------------------------
+	EXPORT_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The export request is invalid",
+	},
+	/** 401: the ticket is the credential, and this one can never succeed unchanged. */
+	EXPORT_TICKET_INVALID: {
+		status: 401,
+		code: "EXPORT_TICKET_INVALID",
+		en: "This download link has expired. Start the export again",
+	},
+	IMPORT_FILE_REQUIRED: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "Choose a .zip file exported from NarraFork",
+	},
+	IMPORT_FILE_TOO_LARGE: {
+		status: 413,
+		code: "IMPORT_FILE_TOO_LARGE",
+		en: "The import file exceeds the {limit} limit",
+	},
+	IMPORT_ZIP_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The uploaded file is not a valid ZIP archive",
+	},
+	IMPORT_ENTRY_MISSING: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import archive is missing {name}; it may not be a NarraFork export",
+	},
+	IMPORT_TABLE_MISSING: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import archive is missing core table {table}; it may not be a complete NarraFork export",
+	},
+	IMPORT_VERSION_TOO_NEW: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "Import version {version} is newer than the supported version {supported}",
+	},
+	IMPORT_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import request is invalid",
+	},
+	/** 410: the preview snapshot is gone, so the request can never succeed unchanged. */
+	IMPORT_PREVIEW_EXPIRED: {
+		status: 410,
+		code: "IMPORT_PREVIEW_EXPIRED",
+		en: "The import preview expired. Choose the file again",
+	},
+	IMPORT_SNAPSHOT_EXPIRED: {
+		status: 410,
+		code: "IMPORT_SNAPSHOT_EXPIRED",
+		en: "The import snapshot is no longer available. Choose the file again",
+	},
+	CLEAR_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The clear request is invalid",
+	},
+	CLEAR_USER_UNKNOWN: {
+		status: 401,
+		code: "UNAUTHORIZED",
+		en: "Cannot identify the current user",
+	},
+	CLEAR_PASSWORD_NOT_SET: {
+		status: 400,
+		code: "CLEAR_PASSWORD_NOT_SET",
+		en: "This account has no password, so data cannot be cleared",
+	},
+	/** 403 rather than 400: the request is well-formed, the caller is not authorized for it. */
+	CLEAR_PASSWORD_INVALID: {
+		status: 403,
+		code: "CLEAR_PASSWORD_INVALID",
+		en: "The password is incorrect. No data was cleared",
+	},
 } as const satisfies Record<string, ErrorCatalogEntry>;
 
 export type ErrorMessageCode = keyof typeof ERROR_CATALOG;
@@ -259,7 +326,7 @@ export function sanitizeErrorParams(params: ErrorMessageParams | undefined): Err
  * Interpolate `{name}` placeholders.
  *
  * A placeholder with no matching param is left verbatim on purpose. Emitting an empty string
- * would produce a confident but incomplete sentence ("Chapter not found: "), whereas a visible
+ * would produce a confident but incomplete sentence ("Project not found: "), whereas a visible
  * `{id}` is unmistakably a defect and gets reported.
  */
 export function interpolate(template: string, params: ErrorMessageParams): string {

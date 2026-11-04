@@ -1,7 +1,7 @@
 import { readdir } from "node:fs/promises";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, terminals } from "../db/schema";
+import { narrators, terminals } from "../db/schema";
 import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -9,7 +9,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
-import { DEV_NULL, getHome, IS_WINDOWS } from "../lib/platform";
+import { getHome, IS_WINDOWS } from "../lib/platform";
 import { BufferManager } from "../terminal/buffer-manager";
 import {
 	dtachService,
@@ -59,7 +59,7 @@ async function getProcessInfoBatch(pids: number[]): Promise<Map<number, Terminal
 					"-Command",
 					`Get-Process -Id ${pidList} -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)" }`,
 				],
-				{ stdout: "pipe", stderr: "ignore", stdin: "ignore" },
+				{ stdout: "pipe", stderr: "ignore", stdin: "ignore", windowsHide: true },
 			);
 			const output = await Promise.race([
 				proc.exited.then(async (code) => {
@@ -94,7 +94,7 @@ async function getProcessInfoBatch(pids: number[]): Promise<Map<number, Terminal
 		}
 		const proc = Bun.spawn(
 			["ps", "-o", "pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=", "-p", pids.join(",")],
-			{ stdout: "pipe", stderr: "ignore", stdin: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", stdin: "ignore", windowsHide: true },
 		);
 		const output = await Promise.race([
 			proc.exited.then(async (code) => {
@@ -135,6 +135,8 @@ interface ActiveTerminal {
 	terminalId: string;
 	buffer: BufferManager;
 	useDtach: boolean;
+	/** Serializes geometry changes so the emulator resizes before the PTY. */
+	resizeChain?: Promise<void>;
 }
 
 const activeTerminals = new Map<string, ActiveTerminal>();
@@ -144,36 +146,29 @@ const activeTerminals = new Map<string, ActiveTerminal>();
  *
  * @param narratorId - Pass `null` if the terminal has no narrator.
  *   Pass `undefined` (or omit) to have the function look up the value from DB.
- * @param chapterId  - Same convention as narratorId.
  */
 async function markTerminalExited(
 	terminalId: string,
 	exitCode: number | null,
 	narratorId?: string | null,
-	chapterId?: string | null,
 ) {
 	await db
 		.update(terminals)
 		.set({ status: "exited", exitCode: exitCode ?? 0 })
 		.where(eq(terminals.id, terminalId));
-	// Resolve narrator/chapter IDs if not provided
+	// Resolve the narrator ID if not provided
 	let nId = narratorId;
-	let cId = chapterId;
-	if (nId === undefined || cId === undefined) {
+	if (nId === undefined) {
 		const row = await db.query.terminals.findFirst({
 			where: eq(terminals.id, terminalId),
-			columns: { narratorId: true, chapterId: true },
+			columns: { narratorId: true },
 		});
-		if (row) {
-			if (nId === undefined) nId = row.narratorId;
-			if (cId === undefined) cId = row.chapterId;
-		}
+		if (row) nId = row.narratorId;
 	}
 	eventBus.emit({
 		type: "terminal:exited",
 		terminalId,
 		narratorId: nId ?? null,
-		chapterId: cId ?? null,
 	});
 }
 
@@ -186,6 +181,32 @@ function onData(id: string, buffer: BufferManager, data: string | Uint8Array) {
 }
 
 /**
+ * Build a buffer whose parser answers the queries it is asked.
+ *
+ * The headless xterm holds the cursor state and sees the same byte stream, so
+ * it answers DA / DSR-CPR (`CSI 6n`) / DECRPM / DECRQSS. It does not answer
+ * OSC color or focus queries; the browser terminal still does. Without the
+ * cursor report, atuin, codex and reedline block until their own timeout.
+ *
+ * `getRuntime` covers the window before the terminal is in `activeTerminals`.
+ * Remote `runtime.write` queues until the PTY is ready, so a startup CPR is
+ * kept instead of dropped. Other callers resolve the live runtime from the map.
+ */
+function createBufferManager(
+	terminalId: string,
+	cols?: number,
+	rows?: number,
+	getRuntime?: () => TerminalRuntime | undefined,
+): BufferManager {
+	return new BufferManager(terminalId, cols, rows, {
+		onReply: (data) => {
+			const runtime = getRuntime ? getRuntime() : activeTerminals.get(terminalId)?.runtime;
+			runtime?.write(data);
+		},
+	});
+}
+
+/**
  * Monitor a dtach attach process. When it exits:
  * - If the dtach socket is still alive, save buffer and remove from activeTerminals
  *   (lazy re-attach will happen when a client subscribes via ensureAttached).
@@ -195,7 +216,6 @@ function monitorAttachProcess(
 	terminalId: string,
 	runtime: TerminalRuntime,
 	narratorId?: string | null,
-	chapterId?: string | null,
 ) {
 	runtime.exited.then(async (code) => {
 		const active = activeTerminals.get(terminalId);
@@ -214,7 +234,7 @@ function monitorAttachProcess(
 		await active.buffer.dispose();
 		activeTerminals.delete(terminalId);
 		runtime.close();
-		await markTerminalExited(terminalId, code ?? 0, narratorId, chapterId);
+		await markTerminalExited(terminalId, code ?? 0, narratorId);
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: code ?? 0 });
 		logger.info("Terminal exited", { terminalId, code });
 	});
@@ -222,7 +242,6 @@ function monitorAttachProcess(
 
 export const terminalService = {
 	async create(opts: {
-		chapterId?: string;
 		narratorId?: string;
 		name?: string;
 		cols?: number;
@@ -235,29 +254,14 @@ export const terminalService = {
 		const cols = opts.cols ?? 80;
 		const rows = opts.rows ?? 24;
 		let cwd: string;
-		let projectId: string | null = null;
-		const chapterId: string | undefined = opts.chapterId;
+		const projectId: string | null = null;
 		const narratorId: string | undefined = opts.narratorId;
 		const requestedDeviceId = opts.deviceId?.trim();
 		const hasExplicitDevice = requestedDeviceId !== undefined && requestedDeviceId !== "";
 		let deviceId: string | undefined =
 			hasExplicitDevice && requestedDeviceId !== "local" ? requestedDeviceId : undefined;
 
-		if (chapterId && narratorId) {
-			throw new ValidationError("Only one of chapterId or narratorId may be provided");
-		}
-
-		if (chapterId) {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, chapterId),
-			});
-			if (!chapter) throw new NotFoundError("Chapter", chapterId);
-			if (!chapter.worktreePath) {
-				throw new ValidationError("Chapter has no worktree (dormant?)");
-			}
-			projectId = chapter.projectId;
-			cwd = chapter.worktreePath;
-		} else if (narratorId) {
+		if (narratorId) {
 			const narrator = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
 			});
@@ -265,26 +269,7 @@ export const terminalService = {
 			if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
 				deviceId = narrator.defaultDeviceId;
 			}
-			if (narrator.chapterId) {
-				const chapter = await db.query.chapters.findFirst({
-					where: eq(chapters.id, narrator.chapterId),
-				});
-				projectId = chapter?.projectId ?? null;
-				logger.info("Terminal CWD resolution (chapter-bound narrator)", {
-					narratorId,
-					chapterId: narrator.chapterId,
-					chapterFound: !!chapter,
-					worktreePath: chapter?.worktreePath,
-					narratorCwd: narrator.cwd,
-				});
-				if (chapter?.worktreePath) {
-					cwd = chapter.worktreePath;
-				} else {
-					cwd = narrator.cwd ?? getHome();
-				}
-			} else {
-				cwd = narrator.cwd ?? getHome();
-			}
+			cwd = narrator.cwd ?? getHome();
 			if (!cwd || cwd === getHome()) {
 				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
 			}
@@ -330,13 +315,15 @@ export const terminalService = {
 		// All remote authorization/capability checks above must finish before any terminal side effect.
 		const id = generateId();
 		const now = new Date().toISOString();
-		const buffer = new BufferManager(id);
+		// Assigned as soon as the PTY exists, before `await runtime.ready`, so
+		// replies during remote startup hit the runtime's pre-ready queue.
+		let runtime: TerminalRuntime | undefined;
+		const buffer = createBufferManager(id, cols, rows, () => runtime);
 		buffer.startPeriodicFlush();
 		// Remote terminals run on a device PTY; dtach (local detach) does not apply.
 		const useRemote = !!deviceId;
 		const useDtach = !useRemote && (await dtachService.isAvailable());
 
-		let runtime: TerminalRuntime;
 		let dtachSocket: string | null = null;
 
 		if (useRemote && deviceId && remoteShell) {
@@ -372,7 +359,9 @@ export const terminalService = {
 				// blanks for its own fetch, so the user's tools behave as they do
 				// outside NarraFork.
 				env: envWithAmbientProxy({
-					HISTFILE: DEV_NULL,
+					// Empty disables Bash history on every platform. "NUL" is an ordinary
+					// filename to Git Bash and creates a Windows-reserved file in the terminal CWD.
+					HISTFILE: "",
 					TERM: "xterm-256color",
 				}),
 				cols,
@@ -408,7 +397,7 @@ export const terminalService = {
 		activeTerminals.set(id, { runtime, terminalId: id, buffer, useDtach });
 
 		if (useDtach) {
-			monitorAttachProcess(id, runtime, narratorId ?? null, chapterId ?? null);
+			monitorAttachProcess(id, runtime, narratorId ?? null);
 		} else {
 			// Direct mode: process exit means the shell exited
 			runtime.exited.then(async (code) => {
@@ -417,7 +406,7 @@ export const terminalService = {
 				await active.buffer.dispose();
 				activeTerminals.delete(id);
 				runtime.close();
-				await markTerminalExited(id, code ?? 0, narratorId ?? null, chapterId ?? null);
+				await markTerminalExited(id, code ?? 0, narratorId ?? null);
 				sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
 				logger.info("Terminal exited", { terminalId: id, code });
 			});
@@ -427,7 +416,6 @@ export const terminalService = {
 			.insert(terminals)
 			.values({
 				id,
-				chapterId: chapterId ?? null,
 				narratorId: narratorId ?? null,
 				name: opts.name ?? "Terminal",
 				cwd,
@@ -438,12 +426,11 @@ export const terminalService = {
 			})
 			.returning();
 
-		logger.info("Terminal created", { id, chapterId, narratorId, useDtach });
+		logger.info("Terminal created", { id, narratorId, useDtach });
 		eventBus.emit({
 			type: "terminal:created",
 			terminalId: id,
 			narratorId: narratorId ?? null,
-			chapterId: chapterId ?? null,
 		});
 		return terminal;
 	},
@@ -460,18 +447,27 @@ export const terminalService = {
 	resize(terminalId: string, cols: number, rows: number) {
 		const active = activeTerminals.get(terminalId);
 		if (!active) return;
-		active.runtime.resize(cols, rows);
-		// Bun.Terminal.resize() does not send SIGWINCH to the child.
-		// dtach relies on SIGWINCH to forward the new size. Only on Unix.
-		if (active.useDtach && !IS_WINDOWS && active.runtime.pid) {
-			try {
-				process.kill(active.runtime.pid, "SIGWINCH");
-			} catch {
-				// process may have exited
-			}
-		}
-		// Buffer resize is async (waits for pending writes) — fire and forget
-		active.buffer.resize(cols, rows);
+		const previous = active.resizeChain ?? Promise.resolve();
+		// Parse bytes already on the wire at the old size, resize the emulator,
+		// then the PTY. A SIGWINCH CPR is therefore answered at the new geometry.
+		// Concurrent requests stay ordered so an older size cannot land last.
+		active.resizeChain = previous
+			.catch(() => {})
+			.then(async () => {
+				if (activeTerminals.get(terminalId) !== active) return;
+				await active.buffer.resize(cols, rows);
+				if (activeTerminals.get(terminalId) !== active) return;
+				active.runtime.resize(cols, rows);
+				// Bun.Terminal.resize() does not send SIGWINCH to the child.
+				// dtach relies on SIGWINCH to forward the new size. Only on Unix.
+				if (active.useDtach && !IS_WINDOWS && active.runtime.pid) {
+					try {
+						process.kill(active.runtime.pid, "SIGWINCH");
+					} catch {
+						// process may have exited
+					}
+				}
+			});
 	},
 
 	async kill(terminalId: string) {
@@ -491,11 +487,11 @@ export const terminalService = {
 				await dtachService.killSession(terminalId);
 			}
 			// Clean up buffer file
-			const buf = new BufferManager(terminalId);
+			const buf = createBufferManager(terminalId);
 			await buf.deleteFromDisk();
 		}
 
-		await markTerminalExited(terminalId, -1, terminal.narratorId, terminal.chapterId);
+		await markTerminalExited(terminalId, -1, terminal.narratorId);
 
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: -1 });
 		logger.info("Terminal killed", { terminalId });
@@ -517,12 +513,6 @@ export const terminalService = {
 		if (!terminal) throw new NotFoundError("Terminal", id);
 		assertLegacyRuntimeOwner(terminal);
 		return terminal;
-	},
-
-	async listByChapter(chapterId: string) {
-		return db.query.terminals.findMany({
-			where: and(eq(terminals.chapterId, chapterId), isNull(terminals.worktreeResourceId)),
-		});
 	},
 
 	async listByNarrator(narratorId: string) {
@@ -577,7 +567,7 @@ export const terminalService = {
 		if (existing) assertLegacyRuntimeOwner(existing);
 		await dtachService.killSession(terminalId);
 		// Clean up buffer file if any
-		const buf = new BufferManager(terminalId);
+		const buf = createBufferManager(terminalId);
 		await buf.deleteFromDisk();
 	},
 
@@ -625,7 +615,7 @@ export const terminalService = {
 		if (!(await dtachService.isAvailable())) return false;
 		if (!(await dtachService.isSocketAlive(terminalId))) return false;
 
-		const buffer = new BufferManager(terminalId);
+		const buffer = createBufferManager(terminalId);
 		await buffer.loadFromDisk();
 		buffer.startPeriodicFlush();
 
@@ -674,7 +664,6 @@ export const terminalService = {
 			// Create DB record for the orphan
 			await db.insert(terminals).values({
 				id,
-				chapterId: null,
 				narratorId: null,
 				name: `Recovered ${id.slice(0, 8)}`,
 				cwd: getHome(),
@@ -709,7 +698,7 @@ export const terminalService = {
 			return { data: contents, cols: active.buffer.cols, rows: active.buffer.rows };
 		}
 		// Try loading from disk (detached terminal)
-		const buf = new BufferManager(terminalId);
+		const buf = createBufferManager(terminalId);
 		if (await buf.loadFromDisk()) {
 			const contents = await buf.getContents();
 			await this.getById(terminalId);
@@ -734,7 +723,7 @@ export const terminalService = {
 			});
 			for (const terminal of running) {
 				if (terminal.worktreeResourceId != null) continue;
-				await markTerminalExited(terminal.id, null, terminal.narratorId, terminal.chapterId);
+				await markTerminalExited(terminal.id, null, terminal.narratorId);
 			}
 			if (running.length > 0) {
 				logger.info("Marked stale terminals as exited (no dtach)", { count: running.length });
@@ -754,7 +743,7 @@ export const terminalService = {
 			if (terminal.worktreeResourceId != null) continue;
 			if (terminal.dtachSocket && (await dtachService.isSocketAlive(terminal.id))) {
 				// Re-attach to the dtach session
-				const buffer = new BufferManager(terminal.id);
+				const buffer = createBufferManager(terminal.id);
 				await buffer.loadFromDisk();
 				buffer.startPeriodicFlush();
 
@@ -775,14 +764,14 @@ export const terminalService = {
 				// Clear stale read cursors so next read returns full buffer
 				resetCursorForTerminal(terminal.id);
 
-				monitorAttachProcess(terminal.id, runtime, terminal.narratorId, terminal.chapterId);
+				monitorAttachProcess(terminal.id, runtime, terminal.narratorId);
 
 				recovered++;
 				continue;
 			}
 
 			// Socket dead — mark as exited
-			await markTerminalExited(terminal.id, null, terminal.narratorId, terminal.chapterId);
+			await markTerminalExited(terminal.id, null, terminal.narratorId);
 			marked++;
 		}
 
@@ -817,7 +806,7 @@ export const terminalService = {
 						})
 						.where(eq(terminals.id, terminalId));
 
-					const buffer = new BufferManager(terminalId);
+					const buffer = createBufferManager(terminalId);
 					await buffer.loadFromDisk();
 					buffer.startPeriodicFlush();
 
@@ -838,7 +827,7 @@ export const terminalService = {
 					// Clear stale read cursors so next read returns full buffer
 					resetCursorForTerminal(terminalId);
 
-					monitorAttachProcess(terminalId, runtime, existing.narratorId, existing.chapterId);
+					monitorAttachProcess(terminalId, runtime, existing.narratorId);
 
 					revivedFromExited++;
 				}
@@ -856,16 +845,9 @@ export const terminalService = {
 		}
 	},
 
-	async cleanupForChapter(chapterId: string) {
-		await this._cleanupByField("chapterId", chapterId);
-	},
-
 	async cleanupForNarrator(narratorId: string) {
-		await this._cleanupByField("narratorId", narratorId);
-	},
-
-	async _cleanupByField(field: "chapterId" | "narratorId", value: string) {
-		const col = field === "chapterId" ? terminals.chapterId : terminals.narratorId;
+		const col = terminals.narratorId;
+		const value = narratorId;
 		const matched = await db.query.terminals.findMany({
 			where: and(eq(col, value), isNull(terminals.worktreeResourceId)),
 		});

@@ -1,10 +1,13 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 
-const { db, sqlite } = getTestDb();
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 // The worktree may contain schema work whose generated migration is intentionally
 // deferred. Add only the columns selected by narrator history queries so this
@@ -31,20 +34,18 @@ for (const statement of [
 // so without this the divergent provider mock (getProvider/resolveProviderAndModel)
 // leaks into later suites (e.g. provider-resolution, AnthropicProvider).
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
-const realDbModule = { ...(await import("../../db")) };
-
-mock.module("../../db", () => ({ db, sqlite }));
 
 const providerCalls: string[] = [];
 let disableContinuationNarratorId: string | null = null;
 const testProvider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: rowsAsHistory,
 	injectSystemPrompt: () => {},
 	async *chat(params) {
-		providerCalls.push(params.content);
+		const input = requestInput(params);
+		providerCalls.push(input);
 		params.onRequestStart?.();
-		if (disableContinuationNarratorId && params.content === "disable auto continuation") {
+		if (disableContinuationNarratorId && input.endsWith("\ndisable auto continuation")) {
 			await db
 				.update(narrators)
 				.set({ autoContinuationOverride: "off" })
@@ -52,9 +53,6 @@ const testProvider: ProviderAdapter = {
 		}
 		yield { text: "explicit goal turn ran" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -91,12 +89,11 @@ async function waitFor(
 	throw new Error("Timed out waiting for narrator loop");
 }
 
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
-	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
-	sqlite.close();
 });
 
 describe("Dynamic Spec continuation stall classification", () => {
@@ -212,7 +209,15 @@ describe("explicit Dynamic Spec goal continuation", () => {
 		providerCalls.length = 0;
 		disableContinuationNarratorId = narratorId;
 		try {
-			await sendMessage(narratorId, "disable auto continuation", undefined, "en");
+			await sendMessage(
+				narratorId,
+				"disable auto continuation",
+				undefined,
+				"en",
+				false,
+				null,
+				null,
+			);
 			await waitFor(async () => {
 				const narrator = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),

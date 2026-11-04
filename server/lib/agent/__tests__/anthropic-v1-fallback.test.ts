@@ -91,6 +91,60 @@ function makeProvider(host: string): TestProvider {
 }
 
 describe("AnthropicProvider /v1 fallback error surfacing", () => {
+	for (const basePath of ["/relay", "/v1/anthropic"]) {
+		for (const errorMessage of [
+			"ECONNRESET: upstream connection closed",
+			"socket connection was closed unexpectedly",
+		]) {
+			test(`preserves the configured ${basePath} endpoint after ${errorMessage}`, async () => {
+				const host = `reset-${basePath.includes("anthropic") ? "nested" : "relay"}-${errorMessage.startsWith("ECONNRESET") ? "code" : "socket"}`;
+				const base = `https://${host}.example.com${basePath}`;
+				const urls: string[] = [];
+				const transportError = Object.assign(new Error(errorMessage), {
+					code: errorMessage.startsWith("ECONNRESET") ? "ECONNRESET" : undefined,
+				});
+				let disconnected = false;
+				setOutboundFetchOverrideForTest(async (input) => {
+					const url = String(input);
+					urls.push(url);
+					if (url !== `${base}/messages`) {
+						return new Response("404 page not found", { status: 404 });
+					}
+					if (!disconnected) {
+						disconnected = true;
+						throw transportError;
+					}
+					return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), {
+						headers: { "content-type": "application/json" },
+					});
+				});
+				const config = {
+					id: host,
+					name: host,
+					prefix: host,
+					baseUrl: base,
+					apiKey: "sk-test",
+					officialApi: false,
+				};
+				const provider = new AnthropicProvider(config);
+				await expect(
+					provider.generateWithHistoryWithMeta("sys", "hi", "anthropic:claude-3"),
+				).rejects.toMatchObject({ cause: transportError, category: "connection_reset" });
+				expect(urls).toEqual([`${base}/messages`]);
+				// Retrying the same instance and creating another must not cache a changed URL.
+				for (const retryProvider of [provider, new AnthropicProvider(config)]) {
+					const result = await retryProvider.generateWithHistoryWithMeta(
+						"sys",
+						"hi",
+						"anthropic:claude-3",
+					);
+					expect(result.text).toBe("ok");
+				}
+				expect(urls).toEqual(Array(3).fill(`${base}/messages`));
+			});
+		}
+	}
+
 	test("surfaces the ORIGINAL 401 when the /v1 fallback only 404s", async () => {
 		const base = "https://a1.example.com/relay";
 		setOutboundFetchOverrideForTest(async (input: RequestInfo | URL) => {
@@ -179,11 +233,57 @@ describe("AnthropicProvider /v1 fallback error surfacing", () => {
 
 		expect(requestBodies[0]).toMatchObject({ stream: true, max_tokens: 4_096 });
 		expect(requestBodies[1]).toMatchObject({ stream: true, max_tokens: 64_000 });
-		expect(requestBodies[2]).toMatchObject({ stream: true, max_tokens: 64_000 });
+		// No catalog ceiling is declared for this unknown id; never invent a 64k cap.
+		expect(requestBodies[2]).toMatchObject({ stream: true, max_tokens: 128_000 });
 		expect(String(acceptHeader)).toBe("text/event-stream");
 		expect(deltas).toEqual(["hello", " world"]);
 		expect(result.text).toBe("hello world");
 		expect(result.usage).toMatchObject({ inputTokens: 3, outputTokens: 2 });
+	});
+
+	test("declared output limits clip large requests without raising small requests", async () => {
+		const { bindModelCatalogSettings, getModelCardSnapshot, mutateModelCard } = await import(
+			"../../model-catalog"
+		);
+		const { settings, saveSettings } = await import("../../settings");
+		const bodies: Array<Record<string, unknown>> = [];
+		const local = {
+			agent: {
+				modelCatalog: {
+					schemaVersion: 2,
+					migrationVersion: 2,
+					local: { revision: 0 },
+					autoApply: false,
+					pinnedVersion: null,
+				},
+			},
+		};
+		bindModelCatalogSettings(local as typeof settings, () => {});
+		try {
+			mutateModelCard({
+				baseRevision: getModelCardSnapshot().local.revision,
+				action: "upsert-model",
+				model: { id: "output-fixture", metadata: { max_output_tokens: 64_000 } },
+			});
+			setOutboundFetchOverrideForTest(async (_input, init) => {
+				bodies.push(JSON.parse(String(init?.body)));
+				return new Response(JSON.stringify({ content: [{ type: "text", text: "ok" }] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			});
+			for (const maxOutputTokens of [undefined, 128_000, 1_024]) {
+				await makeProvider("output-limit").generateWithMeta(
+					"hi",
+					"anthropic:output-fixture",
+					undefined,
+					{ maxOutputTokens },
+				);
+			}
+			expect(bodies.map((body) => body.max_tokens)).toEqual([4_096, 64_000, 1_024]);
+		} finally {
+			bindModelCatalogSettings(settings, () => saveSettings(settings));
+		}
 	});
 
 	test("surfaces the ORIGINAL error when the /v1 fallback drops the connection", async () => {

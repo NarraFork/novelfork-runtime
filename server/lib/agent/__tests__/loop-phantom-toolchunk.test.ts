@@ -8,21 +8,26 @@ let providerScenario:
 	| "phantom_forever" // every attempt: phantom chunk only (exhausts retries)
 	| "retryable_error_then_text" = "phantom_then_text";
 let providerAttempts = 0;
-// Captures the `content` passed to each chat() call so we can assert the
-// in-place same-turn retry behavior (resend identical request).
+// Captures the input each chat() call ends with — the trailing input row of the
+// projected history — so we can assert the in-place same-turn retry behavior
+// (resend identical request).
 const contentLog: string[] = [];
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({
+		history: rows.map((row) => ({ role: row.role, text: row.contentText ?? "" })),
+	}),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
-		contentLog.push(params.content);
+		const tail = params.history.at(-1) as { role?: string; text?: string } | undefined;
+		contentLog.push(params.content || (tail?.role === "user" ? (tail.text ?? "") : ""));
 		params.onRequestStart?.();
 
 		if (providerScenario === "phantom_then_text") {
 			if (providerAttempts === 1) {
+				// A streamed tool-use chunk that carries a toolUseId but no `name`. This is the
 				// real-world NUG edge case: isMeaningfulStreamEvent() flips
 				// sawMeaningfulResponse=true, yet the loop never builds an accumulator
 				// (name is required) and never pushes to toolUses — leaving zero
@@ -52,9 +57,6 @@ const testProvider: ProviderAdapter = {
 			yield { text: "retried answer" };
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -104,7 +106,7 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "do the thing", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -144,7 +146,7 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { maxTransientRetries: 1 }),
 			"retry once",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -164,7 +166,7 @@ describe("agentLoop phantom toolUseChunk (no name) empty turn", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "loop forever", { rows: [] })) {
 			events.push(event);
 		}
 

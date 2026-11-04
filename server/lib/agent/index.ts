@@ -3,10 +3,7 @@ import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
 import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
-import {
-	type FileReferenceProjectionOptions,
-	projectFileReferencesForModel,
-} from "./file-reference-projection";
+import { buildAdapterHistory } from "./history-build";
 import { isRetryableError } from "./loop";
 import {
 	type BuiltHistory,
@@ -15,11 +12,12 @@ import {
 	resolveProviderAndModel,
 } from "./provider";
 import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
-import { projectMessageSenderForModel } from "./sender-projection";
-import { stripCitationMarkersForModel } from "./strip-citation-markers";
-import { stripPlanBodyForModel } from "./strip-plan-body";
+import {
+	resolveAdapterToolLoadingStrategy,
+	type ToolLoadingState,
+	type ToolLoadingStrategy,
+} from "./tool-loading";
 import "./tools";
-import { uniquifyDbMessageToolUseIds } from "./tool-use-id-dedup";
 import { initTruncateCleanup } from "./truncate";
 
 // Start periodic cleanup of truncated output files
@@ -37,9 +35,12 @@ export type {
 export { getProvider, resolveProviderAndModel } from "./provider";
 export { toolRegistry } from "./tool-registry";
 export type {
+	AgentAfterToolsInput,
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
+	AgentInputPart,
+	AgentLoopHistory,
 	AgentToolUse,
 	DangerInfo,
 	DangerSeverity,
@@ -55,6 +56,31 @@ export type {
 } from "./types";
 export { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 
+/** The `prefix:id` a history build for `model` on `provider` resolves. */
+function prefixedHistoryModel(model: string, provider: string): string {
+	const requestedModel = model || settings.agent.defaultModel;
+	const parsed = parseModelId(requestedModel);
+	return parsed.provider ? requestedModel : `${provider}:${parsed.model || "default"}`;
+}
+
+/** Tool loading strategy a history build for `model` on `provider` will target. */
+export function resolveHistoryToolLoadingStrategy(
+	model: string,
+	provider: string,
+): ToolLoadingStrategy {
+	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
+	return resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
+}
+
+/** Cache age and tool strategy are not model identity and never open an epoch. */
+export function resolveEpochTarget(
+	model: string,
+	provider: string,
+): { fingerprint: string; cacheTtlMs: number | null } {
+	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
+	return { fingerprint: `${resolved.provider}:${resolved.model}`, cacheTtlMs: null };
+}
+
 /**
  * Convert DB narrator messages into provider history format.
  * Routes to the correct provider based on the provider name.
@@ -68,43 +94,22 @@ export async function buildHistory(
 	// callers resolve the provider before calling, so there is nothing to guess.
 	provider: string,
 	narratorId?: string,
-	options?: FileReferenceProjectionOptions,
+	options?: {
+		/** Only supplied when media is also sent in a separate current-input lane. */
+		currentMedia?: readonly import("@shared/media-attachments").MediaRef[];
+		/**
+		 * Loading state the request's `tools` array is built from, and the strategy
+		 * resolved for this model. Tool loads inside the history are rendered for it.
+		 */
+		toolLoading?: { state: ToolLoadingState; strategy: ToolLoadingStrategy };
+	},
 ): Promise<BuiltHistory> {
-	const requestedModel = model || settings.agent.defaultModel;
-	const parsed = parseModelId(requestedModel);
-	const prefixedModel = parsed.provider
-		? requestedModel
-		: `${provider}:${parsed.model || "default"}`;
-	const resolved = resolveProviderAndModel(prefixedModel);
-	// Replace file-based ExitPlanMode plan bodies with a short path reference so
-	// the model history does not carry the full plan text on every rebuild. The
-	// persisted DB rows keep the full plan for the UI; this only mutates the
-	// in-memory copy passed to the provider adapter.
-	const modelMessages = stripPlanBodyForModel(dbMessages);
-	// Historical rows may still embed provider-internal citation markers. Replaying
-	// them teaches the model the markers are part of its output format, so it keeps
-	// producing them; strip on the in-memory copy only.
-	// Expand accepted file bytes after prose cleanup: citation-like strings in
-	// a source file are data and must not be rewritten by the citation sanitizer.
-	const cleanedMessages = projectFileReferencesForModel(
-		stripCitationMarkersForModel(modelMessages),
-		options,
-	);
-	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
-	// which only breaks once several turns accumulate: the replayed history then
-	// carries duplicate ids and the API rejects the request with 400. Rename the
-	// later collisions in this in-memory copy — DB rows keep the original ids.
-	// Attribution is a model-only projection, after accepted file material. Roles and
-	// stored rows stay unchanged; every provider receives the same sender format.
-	const uniqueMessages = uniquifyDbMessageToolUseIds(
-		cleanedMessages.map(projectMessageSenderForModel),
-		{
-			narratorId,
-			provider: resolved.provider,
-			model: resolved.model,
-		},
-	);
-	return resolved.adapter.buildHistory(uniqueMessages, resolved.model, narratorId);
+	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
+	return buildAdapterHistory(resolved.adapter, dbMessages, resolved, {
+		narratorId,
+		...(options?.currentMedia ? { currentMedia: options.currentMedia } : {}),
+		...(options?.toolLoading ? { toolLoading: options.toolLoading } : {}),
+	});
 }
 
 /**
@@ -446,6 +451,15 @@ export async function summaryGenerate(
 	onReasoningDelta?: GenerateOptions["onReasoningDelta"],
 	onRetryProgress?: () => void,
 	onRetryScheduled?: (info: SummaryRetryInfo) => void,
+	/**
+	 * Extra {@link GenerateOptions} layered on top of the fixed summary options.
+	 * A trailing bag rather than another positional flag: this signature is
+	 * already deep, and callers that need one more capability should not have to
+	 * re-count parameters. Only additive options belong here — `signal` and the
+	 * delta callbacks keep their dedicated slots so retries and progress stay
+	 * connected to the caller's request.
+	 */
+	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat" | "onGenerationProgress">>,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	// Retries belong to the original invocation, even if the caller reuses its options.
@@ -456,6 +470,9 @@ export async function summaryGenerate(
 		...(onTextDelta ? { onTextDelta } : {}),
 		...(onReasoningDelta ? { onReasoningDelta } : {}),
 		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+		// Last, so an explicit per-call constraint is never shadowed by the
+		// fixed auxiliary defaults above.
+		...extraOptions,
 	};
 	return withSummaryRetry(
 		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking),

@@ -20,8 +20,11 @@
  *      call, copy file path, view file — gated by the row's tool metadata
  *      (vlist-tool-meta.ts) exactly like ToolCallCard / SubagentCard gate them.
  *
- * The inspector & file-preview modals are lazy AND only mounted while open, so
- * scrolling rows pay for neither.
+ * File preview is lazy and only mounted while open, so scrolling rows pay nothing
+ * for it. The tool-call inspector is owned by the list shell (see
+ * tool-call-inspector-host): a virtual row is evicted past the overscan window,
+ * and a dialog mounted here would unmount mid-copy. Without a host, the row
+ * keeps a local fallback.
  *
  * It is deliberately a self-contained child component: all swipe/menu state
  * lives inside this row, so interacting with one row never re-renders the
@@ -36,10 +39,12 @@
 
 import { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
 import type { ToolCallDetailRef } from "@frontend/lib/api/narrators";
+import { fileLinkTargetFromEvent } from "@frontend/lib/file-link-target";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Box } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import { type ReactNode, useCallback } from "react";
+import type { FileTarget } from "@shared/file-reference";
+import { type ReactNode, useCallback, useState } from "react";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
 import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
 import {
@@ -155,6 +160,11 @@ export function VListRowInteraction({
 		onSwipeRight: isSelected ? handleDeselectBlock : undefined,
 	});
 
+	// The file behind the context-menu gesture, when it landed on a file link in this row's body.
+	// Only a right-click can name a file, so it is captured per gesture rather than derived from
+	// the row: a row can render several links, and the menu must answer for the one that was hit.
+	const [fileLinkTarget, setFileLinkTarget] = useState<FileTarget | null>(null);
+
 	// Admit only this row; the original gesture hooks remain mounted even when cold.
 	const showSwipeMenu = interactive && (swipe.swipeOffset > 0 || swipe.swipeClosing);
 	const { ready, ensure } = useDeferredInteractionMount({
@@ -174,6 +184,9 @@ export function VListRowInteraction({
 			const x = Math.min(e.clientX, window.innerWidth - 200);
 			const flipY = e.clientY > window.innerHeight - 300;
 			ensure();
+			// Recorded before the menu opens: the items are built from this, and a stale target
+			// would offer "copy file" for a file the right-click never touched.
+			setFileLinkTarget(fileLinkTargetFromEvent(e.target));
 			swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
 			swipe.setCtxMenuOpened(true);
 		},
@@ -270,6 +283,7 @@ export function VListRowInteraction({
 					onViewOriginal={onViewOriginal}
 					onOpenFullscreen={onOpenFullscreen}
 					inspectContent={inspectContent}
+					fileLinkTarget={fileLinkTarget}
 					swipe={swipe}
 				/>
 			)}

@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { isTeamMember, teamRootOf } from "../../runtime-source";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 
 async function reportTeamSendTargetCount(ctx: ToolContext, count: number): Promise<void> {
@@ -109,7 +110,7 @@ export const teamStatusTool: ToolDefinition = {
 		"Query background agents and bash tasks in the current team/session, see which files " +
 		"subagents modified, and send messages within the team.\n\n" +
 		"Actions:\n" +
-		'- "list": List background agents and background bash tasks (kind=agent|bash)\n' +
+		'- "list": List background agents and background bash tasks (kind=agent|bash; bash includes background_kind=task|service)\n' +
 		'- "list_agents": List sibling subagents only\n' +
 		'- "list_bash": List background bash tasks only\n' +
 		'- "file_changes": Show files modified by each subagent (or a specific one via target_id)\n' +
@@ -182,8 +183,9 @@ export const teamStatusTool: ToolDefinition = {
 			limit?: number;
 		};
 
-		// The primary narrator is the team root; a subagent shares its parent's team scope.
-		const scopeId = ctx.parentNarratorId ?? ctx.narratorId;
+		// A narrator nobody controls is its own team root; a member shares its root's scope.
+		const { narratorService: sessions } = await import("@server/services/narrator-service");
+		const scopeId = teamRootOf(await sessions.getById(ctx.narratorId));
 
 		if (action === "list" || action === "list_agents" || action === "list_bash") {
 			const { narratorService } = await import("@server/services/narrator-service");
@@ -206,22 +208,19 @@ export const teamStatusTool: ToolDefinition = {
 				: null;
 
 			// Bash tasks are keyed by the narrator that STARTED them, so the team scope has
-			// to include the parent, this narrator and every sibling. The sibling ids come
-			// from the unbounded listing on purpose: a bounded one would drop tasks owned
-			// by siblings outside the display window, which is a wrong answer rather than
-			// a shortened one. Only ids are read, so no large columns are materialized.
+			// to include the parent, this narrator and every sibling. Siblings are the whole
+			// team on purpose: a bounded set would drop tasks owned by siblings outside the
+			// display window, which is a wrong answer rather than a shortened one. The
+			// service resolves them in SQL, so a large team never becomes one bound
+			// parameter per member.
 			const bashView = wantBash
-				? await (async () => {
-						const siblingIds = (await narratorService.listSubagentsByParent(scopeId)).map(
-							(s) => s.id,
-						);
-						return backgroundTaskService.listTeamBashTasks({
-							parentNarratorIds: [scopeId, ctx.narratorId, ...siblingIds],
-							limit: rowLimit,
-							recentTerminalLimit: LIST_RECENT_TERMINAL_LIMIT,
-							query: needle,
-						});
-					})()
+				? await backgroundTaskService.listTeamBashTasks({
+						parentNarratorIds: [scopeId, ctx.narratorId],
+						teamRootId: scopeId,
+						limit: rowLimit,
+						recentTerminalLimit: LIST_RECENT_TERMINAL_LIMIT,
+						query: needle,
+					})
 				: null;
 
 			const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
@@ -251,7 +250,7 @@ export const teamStatusTool: ToolDefinition = {
 					const alias = task.alias ? ` | alias=${task.alias}` : "";
 					const cancel = task.canCancelActiveWork ? " | canCancel=true" : "";
 					lines.push(
-						`- kind=bash | id=${task.id}${alias} | status=${status}${cancel} | title=${bashLabel(task.title, task.command)}`,
+						`- kind=bash | background_kind=${task.backgroundKind ?? "task"} | id=${task.id}${alias} | status=${status}${cancel} | title=${bashLabel(task.title, task.command)}`,
 					);
 				}
 				const note = omissionNote(
@@ -414,7 +413,7 @@ export const teamStatusTool: ToolDefinition = {
 				);
 				const delivered = targets.filter((target) => deliveryIds.has(target.id));
 				await reportTeamSendTargetCount(ctx, delivered.length);
-				const targetKind = ctx.parentNarratorId ? "sibling subagents" : "child subagents";
+				const targetKind = scopeId !== ctx.narratorId ? "sibling subagents" : "child subagents";
 				const warning = [
 					"Only working/waiting members receive broadcasts. Idle and archived members are excluded and never woken.",
 					...(ctx.signal.aborted ? ["Broadcast cancelled; no further recipients admitted."] : []),
@@ -434,7 +433,14 @@ export const teamStatusTool: ToolDefinition = {
 						kind: "send",
 						broadcast: true,
 						await: false,
-						warning,
+						// Codes, not prose: the message bubble renders these two sentences from
+						// its own translations. Only per-target failure lines are free text
+						// (`warningDetails`) — `output` above keeps the English for the model.
+						warningCodes: [
+							"broadcastWorkingOnly",
+							...(ctx.signal.aborted ? ["broadcastCancelled"] : []),
+						],
+						...(failures.length > 0 ? { warningDetails: failures } : {}),
 						targetNames,
 						recentIdle: idleSuggestions,
 						recentIdleTruncated,
@@ -464,10 +470,7 @@ export const teamStatusTool: ToolDefinition = {
 				// a real id before the lookup — `getById` alone would throw NotFound.
 				const resolvedTargetId = await resolveTeamMemberId(ctx.narratorId, target_id);
 				const target = await narratorService.getById(resolvedTargetId).catch(() => null);
-				if (
-					!target?.variant?.startsWith("subagent:") ||
-					target.parentNarratorId !== parentNarratorId
-				) {
+				if (!target || !isTeamMember(target, parentNarratorId)) {
 					return {
 						output: `${target_id} is not a direct subagent in this team.`,
 						isError: true,
@@ -501,7 +504,12 @@ export const teamStatusTool: ToolDefinition = {
 						broadcast: false,
 						await: false,
 						targetCount: 1,
-						...(warning ? { warning: warning.trim() } : {}),
+						// The bubble builds this sentence from its own translations; the status
+						// travels as a raw value so the words come from the shared `status_*`
+						// wording rather than from a second copy here.
+						...(warning
+							? { warningCodes: ["sendTargetNotWorking"], warningStatus: target.status }
+							: {}),
 						targets: [
 							{
 								id: target.id,

@@ -75,8 +75,8 @@ const loadedWindowRefreshes = new WeakMap<
 >();
 const loadedWindowRefreshGenerations = new WeakMap<QueryClient, number>();
 
-const CLEAR_UNDO_NOTIFICATION_ID = "recent-tabs-clear-undo";
-const CLEAR_UNDO_AUTO_CLOSE_MS = 6_000;
+const UNDO_NOTIFICATION_ID = "recent-tabs-undo";
+const UNDO_AUTO_CLOSE_MS = 6_000;
 
 export type RecentTabsInfiniteData = InfiniteData<RecentTabsPageResponse>;
 export type RecentTabApiMoveTarget = ApiRecentTabMoveTarget;
@@ -482,31 +482,49 @@ function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): Rece
 		}
 		return tabs.filter((tab) => tabKey(tab) !== operation.key);
 	}
+
+	const previous = tabs.find((tab) => tabKey(tab) === operation.key);
+	const hasAnchor = (key: string) =>
+		tabs.some(
+			(tab) =>
+				tabKey(tab) === key &&
+				tabKey(tab) !== operation.key &&
+				!(previous?.type === "workspace" && tab.workspaceId === previous.id),
+		);
+	// The server emits operations in final order and detects moves by predecessor.
+	// Prefer that already-positioned predecessor: the successor may not have moved
+	// yet, may be outside the loaded window, or may belong to the moved workspace.
+	let target: RecentTabMoveTarget | null = null;
+	if (operation.afterKey === null) target = { toIndex: 0 };
+	else if (hasAnchor(operation.afterKey)) target = { afterKey: operation.afterKey };
+	else if (operation.beforeKey && hasAnchor(operation.beforeKey)) {
+		target = { beforeKey: operation.beforeKey };
+	}
+	if (!target) {
+		// Neither neighbor is loaded: this row belongs outside the visible prefix.
+		// Never invent a top position for an off-page metadata update. A loaded row
+		// moving out of the window is removed so the caller can backfill the page.
+		if (!previous) return tabs;
+		return tabs.filter(
+			(tab) =>
+				tabKey(tab) !== operation.key &&
+				!(previous.type === "workspace" && tab.workspaceId === previous.id),
+		);
+	}
 	if (operation.type === "move") {
-		if (operation.beforeKey) {
-			return applyRecentTabMove(tabs, operation.key, { beforeKey: operation.beforeKey });
-		}
-		if (operation.afterKey) {
-			return applyRecentTabMove(tabs, operation.key, { afterKey: operation.afterKey });
-		}
-		return tabs;
+		return applyRecentTabMove(tabs, operation.key, target);
 	}
 
 	// Deltas only carry persisted columns, so an upsert for an already-rendered tab must
 	// keep its live runtime fields (status colour, terminal count, viewers, container badge).
 	// Otherwise every revisit blanks the row until the next runtime poll lands.
-	const nextTab = mergeRecentTabRuntime(
-		operation.tab,
-		tabs.find((tab) => tabKey(tab) === operation.key),
-	);
+	const nextTab = mergeRecentTabRuntime(operation.tab, previous);
 	const withoutCurrent = tabs.filter((tab) => tabKey(tab) !== operation.key);
-	let insertAt = getPinnedSectionEndIndex(withoutCurrent);
-	if (operation.beforeKey) {
-		const index = withoutCurrent.findIndex((tab) => tabKey(tab) === operation.beforeKey);
-		if (index >= 0) insertAt = index;
-	} else if (operation.afterKey) {
-		const index = withoutCurrent.findIndex((tab) => tabKey(tab) === operation.afterKey);
-		if (index >= 0) insertAt = index + 1;
+	let insertAt = 0;
+	if ("afterKey" in target) {
+		insertAt = withoutCurrent.findIndex((tab) => tabKey(tab) === target.afterKey) + 1;
+	} else if ("beforeKey" in target) {
+		insertAt = withoutCurrent.findIndex((tab) => tabKey(tab) === target.beforeKey);
 	}
 	withoutCurrent.splice(insertAt, 0, nextTab);
 	regroupTabs(withoutCurrent);
@@ -561,9 +579,9 @@ const NO_DELTA_FOLLOW_UP: RecentTabsDeltaApplyResult = { gaps: [], backfill: [] 
  * the mutation response and the WS delta each carry that revision, and every
  * status change during the turn produces another one.
  *
- * A removal is the exception: `replaceLoadedTabs` shrinks the window to the rows
- * that are left, so when the server still has more rows the window is one short
- * until it is refilled.
+ * A removal can shrink a window that still has more server rows, so it needs
+ * backfilling. A move into the window from an unloaded page also needs a fetch:
+ * move operations carry anchors but no tab payload to populate the missing row.
  */
 export function applyRecentTabsDelta(
 	qc: QueryClient,
@@ -599,7 +617,16 @@ export function applyRecentTabsDelta(
 		const previousTabs = flattenPages(data);
 		const nextTabs = reduceRecentTabsOperations(previousTabs, section, relevant);
 		qc.setQueryData(key, replaceLoadedTabs(data, nextTabs, delta.revision));
-		if (nextTabs.length < previousTabs.length && data.pages.at(-1)?.hasMore) {
+		const nextKeys = new Set(nextTabs.map(tabKey));
+		const missingMovedTab = relevant.some(
+			(operation) =>
+				operation.type === "move" &&
+				!nextKeys.has(operation.key) &&
+				(operation.afterKey === null ||
+					nextKeys.has(operation.afterKey) ||
+					(operation.beforeKey !== null && nextKeys.has(operation.beforeKey))),
+		);
+		if (missingMovedTab || (nextTabs.length < previousTabs.length && data.pages.at(-1)?.hasMore)) {
 			backfill.push(section);
 		}
 	}
@@ -729,6 +756,32 @@ function restoreSectionSnapshots(
 		qc.setQueryData(recentTabsSectionQueryKey(section), snapshot);
 	}
 	syncCompatibilityCache(qc);
+}
+
+/**
+ * Remove an entity's tab from the sectioned caches (the source of truth that
+ * `useRecentTabs` re-derives the flat array from) and cascade-delete it server side.
+ * Editing only the flat array is overwritten by that derivation, which left an archived
+ * session's tab visible until a WS delta happened to arrive.
+ */
+export async function removeRecentTabCascade(
+	qc: QueryClient,
+	type: RecentTab["type"],
+	id: string,
+): Promise<void> {
+	const section = recentTabsSectionQueryKey(type === "project" ? "projects" : "work");
+	await qc.cancelQueries({ queryKey: section });
+	const snapshots = snapshotSections(qc);
+	updateSectionData(qc, type === "project" ? "projects" : "work", (current) =>
+		applyOperation(current, { type: "remove", key: `${type}:${id}` }),
+	);
+	syncCompatibilityCache(qc);
+	try {
+		const result = await api.removeRecentTab(type, id, { cascade: true });
+		await applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result));
+	} catch {
+		restoreSectionSnapshots(qc, snapshots);
+	}
 }
 
 class RecentTabsStaleWindowError extends Error {}
@@ -984,6 +1037,78 @@ export function useRecentTabs() {
 		[qc],
 	);
 
+	const restoreMutation = useMutation({
+		mutationFn: (input: { snapshot?: RecentTab[]; token?: string }) => {
+			// Refuse an empty full-list replace: a missing snapshot must never wipe the
+			// user's recent tabs. Token restore is the only path that needs no snapshot.
+			if (!input.token && (!input.snapshot || input.snapshot.length === 0)) {
+				return Promise.reject(new Error("recent-tabs undo needs a token or a non-empty snapshot"));
+			}
+			return api.restoreRecentTabs({
+				...(input.token ? { token: input.token } : {}),
+				...(input.snapshot ? { tabs: input.snapshot.map(toPersistedRecentTab) } : {}),
+			});
+		},
+		onSuccess: applyAuthoritativeResult,
+		onError: () => {
+			void qc.invalidateQueries({ queryKey: RECENT_TABS_QUERY_KEY });
+			notifications.show({ color: "red", message: t("undoFailed") });
+		},
+	});
+
+	/**
+	 * Shared undo toast for destructive recent-tab mutations (clear, single-tab close).
+	 * Only one undo affordance is offered at a time — later mutations replace the toast,
+	 * matching the server's single pending undo token per user.
+	 */
+	const showUndoNotification = useCallback(
+		(message: string, undo: { undoToken?: string; snapshot?: RecentTab[] }) => {
+			const snapshot = undo.snapshot && undo.snapshot.length > 0 ? undo.snapshot : undefined;
+			// Nothing to restore with — showing an undo button would only fail.
+			if (!undo.undoToken && !snapshot) return;
+			notifications.show({
+				id: UNDO_NOTIFICATION_ID,
+				color: "gray",
+				autoClose: UNDO_AUTO_CLOSE_MS,
+				withCloseButton: true,
+				withBorder: true,
+				message: createElement(
+					"div",
+					{
+						style: {
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "space-between",
+							gap: 12,
+						},
+					},
+					createElement("span", null, message),
+					createElement(
+						Button as ComponentType<{
+							size?: string;
+							variant?: string;
+							onClick?: () => void;
+							children?: React.ReactNode;
+						}>,
+						{
+							size: "compact-xs",
+							variant: "light",
+							onClick: () => {
+								// Hide immediately so a second click cannot fire a duplicate restore.
+								// Failure feedback is a separate `undoFailed` toast.
+								notifications.hide(UNDO_NOTIFICATION_ID);
+								if (undo.undoToken) restoreMutation.mutate({ token: undo.undoToken });
+								else if (snapshot) restoreMutation.mutate({ snapshot });
+							},
+						},
+						t("undo"),
+					),
+				),
+			});
+		},
+		[restoreMutation, t],
+	);
+
 	const removeMutation = useMutation({
 		mutationFn: ({ type, id }: { type: RecentTab["type"]; id: string }) =>
 			api.removeRecentTab(type, id),
@@ -1000,7 +1125,18 @@ export function useRecentTabs() {
 		onError: (_error, _variables, context) => {
 			if (context) restoreSectionSnapshots(qc, context.snapshots);
 		},
-		onSuccess: applyAuthoritativeResult,
+		onSuccess: (result, variables) => {
+			applyAuthoritativeResult(result);
+			// Single-tab close via swipe / context menu / middle-click — same undo affordance
+			// as one-click clear. Workspace dissolve is excluded: it also tears down the
+			// workspace entity and its panels, which a tab-list restore cannot bring back.
+			// Token-only: a loaded-window snapshot would wipe unloaded pages if used as a
+			// full-list restore fallback.
+			if (variables.type === "workspace" || result.removedCount !== 1 || !result.undoToken) {
+				return;
+			}
+			showUndoNotification(t("tabClosed"), { undoToken: result.undoToken });
+		},
 	});
 
 	const moveMutation = useMutation({
@@ -1046,18 +1182,6 @@ export function useRecentTabs() {
 		onSuccess: applyAuthoritativeResult,
 	});
 
-	const restoreMutation = useMutation({
-		mutationFn: (input: { snapshot?: RecentTab[]; token?: string }) =>
-			api.restoreRecentTabs({
-				...(input.token ? { token: input.token } : {}),
-				...(input.snapshot ? { tabs: input.snapshot.map(toPersistedRecentTab) } : {}),
-			}),
-		onSuccess: applyAuthoritativeResult,
-		onError: () => {
-			void qc.invalidateQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-		},
-	});
-
 	const clearMutation = useMutation({
 		mutationFn: ({
 			scope,
@@ -1088,43 +1212,9 @@ export function useRecentTabs() {
 			applyAuthoritativeResult(result);
 			const removedCount = result.removedCount ?? context?.removedCount ?? 0;
 			if (!context || removedCount <= 0) return;
-			notifications.show({
-				id: CLEAR_UNDO_NOTIFICATION_ID,
-				color: "gray",
-				autoClose: CLEAR_UNDO_AUTO_CLOSE_MS,
-				withCloseButton: true,
-				withBorder: true,
-				message: createElement(
-					"div",
-					{
-						style: {
-							display: "flex",
-							alignItems: "center",
-							justifyContent: "space-between",
-							gap: 12,
-						},
-					},
-					createElement("span", null, t("tabsCleared", { count: removedCount })),
-					createElement(
-						Button as ComponentType<{
-							size?: string;
-							variant?: string;
-							onClick?: () => void;
-							children?: React.ReactNode;
-						}>,
-						{
-							size: "compact-xs",
-							variant: "light",
-							onClick: () => {
-								notifications.hide(CLEAR_UNDO_NOTIFICATION_ID);
-								restoreMutation.mutate(
-									result.undoToken ? { token: result.undoToken } : { snapshot: context.snapshot },
-								);
-							},
-						},
-						t("undo"),
-					),
-				),
+			showUndoNotification(t("tabsCleared", { count: removedCount }), {
+				...(result.undoToken ? { undoToken: result.undoToken } : {}),
+				snapshot: context.snapshot,
 			});
 		},
 	});

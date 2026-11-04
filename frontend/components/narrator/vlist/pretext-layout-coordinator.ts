@@ -8,6 +8,7 @@ import {
 } from "@shared/pretext-layout";
 import { resetPreparedMarkdownCache } from "@shared/pretext-layout/prepared-markdown-cache";
 import { getTypographyRevision } from "@shared/pretext-layout/typography";
+import { MessageSegmentationCache } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	ensureKatexLoaded,
@@ -34,13 +35,16 @@ import {
 } from "./pretext-document-layout";
 import {
 	firstScreenPageSizeForLod,
+	invalidatePretextDocumentTail,
 	loadPretextDocumentOlder,
 	loadPretextDocumentTail,
 	type PretextDocumentInput,
 	type PretextDocumentLoadOptions,
 	refreshPretextDocumentWindow,
 } from "./pretext-document-loader";
-import { measureElementCached } from "./registry";
+import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
+import { createScopedMeasureElement } from "./registry";
+import { StreamingBlockCache } from "./streaming-block-cache";
 import { projectPendingEmptyReasoning, projectStreamingDocument } from "./streaming-handoff";
 import { askInPassingBlock, syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
@@ -161,12 +165,24 @@ export function captureCoordinatorAnchor(
 }
 
 export class PretextLayoutCoordinator {
+	private readonly streamingBlockCache = new StreamingBlockCache();
+	private readonly segmentationCache = new MessageSegmentationCache();
+	private readonly measure = createScopedMeasureElement(this.streamingBlockCache);
 	private generation = 0;
+	private readonly sessionEpoch = pretextSessionEpoch();
 	private input: PretextDocumentInput | undefined;
 	private deletedMessageIds = new Set<string>();
 	/** Seq projection version, separate from the layout cache's messageVersion. */
 	private structureVersion: number | undefined;
-	private pendingAskRefresh: Promise<boolean> | undefined;
+	private pendingWindowRefresh:
+		| {
+				promise: Promise<boolean>;
+				controller: AbortController;
+				narratorId: string;
+				generation: number;
+				sessionEpoch: number;
+		  }
+		| undefined;
 	/** Includes declined canonical events, which do not advance layout generation. */
 	private askMutationEpoch = 0;
 	private current: PretextLayoutCoordinatorSnapshot = { status: "idle" };
@@ -250,6 +266,8 @@ export class PretextLayoutCoordinator {
 		viewportHeight = 0,
 		opts: { forceReload?: boolean; restoreOverrides?: ReadonlyMap<string, number> } = {},
 	): Promise<PretextLayoutCoordinatorSnapshot> {
+		if (this.sessionEpoch !== pretextSessionEpoch())
+			throw new DOMException("Coordinator session retired", "AbortError");
 		// Coalesce: reuse an in-flight tail fetch for the same narrator instead of
 		// issuing a duplicate request. Re-target it to the latest build options so
 		// it commits once at the final width/LOD. forceReload always restarts.
@@ -265,8 +283,11 @@ export class PretextLayoutCoordinator {
 			return pending.promise;
 		}
 
-		const generation = ++this.generation;
-		if (this.narratorId !== narratorId) this.mathScanCursor = createMathScanCursor();
+		const generation = this.advanceGeneration();
+		if (this.narratorId !== narratorId) {
+			this.mathScanCursor = createMathScanCursor();
+			this.releaseTransientCaches();
+		}
 		this.narratorId = narratorId;
 		this.loadOptions = loadOptions;
 		this.current = { ...this.current, status: "loading", error: undefined };
@@ -319,6 +340,11 @@ export class PretextLayoutCoordinator {
 				);
 			} catch (error) {
 				if (generation !== this.generation) return this.current;
+				const status = (error as { status?: number })?.status;
+				if (status === 401 || status === 403) {
+					this.denyCachedWindow(narratorId, error);
+					throw error;
+				}
 				this.current = {
 					...this.current,
 					status: "error",
@@ -458,7 +484,7 @@ export class PretextLayoutCoordinator {
 		viewportHeight = 0,
 	): PretextLayoutCoordinatorSnapshot {
 		if (!this.input) throw new Error("cannot rebuild layout before document input is loaded");
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		this.current = { ...this.current, status: "computing", error: undefined };
 		this.emit();
 		return this.commitLayout(this.input, buildOptions, anchor, viewportHeight, generation);
@@ -500,7 +526,7 @@ export class PretextLayoutCoordinator {
 			dirtyKeys: options?.dirtyKeys,
 			resolvePermissionForm: options?.resolvePermissionForm,
 			compactUsageLines: options?.compactUsageLines,
-			measure: measureElementCached,
+			measure: this.measure,
 		});
 		const targetWidth = Math.max(1, Math.round(width));
 		if (result.changedKeys.size === 0) {
@@ -644,7 +670,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		// A live patch resizes a card at the tail (a tool completes and grows its
 		// output body): tail growth, so a pinned reader may glide to the new bottom.
 		this.commitLayout(
@@ -689,7 +715,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		// A new message landing at the tail is tail growth: a pinned reader may
 		// glide to the new bottom instead of being snapped to it.
 		this.commitLayout(
@@ -729,7 +755,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
@@ -746,49 +772,134 @@ export class PretextLayoutCoordinator {
 	 * Captures the LIVE viewport only after fetching. Concurrent document changes
 	 * invalidate the result; callers can retry on the next canonical event.
 	 */
+	private advanceGeneration(preserveWindowRefresh = false): number {
+		if (!preserveWindowRefresh) {
+			this.pendingWindowRefresh?.controller.abort();
+			this.pendingWindowRefresh = undefined;
+		}
+		return ++this.generation;
+	}
+
+	private denyCachedWindow(narratorId: string, error: unknown): void {
+		// Never leave unauthorized cached text visible, nor reuse its tail handoff.
+		invalidateCachedPretextDocument(narratorId);
+		invalidatePretextDocumentTail(narratorId);
+		this.advanceGeneration();
+		this.pendingLoad = null;
+		this.input = undefined;
+		this.structureVersion = undefined;
+		this.streamingMessage = null;
+		this.releaseTransientCaches();
+		this.mathScanCursor = createMathScanCursor();
+		this.current = {
+			status: "error",
+			error: error instanceof Error ? error : new Error("Window access denied"),
+		};
+		this.emit();
+	}
+
 	refreshAskInPassing(getView: () => PrependView): Promise<boolean> {
-		if (this.pendingAskRefresh) return this.pendingAskRefresh;
+		return this.refreshCurrentWindow(getView);
+	}
+
+	/** Revalidate the loaded window by stable head ID; cached input is never freshness evidence. */
+	refreshCurrentWindow(getView: () => PrependView, windowTimeoutMs = 10_000): Promise<boolean> {
+		if (this.sessionEpoch !== pretextSessionEpoch())
+			return Promise.reject(new DOMException("Coordinator session retired", "AbortError"));
 		const input = this.input;
 		const narratorId = this.narratorId;
 		const generation = this.generation;
+		const sessionEpoch = pretextSessionEpoch();
 		const askMutationEpoch = this.askMutationEpoch;
 		if (!input || !narratorId || !this.lastBuildOptions) return Promise.resolve(false);
-		const run = async () => {
+		const previous = this.pendingWindowRefresh;
+		if (
+			previous &&
+			!previous.controller.signal.aborted &&
+			previous.narratorId === narratorId &&
+			previous.generation === generation &&
+			previous.sessionEpoch === sessionEpoch
+		)
+			return previous.promise;
+		previous?.controller.abort();
+		const controller = new AbortController();
+		const parentSignal = this.loadOptions.signal;
+		const parentAbort = () => controller.abort(parentSignal?.reason);
+		const unsubscribeSession = onPretextSessionChange(() => controller.abort());
+		if (parentSignal?.aborted) parentAbort();
+		else parentSignal?.addEventListener("abort", parentAbort, { once: true });
+		const entry: NonNullable<PretextLayoutCoordinator["pendingWindowRefresh"]> = {
+			controller,
+			narratorId,
+			generation,
+			sessionEpoch,
+			promise: undefined as unknown as Promise<boolean>,
+		};
+		this.pendingWindowRefresh = entry;
+		const current = () =>
+			this.pendingWindowRefresh === entry &&
+			!controller.signal.aborted &&
+			this.narratorId === narratorId &&
+			this.generation === generation &&
+			pretextSessionEpoch() === sessionEpoch;
+		const superseded = () => new DOMException("Window refresh superseded", "AbortError");
+		entry.promise = (async () => {
+			let committing = false;
 			try {
-				const next = await refreshPretextDocumentWindow(narratorId, input, this.loadOptions);
-				if (
-					!next ||
-					askMutationEpoch !== this.askMutationEpoch ||
-					generation !== this.generation ||
-					!this.current.index ||
-					!this.lastBuildOptions
-				)
-					return false;
+				const next = await refreshPretextDocumentWindow(narratorId, input, {
+					...this.loadOptions,
+					signal: controller.signal,
+					windowTimeoutMs,
+				});
+				if (!current()) throw superseded();
+				if (askMutationEpoch !== this.askMutationEpoch) return false;
+				if (!next || !this.current.index || !this.lastBuildOptions) return false;
 				await this.prepareKatex(next);
-				if (generation !== this.generation || askMutationEpoch !== this.askMutationEpoch)
-					return false;
+				if (!current()) throw superseded();
+				if (askMutationEpoch !== this.askMutationEpoch) return false;
 				const view = getView();
+				if (!current() || !this.current.index || !this.lastBuildOptions) throw superseded();
+				if (askMutationEpoch !== this.askMutationEpoch) return false;
 				const anchor = captureCoordinatorAnchor(this.current.index, view);
 				this.input = next;
 				this.structureVersion = next.messageVersion;
+				committing = true;
+				const commitGeneration = this.advanceGeneration(true);
 				this.commitLayout(
 					next,
 					this.lastBuildOptions,
 					anchor,
 					view.viewportHeight,
-					++this.generation,
+					commitGeneration,
 				);
+				if (
+					this.pendingWindowRefresh !== entry ||
+					controller.signal.aborted ||
+					this.narratorId !== narratorId ||
+					this.generation !== commitGeneration ||
+					this.askMutationEpoch !== askMutationEpoch ||
+					pretextSessionEpoch() !== sessionEpoch
+				)
+					throw superseded();
 				return true;
-			} catch {
-				// A 409 means the canonical page moved during this bounded read; leave
-				// the visible document intact rather than committing a mixed snapshot.
+			} catch (error) {
+				if (committing) throw error;
+				if (!current()) throw superseded();
+				const status = (error as { status?: number })?.status;
+				if (status === 401 || status === 403) {
+					this.denyCachedWindow(narratorId, error);
+					throw error;
+				}
+				if ((error as { name?: string })?.name === "AbortError") throw error;
+				// A bad boundary/409/temporary failure may recover through ONE canonical tail.
 				return false;
 			} finally {
-				this.pendingAskRefresh = undefined;
+				unsubscribeSession();
+				parentSignal?.removeEventListener("abort", parentAbort);
+				if (this.pendingWindowRefresh === entry) this.pendingWindowRefresh = undefined;
 			}
-		};
-		this.pendingAskRefresh = run();
-		return this.pendingAskRefresh;
+		})();
+		return entry.promise;
 	}
 
 	/**
@@ -838,7 +949,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
@@ -904,7 +1015,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
@@ -960,7 +1071,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
@@ -1022,7 +1133,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
@@ -1072,7 +1183,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		// The streaming row IS the tail growing: a pinned reader glides to the new
 		// bottom rather than watching every committed row jump up per delta.
 		this.commitLayout(
@@ -1082,12 +1193,21 @@ export class PretextLayoutCoordinator {
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
 			true,
+			"ready",
+			undefined,
+			true,
 		);
 		return true;
 	}
 
+	/** Drop only this surface's transient preparation, preserving its published window. */
+	releaseTransientCaches(): void {
+		this.streamingBlockCache.clear();
+		this.segmentationCache.clear();
+	}
+
 	cancel(): void {
-		this.generation++;
+		this.advanceGeneration();
 		// Abandon any in-flight tail load so a later same-narrator load() does not
 		// coalesce onto a superseded fetch.
 		this.pendingLoad = null;
@@ -1113,8 +1233,8 @@ export class PretextLayoutCoordinator {
 	 */
 	reset(): void {
 		this.publishDocumentSnapshot();
-		this.generation++;
-		this.pendingLoad = null;
+		this.releaseTransientCaches();
+		this.cancel();
 		this.input = undefined;
 		this.narratorId = undefined;
 		this.loadingOlder = false;
@@ -1139,7 +1259,7 @@ export class PretextLayoutCoordinator {
 	 * `shouldReplace` gate keeps the wider/newer one.
 	 */
 	publishDocumentSnapshot(): void {
-		if (!this.narratorId || !this.input) return;
+		if (!this.narratorId || !this.input || this.sessionEpoch !== pretextSessionEpoch()) return;
 		writeCachedPretextDocument({ narratorId: this.narratorId, input: this.input });
 	}
 
@@ -1161,12 +1281,19 @@ export class PretextLayoutCoordinator {
 		loadOptions: PretextDocumentLoadOptions = {},
 		viewportHeight = 0,
 	): boolean {
+		if (this.sessionEpoch !== pretextSessionEpoch()) return false;
+		// An unpositioned dock pane is not a corrupt document. Defer adoption
+		// without touching the snapshot; never turn width zero into a 1px layout.
+		if (!Number.isFinite(buildOptions.contentWidth) || buildOptions.contentWidth <= 0) return false;
 		const cached = peekCachedPretextDocument(narratorId);
 		if (!cached) return false;
-		this.generation++;
+		this.advanceGeneration();
 		const generation = this.generation;
 		this.pendingLoad = null;
-		if (this.narratorId !== narratorId) this.mathScanCursor = createMathScanCursor();
+		if (this.narratorId !== narratorId) {
+			this.mathScanCursor = createMathScanCursor();
+			this.releaseTransientCaches();
+		}
 		this.narratorId = narratorId;
 		this.loadOptions = loadOptions;
 		this.loadingOlder = false;
@@ -1219,7 +1346,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = ++this.generation;
+		const generation = this.advanceGeneration();
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
@@ -1257,17 +1384,33 @@ export class PretextLayoutCoordinator {
 	private lastTrimAt = 0;
 
 	/** Build the exact layout for the loaded input (shared by every commit path). */
-	private buildLayout(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
+	private buildLayout(
+		input: PretextDocumentInput,
+		buildOptions: PretextLayoutBuildOptions,
+		reuseMessageSegments = false,
+	) {
+		// Only a streaming-only update can promise the historical inputs were not
+		// edited in place. Other mutation/rebuild entries explicitly invalidate.
+		if (!reuseMessageSegments) this.segmentationCache.invalidate();
 		const startedAt = now();
-		const built = this.buildLayoutInner(input, buildOptions);
-		this.lastBuildMs = now() - startedAt;
-		return built;
+		this.streamingBlockCache.beginBuild();
+		try {
+			const built = this.buildLayoutInner(input, buildOptions);
+			this.lastBuildMs = now() - startedAt;
+			return built;
+		} finally {
+			// Prune retired/hidden streaming rows only after a full build. A resize
+			// preview measures a subset and must not sweep the other active rows.
+			this.streamingBlockCache.endBuild();
+		}
 	}
 
 	private buildLayoutInner(input: PretextDocumentInput, buildOptions: PretextLayoutBuildOptions) {
 		const messages = this.layoutMessages(input, buildOptions);
 		return buildPretextDocumentLayout(messages as unknown as NarratorMsg[], {
 			...buildOptions,
+			segmentationCache: this.segmentationCache,
+			measure: this.measure,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
 			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}:t${getTypographyRevision()}`,
@@ -1372,7 +1515,7 @@ export class PretextLayoutCoordinator {
 					view && this.current.index
 						? captureCoordinatorAnchor(this.current.index, view)
 						: undefined;
-				const nextGeneration = ++this.generation;
+				const nextGeneration = this.advanceGeneration();
 				this.commitLayout(
 					this.input,
 					this.lastBuildOptions,
@@ -1395,12 +1538,13 @@ export class PretextLayoutCoordinator {
 		smoothFollow?: boolean,
 		status: "ready" | "loading" = "ready",
 		restoreOverrides?: ReadonlyMap<string, number>,
+		reuseMessageSegments = false,
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
 			this.lastBuildOptions = buildOptions;
 			this.lastViewportHeight = viewportHeight;
-			const built = this.buildLayout(input, buildOptions);
+			const built = this.buildLayout(input, buildOptions, reuseMessageSegments);
 			if (generation !== this.generation) return this.current;
 			const previous = this.current.index;
 			let scrollTop: number | undefined;

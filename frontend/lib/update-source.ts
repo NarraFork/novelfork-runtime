@@ -1,0 +1,88 @@
+import { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
+import {
+	parseUpdateSourceIdentity,
+	sameUpdateSourceIdentity,
+	type UpdateSourceIdentity,
+} from "@shared/update-identity";
+
+import {
+	normalizeUpdateServerUrl as normalizeServerUrl,
+	type UpdateSource,
+	type UpdateSourceSettings,
+} from "@shared/update-settings";
+
+export { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
+export {
+	type UpdateSource,
+	type UpdateSourceSettings,
+	updateSettingsKey,
+} from "@shared/update-settings";
+
+export function settingsSourceIdentity(
+	update: UpdateSourceSettings | undefined,
+	platform: string,
+): UpdateSourceIdentity | null {
+	return parseUpdateSourceIdentity({
+		source: update?.source ?? "github",
+		repository: update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
+		serverUrl: normalizeServerUrl(update?.serverUrl),
+		product: update?.product ?? "narrafork",
+		channel: update?.channel ?? "stable",
+		platform,
+	});
+}
+
+export function sameUpdateSource(
+	previous: { source?: UpdateSource; repository?: string; sourceIdentity?: UpdateSourceIdentity },
+	next: { source?: UpdateSource; repository?: string; sourceIdentity?: UpdateSourceIdentity },
+): boolean {
+	// Partial evidence must never override a complete identity (including channel/product/platform).
+	if (previous.sourceIdentity || next.sourceIdentity) {
+		return sameUpdateSourceIdentity(previous.sourceIdentity, next.sourceIdentity);
+	}
+	// Older responses without a source came only from the update server.
+	const source = previous.source ?? "update-server";
+	return (
+		source === (next.source ?? "update-server") &&
+		!!previous.repository &&
+		previous.repository.trim().toLowerCase() === next.repository?.trim().toLowerCase()
+	);
+}
+
+export function updateCheckErrorKey(code?: string): string {
+	switch (code) {
+		case "GITHUB_RATE_LIMIT":
+		case "RATE_LIMITED":
+			return "updateCheckRateLimited";
+		case "GITHUB_NOT_FOUND":
+		case "REPOSITORY_NOT_FOUND":
+		case "REPOSITORY_UNAVAILABLE":
+			return "updateCheckRepositoryNotFound";
+		case "INVALID_REPOSITORY":
+		case "INVALID_GITHUB_REPOSITORY":
+			return "updateCheckInvalidRepository";
+		case "NO_COMPATIBLE_ASSET":
+		case "GITHUB_ASSET_NOT_FOUND":
+		case "PLATFORM_UNAVAILABLE":
+			return "updateCheckAssetMissing";
+		case "INVALID_CONFIGURATION":
+			return "updateCheckInvalidConfiguration";
+		case "CANONICAL_MIRROR_REQUIRED":
+			return "updateCheckMirrorRequired";
+		case "INVALID_METADATA":
+			return "updateCheckInvalidMetadata";
+		case "NETWORK_ERROR":
+		case "TIMEOUT":
+			return "updateCheckNetworkFailed";
+		case "NO_RELEASE":
+			return "updateCheckNoRelease";
+		case "SCAN_LIMIT_REACHED":
+			return "updateCheckScanLimit";
+		case "UPDATE_SOURCE_CHANGED":
+			return "updateSourceChanged";
+		case "UPDATE_ARTIFACT_CHANGED":
+			return "updateArtifactChanged";
+		default:
+			return "updateCheckFailed";
+	}
+}

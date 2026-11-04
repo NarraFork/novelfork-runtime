@@ -9,8 +9,10 @@ on:
       - main
     paths:
       - "server/services/file-change-*.ts"
+      - "server/services/editor-document-*.ts"
+      - "shared/editor-provider-contracts*"
+      - "server/services/file-write-*.ts"
       - "server/services/revert-*.ts"
-      - "server/services/workspace-write-*.ts"
       - "server/services/narrator-scoped-revert.ts"
       - "server/lib/agent/execution/local-backend.ts"
       - "server/lib/agent/execution/path-semantics.ts"
@@ -23,8 +25,10 @@ on:
   pull_request:
     paths:
       - "server/services/file-change-*.ts"
+      - "server/services/editor-document-*.ts"
+      - "shared/editor-provider-contracts*"
+      - "server/services/file-write-*.ts"
       - "server/services/revert-*.ts"
-      - "server/services/workspace-write-*.ts"
       - "server/services/narrator-scoped-revert.ts"
       - "server/lib/agent/execution/local-backend.ts"
       - "server/lib/agent/execution/path-semantics.ts"
@@ -37,6 +41,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  editor-host-save:
+    name: Editor Host save (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-26-intel, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+      - name: Run real Host editor save subset (no executor bootstrap)
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: >-
+          bun test --isolate
+          ./server/services/editor-document-host.test.ts
+          ./shared/editor-provider-contracts.test.ts
+
   file-revert:
     name: File revert pipeline (${{ matrix.os }})
     strategy:
@@ -53,21 +82,67 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.2
+          bun-version: 1.4.3
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Build frontend
+        run: bun run build
+
+      - name: Install VS Code extension type dependencies
+        run: bun install --cwd vscode-extension --frozen-lockfile
+
       - name: Check TypeScript
         run: bunx tsgo --noEmit
 
+      - name: Verify Windows scratch volumes
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($path in @($env:TEMP, $env:RUNNER_TEMP)) {
+            $volume = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($path))
+            if ($volume.DriveFormat -ne 'NTFS' -or $volume.DriveType -ne 'Fixed') {
+              throw "File revert scratch must remain on a fixed NTFS volume: $path"
+            }
+            [pscustomobject]@{ Path = $path; Volume = $volume.Name; FileSystem = $volume.DriveFormat; DriveType = $volume.DriveType.ToString() } | ConvertTo-Json -Compress
+          }
+
+      # Keep the default profile-temp canonicalization/alias coverage separate.
+      - name: Check profile temp path isolation
+        if: runner.os == 'Windows'
+        run: >-
+          bun test --isolate
+          ./tests/preload-isolation.test.ts
+          ./server/lib/agent/execution/__tests__/local-backend-read.test.ts
+
+      - name: Record file revert scratch location
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: >-
+          bun -e 'import { tmpdir } from "node:os"; import { realpath, statfs } from "node:fs/promises";
+          const path = await realpath(tmpdir()); const volume = await statfs(path);
+          console.log(JSON.stringify({ platform: process.platform, scratch: path, filesystemType: volume.type }));'
+
       - name: Run file revert tests
+        # Use runner-owned scratch; do not change IO, fsync, test selection or deadlines.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: >-
           bun test --isolate
           ./server/services/file-change-platform-capability.test.ts
           ./server/services/file-change-local-restore.test.ts
           ./server/services/file-change-runtime.test.ts
+          ./server/services/file-change-runtime-default.test.ts
+          ./server/services/file-write-queue.test.ts
           ./server/services/revert-transaction-service.test.ts
+          ./server/services/revert-transaction-interleaving.test.ts
+          ./server/services/revert-transaction-real-tools.test.ts
+          ./server/services/revert-history-commit.test.ts
           ./server/services/revert-planner-local-access.test.ts
           ./server/services/revert-mutation-journal.test.ts
           ./server/services/narrator-scoped-revert.test.ts

@@ -14,9 +14,8 @@
  *   - The chat toolbar *opens / closes / toggles* tool panels via the dockview
  *     api, without owning it.
  *
- * Everything is optional: outside a provider (workspace page, narraflow graph
- * embed) the publish hooks are no-ops and NarratorPanel keeps its legacy
- * prop-callback behaviour.
+ * Everything is optional: outside a provider (workspace page) the publish hooks
+ * are no-ops and NarratorPanel keeps its legacy prop-callback behaviour.
  */
 
 import type { FileReference, FileReferenceEditorSelection } from "@shared/file-reference";
@@ -30,10 +29,22 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useOutlineEnabledInCache } from "../../../hooks/useOutlineEnabled";
+import {
+	type OutlineOpener,
+	OutlineOpenerProvider,
+	type OutlineOpenOptions,
+} from "../../../lib/outline-opener";
+import {
+	nextOutlinePanelId,
+	normalizeOutlinePanelState,
+	type OutlinePanelState,
+} from "../../../lib/outline-panel";
 import {
 	type PluginUiHostSurface,
 	PluginUiSurfaceProvider,
 } from "../../plugins/PluginUiSurfaceContext";
+import type { ScrollToMessageFn } from "../message/message-list-handle";
 import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
 import { useRuntimeFileOpenInterceptor } from "../RuntimeFileOpenInterceptorContext";
@@ -45,7 +56,11 @@ import {
 	nextHighlightRequestId,
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
-import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
+import {
+	resolveFileBrowserPosition,
+	resolveToolPlacement,
+	WIDE_TOOL_PANEL_TYPES,
+} from "../panels/tool-placement";
 import {
 	dockPanelId,
 	fileDockPanelId,
@@ -54,8 +69,11 @@ import {
 	NARRATOR_DOCK_COMPONENT,
 	type NarratorDockPanelParams,
 	type NarratorToolPanelType,
+	OUTLINE_DOCK_PANEL_PREFIX,
+	resolveFilePanel,
 	subagentDockPanelId,
 } from "./dock-panel-types";
+import { findOutlinePanel, navigateOutlinePanel } from "./outline-dock";
 
 export interface NarratorBrowserInfo {
 	sessionCount: number;
@@ -69,7 +87,7 @@ interface NarratorDockBridges {
 	/** Registered by the terminal panel; called by chat to write to terminal stdin. */
 	writeTerminalStdin: ((text: string) => void) | null;
 	/** Registered by the chat panel; called by the search panel to jump to a message. */
-	scrollToMessage: ((messageId: string) => void) | null;
+	scrollToMessage: ScrollToMessageFn | null;
 	/**
 	 * Registered by the chat panel; called by the user-chat panel to SUBMIT text as
 	 * a real user message.
@@ -85,33 +103,20 @@ interface NarratorDockBridges {
 
 export interface NarratorDockContextValue {
 	narratorId: string;
-	chapterId: string | null | undefined;
 
 	/**
 	 * The surrounding host already displays this narrator's title, so the chat panel
 	 * must not render its own title row (nor its edit / generate actions).
 	 *
-	 * Set by a chapter node's embedded dock: the node header shows the title and owns
-	 * those two actions, and the panel's copy was being squeezed to zero width by its
-	 * own tool buttons.
+	 * Optional so the hand-built context values (workspace shards) keep their current
+	 * behaviour by simply not setting it — none of them has an outer header to show
+	 * the title.
 	 *
-	 * Optional so the hand-built context values (detached canvas panels, workspace
-	 * shards) keep their current behaviour by simply not setting it — none of them has
-	 * an outer header to show the title.
-	 *
-	 * Deliberately NOT derived from `pluginSurface === "graph"`: that flag identifies
-	 * the host for PLUGINS, and using it to decide chat chrome would silently drop the
-	 * title the moment a surface name is reused or renamed.
+	 * Deliberately NOT derived from `pluginSurface`: that flag identifies the host for
+	 * PLUGINS, and using it to decide chat chrome would silently drop the title the
+	 * moment a surface name is reused or renamed.
 	 */
 	hostOwnsTitle?: boolean;
-
-	/**
-	 * Chapter fork-from-message handler supplied by the page (route owns the
-	 * mutation + notifications). Consumed by the chat panel; null when the
-	 * narrator has no chapter. Panel params can't carry functions, so this is
-	 * threaded through context rather than params.
-	 */
-	onForkFromMessage: ((messageId: string) => void) | null;
 
 	/**
 	 * Message id to scroll to + highlight on open (from search-result / deep-link
@@ -147,7 +152,7 @@ export interface NarratorDockContextValue {
 	writeTerminalStdin: (text: string) => void;
 
 	/** Register the message-jump handler (returns an unregister fn). */
-	registerScrollToMessage: (fn: (messageId: string) => void) => () => void;
+	registerScrollToMessage: (fn: ScrollToMessageFn) => () => void;
 	/**
 	 * Scroll to + highlight a message in the chat panel.
 	 *
@@ -157,7 +162,7 @@ export interface NarratorDockContextValue {
 	 * Consumers must treat absence as "disable the control" rather than calling it
 	 * through a `?.` that silently does nothing.
 	 */
-	scrollToMessage?: (messageId: string) => void;
+	scrollToMessage?: ScrollToMessageFn;
 
 	/** Register the user-message submitter (returns an unregister fn). */
 	registerSubmitToNarrator: (fn: (text: string) => void) => () => void;
@@ -232,8 +237,6 @@ export const NarratorDockContext = createContext<NarratorDockContextValue | null
 /** Provider that owns the shared state for one narrator dockview surface. */
 export function NarratorDockProvider({
 	narratorId,
-	chapterId,
-	onForkFromMessage = null,
 	highlightMessageId,
 	onBack = null,
 	onMinimize = null,
@@ -242,8 +245,6 @@ export function NarratorDockProvider({
 	children,
 }: {
 	narratorId: string;
-	chapterId?: string | null;
-	onForkFromMessage?: ((messageId: string) => void) | null;
 	highlightMessageId?: string;
 	onBack?: (() => void) | null;
 	onMinimize?: (() => void) | null;
@@ -251,9 +252,7 @@ export function NarratorDockProvider({
 	hostOwnsTitle?: boolean;
 	/**
 	 * Which host surface plugins should see. Defaults to `"focus"` (the narrator
-	 * page). A chapter node's embedded dock passes `"graph"`: the coordination
-	 * model is identical — one surface, one narrator — but plugins get to tell the
-	 * two apart, since a node's viewport is far smaller than a full page.
+	 * page).
 	 */
 	pluginSurface?: PluginUiHostSurface;
 	children: React.ReactNode;
@@ -281,11 +280,6 @@ export function NarratorDockProvider({
 		submitToNarrator: null,
 		addFileReference: null,
 	});
-
-	// Keep chapterId in a ref so openToolPanel always uses the latest without
-	// churning callback identity.
-	const chapterIdRef = useRef<string | null | undefined>(chapterId);
-	chapterIdRef.current = chapterId;
 
 	const refreshOpenToolTypes = useCallback(() => {
 		const api = apiRef.current;
@@ -322,20 +316,34 @@ export function NarratorDockProvider({
 			// open tool panel (panelType !== "chat").
 			const existingTool = api.panels.find((p) => {
 				const params = p.params as NarratorDockPanelParams | undefined;
-				return params && params.panelType !== "chat";
+				return (
+					params && params.panelType !== "chat" && !WIDE_TOOL_PANEL_TYPES.has(params.panelType)
+				);
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 
 			const params: NarratorDockPanelParams = {
 				panelType: type,
 				narratorId,
-				chapterId: chapterIdRef.current,
 			};
 			const placement = resolveToolPlacement({
 				hasSecondaryGroup: !!existingTool?.group,
 				hasChatPanel: !!chatPanel,
 				surfaceWidth: api.width,
+				surfaceHeight: api.height,
+				wide: WIDE_TOOL_PANEL_TYPES.has(type),
 			});
+
+			if (placement.mode === "split-above" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT[type],
+					params,
+					initialHeight: placement.initialHeight,
+					position: { referencePanel: chatPanel.id, direction: "above" },
+				});
+				return;
+			}
 
 			if (placement.mode === "within-secondary" && existingTool?.group) {
 				// Subsequent tool panels: add as a tab within the existing secondary
@@ -408,7 +416,7 @@ export function NarratorDockProvider({
 
 			const existingSecondary = api.panels.find((panel) => {
 				const params = panel.params as NarratorDockPanelParams | undefined;
-				return params?.panelType !== "chat";
+				return params?.panelType !== "chat" && !WIDE_TOOL_PANEL_TYPES.has(params?.panelType ?? "");
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 			const params: NarratorDockPanelParams = {
@@ -484,14 +492,22 @@ export function NarratorDockProvider({
 				selection: options.selection,
 				highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
 			};
-			const id = fileDockPanelId(filePath, deviceId, options.toolEdit, fileNarratorId);
-			const existing = api.getPanel(id);
+			const identity: FilePanelParams & { hostNarratorId: string } = {
+				panelType: "file",
+				hostNarratorId: narratorId,
+				filePath,
+				...navigation,
+			};
+			const { id, existing } = resolveFilePanel(
+				api.panels,
+				identity,
+				fileDockPanelId(filePath, deviceId, options.toolEdit, fileNarratorId),
+				"focus",
+			);
 			if (existing) {
 				// Layouts written before file editing carried no host identity. Repair the
 				// live panel when it is reopened so the edit action appears immediately and
-				// the corrected params are available to later drags / persistence. Guard the
-				// cast: corrupt persisted params are replaced wholesale — falling through to
-				// addPanel would throw on the duplicate id.
+				// the corrected params are available to later drags / persistence.
 				const current = existing.params as FilePanelParams | undefined;
 				existing.api.updateParameters({
 					...current,
@@ -508,7 +524,10 @@ export function NarratorDockProvider({
 
 			const existingSecondary = api.panels.find((panel) => {
 				const panelParams = panel.params as NarratorDockPanelParams | undefined;
-				return panelParams?.panelType !== "chat";
+				return (
+					panelParams?.panelType !== "chat" &&
+					!WIDE_TOOL_PANEL_TYPES.has(panelParams?.panelType ?? "")
+				);
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 			const params: NarratorDockPanelParams = {
@@ -580,7 +599,10 @@ export function NarratorDockProvider({
 
 			const existingSecondary = api.panels.find((panel) => {
 				const panelParams = panel.params as NarratorDockPanelParams | undefined;
-				return panelParams?.panelType !== "chat";
+				return (
+					panelParams?.panelType !== "chat" &&
+					!WIDE_TOOL_PANEL_TYPES.has(panelParams?.panelType ?? "")
+				);
 			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
 			const params: KnowledgePanelParams = { panelType: "knowledge", entryId, scope };
@@ -620,6 +642,68 @@ export function NarratorDockProvider({
 		[],
 	);
 
+	// Outline panels: one per (space, page) unless a new one is asked for (Ctrl/Cmd-click);
+	// an existing one is navigated there. Same placement as the other secondary panels. False
+	// while no dock is mounted (the phone layout), so the session falls back to its drawer.
+	const openOutlinePanel = useCallback(
+		(request: OutlinePanelState, options: OutlineOpenOptions = {}): boolean => {
+			const api = apiRef.current;
+			if (!api) return false;
+			const existing = options.newPanel ? undefined : findOutlinePanel(api.panels, request);
+			if (existing) {
+				navigateOutlinePanel(existing, request);
+				existing.api.setActive();
+				return true;
+			}
+			const id = nextOutlinePanelId(OUTLINE_DOCK_PANEL_PREFIX);
+			// The place only: a known title names the tab, it is not stored with the panel.
+			const params: NarratorDockPanelParams = {
+				panelType: "outline",
+				...normalizeOutlinePanelState(request),
+			};
+			const existingSecondary = api.panels.find((panel) => {
+				const panelParams = panel.params as NarratorDockPanelParams | undefined;
+				return (
+					panelParams?.panelType !== "chat" &&
+					!WIDE_TOOL_PANEL_TYPES.has(panelParams?.panelType ?? "")
+				);
+			});
+			const chatPanel = api.getPanel(dockPanelId("chat"));
+			const placement = resolveToolPlacement({
+				hasSecondaryGroup: !!existingSecondary?.group,
+				hasChatPanel: !!chatPanel,
+				surfaceWidth: api.width,
+			});
+			const base = {
+				id,
+				component: NARRATOR_DOCK_COMPONENT.outline,
+				params,
+				...(request.title ? { title: request.title } : {}),
+			};
+			if (placement.mode === "within-secondary" && existingSecondary?.group) {
+				api.addPanel<NarratorDockPanelParams>({
+					...base,
+					position: { referenceGroup: existingSecondary.group },
+				});
+			} else if (placement.mode === "split-right" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					...base,
+					initialWidth: placement.initialWidth,
+					position: { referencePanel: chatPanel.id, direction: "right" },
+				});
+			} else {
+				api.addPanel<NarratorDockPanelParams>(base);
+			}
+			return true;
+		},
+		[],
+	);
+	const outlineEnabled = useOutlineEnabledInCache();
+	const outlineOpener = useMemo<OutlineOpener | null>(
+		() => (outlineEnabled ? { open: openOutlinePanel } : null),
+		[outlineEnabled, openOutlinePanel],
+	);
+
 	const closeToolPanel = useCallback((type: NarratorToolPanelType) => {
 		apiRef.current?.getPanel(dockPanelId(type))?.api.close();
 	}, []);
@@ -652,11 +736,10 @@ export function NarratorDockProvider({
 		[],
 	);
 
-	// These callback props (onForkFromMessage, onBack, onMinimize) MUST keep stable
-	// references across parent renders. The sole call site in
-	// routes/narrators/$narratorId.tsx wraps each with useCallback, ensuring the
-	// context value below only rebuilds when truly necessary (narratorId/chapterId
-	// change, or local state changes). If a new call site is added without
+	// These callback props (onBack, onMinimize) MUST keep stable references across
+	// parent renders. The sole call site in routes/narrators/$narratorId.tsx wraps
+	// each with useCallback, ensuring the context value below only rebuilds when
+	// truly necessary (narratorId change, or local state changes). If a new call site is added without
 	// useCallback, the entire context will re-create on every parent render.
 	// Publishing details/file/browser state must not replace the chat/terminal
 	// bridges. Their consumers register in effects; changing these identities
@@ -696,7 +779,8 @@ export function NarratorDockProvider({
 					if (bridgesRef.current.scrollToMessage === fn) bridgesRef.current.scrollToMessage = null;
 				};
 			},
-			scrollToMessage: (messageId) => bridgesRef.current.scrollToMessage?.(messageId),
+			scrollToMessage: (messageId, options) =>
+				bridgesRef.current.scrollToMessage?.(messageId, options),
 			registerSubmitToNarrator: (fn) => {
 				bridgesRef.current.submitToNarrator = fn;
 				return () => {
@@ -711,9 +795,7 @@ export function NarratorDockProvider({
 	const value = useMemo<NarratorDockContextValue>(() => {
 		return {
 			narratorId,
-			chapterId,
 			hostOwnsTitle,
-			onForkFromMessage,
 			highlightMessageId,
 			onBack,
 			onMinimize,
@@ -739,9 +821,7 @@ export function NarratorDockProvider({
 	}, [
 		bridgeCallbacks,
 		narratorId,
-		chapterId,
 		hostOwnsTitle,
-		onForkFromMessage,
 		highlightMessageId,
 		onBack,
 		onMinimize,
@@ -761,12 +841,14 @@ export function NarratorDockProvider({
 	]);
 
 	const pluginHostContext = useMemo(
-		() => ({ surface: pluginSurface, narratorId, chapterId }),
-		[pluginSurface, narratorId, chapterId],
+		() => ({ surface: pluginSurface, narratorId }),
+		[pluginSurface, narratorId],
 	);
 	return (
 		<PluginUiSurfaceProvider hostContext={pluginHostContext}>
-			<NarratorDockContext.Provider value={value}>{children}</NarratorDockContext.Provider>
+			<NarratorDockContext.Provider value={value}>
+				<OutlineOpenerProvider value={outlineOpener}>{children}</OutlineOpenerProvider>
+			</NarratorDockContext.Provider>
 		</PluginUiSurfaceProvider>
 	);
 }

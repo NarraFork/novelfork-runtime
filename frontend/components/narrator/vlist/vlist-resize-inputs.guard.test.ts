@@ -128,10 +128,13 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 	});
 
 	it("threads node.offsetWidth through readSize into the controller settle decision", () => {
-		const readSize = region(resizeOptions(), "readSize: () => ({");
-		expect(readSize).toMatch(/width:\s*resolveNarratorColumnWidth\(node\.clientWidth,/);
-		expect(readSize).toMatch(/boxWidth:\s*node\.offsetWidth\b/);
-		expect(readSize).not.toMatch(/boxWidth:\s*node\.clientWidth\b/);
+		const readSize = region(resizeOptions(), "readSize: () => {");
+		expect(readSize).toContain("const ready = canMeasure()");
+		expect(readSize).toMatch(
+			/width:\s*ready\s*\?\s*resolveNarratorColumnWidth\(node\.clientWidth,/,
+		);
+		expect(readSize).toMatch(/boxWidth:\s*ready\s*\?\s*node\.offsetWidth\s*:\s*0/);
+		expect(readSize).not.toMatch(/boxWidth:\s*(?:ready\s*\?\s*)?node\.clientWidth\b/);
 		const evaluate = region(controller(), "function evaluate(trigger: WidthSettleTrigger): void {");
 		expect(evaluate).toMatch(/const\s+size\s*=\s*options\.readSize\(\)/);
 		const call = region(evaluate, "resolveWidthSettle({");
@@ -200,7 +203,8 @@ describe("resize inputs cannot reach the full layout at pixel resolution", () =>
 		const preview = region(source.slice(start), "): boolean {");
 		expect(preview).toContain("previewResize({");
 		expect(preview).toMatch(/items:\s*current\.items/);
-		expect(preview).toMatch(/measure:\s*measureElementCached/);
+		expect(preview).toMatch(/measure:\s*this\.measure/);
+		expect(source).toContain("createScopedMeasureElement(this.streamingBlockCache)");
 		const paths = [preview, readVlistFile("vlist-resize-preview.ts")].join("\n");
 		expect(paths).not.toMatch(
 			/\b(?:buildPretext(?:DocumentLayout|LayoutManifest|EngineLayout)|compute(?:Pretext)?VListLayout|buildLayout|rebuild|adaptSegments|segmentMessages|groupRenderUnits)\s*\(/,
@@ -232,7 +236,7 @@ it("commits the usage breakpoint only alongside final geometry and previews its 
 			"setLayoutCompactUsageLines(mobileViewportRef.current)",
 		);
 	}
-	expect(region(resizeOptions(), "readSize: () => ({")).toContain("presentationKey:");
+	expect(region(resizeOptions(), "readSize: () => {")).toContain("presentationKey:");
 	// The capped-column case may not get an observer notification at all.
 	expect(shellModule("PretextExactMessageList.tsx")).toMatch(
 		/resizeControllerRef\.current\?\.observe\(\);\s*},\s*\[isMobileViewport\]\)/,

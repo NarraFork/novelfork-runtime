@@ -5,6 +5,9 @@ export const MAX_FILE_REFERENCE_PATH_CHARS = 4096;
 export const MAX_FILE_REFERENCE_POSITION = 1_000_000;
 export const MAX_FILE_REFERENCE_METADATA_BYTES = 64 * 1024;
 export const MAX_FILE_REFERENCE_SOURCE_BYTES = 1024 * 1024;
+/** Read-only panel limits, independent of immutable reference snapshot limits. */
+export const MAX_FILE_PANEL_BYTES = 1024 ** 3;
+export const FILE_PANEL_PAGE_BYTES = 256 * 1024;
 export const MAX_FILE_REFERENCE_TEXT_BYTES = 32 * 1024;
 export const MAX_FILE_REFERENCE_TOTAL_TEXT_BYTES = 128 * 1024;
 export const MAX_FILE_REFERENCE_QUERY_CHARS = 256;
@@ -71,6 +74,19 @@ export interface FileReferenceSearchResult {
 	truncated: boolean;
 }
 
+export interface FilePanelInfo {
+	target: FileTarget;
+	fileName: string;
+	size: number;
+}
+
+export interface FilePanelPage extends FilePanelInfo {
+	/** Actual UTF-8-aligned start; may precede a requested jump by up to three bytes. */
+	offset: number;
+	nextOffset: number | null;
+	content: string;
+}
+
 export interface FileReferencePreview {
 	target: FileTarget;
 	content: string;
@@ -112,8 +128,16 @@ export function fileReferenceContentForDisplay(content: unknown): unknown {
 /** Only call at HTTP/WS display exits; DB rows and model input keep their immutable snapshots. */
 export function fileReferenceMessageForDisplay<T extends { contentJson?: unknown }>(
 	message: T,
-): Omit<T, "contentJson"> & { contentJson: unknown } {
-	return { ...message, contentJson: fileReferenceContentForDisplay(message.contentJson) };
+): Omit<T, "contentJson" | "composerDocument"> & {
+	contentJson: unknown;
+	hasComposerDocument?: boolean;
+} {
+	const { composerDocument, ...rest } = message as T & { composerDocument?: unknown };
+	return {
+		...(rest as Omit<T, "contentJson" | "composerDocument">),
+		...(composerDocument ? { hasComposerDocument: true } : {}),
+		contentJson: fileReferenceContentForDisplay(message.contentJson),
+	};
 }
 
 export function isFileReferenceSnapshot(value: unknown): value is FileReferenceSnapshot {

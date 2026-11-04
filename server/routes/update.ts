@@ -3,8 +3,15 @@
  */
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { isValidReleaseVersion } from "../../shared/release-version";
+import {
+	parseUpdateSourceIdentity,
+	sameUpdateSourceIdentity,
+	type UpdateSourceIdentity,
+} from "../../shared/update-identity";
 import { APP_VERSION } from "../lib/version";
-import { requireAdmin, requireAuth } from "../middleware/auth";
+import { requireAdmin, requireAdminOrManagerToken, requireAuth } from "../middleware/auth";
+import { GithubUpdateError } from "../services/github-release-update";
 import {
 	applyUpdate,
 	cancelPreparedUpdate,
@@ -13,12 +20,73 @@ import {
 	downloadUpdate,
 	getUpdateDirectory,
 	getUpdateInstructions,
+	getUpdateNotes,
 	getUpdateStatus,
+	isUpdateSourceCurrent,
 	shutdownForManualUpdate,
 	type UpdateProgress,
 } from "../services/update-service";
 
 export const updateRoutes = new Hono();
+
+/**
+ * 管理器面板的更新端点。面板没有用户 JWT，凭本机回环加环境变量令牌调用。
+ *
+ * 必须挂载在全局会话认证之前 —— Hono 按注册顺序匹配，挂载点晚于 requireSessionAuth
+ * 就永远轮不到这里。其它来源仍要管理员会话。
+ */
+export const localPeerUpdateRoutes = new Hono();
+
+class DownloadRequestError extends Error {
+	constructor(
+		message: string,
+		public readonly status: 400 | 408 | 413,
+	) {
+		super(message);
+	}
+}
+
+/** Identity-only requests must not accept unbounded client-supplied release metadata. */
+async function readDownloadRequest(request: Request): Promise<Record<string, unknown> | null> {
+	if (!request.body) return null;
+	const maxBytes = 64 * 1024;
+	if (Number(request.headers.get("content-length") ?? 0) > maxBytes) {
+		throw new DownloadRequestError("Update request exceeds 64 KiB", 413);
+	}
+	const signal = AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]);
+	const reader = request.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let bytes = 0;
+	const onAbort = () => {
+		void reader.cancel().catch(() => {});
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		while (true) {
+			if (signal.aborted) throw new DownloadRequestError("Update request body timed out", 408);
+			const { value, done } = await reader.read();
+			if (done) break;
+			bytes += value.byteLength;
+			if (bytes > maxBytes) throw new DownloadRequestError("Update request exceeds 64 KiB", 413);
+			chunks.push(value);
+		}
+		if (signal.aborted) throw new DownloadRequestError("Update request body timed out", 408);
+		if (!bytes) return null;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
+		} catch {
+			throw new DownloadRequestError("Invalid update request JSON", 400);
+		}
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new DownloadRequestError("Update request must be a JSON object", 400);
+		}
+		return parsed as Record<string, unknown>;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		void reader.cancel().catch(() => {});
+	}
+}
 
 /**
  * GET /api/update/check
@@ -29,9 +97,42 @@ export const updateRoutes = new Hono();
  * release metadata and download URLs. Every caller in the UI already sits behind the login gate,
  * and acting on the result (`/download`, `/apply`) is admin-only anyway.
  */
-updateRoutes.get("/check", requireAuth, requireAdmin, async (c) => {
+localPeerUpdateRoutes.get("/check", requireAdminOrManagerToken, async (c) => {
 	const result = await checkForUpdate();
 	return c.json(result);
+});
+
+/** Optional notes accept identity only, never an arbitrary metadata URL. */
+updateRoutes.post("/notes", requireAuth, requireAdmin, async (c) => {
+	try {
+		const body = await readDownloadRequest(c.req.raw);
+		const identity = parseUpdateSourceIdentity(body?.sourceIdentity);
+		if (
+			!body ||
+			Object.keys(body).some((key) => !["version", "sha512", "sourceIdentity"].includes(key)) ||
+			!identity ||
+			typeof body.version !== "string" ||
+			!isValidReleaseVersion(body.version) ||
+			typeof body.sha512 !== "string" ||
+			!/^[A-Za-z0-9+/]{86}==$/.test(body.sha512)
+		)
+			return c.json({ error: "Invalid release notes identity" }, 400);
+		return c.json(
+			await getUpdateNotes(
+				{ version: body.version, sha512: body.sha512, sourceIdentity: identity },
+				c.req.raw.signal,
+			),
+		);
+	} catch (error) {
+		if (error instanceof DownloadRequestError)
+			return c.json({ error: error.message }, error.status);
+		if (error instanceof GithubUpdateError)
+			return c.json(
+				{ error: error.message, errorCode: error.code },
+				error.code.startsWith("UPDATE_") ? 409 : 503,
+			);
+		return c.json({ error: "Release notes are unavailable" }, 503);
+	}
 });
 
 /**
@@ -57,29 +158,104 @@ updateRoutes.get("/version", requireAuth, (c) => {
  * The frontend may send the version it expects, but all release metadata and
  * patch URLs are re-fetched from the configured update server.
  */
-updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
+localPeerUpdateRoutes.post("/download", requireAdminOrManagerToken, async (c) => {
 	let requestedVersion: string | undefined;
+	let requestedSource: string | undefined;
+	let requestedRepository: string | undefined;
+	let requestedIdentity: UpdateSourceIdentity | undefined;
+	let requestedSha512: string | undefined;
 	let retry = false;
 	try {
-		const body = await c.req.json();
-		const version = body?.releaseInfo?.version;
+		const body = await readDownloadRequest(c.req.raw);
+		const info = body?.releaseInfo;
+		const version =
+			info && typeof info === "object" && "version" in info ? info.version : undefined;
 		if (typeof version === "string" && version.trim()) requestedVersion = version.trim();
+		if (typeof body?.source === "string") requestedSource = body.source;
+		if (typeof body?.repository === "string") requestedRepository = body.repository;
+		const descriptor =
+			info && typeof info === "object" && !Array.isArray(info)
+				? (info as Record<string, unknown>)
+				: undefined;
+		const rawIdentity =
+			descriptor && Object.hasOwn(descriptor, "sourceIdentity")
+				? descriptor.sourceIdentity
+				: body?.sourceIdentity;
+		const rawSha512 =
+			descriptor && Object.hasOwn(descriptor, "sha512") ? descriptor.sha512 : body?.sha512;
+		if (rawIdentity !== undefined) {
+			const identity = parseUpdateSourceIdentity(rawIdentity);
+			if (!identity) throw new DownloadRequestError("Invalid update source identity", 400);
+			requestedIdentity = identity;
+		}
+		if (rawSha512 !== undefined) {
+			if (typeof rawSha512 !== "string" || !/^[A-Za-z0-9+/]{86}==$/.test(rawSha512))
+				throw new DownloadRequestError("Invalid update digest", 400);
+			requestedSha512 = rawSha512;
+		}
 		retry = body?.retry === true;
-	} catch {
-		// Empty body is OK — we'll re-check and use server-side release metadata.
+	} catch (error) {
+		if (error instanceof DownloadRequestError)
+			return c.json({ error: error.message }, error.status);
+		return c.json({ error: "Could not read update request" }, 400);
 	}
 
-	// Re-check to get full releaseInfo with trusted _v2 URLs. Never trust client-supplied URLs.
-	const checkResult = await checkForUpdate();
+	// Force a fresh conditional check: only server-resolved URLs may deliver executable code.
+	const checkResult = await checkForUpdate({ force: true });
+	if (
+		(requestedSource && requestedSource !== checkResult.source) ||
+		(requestedRepository &&
+			requestedRepository.toLowerCase() !== checkResult.repository?.toLowerCase())
+	) {
+		return c.json(
+			{
+				error: "Update source changed; check for updates again",
+				errorCode: "UPDATE_SOURCE_CHANGED",
+			},
+			409,
+		);
+	}
 	const releaseInfo = checkResult.releaseInfo;
 
 	if (!releaseInfo) {
+		if (checkResult.errorCode) {
+			return c.json(
+				{
+					error: checkResult.error,
+					errorCode: checkResult.errorCode,
+					retryAfter: checkResult.retryAfter,
+				},
+				checkResult.errorCode === "NO_RELEASE" ? 404 : 503,
+			);
+		}
 		return c.json({ error: "No update available" }, 404);
+	}
+	if (
+		!isUpdateSourceCurrent(releaseInfo) ||
+		(requestedIdentity && !sameUpdateSourceIdentity(requestedIdentity, releaseInfo.sourceIdentity))
+	) {
+		return c.json(
+			{
+				error: "Update source changed during detection; check for updates again",
+				errorCode: "UPDATE_SOURCE_CHANGED",
+			},
+			409,
+		);
+	}
+	if (requestedSha512 && requestedSha512 !== releaseInfo.sha512) {
+		return c.json(
+			{
+				error: "Selected update artifact changed; check for updates again",
+				errorCode: "UPDATE_ARTIFACT_CHANGED",
+			},
+			409,
+		);
 	}
 	if (requestedVersion && requestedVersion !== releaseInfo.version) {
 		return c.json(
 			{
 				error: "Requested update version no longer matches the latest server metadata",
+				errorCode: "UPDATE_VERSION_CHANGED",
 				requestedVersion,
 				latestVersion: releaseInfo.version,
 			},
@@ -88,11 +264,33 @@ updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 	}
 
 	return streamSSE(c, async (stream) => {
+		// At most one write and one latest snapshot: a slow SSE client must not build an
+		// unbounded queue of increasingly stale download progress events.
+		let pendingProgress: UpdateProgress | undefined;
+		let progressWrite: Promise<void> | undefined;
+		let progressError: unknown;
+		const flushProgress = (): Promise<void> => {
+			if (progressWrite) return progressWrite;
+			progressWrite = (async () => {
+				while (pendingProgress) {
+					const progress = pendingProgress;
+					pendingProgress = undefined;
+					await stream.writeSSE({ event: "progress", data: JSON.stringify(progress) });
+				}
+			})()
+				.catch((error) => {
+					progressError = error;
+					pendingProgress = undefined;
+				})
+				.finally(() => {
+					progressWrite = undefined;
+				});
+			return progressWrite;
+		};
 		const onProgress = (progress: UpdateProgress) => {
-			stream.writeSSE({
-				event: "progress",
-				data: JSON.stringify(progress),
-			});
+			if (progressError) return;
+			pendingProgress = progress;
+			void flushProgress();
 		};
 
 		// A client that cancels its own fetch must also stop the server-side work; without this
@@ -105,6 +303,8 @@ updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 			signal: abort.signal,
 		});
 
+		while (progressWrite || pendingProgress) await flushProgress();
+		if (progressError) return;
 		if (result.success && result.updatePath) {
 			const instructions = getUpdateInstructions(result.updatePath, result.newBinaryPath);
 			await stream.writeSSE({
@@ -115,6 +315,7 @@ updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 					updatePath: result.updatePath,
 					newBinaryPath: result.newBinaryPath,
 					placed: result.placed,
+					preparedIdentity: result.preparedIdentity,
 					instructions,
 				}),
 			});
@@ -162,18 +363,40 @@ updateRoutes.get("/status", requireAuth, requireAdmin, async (c) => {
  * Schedule the downloaded update. The response returns immediately while the
  * server drains active Bash/subagent executions before starting the replacement.
  */
-updateRoutes.post("/apply", requireAuth, requireAdmin, async (c) => {
+localPeerUpdateRoutes.post("/apply", requireAdminOrManagerToken, async (c) => {
 	let targetVersion: string | undefined;
+	let preparedId: string | undefined;
 	try {
-		const body = await c.req.json();
-		if (typeof body?.version === "string" && body.version.trim()) {
+		const body = await readDownloadRequest(c.req.raw);
+		if (body?.version !== undefined) {
+			if (typeof body.version !== "string" || !body.version.trim() || body.version.length > 128)
+				throw new DownloadRequestError("Invalid update version", 400);
 			targetVersion = body.version.trim();
 		}
-	} catch {
-		// Empty body is OK; applyUpdate still validates the prepared update metadata.
+		if (body?.preparedId !== undefined) {
+			if (typeof body.preparedId !== "string" || !/^[a-f0-9]{64}$/.test(body.preparedId))
+				throw new DownloadRequestError("Invalid prepared update identity", 400);
+			preparedId = body.preparedId;
+		}
+	} catch (error) {
+		if (error instanceof DownloadRequestError)
+			return c.json({ error: error.message }, error.status);
+		return c.json({ error: "Could not read update request" }, 400);
 	}
-	const result = await applyUpdate({ targetVersion });
-	return c.json(result);
+	if (!preparedId)
+		return c.json(
+			{
+				success: false,
+				error: "Read the prepared update identity before applying",
+				code: "PREPARED_UPDATE_IDENTITY_REQUIRED",
+			},
+			409,
+		);
+	const result = await applyUpdate({ targetVersion, preparedId });
+	const conflict =
+		result.code === "PREPARED_UPDATE_IDENTITY_REQUIRED" ||
+		result.code === "PREPARED_UPDATE_CHANGED";
+	return c.json(result, conflict ? 409 : 200);
 });
 
 /**

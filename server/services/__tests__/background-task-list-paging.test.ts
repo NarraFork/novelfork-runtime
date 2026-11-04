@@ -8,15 +8,15 @@
  * row, and a delta stream a client can tell is contiguous.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { BackgroundTaskListItem, BackgroundTaskListPage } from "@shared/background-task-list";
 import { Hono } from "hono";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narrators } from "../../db/schema";
+import { backgroundTasks, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 /** Frames the service pushed, in order, so version continuity is observable. */
 const broadcasts: Array<{ narratorId: string; message: Record<string, unknown> }> = [];
@@ -37,6 +37,33 @@ mock.module("../narrator-session", () => ({
 	isLoopRunning: (id: string) => liveLoops.has(id),
 }));
 
+const { backgroundOccupancyStore, databaseBackgroundOccupancySource } = await import(
+	"../background-occupancy-store"
+);
+
+function setRuntimeLive(id: string, live: boolean): void {
+	if (live) liveLoops.add(id);
+	else liveLoops.delete(id);
+	backgroundOccupancyStore.setRuntimeLive(id, live);
+}
+
+/** Direct SQL fixtures publish the same entity-specific maintenance as production writes. */
+async function seedNarrators(
+	rows: typeof narrators.$inferInsert | Array<typeof narrators.$inferInsert>,
+): Promise<void> {
+	const values = Array.isArray(rows) ? rows : [rows];
+	await db.insert(narrators).values(values);
+	backgroundOccupancyStore.refreshNarrators(values.map((row) => row.id));
+}
+
+async function seedTasks(
+	rows: typeof backgroundTasks.$inferInsert | Array<typeof backgroundTasks.$inferInsert>,
+): Promise<void> {
+	const values = Array.isArray(rows) ? rows : [rows];
+	await db.insert(backgroundTasks).values(values);
+	for (const row of values) backgroundOccupancyStore.refreshTask(row.id);
+}
+
 const {
 	backgroundTaskService,
 	BACKGROUND_TASK_LIST_EPOCH,
@@ -46,6 +73,36 @@ const {
 const { BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS, BACKGROUND_TASK_LIST_PAGE_SIZE } = await import(
 	"@shared/background-task-list"
 );
+const { getRuntimePublicationService, runtimePublication } = await import(
+	"../agent-runtime/publication"
+);
+const { wakeInboxIfEligible, runtimeInbox, claimInboxHead, inboxClaim } = await import(
+	"../agent-runtime/inbox"
+);
+const { tryClaimExecution } = await import("../agent-runtime/ownership");
+const { projectPendingInjection } = await import("../parent-injection-queue");
+const publicationWakes = new Set<string>();
+async function consumeTerminal(taskId: string, expectedPendingSource = false) {
+	const result = await backgroundTaskService.waitForCompletion(taskId, 100);
+	expect(result.terminalResultReceived).toBe(true);
+	if (!result.publicationRun) throw new Error("Missing terminal publication run");
+	await getRuntimePublicationService().consumeAwaitedTerminal(result.publicationRun);
+	expect(
+		sqlite
+			.query(
+				"SELECT task_id, logical_run_id, recipient_id FROM runtime_awaited_terminal_consumptions WHERE task_id = ? AND logical_run_id = ? AND recipient_id = ?",
+			)
+			.get(taskId, result.publicationRun.logicalRunId, result.publicationRun.recipientId),
+	).toEqual({
+		task_id: taskId,
+		logical_run_id: result.publicationRun.logicalRunId,
+		recipient_id: result.publicationRun.recipientId,
+	});
+	expect(await getRuntimePublicationService().hasPendingSource(result.publicationRun)).toBe(
+		expectedPendingSource,
+	);
+	return result.publicationRun;
+}
 const { narratorRoutes } = await import("../../routes/narrators");
 const app = new Hono();
 app.use("*", async (c, next) => {
@@ -55,6 +112,10 @@ app.use("*", async (c, next) => {
 app.route("/api/narrators", narratorRoutes);
 
 afterAll(() => {
+	runtimePublication.stop();
+	runtimePublication.setWake(async (narratorId) => {
+		await wakeInboxIfEligible(narratorId);
+	});
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
 	mock.module("../narrator-session", () => realNarratorSession);
@@ -62,22 +123,38 @@ afterAll(() => {
 });
 
 beforeEach(() => {
+	// List/delta tests have no configured model. Keep durable delivery real, but
+	// observe the production wake seam instead of accidentally starting an AI loop.
+	publicationWakes.clear();
+	runtimePublication.setWake((recipientId) => {
+		publicationWakes.add(recipientId);
+	});
 	broadcasts.length = 0;
 	liveLoops.clear();
 	backgroundTaskService.resetListVersionsForTests();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	if (backgroundOccupancyStore.isReady) await backgroundOccupancyStore.flush();
+	await flushDeltas();
 	cleanDb(sqlite);
+	// An emptied case cannot leave an outbox page cursor positioned in the next case.
+	runtimePublication.flushPage();
 });
 
 const PARENT = "list-parent";
 
 async function seedParent(): Promise<void> {
 	const now = new Date().toISOString();
-	await db
-		.insert(narrators)
-		.values({ id: PARENT, type: "primary", variant: "primary", createdAt: now, updatedAt: now });
+	await seedNarrators({
+		id: PARENT,
+		type: "primary",
+		variant: "primary",
+		createdAt: now,
+		updatedAt: now,
+	});
+	// Bootstrap once before exercising subsequent incremental writes and reads.
+	await backgroundOccupancyStore.start();
 }
 
 /** A legacy background subagent: pre-unified-table history, keyed off narrators. */
@@ -87,7 +164,7 @@ async function seedLegacyTask(opts: {
 	result?: string;
 	backgroundStatus?: "running" | "completed" | "failed" | "cancelled";
 }): Promise<void> {
-	await db.insert(narrators).values({
+	await seedNarrators({
 		id: opts.id,
 		type: "subagent",
 		variant: "subagent:general",
@@ -113,15 +190,28 @@ async function seedBashTaskAt(id: string, createdAt: string, output?: string): P
 	if (output !== undefined) {
 		await backgroundTaskService.markCompleted(id, output);
 	}
-	const { backgroundTasks } = await import("../../db/schema");
 	const { eq } = await import("drizzle-orm");
 	await db.update(backgroundTasks).set({ createdAt }).where(eq(backgroundTasks.id, id));
+	backgroundOccupancyStore.refreshTask(id);
 }
 
 function listDeltas(): Array<Record<string, unknown>> {
 	return broadcasts
 		.filter((b) => b.message.type === "background_task_list_delta")
 		.map((b) => b.message);
+}
+
+/** Maintenance invalidations may accompany a row delta; neither replaces the row identity. */
+function listRowDeltas(parentId = PARENT): Array<Record<string, unknown>> {
+	return listDeltas().filter(
+		(delta) =>
+			delta.narratorId === parentId &&
+			(delta.upsert !== undefined || delta.removeIds !== undefined),
+	);
+}
+
+function transitions(values: unknown[]): unknown[] {
+	return values.filter((value, index) => index === 0 || value !== values[index - 1]);
 }
 
 /** Let the fire-and-forget delta broadcasts settle. */
@@ -214,7 +304,7 @@ describe("subagents remain discoverable without a background projection", () => 
 	test("lists a foreground/resumed child but not a forked primary narrator", async () => {
 		await seedParent();
 		const now = new Date().toISOString();
-		await db.insert(narrators).values([
+		await seedNarrators([
 			{
 				id: "foreground-child",
 				parentNarratorId: PARENT,
@@ -239,7 +329,7 @@ describe("subagents remain discoverable without a background projection", () => 
 		expect(page.activeTasks?.map((task) => task.id)).toEqual(["foreground-child"]);
 		backgroundTaskService.notifyDerivedStatusChanged(PARENT, "foreground-child");
 		await flushDeltas();
-		expect(listDeltas().at(-1)).toMatchObject({
+		expect(listRowDeltas().at(-1)).toMatchObject({
 			activeCount: 1,
 			upsert: { id: "foreground-child", effectiveStatus: "running" },
 		});
@@ -252,12 +342,11 @@ describe("subagents remain discoverable without a background projection", () => 
 		await seedLegacyTask({ id, createdAt: old });
 		await backgroundTaskService.createAgentTask({
 			id,
-			parentNarratorId: PARENT,
 			subagentNarratorId: id,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markTakenOver(id);
-		const { backgroundTasks } = await import("../../db/schema");
 		const { eq } = await import("drizzle-orm");
 		await db.update(backgroundTasks).set({ completedAt: old }).where(eq(backgroundTasks.id, id));
 		await db
@@ -268,6 +357,8 @@ describe("subagents remain discoverable without a background projection", () => 
 				substatus: JSON.stringify(["taken_over"]),
 			})
 			.where(eq(narrators.id, id));
+		backgroundOccupancyStore.refreshTask(id);
+		backgroundOccupancyStore.refreshNarrator(id);
 		expect(await backgroundTaskService.cleanupCompleted()).toBe(0);
 		expect(await backgroundTaskService.getById(id)).not.toBeNull();
 		const page = await backgroundTaskService.listPageByParent(PARENT);
@@ -396,12 +487,17 @@ describe("background task list row size", () => {
 			);
 			// The true size is still reported, so the UI can offer the full text.
 			expect(task.outputBytes).toBeGreaterThanOrEqual(40_000);
-			expect(task.outputPreviewTruncated).toBe(true);
+			// Legacy full rows need list slicing; Bash already spilled at 5120 bytes.
+			expect(task.outputPreviewTruncated).toBe(task.id === "big-legacy");
+			if (task.id === "big-unified") {
+				expect(task.output).not.toContain(huge);
+				expect(task.output).toContain("file");
+			}
 		}
-		// `outputTruncated` is a different claim — bytes lost at STORAGE time (the
-		// 512 KB cap). 40 KB is nowhere near it, so conflating the two flags would
-		// tell the user the full text is unrecoverable when it is one request away.
-		expect(page.tasks.every((t) => t.outputTruncated === false)).toBe(true);
+		// Storage projection is shortened for a spilled Bash result, independently
+		// of list-preview slicing. Legacy 40KB output is only sliced at list time.
+		expect(page.tasks.find((task) => task.id === "big-unified")?.outputTruncated).toBe(true);
+		expect(page.tasks.find((task) => task.id === "big-legacy")?.outputTruncated).toBe(false);
 	});
 
 	// Every background subagent alive TODAY writes both records under one id:
@@ -414,7 +510,7 @@ describe("background task list row size", () => {
 		await seedParent();
 		const subagentId = "dual-recorded";
 		const now = new Date().toISOString();
-		await db.insert(narrators).values({
+		await seedNarrators({
 			id: subagentId,
 			type: "subagent",
 			variant: "subagent:general",
@@ -428,10 +524,10 @@ describe("background task list row size", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
 			alias: "detached-worker",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 
 		const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 30 });
@@ -469,7 +565,7 @@ describe("background task active count", () => {
 		await seedParent();
 		const subagentId = "sub-continued";
 		const now = new Date().toISOString();
-		await db.insert(narrators).values({
+		await seedNarrators({
 			id: subagentId,
 			type: "subagent",
 			variant: "subagent:general",
@@ -480,9 +576,9 @@ describe("background task active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "first pass done");
 
@@ -500,7 +596,7 @@ describe("background task active count", () => {
 		await seedParent();
 		const subagentId = "live-loop";
 		const now = new Date().toISOString();
-		await db.insert(narrators).values({
+		await seedNarrators({
 			id: subagentId,
 			type: "subagent",
 			variant: "subagent:general",
@@ -512,9 +608,9 @@ describe("background task active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "done");
 
@@ -523,7 +619,7 @@ describe("background task active count", () => {
 		expect(before.tasks[0]?.effectiveStatus).toBe("completed");
 		expect(before.activeCount).toBe(0);
 
-		liveLoops.add(subagentId);
+		setRuntimeLive(subagentId, true);
 		const after = await backgroundTaskService.listPageByParent(PARENT, { limit: 10 });
 		expect(after.tasks[0]?.effectiveStatus).toBe("continued");
 		expect(after.tasks[0]?.canCancelActiveWork).toBe(true);
@@ -544,6 +640,78 @@ describe("background task active count", () => {
 });
 
 describe("background task batch active count", () => {
+	test("unstarted count reads reject without implicitly scanning SQL", async () => {
+		const reads = [
+			spyOn(databaseBackgroundOccupancySource, "scanNarrators"),
+			spyOn(databaseBackgroundOccupancySource, "scanTasks"),
+			spyOn(databaseBackgroundOccupancySource, "getNarrators"),
+			spyOn(databaseBackgroundOccupancySource, "getTasks"),
+			spyOn(databaseBackgroundOccupancySource, "getProjections"),
+		];
+		try {
+			await expect(backgroundTaskService.countActiveKindsByParentBatch([PARENT])).rejects.toThrow(
+				"not initialized",
+			);
+			for (const read of reads) expect(read).not.toHaveBeenCalled();
+		} finally {
+			for (const read of reads) read.mockRestore();
+		}
+	});
+
+	test("warm count APIs perform zero SQL reads even when unrelated terminal history grows", async () => {
+		await seedParent();
+		await backgroundTaskService.createBashTask({
+			id: "warm-work",
+			parentNarratorId: PARENT,
+			command: "build",
+		});
+		await backgroundTaskService.createBashTask({
+			id: "warm-service",
+			parentNarratorId: PARENT,
+			command: "serve",
+			backgroundKind: "service",
+		});
+		await backgroundOccupancyStore.flush();
+		await flushDeltas();
+		const reads = [
+			spyOn(databaseBackgroundOccupancySource, "scanNarrators"),
+			spyOn(databaseBackgroundOccupancySource, "scanTasks"),
+			spyOn(databaseBackgroundOccupancySource, "getNarrators"),
+			spyOn(databaseBackgroundOccupancySource, "getTasks"),
+			spyOn(databaseBackgroundOccupancySource, "getProjections"),
+		];
+		try {
+			const now = new Date().toISOString();
+			// These terminal rows cannot affect occupancy, so no notification is needed.
+			// In particular, do not rebuild the index to make the following reads pass.
+			await db.insert(backgroundTasks).values(
+				Array.from({ length: 128 }, (_, index) => ({
+					id: `unrelated-history-${index}`,
+					parentNarratorId: PARENT,
+					type: "bash" as const,
+					status: "completed" as const,
+					startedAt: now,
+					completedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				})),
+			);
+			for (let iteration = 0; iteration < 10; iteration++) {
+				expect(
+					(await backgroundTaskService.countActiveKindsByParentBatch([PARENT])).get(PARENT),
+				).toEqual({
+					activeCount: 2,
+					activeWorkCount: 1,
+					activeServiceCount: 1,
+				});
+				expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(2);
+			}
+			for (const read of reads) expect(read).not.toHaveBeenCalled();
+		} finally {
+			for (const read of reads) read.mockRestore();
+		}
+	});
+
 	// List surfaces (RecentTabs snapshot, GET /api/narrators) render one badge per
 	// narrator from `countActiveByParentBatch`. It must agree with the single-parent
 	// count on every state that count recognizes, or the sidebar and the panel
@@ -555,7 +723,7 @@ describe("background task batch active count", () => {
 
 		const subagentId = "batch-continued";
 		const now = new Date().toISOString();
-		await db.insert(narrators).values({
+		await seedNarrators({
 			id: subagentId,
 			type: "subagent",
 			variant: "subagent:general",
@@ -566,9 +734,9 @@ describe("background task batch active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "first pass done");
 
@@ -582,9 +750,13 @@ describe("background task batch active count", () => {
 		await seedParent();
 		const other = "batch-parent-2";
 		const now = new Date().toISOString();
-		await db
-			.insert(narrators)
-			.values({ id: other, type: "primary", variant: "primary", createdAt: now, updatedAt: now });
+		await seedNarrators({
+			id: other,
+			type: "primary",
+			variant: "primary",
+			createdAt: now,
+			updatedAt: now,
+		});
 		await seedBashTaskAt("batch-p1", "2026-07-02T00:00:00.000Z");
 		await backgroundTaskService.createBashTask({
 			id: "batch-p2",
@@ -623,9 +795,8 @@ describe("background task batch active count", () => {
 	// read as "nothing running" while work is resumable.
 	test("counts a paused transfer as active", async () => {
 		await seedParent();
-		const { backgroundTasks } = await import("../../db/schema");
 		const now = new Date().toISOString();
-		await db.insert(backgroundTasks).values({
+		await seedTasks({
 			id: "batch-paused-transfer",
 			parentNarratorId: PARENT,
 			type: "transfer",
@@ -644,7 +815,7 @@ describe("background task batch active count", () => {
 		await seedParent();
 		const subagentId = "batch-live-loop";
 		const now = new Date().toISOString();
-		await db.insert(narrators).values({
+		await seedNarrators({
 			id: subagentId,
 			type: "subagent",
 			variant: "subagent:general",
@@ -655,21 +826,611 @@ describe("background task batch active count", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markCompleted(subagentId, "done");
 
 		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).has(PARENT)).toBe(
 			false,
 		);
-		liveLoops.add(subagentId);
+		setRuntimeLive(subagentId, true);
 		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).get(PARENT)).toBe(1);
 	});
 });
 
+describe("derived status notification identity", () => {
+	test("resolves a distinct narrator id to its projection through working and idle transitions", async () => {
+		await seedParent();
+		const narratorId = "derived-narrator";
+		const taskId = "derived-projection";
+		await seedLegacyTask({ id: narratorId, createdAt: new Date().toISOString() });
+		await backgroundTaskService.createAgentTask({
+			id: taskId,
+			subagentNarratorId: narratorId,
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+		});
+		const { eq } = await import("drizzle-orm");
+		await db
+			.update(backgroundTasks)
+			.set({ status: "completed", output: "done", completedAt: new Date().toISOString() })
+			.where(eq(backgroundTasks.id, taskId));
+		backgroundOccupancyStore.refreshTask(taskId);
+		await flushDeltas();
+		const stored = await backgroundTaskService.getById(taskId);
+		for (const status of ["working", "idle"] as const) {
+			await db.update(narrators).set({ status }).where(eq(narrators.id, narratorId));
+			broadcasts.length = 0;
+			backgroundTaskService.notifyDerivedStatusChanged(PARENT, narratorId);
+			await flushDeltas();
+			expect(listRowDeltas()).toHaveLength(1);
+			expect(listRowDeltas()[0]).toMatchObject({
+				activeCount: status === "working" ? 1 : 0,
+				upsert: {
+					id: taskId,
+					status: "completed",
+					effectiveStatus: status === "working" ? "continued" : "completed",
+				},
+			});
+			expect(listRowDeltas()[0]?.removeIds).toBeUndefined();
+			expect(await backgroundTaskService.getById(taskId)).toEqual(stored);
+		}
+	});
+
+	test("does not publish another parent's direct task or narrator projection", async () => {
+		await seedParent();
+		const now = new Date().toISOString();
+		const otherParent = "other-derived-parent";
+		await seedNarrators({
+			id: otherParent,
+			type: "primary",
+			variant: "primary",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await seedLegacyTask({ id: "scoped-narrator", createdAt: now });
+		await backgroundTaskService.createAgentTask({
+			id: "scoped-projection",
+			subagentNarratorId: "scoped-narrator",
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+		});
+		await seedBashTaskAt("scoped-bash", now);
+		await flushDeltas();
+		for (const id of ["scoped-projection", "scoped-narrator", "scoped-bash"]) {
+			broadcasts.length = 0;
+			backgroundTaskService.notifyDerivedStatusChanged(otherParent, id);
+			await flushDeltas();
+			expect(listRowDeltas(otherParent)).toEqual([
+				expect.objectContaining({ narratorId: otherParent, removeIds: [id], activeCount: 0 }),
+			]);
+			expect(listRowDeltas(otherParent)[0]?.upsert).toBeUndefined();
+			// Global maintenance may invalidate the owning parent, but must never
+			// leak its row payload into the requested parent's update.
+			expect(listDeltas().filter((delta) => delta.upsert !== undefined)).toEqual([]);
+		}
+	});
+
+	test("preserves direct task priority, legacy updates and missing row removal", async () => {
+		await seedParent();
+		const now = new Date().toISOString();
+		await seedLegacyTask({ id: "direct-id", createdAt: now });
+		await backgroundTaskService.createAgentTask({
+			id: "indirect-id",
+			subagentNarratorId: "direct-id",
+			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
+		});
+		await seedBashTaskAt("direct-id", now);
+		await seedLegacyTask({ id: "plain-legacy", createdAt: now });
+		await flushDeltas();
+		for (const [id, type] of [
+			["direct-id", "bash"],
+			["plain-legacy", "agent"],
+		] as const) {
+			broadcasts.length = 0;
+			backgroundTaskService.notifyDerivedStatusChanged(PARENT, id);
+			await flushDeltas();
+			expect(listRowDeltas()).toHaveLength(1);
+			expect(listRowDeltas()[0]?.upsert).toMatchObject({ id, type });
+			expect(listRowDeltas()[0]?.removeIds).toBeUndefined();
+		}
+		broadcasts.length = 0;
+		backgroundTaskService.notifyDerivedStatusChanged(PARENT, "missing-id");
+		await flushDeltas();
+		expect(listRowDeltas()).toHaveLength(1);
+		expect(listRowDeltas()[0]?.removeIds).toEqual(["missing-id"]);
+		expect(listRowDeltas()[0]?.upsert).toBeUndefined();
+	});
+});
+
+describe("background service classification", () => {
+	test("first page derives classified counts from its active snapshot without a second async count", async () => {
+		await seedParent();
+		await backgroundTaskService.createBashTask({
+			id: "snapshot-work",
+			parentNarratorId: PARENT,
+			command: "build",
+		});
+		await backgroundTaskService.createBashTask({
+			id: "snapshot-service",
+			parentNarratorId: PARENT,
+			command: "serve",
+			backgroundKind: "service",
+		});
+		await flushDeltas();
+		const original = backgroundTaskService.countActiveKindsByParent;
+		let rereads = 0;
+		backgroundTaskService.countActiveKindsByParent = async () => {
+			rereads++;
+			// Simulate a newer count snapshot overtaking the already-read rows.
+			await Promise.resolve();
+			return { activeCount: 1, activeWorkCount: 1, activeServiceCount: 0 };
+		};
+		try {
+			const page = await backgroundTaskService.listPageByParent(PARENT);
+			expect(rereads).toBe(0);
+			expect(page.activeTasks).toHaveLength(2);
+			expect(page).toMatchObject({ activeCount: 2, activeWorkCount: 1, activeServiceCount: 1 });
+			expect(page.activeTasks?.filter((item) => item.backgroundKind === "service")).toHaveLength(
+				page.activeServiceCount ?? 0,
+			);
+		} finally {
+			backgroundTaskService.countActiveKindsByParent = original;
+		}
+	});
+	test("services remain active and paged, while old rows and legacy agents default to task", async () => {
+		await seedParent();
+		await seedBashTaskAt("default-task", "2026-01-01T00:00:00.000Z");
+		await seedLegacyTask({
+			id: "default-legacy",
+			createdAt: "2026-01-02T00:00:00.000Z",
+			backgroundStatus: "running",
+		});
+		await backgroundTaskService.createBashTask({
+			id: "service",
+			parentNarratorId: PARENT,
+			command: "serve",
+			backgroundKind: "service",
+		});
+		await flushDeltas();
+		expect(await databaseBackgroundOccupancySource.getNarrators(["default-legacy"])).toEqual([
+			expect.objectContaining({ hasProjection: false, isBackground: true, legacySubagent: true }),
+		]);
+		const expected = { activeCount: 3, activeWorkCount: 2, activeServiceCount: 1 };
+		expect(await backgroundTaskService.countActiveKindsByParent(PARENT)).toEqual(expected);
+		expect(
+			(await backgroundTaskService.countActiveKindsByParentBatch([PARENT])).get(PARENT),
+		).toEqual(expected);
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(3);
+		const first = await backgroundTaskService.listPageByParent(PARENT, { limit: 1 });
+		expect(first).toMatchObject(expected);
+		expect(first.activeTasks).toHaveLength(3);
+		expect(first.activeTasks?.find((item) => item.id === "service")).toMatchObject({
+			backgroundKind: "service",
+			effectiveStatus: "running",
+		});
+		for (const id of ["default-task", "default-legacy"]) {
+			expect(first.activeTasks?.find((item) => item.id === id)?.backgroundKind).toBe("task");
+		}
+		const next = await backgroundTaskService.listPageByParent(PARENT, {
+			limit: 1,
+			cursor: first.nextCursor ?? undefined,
+		});
+		expect(next).toMatchObject(expected);
+		expect(
+			listDeltas()
+				.filter((delta) => delta.narratorId === PARENT)
+				.at(-1),
+		).toMatchObject(expected);
+		expect(
+			broadcasts
+				.filter(
+					(frame) =>
+						frame.narratorId === PARENT && frame.message.type === "background_task_count_changed",
+				)
+				.at(-1)?.message,
+		).toMatchObject({
+			activeBackgroundTaskCount: 3,
+			activeBackgroundWorkCount: 2,
+			activeBackgroundServiceCount: 1,
+		});
+	});
+
+	test.each([
+		false,
+		true,
+	])("service-only descendants do not occupy a %s unified ancestor; mixed work does", async (unified) => {
+		await seedParent();
+		const now = new Date().toISOString();
+		await seedLegacyTask({ id: "service-child", createdAt: now });
+		if (unified) {
+			await seedTasks({
+				id: "service-child-projection",
+				parentNarratorId: PARENT,
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: "service-child",
+				subagentType: "general",
+				startedAt: now,
+				completedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			});
+		}
+		await backgroundTaskService.createBashTask({
+			id: "child-service",
+			parentNarratorId: "service-child",
+			command: "serve",
+			backgroundKind: "service",
+		});
+		await flushDeltas();
+		expect(await backgroundTaskService.countActiveKindsByParent(PARENT)).toEqual({
+			activeCount: 0,
+			activeWorkCount: 0,
+			activeServiceCount: 0,
+		});
+		expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]?.effectiveStatus).toBe(
+			"completed",
+		);
+		expect(await backgroundTaskService.countActiveKindsByParent("service-child")).toEqual({
+			activeCount: 1,
+			activeWorkCount: 0,
+			activeServiceCount: 1,
+		});
+		await backgroundTaskService.createBashTask({
+			id: "child-work",
+			parentNarratorId: "service-child",
+			command: "build",
+		});
+		await flushDeltas();
+		expect((await backgroundTaskService.listPageByParent(PARENT)).tasks[0]?.effectiveStatus).toBe(
+			"child_running",
+		);
+		expect(await backgroundTaskService.countActiveKindsByParent(PARENT)).toEqual({
+			activeCount: 1,
+			activeWorkCount: 1,
+			activeServiceCount: 0,
+		});
+		await backgroundTaskService.markCompleted("child-work", "done");
+		await flushDeltas();
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(0);
+		expect((await backgroundTaskService.getById("child-service"))?.status).toBe("running");
+	});
+
+	test("a large service collection cannot exhaust descendant work or work candidate budgets", async () => {
+		await seedParent();
+		await seedLegacyTask({ id: "many-services-child", createdAt: "2026-01-01T00:00:00.000Z" });
+		const now = new Date().toISOString();
+		// Exceeds the occupancy row budget, but services must never enter that graph.
+		for (let offset = 0; offset < 8_300; offset += 100) {
+			await seedTasks(
+				Array.from({ length: 100 }, (_, index) => ({
+					id: `many-service-${offset + index}`,
+					parentNarratorId: "many-services-child",
+					type: "bash" as const,
+					backgroundKind: "service" as const,
+					status: "running" as const,
+					startedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				})),
+			);
+		}
+		await seedTasks({
+			id: "older-work",
+			parentNarratorId: "many-services-child",
+			type: "bash",
+			status: "running",
+			startedAt: now,
+			createdAt: "2020-01-01T00:00:00.000Z",
+			updatedAt: now,
+		});
+		const expected = { activeCount: 201, activeWorkCount: 1, activeServiceCount: 200 };
+		expect(await backgroundTaskService.countActiveKindsByParent("many-services-child")).toEqual(
+			expected,
+		);
+		expect(
+			(
+				await backgroundTaskService.countActiveKindsByParentBatch([PARENT, "many-services-child"])
+			).get("many-services-child"),
+		).toEqual(expected);
+		const page = await backgroundTaskService.listPageByParent("many-services-child");
+		expect(page).toMatchObject({ ...expected, activeTruncated: true });
+		expect(page.activeTasks?.some((item) => item.id === "older-work")).toBe(true);
+		expect(page.activeTasks).toHaveLength(201);
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+	});
+});
+
 describe("background task count frames", () => {
+	test.each([
+		["unified", true, false],
+		["legacy", false, false],
+		["two idle levels", true, true],
+	] as const)("%s child work refreshes idle ancestors and clears on completion", async (_label, unified, deep) => {
+		await seedParent();
+		const now = new Date().toISOString();
+		const childId = "nested-agent";
+		await seedLegacyTask({ id: childId, createdAt: now });
+		const seedProjection = async (id: string, parentId: string, subagentId: string) => {
+			await seedTasks({
+				id,
+				parentNarratorId: parentId,
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: subagentId,
+				subagentType: "general",
+				startedAt: now,
+				completedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			});
+		};
+		if (unified) await seedProjection("nested-projection", PARENT, childId);
+		let bashParentId = childId;
+		if (deep) {
+			bashParentId = "nested-grandchild";
+			await seedNarrators({
+				id: bashParentId,
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: childId,
+				status: "idle",
+				isBackground: true,
+				backgroundStatus: "completed",
+				createdAt: now,
+				updatedAt: now,
+			});
+			await seedProjection("nested-grandchild-projection", childId, bashParentId);
+		}
+		await flushDeltas();
+		broadcasts.length = 0;
+		await backgroundTaskService.createBashTask({
+			id: "nested-bash",
+			parentNarratorId: bashParentId,
+			command: "long work",
+		});
+		await flushDeltas();
+		const ancestorFrames = () =>
+			broadcasts.filter(
+				(frame) =>
+					frame.narratorId === PARENT && frame.message.type === "background_task_count_changed",
+			);
+		expect(
+			transitions(ancestorFrames().map((frame) => frame.message.activeBackgroundTaskCount)),
+		).toEqual([1]);
+		const ancestorDelta = broadcasts.find(
+			(frame) =>
+				frame.narratorId === PARENT &&
+				frame.message.type === "background_task_list_delta" &&
+				frame.message.invalidate === true,
+		);
+		expect(ancestorDelta?.message).toMatchObject({ invalidate: true, activeCount: 1 });
+		// Ancestors refetch from a bounded invalidation, while the changed direct
+		// task still receives its identity-preserving upsert.
+		expect(listRowDeltas(bashParentId).map((delta) => delta.upsert)).toEqual([
+			expect.objectContaining({ id: "nested-bash", effectiveStatus: "running" }),
+		]);
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).get(PARENT)).toBe(1);
+		const page = await backgroundTaskService.listPageByParent(PARENT);
+		expect(page.activeCount).toBe(1);
+		expect(page.tasks).toHaveLength(1);
+		expect(page.tasks[0]).toMatchObject({
+			id: unified ? "nested-projection" : childId,
+			effectiveStatus: "child_running",
+		});
+		await backgroundTaskService.markCompleted("nested-bash", "done");
+		await flushDeltas();
+		expect(
+			transitions(ancestorFrames().map((frame) => frame.message.activeBackgroundTaskCount)),
+		).toEqual([1, 0]);
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(0);
+	});
+
+	test("a paused descendant transfer keeps an idle legacy ancestor occupied", async () => {
+		await seedParent();
+		const now = new Date().toISOString();
+		await seedLegacyTask({ id: "paused-child", createdAt: now });
+		await seedTasks({
+			id: "paused-descendant",
+			parentNarratorId: "paused-child",
+			type: "transfer",
+			status: "paused",
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
+		});
+		backgroundTaskService.notifyDerivedStatusChanged("paused-child", "paused-descendant");
+		await flushDeltas();
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).get(PARENT)).toBe(1);
+		expect(
+			broadcasts.find(
+				(frame) =>
+					frame.narratorId === PARENT && frame.message.type === "background_task_count_changed",
+			)?.message.activeBackgroundTaskCount,
+		).toBe(1);
+	});
+
+	test("thousands of terminal legacy leaves do not block a directly running task", async () => {
+		await seedParent();
+		const createdAt = "2020-01-01T00:00:00.000Z";
+		for (let offset = 0; offset < 4096; offset += 512) {
+			await seedNarrators(
+				Array.from({ length: 512 }, (_, index) => ({
+					id: `historical-leaf-${offset + index}`,
+					type: "subagent" as const,
+					variant: "subagent:general" as const,
+					parentNarratorId: PARENT,
+					status: "idle" as const,
+					isBackground: true,
+					backgroundStatus: "completed" as const,
+					createdAt,
+					updatedAt: createdAt,
+				})),
+			);
+		}
+		await backgroundTaskService.createBashTask({
+			id: "history-live-bash",
+			parentNarratorId: PARENT,
+			command: "ongoing work",
+		});
+		await flushDeltas();
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).get(PARENT)).toBe(1);
+		const page = await backgroundTaskService.listPageByParent(PARENT, { limit: 10 });
+		expect(page.activeCount).toBe(1);
+		expect(page.activeTasks?.map((task) => task.id)).toEqual(["history-live-bash"]);
+		expect(page.tasks).toHaveLength(10);
+		expect(
+			broadcasts.find((frame) => frame.message.type === "background_task_count_changed")?.message
+				.activeBackgroundTaskCount,
+		).toBe(1);
+	});
+
+	test.each([
+		21, 50,
+	])("%i parents with terminal probe leaves fit the separate row/node budgets", async (parentCount) => {
+		const now = new Date().toISOString();
+		const parentIds = Array.from({ length: parentCount }, (_, index) => `probe-parent-${index}`);
+		await seedNarrators(
+			parentIds.map((id) => ({
+				id,
+				type: "primary" as const,
+				variant: "primary" as const,
+				createdAt: now,
+				updatedAt: now,
+			})),
+		);
+		for (const parentId of parentIds) {
+			await seedNarrators(
+				Array.from({ length: 201 }, (_, index) => ({
+					id: `${parentId}-leaf-${index}`,
+					parentNarratorId: parentId,
+					type: "subagent" as const,
+					variant: "subagent:general" as const,
+					status: "idle" as const,
+					backgroundStatus: "completed" as const,
+					createdAt: now,
+					updatedAt: now,
+				})),
+			);
+		}
+		await seedTasks(
+			parentIds.map((parentNarratorId) => ({
+				id: `${parentNarratorId}-bash`,
+				parentNarratorId,
+				type: "bash" as const,
+				status: "running" as const,
+				startedAt: now,
+				createdAt: now,
+				updatedAt: now,
+			})),
+		);
+		// This bulk fixture intentionally precedes the suite's explicit startup boundary.
+		await backgroundOccupancyStore.start();
+		const counts = await backgroundTaskService.countActiveByParentBatch(parentIds);
+		expect(counts.size).toBe(parentCount);
+		for (const id of parentIds) expect(counts.get(id)).toBe(1);
+	});
+
+	test("deep descendant work counts through the chain without a read-time depth limit", async () => {
+		await seedParent();
+		const now = new Date().toISOString();
+		let parentId = PARENT;
+		for (let depth = 0; depth < 34; depth++) {
+			const id = `depth-child-${depth}`;
+			await seedNarrators({
+				id,
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: parentId,
+				status: "idle",
+				backgroundStatus: "completed",
+				createdAt: now,
+				updatedAt: now,
+			});
+			parentId = id;
+		}
+		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).has(PARENT)).toBe(
+			false,
+		);
+		await backgroundTaskService.createBashTask({
+			id: "deep-work",
+			parentNarratorId: parentId,
+			command: "deep work",
+		});
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
+		expect((await backgroundTaskService.listPageByParent(PARENT)).activeTasks).toEqual([
+			expect.objectContaining({ id: "depth-child-0", effectiveStatus: "child_running" }),
+		]);
+		await backgroundTaskService.markCompleted("deep-work", "done");
+		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(0);
+	});
+
+	test("cyclic narrator ancestry terminates with bounded invalidations and a direct row upsert", async () => {
+		await seedParent();
+		const childId = "cyclic-agent";
+		await seedLegacyTask({ id: childId, createdAt: new Date().toISOString() });
+		const { eq } = await import("drizzle-orm");
+		await db
+			.update(narrators)
+			.set({
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: childId,
+			})
+			.where(eq(narrators.id, PARENT));
+		backgroundOccupancyStore.refreshNarrator(PARENT);
+		await backgroundOccupancyStore.flush();
+		await flushDeltas();
+		broadcasts.length = 0;
+		await backgroundTaskService.createBashTask({
+			id: "cyclic-bash",
+			parentNarratorId: childId,
+			command: "work",
+		});
+		await flushDeltas();
+		const counts = broadcasts.filter(
+			(frame) => frame.message.type === "background_task_count_changed",
+		);
+		expect(new Set(counts.map((frame) => frame.narratorId))).toEqual(new Set([childId, PARENT]));
+		expect(counts.length).toBeLessThanOrEqual(6);
+		expect(listDeltas().filter((delta) => delta.narratorId === PARENT)).toEqual(
+			expect.arrayContaining([expect.objectContaining({ invalidate: true, activeCount: 1 })]),
+		);
+		expect((await backgroundTaskService.listPageByParent(PARENT)).activeTasks).toEqual([
+			expect.objectContaining({ id: childId, effectiveStatus: "child_running" }),
+		]);
+		expect(listRowDeltas(childId).map((delta) => delta.upsert)).toEqual([
+			expect.objectContaining({ id: "cyclic-bash", effectiveStatus: "running" }),
+		]);
+	});
+
+	test("count failures do not publish a fabricated zero or advance the list version", async () => {
+		await seedParent();
+		await seedBashTaskAt("count-error", "2026-08-01T00:00:00.000Z");
+		await flushDeltas();
+		broadcasts.length = 0;
+		const version = backgroundTaskService.getListVersion(PARENT);
+		const original = backgroundTaskService.countActiveKindsByParent;
+		backgroundTaskService.countActiveKindsByParent = async () => {
+			throw new Error("count unavailable");
+		};
+		try {
+			backgroundTaskService.notifyDerivedStatusChanged(PARENT, "count-error");
+			await flushDeltas();
+			expect(broadcasts).toHaveLength(0);
+			expect(backgroundTaskService.getListVersion(PARENT)).toBe(version);
+		} finally {
+			backgroundTaskService.countActiveKindsByParent = original;
+		}
+	});
+
 	// Count-only consumers (sidebar badges) must not parse full delta payloads, so
 	// every delta is paired with a tiny `background_task_count_changed` frame
 	// carrying the same activeCount.
@@ -691,12 +1452,12 @@ describe("background task count frames", () => {
 		for (const frame of countFrames) {
 			expect(frame.narratorId).toBe(PARENT);
 		}
-		expect(countFrames.map((f) => f.activeBackgroundTaskCount)).toEqual([1, 0]);
+		expect(transitions(countFrames.map((f) => f.activeBackgroundTaskCount))).toEqual([1, 0]);
 	});
 });
 
 describe("background task list deltas", () => {
-	test("creation and completion each push exactly one delta with consecutive versions", async () => {
+	test("creation and completion preserve row upserts and contiguous delta versions", async () => {
 		await seedParent();
 		await seedBashTaskAt("d1", "2026-06-01T00:00:00.000Z");
 		await flushDeltas();
@@ -706,15 +1467,19 @@ describe("background task list deltas", () => {
 		const deltas = listDeltas();
 		// A version that advances by more than one reads as a lost frame on the
 		// client and forces a refetch, defeating the whole mechanism.
-		expect(deltas.map((d) => d.version)).toEqual([1, 2]);
+		expect(deltas.map((d) => d.version)).toEqual(deltas.map((_, index) => index + 1));
 		for (const d of deltas) {
 			expect(d.listEpoch).toBe(BACKGROUND_TASK_LIST_EPOCH);
 			expect(d.narratorId).toBe(PARENT);
-			expect(d.upsert).toBeDefined();
+			expect(d.upsert !== undefined || d.invalidate === true).toBe(true);
 		}
-		expect((deltas[0]?.upsert as { effectiveStatus: string }).effectiveStatus).toBe("running");
-		expect((deltas[1]?.upsert as { effectiveStatus: string }).effectiveStatus).toBe("completed");
-		expect(deltas[1]?.activeCount).toBe(0);
+		const upserts = listRowDeltas();
+		expect(upserts).toHaveLength(2);
+		expect(upserts.map((delta) => delta.upsert)).toEqual([
+			expect.objectContaining({ id: "d1", effectiveStatus: "running" }),
+			expect.objectContaining({ id: "d1", effectiveStatus: "completed" }),
+		]);
+		expect(upserts[1]?.activeCount).toBe(0);
 	});
 
 	// A delta carrying a bigger payload than a page row would reintroduce the
@@ -727,7 +1492,7 @@ describe("background task list deltas", () => {
 		await backgroundTaskService.markCompleted("d-big", "y".repeat(40_000));
 		await flushDeltas();
 
-		const upsert = listDeltas().at(-1)?.upsert as { output: string; outputBytes: number };
+		const upsert = listRowDeltas().at(-1)?.upsert as { output: string; outputBytes: number };
 		expect(upsert.output.length).toBeLessThanOrEqual(BACKGROUND_TASK_LIST_OUTPUT_PREVIEW_CHARS + 1);
 		expect(upsert.outputBytes).toBeGreaterThanOrEqual(40_000);
 	});
@@ -738,6 +1503,9 @@ describe("background task list deltas", () => {
 		await flushDeltas();
 		broadcasts.length = 0;
 
+		// Unconsumed terminal publication must prevent premature deletion.
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+		await consumeTerminal("reap-1");
 		// olderThanMs: -1 makes every completed row older than the cutoff.
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
 		await flushDeltas();
@@ -753,15 +1521,98 @@ describe("background task list deltas", () => {
 			const id = `bulk-${String(i).padStart(2, "0")}`;
 			await seedBashTaskAt(id, `2026-08-01T00:00:${String(i).padStart(2, "0")}.000Z`, "done");
 		}
+		// Explicitly transfer across bounded publication pages before Await consumption.
+		// This pins the formerly timing-dependent delivery phase without starting a model.
+		for (let page = 0; page < 3; page++)
+			await getRuntimePublicationService().flushRecipient(PARENT);
+		expect(
+			sqlite
+				.query(
+					"SELECT state, count(*) AS count FROM narrator_buffered_messages WHERE narrator_id = ? AND kind = 'task_notice' GROUP BY state",
+				)
+				.all(PARENT),
+		).toEqual([{ state: "queued", count: 60 }]);
+		expect(publicationWakes.has(PARENT)).toBe(true);
 		await flushDeltas();
 		broadcasts.length = 0;
 
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+		for (let i = 0; i < 60; i++) await consumeTerminal(`bulk-${String(i).padStart(2, "0")}`);
+		expect(
+			sqlite.query("SELECT count(*) AS count FROM runtime_awaited_terminal_consumptions").get(),
+		).toEqual({ count: 60 });
+		expect(
+			sqlite
+				.query(
+					"SELECT state, count(*) AS count FROM narrator_buffered_messages WHERE narrator_id = ? AND kind = 'task_notice' GROUP BY state ORDER BY state",
+				)
+				.all(PARENT),
+		).toEqual([{ state: "cancelled", count: 60 }]);
+		expect(
+			sqlite
+				.query(
+					"SELECT count(*) AS count FROM narrator_buffered_messages WHERE narrator_id = ? AND state = 'materialized' AND adopted_at IS NULL",
+				)
+				.get(PARENT),
+		).toEqual({ count: 0 });
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(60);
 		await flushDeltas();
 
 		const delta = listDeltas().at(-1);
 		expect(delta?.invalidate).toBe(true);
 		expect(delta?.removeIds).toBeUndefined();
+	});
+
+	test("Await consumption cannot reap a materialized notice until its real adoption receipt", async () => {
+		await seedParent();
+		const taskId = "materialized-retention";
+		await seedBashTaskAt(taskId, "2026-08-02T00:00:00.000Z", "done");
+		await getRuntimePublicationService().flushRecipient(PARENT);
+		const owner = tryClaimExecution(PARENT, "run");
+		if (!owner) throw new Error("Cannot claim isolated notice consumer");
+		try {
+			const row = await claimInboxHead(PARENT, (candidate) => candidate.kind === "task_notice");
+			if (!row) throw new Error("No real task notice delivered");
+			await realNarratorSession.deliverPendingInjection(PARENT, "en", "idle", "none", {
+				...projectPendingInjection(row),
+				mailboxClaim: inboxClaim(row),
+				recipientMessageId: row.recipientMessageId ?? undefined,
+			});
+			const persisted = sqlite
+				.query(
+					"SELECT delivery_id, recipient_ref_id, content_revision, state, adopted_at FROM narrator_buffered_messages WHERE id = ?",
+				)
+				.get(row.id) as {
+				delivery_id: string | null;
+				recipient_ref_id: string | null;
+				content_revision: number;
+				state: string;
+				adopted_at: string | null;
+			};
+			expect(persisted).toMatchObject({ state: "materialized", adopted_at: null });
+			const run = await consumeTerminal(taskId, true);
+			expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+			expect(await backgroundTaskService.getById(taskId)).not.toBeNull();
+			if (!persisted.delivery_id || !persisted.recipient_ref_id)
+				throw new Error("Missing durable materialization receipt");
+			expect(
+				await runtimeInbox.ackAdopted(
+					persisted.delivery_id,
+					PARENT,
+					persisted.recipient_ref_id,
+					persisted.content_revision,
+				),
+			).toBe(true);
+			expect(await getRuntimePublicationService().hasPendingSource(run)).toBe(false);
+			expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
+			expect(
+				sqlite
+					.query("SELECT injection_consumed_at FROM narrator_message_refs WHERE id = ?")
+					.get(persisted.recipient_ref_id),
+			).toMatchObject({ injection_consumed_at: expect.any(Number) });
+		} finally {
+			owner.release();
+		}
 	});
 
 	test("restart recovery invalidates rather than upserting each rewritten row", async () => {
@@ -788,7 +1639,7 @@ describe("background task list deltas", () => {
 		await backgroundTaskService.markTakenOver("taken");
 		await flushDeltas();
 
-		const deltas = listDeltas();
+		const deltas = listRowDeltas();
 		expect(deltas).toHaveLength(1);
 		expect((deltas[0]?.upsert as { status: string }).status).toBe("cancelled");
 		expect(broadcasts.some((b) => b.message.type === "background_task_cancelled")).toBe(false);
@@ -803,7 +1654,7 @@ describe("background task list deltas", () => {
 		await seedParent();
 		const subagentId = "resumed-sub";
 		const now = new Date().toISOString();
-		await db.insert(narrators).values({
+		await seedNarrators({
 			id: subagentId,
 			type: "subagent",
 			variant: "subagent:general",
@@ -814,9 +1665,9 @@ describe("background task list deltas", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markTakenOver(subagentId);
 		await flushDeltas();
@@ -826,11 +1677,11 @@ describe("background task list deltas", () => {
 
 		// What the resumed runner sees: the loop is live in this process while the row
 		// is terminal, which is exactly the state `applyLiveness` calls `continued`.
-		liveLoops.add(subagentId);
+		setRuntimeLive(subagentId, true);
 		backgroundTaskService.notifyDerivedStatusChanged(PARENT, subagentId);
 		await flushDeltas();
 
-		const deltas = listDeltas();
+		const deltas = listRowDeltas();
 		expect(deltas).toHaveLength(1);
 		const upsert = deltas[0]?.upsert as { status: string; effectiveStatus: string };
 		// The stored status is untouched — only the derived one moved, which is the
@@ -850,7 +1701,7 @@ describe("resolveSubagentNarratorId", () => {
 		await seedParent();
 		const subagentId = "resolve-sub";
 		const now = new Date().toISOString();
-		await db.insert(narrators).values({
+		await seedNarrators({
 			id: subagentId,
 			type: "subagent",
 			variant: "subagent:general",
@@ -861,10 +1712,10 @@ describe("resolveSubagentNarratorId", () => {
 		});
 		await backgroundTaskService.createAgentTask({
 			id: subagentId,
-			parentNarratorId: PARENT,
 			subagentNarratorId: subagentId,
 			subagentType: "general",
 			alias: "map-the-providers",
+			binding: { deliverTo: { narratorId: PARENT, toolUseId: "test-tool-use" } },
 		});
 
 		for (const target of [subagentId, "map-the-providers"]) {

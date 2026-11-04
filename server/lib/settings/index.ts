@@ -5,17 +5,29 @@
  * because this index re-exports everything from the sub-modules.
  */
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { resolve } from "node:path";
+import { normalizeMcpLoadingConfig } from "@shared/mcp-loading-mode";
+import { normalizeProxyUrl } from "@shared/proxy-settings";
+import type { RecordingSettings } from "@shared/request-recording";
+import { getBuiltinToolRoutines } from "../builtin-routines";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
-import { invalidateModelCardCache } from "../model-cards";
 import {
 	bindModelCatalogSettings,
-	markLegacyWindowSettingsSaved,
-	reconcileLegacyWindowSettings,
-	settingsWithRawModelCatalog,
+	keepLatestCatalog,
+	normalizeModelCatalogSettings,
+	rewriteConnectionOverrides,
 	startModelCatalogDailyCheck,
 } from "../model-catalog";
 import { getNarraforkHome } from "../narrafork-home";
@@ -25,11 +37,22 @@ import {
 } from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
+import { withSettingsFileLock } from "../settings-file-lock";
+import {
+	type ManagerOwnedFields,
+	managerFieldsFromSettings,
+	preserveExternalManagerFields,
+	readManagerOwnedFields,
+} from "../settings-manager-fields";
+import { loadSpeechSettings } from "../speech-settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
+import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
+import { normalizeUpdateSourceSettings } from "./update-source";
 
+export { normalizeProxyUrl } from "@shared/proxy-settings";
 export {
 	customApiProtocolFromAnthropic,
 	customApiProtocolFromOpenAI,
@@ -42,7 +65,9 @@ export {
 	isAnthropicCustomApiProtocol,
 	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
+	migrateLegacyCustomApiProtocol,
 	migrateProviderPrefixReferences,
+	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
 	type ProviderPrefixChange,
 	rewriteModelReference,
@@ -76,7 +101,9 @@ export {
 	getReasoningEffortBlocklist,
 	getSubagentVisibleModels,
 	getSummaryModelContextWindow,
+	getSummaryModelContextWindowDetail,
 	getVisibleModels,
+	hasConfiguredCommandCodeProvider,
 	hasConfiguredGeminiProvider,
 	hasConfiguredNugProvider,
 	isAnthropicProvider,
@@ -84,6 +111,7 @@ export {
 	LARGE_CONTEXT_BOUNDARY,
 	type ModelContextWindowResolution,
 	type ModelContextWindowSource,
+	modelProtocolKey,
 	nugProviderPrefix,
 	openaiProviderPrefix,
 	parseAggModelValue,
@@ -105,6 +133,7 @@ export {
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveModelContextWindow,
+	resolveModelProtocol,
 	resolveProvider,
 	resolveTranslationModelOverride,
 	usesCodexApiMode,
@@ -125,13 +154,59 @@ export const narraforkDir = getNarraforkHome();
 const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
+/**
+ * Groups whose settings no longer exist: `chapters` (its tree-snapshot switch moved to
+ * `workspace`, migrated in `loadSettingsFromDisk` before this strip runs) and the
+ * chapter-container `containers` group.
+ */
+const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = ["chapters", "containers"];
 
-// Restored from upstream main (4e04d2f2): the v0.8.3 release anchor dropped this
-// declaration while keeping its use below, which threw ReferenceError on settings load.
-const OBSOLETE_TOP_LEVEL_SETTINGS_KEYS: readonly string[] = [];
+/** Pre-unification `agent.*` request dump keys, replaced by `requestEvidence`. */
+const LEGACY_REQUEST_DUMP_KEYS = [
+	"requestDumpRecordingEnabled",
+	"requestDumpRequestBytes",
+	"requestDumpResponseBytes",
+	"requestDumpEnabled",
+	"requestDumpErrorsOnly",
+	"requestDumpMaxSize",
+] as const;
 
-/** The superseded 1MB `agent.requestDumpMaxSize` default, rewritten on load. */
-const LEGACY_REQUEST_DUMP_MAX_SIZE = 1024 * 1024;
+/**
+ * Translate legacy `agent.requestDump*` keys into a `requestEvidence` patch.
+ * Returns undefined when none are present. `requestDumpMaxSize` has no successor.
+ */
+export function requestEvidenceFromLegacyAgent(
+	agent: Record<string, unknown> | undefined,
+): Partial<RecordingSettings> | undefined {
+	if (!agent || !LEGACY_REQUEST_DUMP_KEYS.some((key) => key in agent)) return undefined;
+	const patch: Partial<RecordingSettings> = {};
+	if (typeof agent.requestDumpRecordingEnabled === "boolean")
+		patch.ringEnabled = agent.requestDumpRecordingEnabled;
+	if (typeof agent.requestDumpRequestBytes === "number")
+		patch.ringRequestBytes = agent.requestDumpRequestBytes;
+	if (typeof agent.requestDumpResponseBytes === "number")
+		patch.ringResponseBytes = agent.requestDumpResponseBytes;
+	if (typeof agent.requestDumpEnabled === "boolean")
+		patch.autoPin = agent.requestDumpEnabled
+			? agent.requestDumpErrorsOnly === true
+				? "errors"
+				: "all"
+			: "off";
+	return patch;
+}
+
+/** Remove legacy request dump keys in place; true when anything was removed. */
+export function stripLegacyRequestDumpKeys(agent: Record<string, unknown> | undefined): boolean {
+	if (!agent) return false;
+	let changed = false;
+	for (const key of LEGACY_REQUEST_DUMP_KEYS) {
+		if (key in agent) {
+			delete agent[key];
+			changed = true;
+		}
+	}
+	return changed;
+}
 
 export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): boolean {
 	let changed = false;
@@ -140,6 +215,12 @@ export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): bo
 			delete settings[key];
 			changed = true;
 		}
+	}
+	// The message protocol v1 fallback switch, retired with v1 (P3d): every client speaks v2.
+	const blocks = settings.narratorBlocks;
+	if (blocks && typeof blocks === "object" && !Array.isArray(blocks) && "wsV2" in blocks) {
+		delete (blocks as Record<string, unknown>).wsV2;
+		changed = true;
 	}
 	const agent = settings.agent;
 	if (agent && typeof agent === "object" && !Array.isArray(agent)) {
@@ -224,12 +305,42 @@ export function loadSettings(): NarraForkSettings {
 	return loadSettingsFromDisk();
 }
 
+/** The settings.json text this process last read or wrote. */
+let lastSettingsText: string | undefined;
+
+/**
+ * Reload only when settings.json differs from what this process last read or wrote.
+ * The file watcher also fires for our own saves; those need no reload.
+ */
+export function reloadSettingsIfChanged(): boolean {
+	let text: string | undefined;
+	try {
+		text = readFileSync(settingsPath, "utf-8");
+	} catch {
+		text = undefined;
+	}
+	if (text !== undefined && text === lastSettingsText) return false;
+	reloadSettings();
+	return true;
+}
+
 /**
  * Force re-read settings from disk, bypassing the in-memory cache.
  * Use this after external modifications to settings.json.
  */
 export function reloadSettings(): NarraForkSettings {
-	const fresh = loadSettingsFromDisk();
+	let fresh: NarraForkSettings;
+	try {
+		fresh = loadSettingsFromDisk();
+	} catch (error) {
+		// A reload is all-or-nothing: an unreadable or invalid file keeps the running
+		// configuration instead of half-applying it. Startup still fails loudly.
+		if (!_cache.current) throw error;
+		logger.error("Settings reload rejected; keeping the running configuration", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return _cache.current;
+	}
 	settingsRevision++;
 	if (_cache.current) {
 		for (const key of Object.keys(fresh) as Array<keyof NarraForkSettings>) {
@@ -246,15 +357,46 @@ export function reloadSettings(): NarraForkSettings {
 
 function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
+	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	if (!existsSync(settingsPath)) {
-		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2), { mode: 0o600 });
+		// Only a new installation opts into discovery. Merging these into DEFAULTS
+		// would silently change every existing user's explicit manual/resident choices.
+		const initial = {
+			...DEFAULTS,
+			routines: {
+				...DEFAULTS.routines,
+				toolModes: Object.fromEntries(
+					getBuiltinToolRoutines().map((routine) => [routine.id, "auto"]),
+				),
+			},
+		};
+		writeFileSync(settingsPath, JSON.stringify(initial, null, 2), { mode: 0o600 });
 	}
-	const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
+	const text = existsSync(settingsPath) ? readFileSync(settingsPath, "utf-8") : undefined;
+	const raw = text === undefined ? {} : JSON.parse(text);
+	lastSettingsText = text;
 	const merged = deepMerge(DEFAULTS, raw);
+	// Do not let the generic defaults merge conceal an invalid partial speech config.
+	merged.speech = loadSpeechSettings(raw.speech);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
 	const mergedAny = merged as any;
 
-	let needsSave = false;
+	// `chapters.treeSnapshotsEnabled` became `workspace.treeSnapshotsEnabled` when chapters
+	// were removed. Read from `raw`, so the strip of the obsolete group below cannot race it.
+	if (
+		typeof raw.chapters?.treeSnapshotsEnabled === "boolean" &&
+		raw.workspace?.treeSnapshotsEnabled === undefined
+	) {
+		// A fresh object: without a stored `workspace` group, `merged.workspace` is DEFAULTS'.
+		merged.workspace = {
+			...merged.workspace,
+			treeSnapshotsEnabled: raw.chapters.treeSnapshotsEnabled,
+		};
+	}
+
+	const normalizedUpdate = normalizeUpdateSourceSettings(merged, raw);
+	merged.update = normalizedUpdate.update;
+	let needsSave = normalizedUpdate.needsSave;
 	if (stripObsoleteSettingsKeys(mergedAny)) {
 		needsSave = true;
 	}
@@ -312,16 +454,13 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
-	// Raise the superseded 1MB raw-dump ceiling.
-	//
-	// 1MB was the old default and is below the size of essentially any request worth
-	// dumping (full history + replayed tool output), so it truncated the request body of
-	// every capture. Because it was a *default* rather than a deliberate choice, it sits
-	// in settings.json verbatim for existing installs and would survive the new default
-	// forever. Only the exact old default is rewritten: any other value — including a
-	// smaller one — is an operator decision and is left alone.
-	if (raw.agent?.requestDumpMaxSize === LEGACY_REQUEST_DUMP_MAX_SIZE) {
-		merged.agent.requestDumpMaxSize = DEFAULTS.agent.requestDumpMaxSize;
+	// Request dump settings moved from `agent.requestDump*` to `requestEvidence`. An
+	// explicit `requestEvidence` section wins; legacy keys are dropped either way.
+	const legacyEvidence = requestEvidenceFromLegacyAgent(raw.agent);
+	if (legacyEvidence && raw.requestEvidence === undefined) {
+		merged.requestEvidence = { ...merged.requestEvidence, ...legacyEvidence };
+	}
+	if (stripLegacyRequestDumpKeys(merged.agent as unknown as Record<string, unknown>)) {
 		needsSave = true;
 	}
 
@@ -447,6 +586,12 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	// The model catalog has one stored and in-memory form; both startup and hot reload
+	// pass through this, so no reader can see a document that skipped the import.
+	if (normalizeModelCatalogSettings(merged)) {
+		needsSave = true;
+	}
+
 	if (normalizeMcpServerIds(merged)) {
 		needsSave = true;
 	}
@@ -455,25 +600,14 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
-	// Clean up agent fields that reference models from providers no longer in settings
-	const activePrefixes = new Set<string>();
-	for (const prov of merged.openaiProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.anthropicProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.nugProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.geminiProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const b of ["codex"]) activePrefixes.add(b);
-
-	if (purgeStaleAgentModelRefs(merged, (prefix) => !activePrefixes.has(prefix))) {
+	if (migrateCommandCodeDisabledFlag(merged)) {
 		needsSave = true;
 	}
+
+	// Loading settings must not destructively purge model references. Custom API
+	// providers, aggregations and plugin providers are not all represented by the
+	// legacy provider arrays (plugins may not even be registered yet at startup).
+	// Explicit provider removal cleans up references in the settings PATCH route.
 
 	if (migrateGlobalProxy(merged, raw)) {
 		needsSave = true;
@@ -491,6 +625,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (initializeTokenDanceModelCollection(merged)) needsSave = true;
+
+	lastDiskManagerFields = managerFieldsFromSettings(merged);
 	if (needsSave) saveSettings(merged);
 
 	// Pricing lives in its own module so cost attribution does not have to pull in
@@ -513,8 +650,8 @@ function loadSettingsFromDisk(): NarraForkSettings {
  * revert a correction they cannot see being reverted. New edits go through cards
  * and land in the same place.
  */
-// Legacy pricing is migrated once by bindModelCatalogSettings. New estimates
-// read the same effective metadata as request construction, never a projection.
+// Legacy pricing is imported once by normalizeModelCatalogSettings. New estimates
+// read the same effective card as request construction.
 
 /** Simple 8-char random ID for migration (avoids importing nanoid at this level). */
 function generateMigrationId(): string {
@@ -545,8 +682,34 @@ export function normalizeMcpServerIds(settings: NarraForkSettings): boolean {
 			dirty = true;
 		}
 		seen.add(server.id);
+		const normalized = normalizeMcpLoadingConfig(server);
+		if (server.mode !== normalized.mode || server.enabled !== normalized.enabled) {
+			server.mode = normalized.mode;
+			server.enabled = normalized.enabled;
+			dirty = true;
+		}
 	}
 	return dirty;
+}
+
+/**
+ * Move a legacy `agent.disabledProviders` entry for Command Code onto its own
+ * `commandCode.disabled` flag.
+ *
+ * Earlier builds treated Command Code as an ordinary prefix in that set. The set
+ * still filters models client-side, so leaving the entry behind would hide every
+ * Command Code model while the provider itself stayed enabled. The user's intent
+ * (it was switched off) is preserved on the flag the provider actually reads.
+ */
+export function migrateCommandCodeDisabledFlag(settings: NarraForkSettings): boolean {
+	const disabled = settings.agent?.disabledProviders;
+	if (!disabled?.includes(COMMAND_CODE_PREFIX)) return false;
+	settings.agent.disabledProviders = disabled.filter((prefix) => prefix !== COMMAND_CODE_PREFIX);
+	settings.commandCode = {
+		...settings.commandCode,
+		disabled: settings.commandCode?.disabled ?? true,
+	};
+	return true;
 }
 
 /** Migrate pre readOnly/readWrite MCP behavior values. */
@@ -612,15 +775,8 @@ export function purgeStaleAgentModelRefs(
 		settings.agent.hiddenModels = cleanedHidden;
 		dirty = true;
 	}
-	const origWindows = settings.agent.modelContextWindows ?? {};
-	const cleanedWindows: Record<string, number> = {};
-	for (const [k, v] of Object.entries(origWindows)) {
-		if (!isStale(k)) cleanedWindows[k] = v;
-	}
-	if (Object.keys(cleanedWindows).length !== Object.keys(origWindows).length) {
-		settings.agent.modelContextWindows = cleanedWindows;
+	if (rewriteConnectionOverrides(settings, (model) => (isStale(model) ? null : model)))
 		dirty = true;
-	}
 	const origCustom = settings.agent.customModels ?? [];
 	const cleanedCustom = origCustom.filter((m) => !isStale(m.value));
 	if (cleanedCustom.length !== origCustom.length) {
@@ -634,6 +790,8 @@ export function purgeStaleAgentModelRefs(
 const _cache: { current: NarraForkSettings | null } = { current: null };
 
 let settingsRevision = 0;
+/** 上次从磁盘加载（或写回）时，管理器可能单独修改的那些字段。 */
+let lastDiskManagerFields: ManagerOwnedFields = {};
 const settingsChangeListeners = new Set<() => void>();
 
 /** Subscribe to persisted settings after the runtime singleton has been updated. */
@@ -644,24 +802,6 @@ export function subscribeSettingsChanges(listener: () => void): () => void {
 
 export function getSettingsRevision(): number {
 	return settingsRevision;
-}
-
-const URL_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
-
-/**
- * Normalize user-entered proxy addresses.
- * If a user enters only host:port, assume an HTTP proxy by default.
- */
-export function normalizeProxyUrl(value: string | null | undefined): string | undefined {
-	const trimmed = value?.trim();
-	if (!trimmed) return undefined;
-	const normalized = URL_PROTOCOL_RE.test(trimmed) ? trimmed : `http://${trimmed}`;
-	try {
-		const protocol = new URL(normalized).protocol;
-		return protocol === "http:" || protocol === "https:" ? normalized : undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 /** Preserve the formerly shared Browser/WebFetch override once, on settings load. */
@@ -681,6 +821,7 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
 		settings.proxy,
 		settings.agent?.webFetchPolicy?.proxy,
 		settings.agent?.browserProxy,
+		settings.update?.proxy,
 	]) {
 		if (!proxy) continue;
 		if (proxy.mode !== "custom") {
@@ -788,25 +929,34 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
-	reconcileLegacyWindowSettings(newSettings);
+	initializeTokenDanceModelCollection(newSettings);
+	keepLatestCatalog(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
-	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
-	try {
-		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {
-			mode: 0o600,
-		});
-		renameSync(tempPath, settingsPath);
-	} catch (error) {
-		rmSync(tempPath, { force: true });
-		throw error;
-	}
-	markLegacyWindowSettingsSaved(newSettings);
+	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
+	withSettingsFileLock(narraforkDir, () => {
+		newSettings.speech = loadSpeechSettings(newSettings.speech);
+		let disk: unknown = {};
+		if (existsSync(settingsPath)) {
+			try {
+				disk = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			} catch {
+				disk = {};
+			}
+		}
+		preserveExternalManagerFields(newSettings, readManagerOwnedFields(disk), lastDiskManagerFields);
+		const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
+		try {
+			const text = JSON.stringify(newSettings, null, 2);
+			writeFileSync(tempPath, text, { mode: 0o600 });
+			renameSync(tempPath, settingsPath);
+			lastSettingsText = text;
+		} catch (error) {
+			rmSync(tempPath, { force: true });
+			throw error;
+		}
+		lastDiskManagerFields = managerFieldsFromSettings(newSettings);
+	});
 	settingsRevision++;
-
-	// The card index is memoized on the identity of the cards array. A save that
-	// mutated the existing array in place would keep that identity, so the cache
-	// is dropped explicitly rather than relying on a new reference arriving.
-	invalidateModelCardCache();
 	if (_cache.current) {
 		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);
 		for (const key of Object.keys(_cache.current) as Array<keyof NarraForkSettings>) {

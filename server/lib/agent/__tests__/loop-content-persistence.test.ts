@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
-import type { ProviderAdapter } from "../provider";
+import type { DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
@@ -15,23 +15,32 @@ function gate() {
 let script: ProviderAdapter["chat"];
 let attempts = 0;
 const started: string[] = [];
-const replayed: unknown[][] = [];
+/** Rows each projected request was built from (the fake builder's input). */
+const builtRows: DbMessage[][] = [];
+const requests: Array<{ history: unknown[]; toolResults?: unknown[] }> = [];
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => {
+		builtRows.push(structuredClone(rows));
+		return {
+			history: rows.map((row) => ({
+				role: row.role,
+				content: row.contentJson,
+				calls: row.toolCalls,
+			})),
+		};
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
+		requests.push(
+			structuredClone({ history: params.history ?? [], toolResults: params.toolResults }),
+		);
 		params.onRequestStart?.();
 		if (++attempts > 1) {
 			yield { text: "收尾" };
 			return;
 		}
 		yield* script(params);
-	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: (...args) => {
-		replayed.push(args);
 	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
@@ -63,7 +72,8 @@ toolRegistry.register({
 beforeEach(() => {
 	attempts = 0;
 	started.length = 0;
-	replayed.length = 0;
+	builtRows.length = 0;
+	requests.length = 0;
 });
 afterAll(() => {
 	mock.module("../provider", () => realProvider);
@@ -71,7 +81,10 @@ afterAll(() => {
 	mock.restore();
 });
 
-async function run(onEvent?: (event: AgentEvent) => Promise<void> | void) {
+async function run(
+	onEvent?: (event: AgentEvent) => Promise<void> | void,
+	permissionHandler: AgentConfig["permissionHandler"] = async () => ({ behavior: "allow" }),
+) {
 	const config: AgentConfig = {
 		narratorId: "n-content-persistence",
 		conversationId: "content-persistence",
@@ -79,10 +92,10 @@ async function run(onEvent?: (event: AgentEvent) => Promise<void> | void) {
 		model: "test:model",
 		cwd: process.cwd(),
 		signal: new AbortController().signal,
-		permissionHandler: async () => ({ behavior: "allow" }),
+		permissionHandler,
 	};
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(config, "test content ordering", [])) {
+	for await (const event of agentLoop(config, "test content ordering", { rows: [] })) {
 		events.push(event);
 		await onEvent?.(event);
 	}
@@ -130,7 +143,9 @@ describe("reasoning identity and replay", () => {
 			text: "abcd",
 			providerMetadata: { anthropic: { signature: "signed" } },
 		});
-		expect(replayed[0]?.[9]).toEqual(
+		// The next request reads the step with the reasoning whole.
+		const step = builtRows.at(-1)?.find((row) => row.role === "assistant");
+		expect(step?.contentJson).toEqual(
 			expect.arrayContaining([expect.objectContaining({ type: "reasoning", text: "abcd" })]),
 		);
 	});
@@ -269,5 +284,73 @@ describe("content publication precedes tools", () => {
 		expect(reasoningWrites.at(-1)?.providerMetadata?.openai?.reasoningEncryptedContent).toBe(
 			"encrypted",
 		);
+	});
+});
+
+describe("question reply ownership during real loop execution", () => {
+	test.each([
+		false,
+		true,
+	])("permission reply never becomes the assistant's arguments (deferred=%s)", async (deferred) => {
+		const originalTool = toolRegistry.get("AskUserQuestion");
+		const authored = {
+			questions: [{ header: "Direction", options: [{ header: "A" }, { header: "B" }] }],
+			async: false,
+		};
+		const reply = deferred
+			? { ...authored, async: true, deferredByUser: true }
+			: {
+					...authored,
+					answers: { Direction: "UNIQUE_HUMAN_PERMISSION_REPLY" },
+					annotations: { Direction: { notes: "human note" } },
+				};
+		let executionInput: unknown;
+		toolRegistry.register({
+			name: "AskUserQuestion",
+			description: "Question execution observer",
+			parameters: z.object({ questions: z.array(z.unknown()), async: z.boolean().optional() }),
+			execute: async (input) => {
+				executionInput = structuredClone(input);
+				return {
+					output: deferred
+						? "Question accepted asynchronously."
+						: "User answered: UNIQUE_HUMAN_PERMISSION_REPLY",
+				};
+			},
+		});
+		script = async function* () {
+			yield {
+				toolUses: [
+					{
+						toolUseId: "question-authored",
+						name: "AskUserQuestion",
+						input: structuredClone(authored),
+					},
+				],
+			};
+		};
+		try {
+			const events = await run(undefined, async () => ({ behavior: "allow", updatedInput: reply }));
+			expect(executionInput).toEqual(reply);
+			// The next request's step keeps the authored call; the reply is only its result.
+			expect(requests).toHaveLength(2);
+			const step = builtRows.at(-1)?.find((row) => row.role === "assistant");
+			const call = (step?.contentJson as Array<{ type: string; name?: string; input?: unknown }>)
+				.filter((block) => block.type === "tool_use")
+				.find((block) => block.name === "AskUserQuestion");
+			expect(call?.input).toEqual(authored);
+			const ledger = step?.toolCalls?.find((entry) => entry.toolUseId === "question-authored");
+			expect(ledger?.inputJson).toEqual(authored);
+			expect(JSON.stringify(ledger?.outputJson)).toContain(
+				deferred ? "Question accepted asynchronously." : "UNIQUE_HUMAN_PERMISSION_REPLY",
+			);
+			expect(events.find((event) => event.type === "tool_result")).toMatchObject({
+				updatedInput: reply,
+			});
+			expect(authored.async).toBe(false);
+		} finally {
+			if (originalTool) toolRegistry.register(originalTool);
+			else toolRegistry.unregister("AskUserQuestion");
+		}
 	});
 });

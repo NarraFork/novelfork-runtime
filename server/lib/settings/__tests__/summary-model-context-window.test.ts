@@ -10,12 +10,16 @@
  * model correctly. No mocks here: the resolution chain under test is the point.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { getModelCatalogRevision, setModelWindow } from "../../model-catalog";
 import type { ModelAggregation } from "../../settings/types";
 import {
 	DEFAULT_CONTEXT_WINDOW,
 	getModelContextWindow,
 	getSummaryModelContextWindow,
+	getSummaryModelContextWindowDetail,
 	parseModelId,
+	resolveModelContextWindow,
+	saveSettings,
 	settings,
 } from "../index";
 
@@ -93,5 +97,65 @@ describe("getSummaryModelContextWindow", () => {
 		settings.agent.defaultModel = "";
 		expect(() => getSummaryModelContextWindow()).not.toThrow();
 		expect(getSummaryModelContextWindow()).toBe(DEFAULT_CONTEXT_WINDOW);
+	});
+});
+
+describe("getSummaryModelContextWindowDetail", () => {
+	let original: {
+		defaultModel: string;
+		summaryModel: string;
+	};
+
+	beforeEach(() => {
+		original = {
+			defaultModel: settings.agent.defaultModel,
+			summaryModel: settings.agent.summaryModel,
+		};
+		settings.agent.defaultModel = DEFAULT_MODEL;
+	});
+
+	afterEach(() => {
+		settings.agent.defaultModel = original.defaultModel;
+		settings.agent.summaryModel = original.summaryModel;
+	});
+
+	test("reports the same window as getSummaryModelContextWindow", () => {
+		settings.agent.summaryModel = SUMMARY_MODEL;
+		const detail = getSummaryModelContextWindowDetail();
+		expect(detail.contextWindow).toBe(getSummaryModelContextWindow());
+		const parsed = parseModelId(SUMMARY_MODEL);
+		expect(detail.source).toBe(
+			resolveModelContextWindow(parsed.model, parsed.provider ?? "anthropic").source,
+		);
+	});
+
+	test("a user-filled window is reported as source=user", () => {
+		const parsed = parseModelId(SUMMARY_MODEL);
+		const key = `anthropic:${parsed.model}`;
+		settings.agent.summaryModel = SUMMARY_MODEL;
+		// The provider page writes the entry's own window into the catalog.
+		const originalCatalog = settings.agent.modelCatalog;
+		try {
+			setModelWindow({
+				baseRevision: getModelCatalogRevision(),
+				scope: "connection",
+				target: key,
+				contextWindow: 50_000,
+			});
+			const detail = getSummaryModelContextWindowDetail();
+			expect(detail.contextWindow).toBe(50_000);
+			expect(detail.source).toBe("user");
+		} finally {
+			settings.agent.modelCatalog = originalCatalog;
+			saveSettings(settings);
+		}
+	});
+
+	test("when nothing resolves the source is fallback", () => {
+		settings.agent.summaryModel = "";
+		settings.agent.defaultModel = "";
+		const detail = getSummaryModelContextWindowDetail();
+		expect(detail.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
+		expect(detail.source).toBe("fallback");
 	});
 });

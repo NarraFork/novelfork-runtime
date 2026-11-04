@@ -1,4 +1,5 @@
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type DockviewApi,
@@ -8,13 +9,27 @@ import {
 	type SerializedDockview,
 } from "dockview-react";
 import { createInstance } from "i18next";
-import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+	type ReactNode,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import type { PretextDocumentPageResult, TreeMessage } from "../../../lib/api/types";
 import { onPanelDragEnd, onPanelDragMove } from "../../../lib/panel-drag";
 import narratorTranslations from "../../../locales/en/narrators.json";
 import { ToolPanelShell } from "../dock/panels";
-import { useNarratorPanelVisible } from "../narrator-panel-visibility";
+import {
+	DockviewNarratorPanelVisibilityProvider,
+	useNarratorPanelVisible,
+} from "../narrator-panel-visibility";
+import type { PretextDocumentFetchPage } from "../vlist/pretext-document-loader";
+import { usePretextDocument } from "../vlist/usePretextDocument";
+import { hasVisibleVListGeometry } from "../vlist/vlist-visible-viewport";
 import { DEFAULT_DIRECTOR_STATE, serializeWorkspaceLayout } from "./dockview-layout";
 import type { WorkspacePanelParams } from "./panel-types";
 import { WorkspaceResourceFrame } from "./WorkspaceResourceFrame";
@@ -48,13 +63,90 @@ let nextInstance = 0;
 let reveals = 0;
 let overlayClicks = 0;
 let ready = false;
+// Opt-in only: existing resource/Director cases retain their original mocked bodies.
+const messagesMode = new URLSearchParams(location.search).get("messages") === "1";
+const messageRequests: { narratorId: string; tail: boolean; aborted: boolean }[] = [];
+const parkAfterMessageCommit = new Set<string>();
+const parkedMessageCommits: { panelId: string; width: number; height: number }[] = [];
+
+/** Force commit -> CSS parking -> passive effects without depending on browser scheduling. */
+export function parkAfterNextMessageCommit(panelId: string) {
+	parkAfterMessageCommit.add(panelId);
+}
+const messageDocuments: Record<
+	string,
+	{
+		narratorId: string;
+		providerVisible: boolean;
+		status: string;
+		messageIds: string[];
+		texts: string[];
+		itemCount: number;
+		totalHeight: number;
+		itemWidths: (number | undefined)[];
+		firstReadyMs: number | null;
+		clearedAfterReady: number;
+		zeroSizeAdoptions: number;
+		error: string | null;
+	}
+> = {};
 let normalDragMoves = 0;
 let normalDragDrops = 0;
 onPanelDragMove(() => normalDragMoves++);
 onPanelDragEnd((state) => {
 	if (state) normalDragDrops++;
 });
-const escapeDecisions: { closed: boolean; prevented: boolean; target: string | null }[] = [];
+const escapeDecisions: {
+	closed: boolean;
+	prevented: boolean;
+	target: string | null;
+	focused: boolean;
+	opener: string | null;
+}[] = [];
+
+/** Deterministically expose Dockview's pre-first-paint attachment state. */
+export function holdLayoutFrames() {
+	const request = window.requestAnimationFrame;
+	const cancel = window.cancelAnimationFrame;
+	const pending = new Map<number, FrameRequestCallback>();
+	let nextId = -1;
+	window.requestAnimationFrame = (callback) => {
+		if (pending.size >= 100) throw new Error("Fixture layout callback budget exceeded");
+		const id = nextId--;
+		pending.set(id, callback);
+		return id;
+	};
+	window.cancelAnimationFrame = (id) => {
+		if (!pending.delete(id)) cancel.call(window, id);
+	};
+	releaseLayoutFrames = () => {
+		window.requestAnimationFrame = request;
+		window.cancelAnimationFrame = cancel;
+		for (const callback of pending.values()) request.call(window, callback);
+		pending.clear();
+	};
+}
+export let releaseLayoutFrames = () => {};
+
+export function resourceFocus(id: string) {
+	const pin = document.querySelector<HTMLButtonElement>(`[data-workspace-resource-pin="${id}"]`);
+	if (!pin) throw new Error("Missing resource pin");
+	const rect = pin.getBoundingClientRect();
+	const panel = apiRef.current?.getPanel(id);
+	return {
+		focused: document.activeElement === pin,
+		activeTag: document.activeElement?.tagName,
+		activeOpener: document.activeElement?.getAttribute("data-open"),
+		disabled: pin.disabled,
+		visible: pin.checkVisibility({ checkVisibilityCSS: true }),
+		visibility: getComputedStyle(pin).visibility,
+		width: rect.width,
+		height: rect.height,
+		panelVisible: panel?.api.isVisible,
+		floating: panel?.api.location.type === "floating",
+		contentContains: panel?.view.content.element.contains(pin),
+	};
+}
 
 const client = new QueryClient({
 	defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
@@ -76,7 +168,7 @@ export function resourceId(kind: ResourceKind) {
 
 function openResource(kind: ResourceKind) {
 	if (kind === "subagent") store.openSubagentPanel("narrator-a", "child-one");
-	else store.openToolPanel("narrator-a", kind, null);
+	else store.openToolPanel("narrator-a", kind);
 }
 
 function ResourceButtons({ director = false }: { director?: boolean }) {
@@ -95,12 +187,186 @@ function ResourceButtons({ director = false }: { director?: boolean }) {
 			<button
 				type="button"
 				data-toggle={`${director ? "director" : "grid"}-terminal`}
-				onClick={() => store.toggleToolPanel("narrator-a", "terminal", null)}
+				onClick={() => store.toggleToolPanel("narrator-a", "terminal")}
 			>
 				Toggle terminal
 			</button>
 		</div>
 	);
+}
+
+// Stable identity is essential: coordinator rerenders must not restart transport.
+const fetchMessagePage: PretextDocumentFetchPage = async (narratorId, options) => {
+	const request = {
+		narratorId,
+		tail: options.afterSeq == null && options.beforeSeq == null,
+		aborted: options.signal?.aborted ?? false,
+	};
+	messageRequests.push(request);
+	options.signal?.addEventListener(
+		"abort",
+		() => {
+			request.aborted = true;
+		},
+		{ once: true },
+	);
+	const messages = [0, 1].map((seq): TreeMessage => {
+		const text =
+			`## ${narratorId} message ${seq}\n\nReal measured document body for ${narratorId}. ` +
+			"Several words wrap naturally using this panel's actual browser width. ".repeat(8);
+		const row = {
+			id: `${narratorId}-message-${seq}`,
+			narratorId,
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-10-01T00:00:00.000Z",
+			seq,
+		} as Omit<TreeMessage, "blocks">;
+		return rowWithElements(row, [{ type: "text", text }]);
+	});
+	return {
+		messages,
+		minSeq: 0,
+		maxSeq: 1,
+		hasNext: false,
+		hasPrev: false,
+		messageVersion: 1,
+	} satisfies PretextDocumentPageResult;
+};
+const messageLoadOptions = { fetchPage: fetchMessagePage };
+
+/** Real hook/coordinator/build; only the transport and expensive session/WS view are mocked. */
+function MessageDocumentProbe({ panelId, narratorId }: { panelId: string; narratorId: string }) {
+	const visible = useNarratorPanelVisible();
+	const nodeRef = useRef<HTMLDivElement | null>(null);
+	const [geometry, setGeometry] = useState({ width: 0, height: 0, ready: false });
+	const startedAt = useRef(performance.now());
+	const firstReadyAt = useRef<number | null>(null);
+	const previouslyReady = useRef(false);
+	const previousIndex = useRef<unknown>(null);
+	const cleared = useRef(0);
+	const zeroAdoptions = useRef(0);
+	useEffect(() => {
+		const node = nodeRef.current;
+		if (!node) return;
+		const measure = () => {
+			const ready = visible && hasVisibleVListGeometry(node);
+			const width = node.clientWidth;
+			const height = node.clientHeight;
+			setGeometry((old) =>
+				old.width === width && old.height === height && old.ready === ready
+					? old
+					: { width, height, ready },
+			);
+		};
+		const observer = new ResizeObserver(measure);
+		observer.observe(node);
+		measure();
+		return () => observer.disconnect();
+	}, [visible]);
+	const document = usePretextDocument(narratorId, {
+		layoutReady: visible && geometry.ready,
+		lod: 5,
+		widthBucket: String(geometry.width),
+		contentWidth: geometry.width,
+		viewportHeight: geometry.height,
+		scrollTop: 0,
+		pinnedToBottom: true,
+		loadOptions: messageLoadOptions,
+	});
+	// Observe each committed index synchronously. A passive observer can see an
+	// older commit's index after Dockview/test code has already CSS-parked its DOM,
+	// falsely counting retention of a measured document as a zero-size adoption.
+	useLayoutEffect(() => {
+		if (document.status === "ready" && document.index && firstReadyAt.current == null)
+			firstReadyAt.current = performance.now();
+		if (previouslyReady.current && document.messages.length === 0) cleared.current++;
+		if (
+			document.index &&
+			document.index !== previousIndex.current &&
+			(!nodeRef.current || !hasVisibleVListGeometry(nodeRef.current))
+		)
+			zeroAdoptions.current++;
+		previousIndex.current = document.index;
+		previouslyReady.current ||= document.messages.length > 0;
+		messageDocuments[panelId] = {
+			narratorId,
+			providerVisible: visible,
+			status: document.status,
+			messageIds: document.messages.map((message) => message.id),
+			texts: document.messages.map((message) => message.contentText ?? ""),
+			itemCount: document.items.length,
+			totalHeight: document.index?.totalHeight ?? 0,
+			itemWidths: document.items.map((item) => item.contentWidth),
+			firstReadyMs: firstReadyAt.current == null ? null : firstReadyAt.current - startedAt.current,
+			clearedAfterReady: cleared.current,
+			zeroSizeAdoptions: zeroAdoptions.current,
+			error: document.error == null ? null : String(document.error),
+		};
+	});
+	// Registered after the commit observer: a measured ready document is committed
+	// with real geometry, then parked before React can flush its passive effects.
+	useLayoutEffect(() => {
+		const node = nodeRef.current;
+		if (document.status !== "ready" || !document.index || !node) return;
+		if (!parkAfterMessageCommit.delete(panelId)) return;
+		parkedMessageCommits.push({ panelId, width: node.clientWidth, height: node.clientHeight });
+		node.style.display = "none";
+	}, [document.index, document.status, panelId]);
+	return (
+		<div
+			ref={nodeRef}
+			data-message-document={panelId}
+			data-message-status={document.status}
+			style={{ height: "100%", overflow: "auto" }}
+		>
+			{document.messages.map((message) => (
+				<p key={message.id}>{message.contentText}</p>
+			))}
+		</div>
+	);
+}
+
+export function messageSnapshot() {
+	return {
+		parkedCommits: parkedMessageCommits.map((commit) => ({ ...commit })),
+		requests: messageRequests.map((request) => ({ ...request })),
+		documents: Object.entries(messageDocuments).map(([panelId, document]) => {
+			const node = window.document.querySelector(`[data-message-document="${panelId}"]`);
+			const panel = apiRef.current?.getPanel(panelId);
+			return {
+				panelId,
+				...document,
+				width: node?.clientWidth ?? 0,
+				height: node?.clientHeight ?? 0,
+				apiVisible: panel?.api.isVisible,
+				apiActive: panel?.api.isActive,
+				/** Dockview's own size for the panel; the always-rendered DOM can lag it. */
+				apiWidth: panel?.api.width,
+			};
+		}),
+	};
+}
+
+/** Exercise real zero-size CSS parking, independently of Dockview's visibility:hidden overlay. */
+export function parkMessageViewport(panelId: string, parked: boolean) {
+	const node = document.querySelector<HTMLElement>(`[data-message-document="${panelId}"]`);
+	if (!messagesMode || !node) throw new Error("Message viewport is not mounted");
+	node.style.display = parked ? "none" : "";
+}
+
+export function addMessageTab(panelId: string, narratorId: string) {
+	if (!messagesMode) throw new Error("Message fixture mode is not enabled");
+	return nativeDockviewApi().addPanel({
+		id: panelId,
+		component: "narrator",
+		params: { panelType: "narrator", narratorId },
+		title: narratorId,
+		inactive: true,
+		position: { referencePanel: "source-a", direction: "within" },
+	});
 }
 
 function BodyVisibilityProbe({ children }: { children: ReactNode }) {
@@ -214,7 +480,13 @@ function MockPanel(props: IDockviewPanelProps<WorkspacePanelParams>) {
 			}}
 		>
 			{params.panelType === "narrator" ? (
-				body
+				messagesMode ? (
+					<DockviewNarratorPanelVisibilityProvider api={api}>
+						<MessageDocumentProbe panelId={api.id} narratorId={params.narratorId} />
+					</DockviewNarratorPanelVisibilityProvider>
+				) : (
+					body
+				)
 			) : (
 				<WorkspaceResourceFrame props={props}>
 					<ToolPanelShell
@@ -259,10 +531,13 @@ function Harness() {
 			// React editors may preventDefault after this listener has run.
 			queueMicrotask(() => {
 				escapeDecisions.push({
+					focused: event.target === document.activeElement,
 					closed: store.closeFocusedTemporaryResource(event),
 					prevented: event.defaultPrevented,
 					target: event.target instanceof Element ? event.target.getAttribute("data-editor") : null,
+					opener: event.target instanceof Element ? event.target.getAttribute("data-open") : null,
 				});
+				if (escapeDecisions.length > 40) escapeDecisions.shift();
 			});
 		};
 		root.addEventListener("keydown", onEscape);
@@ -320,6 +595,15 @@ function Harness() {
 										params: { panelType: "narrator", narratorId: "narrator-b" },
 										title: "Bob",
 										position: { referencePanel: "source-a", direction: "right" },
+									});
+								}
+								if (new URLSearchParams(location.search).get("slots") === "3") {
+									api.addPanel({
+										id: "source-c",
+										component: "narrator",
+										params: { panelType: "narrator", narratorId: "narrator-c" },
+										title: "Carol",
+										position: { referencePanel: "source-b", direction: "right" },
 									});
 								}
 								ready = true;

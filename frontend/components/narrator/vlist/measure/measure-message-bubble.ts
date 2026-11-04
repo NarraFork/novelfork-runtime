@@ -16,10 +16,27 @@
  */
 
 import { measureLineStats, measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
+import {
+	layoutNextRichInlineLineRange,
+	materializeRichInlineLineRange,
+	prepareRichInline,
+	type RichInlineItem,
+} from "@chenglou/pretext/rich-inline";
+import { unescapeComposerText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
+import {
+	MEDIA_ATTACHMENT_WIDTH,
+	mediaAttachmentHeight,
+} from "@shared/pretext-layout/media-attachment-layout";
 import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
+import {
+	type ComposerQuote,
+	type ComposerTextSegment,
+	parseComposerQuotePrefix,
+	parseComposerSegments,
+} from "../../composer/composer-quotes";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
@@ -68,6 +85,22 @@ export const USER_HEADER_BODY_GAP = 4;
 export const USER_HEADER_MIN_CONTENT_WIDTH = 140;
 /** Stack gap between a user bubble's attachments and its body text (Stack gap={4}). */
 export const USER_ATTACHMENT_GAP = 4;
+/** Sent quote chips match the composer chip: one 24px row, wrapping onto the next. */
+export const USER_QUOTE_CHIP_HEIGHT = 24;
+export const USER_QUOTE_CHIP_GAP = 6;
+/** Horizontal chrome around the label: padding, quote icon, and the gap before the text. */
+const USER_QUOTE_CHIP_CHROME = 6 + 12 + 4 + 6;
+/**
+ * Chips that sit inside a text line when quotes or attachments are interleaved with it:
+ * a shorter chip than the stacked rows, so it fits the body line box.
+ */
+export const USER_INLINE_CHIP_HEIGHT = 20;
+/** Clear space kept on each side of an inline chip. */
+export const USER_INLINE_CHIP_MARGIN = 2;
+/** Horizontal chrome inside an inline chip: padding, icon/thumbnail, and the gap before the text. */
+export const USER_INLINE_CHIP_CHROME = 1 + 5 + 14 + 4 + 5 + 1;
+/** Inline chip labels are clipped to this many characters so one chip stays a short token. */
+const USER_INLINE_CHIP_LABEL_CHARS = 18;
 /** Stack gap between the reply quote strip and whatever follows it (Stack gap={4}). */
 export const USER_QUOTE_GAP = 4;
 /** Left rail width of the reply quote strip (the tinted vertical bar). */
@@ -146,6 +179,7 @@ export type MessageRole = "assistant" | "user";
 export interface MeasureUserAttachment {
 	type: string;
 	imageId?: string | null;
+	mediaId?: string | null;
 	previewUrl?: string | null;
 	filename?: string | null;
 	mediaType?: string | null;
@@ -328,6 +362,29 @@ function attachmentBlock(
 	marginTop: number,
 	innerWidth: number,
 ): PreparedFixedBlock | null {
+	if (attachment.type === "audio" || attachment.type === "video") {
+		return {
+			kind: "fixed",
+			marginTop,
+			height: mediaAttachmentHeight(attachment.type),
+			tag: `user-${attachment.type}`,
+			displayWidth: Math.min(innerWidth, MEDIA_ATTACHMENT_WIDTH),
+			data: {
+				type: attachment.type,
+				mediaId: attachment.mediaId ?? null,
+				previewUrl: attachment.previewUrl ?? null,
+				filename: attachment.filename ?? null,
+				mediaType: attachment.mediaType ?? null,
+				size: attachment.size ?? null,
+				uploadNarratorId: attachment.uploadNarratorId ?? null,
+			},
+			contentLeft: 0,
+			quoteRailLefts: [],
+			markerText: null,
+			markerLeft: null,
+			markerClassName: null,
+		};
+	}
 	const isImage = attachment.type === "image";
 	const isReference = attachment.type === "file_reference" && !!attachment.reference;
 	if (!isImage && !isReference && attachment.type !== "text_file") return null;
@@ -387,7 +444,272 @@ function attachmentBlock(
 }
 
 // ── user: plain pre-wrap body inside a shrink-wrapping bubble ─────────────────
+/** Pack quote chips into rows. Positions are what the bubble paints; nothing is remeasured there. */
+function quoteChipLayout(quotes: readonly ComposerQuote[], innerWidth: number) {
+	const chips: { x: number; y: number; width: number }[] = [];
+	let x = 0;
+	let y = 0;
+	for (const quote of quotes) {
+		const prepared = prepareWithSegments(quote.label, typographyMetrics().font.xs, {
+			whiteSpace: "pre-wrap",
+		});
+		const textWidth = Math.ceil(measureNaturalWidth(prepared));
+		const width = Math.min(
+			innerWidth,
+			Math.max(USER_QUOTE_CHIP_CHROME + 8, USER_QUOTE_CHIP_CHROME + textWidth),
+		);
+		if (x > 0 && x + width > innerWidth) {
+			x = 0;
+			y += USER_QUOTE_CHIP_HEIGHT + USER_QUOTE_CHIP_GAP;
+		}
+		chips.push({ x, y, width });
+		x += width + USER_QUOTE_CHIP_GAP;
+	}
+	const used = chips.reduce((max, chip) => Math.max(max, chip.x + chip.width), 0);
+	return {
+		height: quotes.length ? y + USER_QUOTE_CHIP_HEIGHT : 0,
+		used: Math.min(innerWidth, used),
+		chips,
+	};
+}
+
+function quoteChipBlock(
+	quotes: readonly ComposerQuote[],
+	innerWidth: number,
+	marginTop: number,
+): PreparedFixedBlock {
+	const layout = quoteChipLayout(quotes, innerWidth);
+	return {
+		kind: "fixed",
+		tag: "user-quote-chips",
+		marginTop,
+		height: layout.height,
+		displayWidth: Math.max(1, layout.used),
+		data: {
+			quotes: quotes.map((quote) => ({
+				label: quote.label,
+				text: quote.text,
+				anchor: quote.anchor ?? null,
+			})),
+			chips: layout.chips,
+		},
+		contentLeft: 0,
+		quoteRailLefts: [],
+		markerText: null,
+		markerLeft: null,
+		markerClassName: null,
+	};
+}
+
+/** One chip inside an inline flow line. */
+export type UserInlineAtom =
+	| { kind: "quote"; label: string; quote: { label: string; text: string; anchor: string | null } }
+	| { kind: "image" | "file"; label: string; attachment: MeasureUserAttachment };
+
+/** A painted piece of an inline flow line: text, or the chip `atom` indexes. */
+export interface UserInlineFragment {
+	x: number;
+	width: number;
+	text?: string;
+	atom?: number;
+}
+
+/**
+ * Where a user body's quotes and attachments go. With every one of them ahead of the
+ * typed text or after it, they stack as rows (the historical look, and the tidier one).
+ * Only when one sits between pieces of text does the body become an inline flow.
+ */
+interface UserBodyLayout {
+	leadingAttachments: MeasureUserAttachment[];
+	leadingQuotes: ComposerQuote[];
+	body: string;
+	inline: ComposerTextSegment[] | null;
+	trailingQuotes: ComposerQuote[];
+	trailingAttachments: MeasureUserAttachment[];
+}
+
+function userBodyLayout(input: MeasureMessageInput): UserBodyLayout {
+	const attachments = input.attachments ?? [];
+	const prefix = parseComposerQuotePrefix(input.text);
+	const legacy: UserBodyLayout = {
+		leadingAttachments: [...attachments],
+		leadingQuotes: prefix.quotes,
+		body: input.text.slice(prefix.prefixLength),
+		inline: null,
+		trailingQuotes: [],
+		trailingAttachments: [],
+	};
+	// Chat bodies are markdown and never carry composer placeholders.
+	if (input.bodyFormat === "markdown") return legacy;
+	legacy.body = unescapeComposerText(legacy.body);
+	const images = attachments.filter((attachment) => attachment.type === "image");
+	const files = attachments.filter((attachment) => attachment.type === "text_file");
+	const segments = parseComposerSegments(input.text, {
+		images: images.map((attachment) => attachment.filename ?? ""),
+		files: files.map((attachment) => attachment.filename ?? ""),
+	});
+	const placed = new Set<MeasureUserAttachment>();
+	for (const segment of segments)
+		if (segment.type === "attachment")
+			placed.add((segment.kind === "image" ? images : files)[segment.index]);
+	const quoteCount = segments.filter((segment) => segment.type === "quote").length;
+	// Nothing positional beyond the historical quote prefix: keep the exact old body.
+	if (!placed.size && quoteCount === prefix.quotes.length) return legacy;
+	const unplaced = attachments.filter((attachment) => !placed.has(attachment));
+	const isContent = (segment: ComposerTextSegment) =>
+		segment.type === "text" && /\S/u.test(segment.text);
+	const first = segments.findIndex(isContent);
+	const last = segments.findLastIndex(isContent);
+	const middle = segments.some(
+		(segment, index) => segment.type !== "text" && index > first && index < last,
+	);
+	if (middle) {
+		return {
+			...legacy,
+			leadingAttachments: unplaced,
+			leadingQuotes: [],
+			body: "",
+			inline: segments,
+		};
+	}
+	const layout: UserBodyLayout = {
+		leadingAttachments: unplaced,
+		leadingQuotes: [],
+		body: "",
+		inline: null,
+		trailingQuotes: [],
+		trailingAttachments: [],
+	};
+	segments.forEach((segment, index) => {
+		const trailing = first >= 0 && index > last;
+		if (segment.type === "text") layout.body += segment.text;
+		else if (segment.type === "quote")
+			(trailing ? layout.trailingQuotes : layout.leadingQuotes).push(segment.quote);
+		else
+			(trailing ? layout.trailingAttachments : layout.leadingAttachments).push(
+				(segment.kind === "image" ? images : files)[segment.index],
+			);
+	});
+	// The projection pads blocks onto their own lines; that spacing is the rows' gap now.
+	layout.body = layout.body.replace(/^(?:[^\S\n]*\n)+/u, "").trimEnd();
+	return layout;
+}
+
+function inlineChipLabel(label: string): string {
+	const flat = label.replace(/\s+/gu, " ").trim() || " ";
+	return flat.length > USER_INLINE_CHIP_LABEL_CHARS
+		? `${flat.slice(0, USER_INLINE_CHIP_LABEL_CHARS - 1)}…`
+		: flat;
+}
+
+/**
+ * Lay out an interleaved body: text wraps around chips that never break. Hard line breaks
+ * start a new flow; the blank line that ends a quote block in the projection is dropped.
+ */
+function inlineFlowBlock(
+	segments: readonly ComposerTextSegment[],
+	attachments: { images: MeasureUserAttachment[]; files: MeasureUserAttachment[] },
+	innerWidth: number,
+	marginTop: number,
+): PreparedFixedBlock {
+	const metrics = typographyMetrics();
+	const atoms: UserInlineAtom[] = [];
+	const paragraphs: Array<Array<{ text: string } | { atom: number }>> = [[]];
+	segments.forEach((segment, index) => {
+		if (segment.type === "text") {
+			let text = segment.text;
+			// The projection always puts a line break before a quote block; drop just that one.
+			if (segments[index + 1]?.type === "quote" && text.endsWith("\n")) text = text.slice(0, -1);
+			text.split("\n").forEach((piece, line) => {
+				if (line) paragraphs.push([]);
+				if (piece) paragraphs[paragraphs.length - 1].push({ text: piece });
+			});
+			return;
+		}
+		if (segment.type === "quote") {
+			atoms.push({
+				kind: "quote",
+				label: inlineChipLabel(segment.quote.label),
+				quote: {
+					label: segment.quote.label,
+					text: segment.quote.text,
+					anchor: segment.quote.anchor ?? null,
+				},
+			});
+		} else {
+			const attachment = (segment.kind === "image" ? attachments.images : attachments.files)[
+				segment.index
+			];
+			atoms.push({
+				kind: segment.kind,
+				label: inlineChipLabel(attachment.filename ?? ""),
+				attachment,
+			});
+		}
+		paragraphs[paragraphs.length - 1].push({ atom: atoms.length - 1 });
+	});
+	// Trailing blank lines carry nothing to paint, matching the rows layout's trimEnd.
+	while (paragraphs.length > 1 && !paragraphs[paragraphs.length - 1].length) paragraphs.pop();
+	const lines: UserInlineFragment[][] = [];
+	let used = 0;
+	for (const paragraph of paragraphs) {
+		if (!paragraph.length) {
+			lines.push([]);
+			continue;
+		}
+		const items: RichInlineItem[] = paragraph.map((piece) =>
+			"text" in piece
+				? { text: piece.text, font: metrics.font.body, break: "normal", extraWidth: 0 }
+				: {
+						text: atoms[piece.atom].label,
+						font: metrics.font.xs,
+						break: "never",
+						extraWidth: USER_INLINE_CHIP_CHROME + USER_INLINE_CHIP_MARGIN * 2,
+					},
+		);
+		const flow = prepareRichInline(items);
+		let cursor: Parameters<typeof layoutNextRichInlineLineRange>[2];
+		for (;;) {
+			const range = layoutNextRichInlineLineRange(flow, innerWidth, cursor);
+			if (!range) break;
+			const line = materializeRichInlineLineRange(flow, range);
+			let x = 0;
+			const fragments: UserInlineFragment[] = [];
+			for (const fragment of line.fragments) {
+				x += fragment.gapBefore;
+				const piece = paragraph[fragment.itemIndex];
+				fragments.push(
+					"text" in piece
+						? { x, width: fragment.occupiedWidth, text: fragment.text }
+						: { x, width: fragment.occupiedWidth, atom: piece.atom },
+				);
+				x += fragment.occupiedWidth;
+			}
+			lines.push(fragments);
+			used = Math.max(used, Math.ceil(line.width));
+			cursor = range.end;
+		}
+	}
+	return {
+		kind: "fixed",
+		tag: "user-inline-flow",
+		marginTop,
+		height: Math.max(1, lines.length) * metrics.line.body,
+		displayWidth: Math.max(1, Math.min(innerWidth, used)),
+		data: { lines, atoms, lineHeight: metrics.line.body },
+		contentLeft: 0,
+		quoteRailLefts: [],
+		markerText: null,
+		markerLeft: null,
+		markerClassName: null,
+	};
+}
+
 function measureUserMessage(input: MeasureMessageInput, contentWidth: number): MeasuredElement {
+	// The stored text still carries quote blocks and attachment placeholders so a click
+	// knows its source. The bubble shows them as chips or rows, never as raw text.
+	const layout = userBodyLayout(input);
+	const bodyText = layout.body;
 	const innerWidth = Math.max(1, contentWidth - USER_BUBBLE_PADDING * 2);
 	const blocks: PreparedBlock[] = [];
 	// True when the bubble holds at least one attachment block (used for the
@@ -440,22 +762,51 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 		});
 	} else {
 		// Attachments (images / text files) stack ABOVE the body text, inside the same
-		// bubble — the block order MessageBubble renders (server persists attachment
-		// blocks before the text block).
-		for (const attachment of input.attachments ?? []) {
-			const block = attachmentBlock(
-				attachment,
-				blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
-				innerWidth,
+		// bubble, unless the user put every one of them after the text (then below it).
+		const pushAttachments = (attachments: readonly MeasureUserAttachment[]) => {
+			for (const attachment of attachments) {
+				const block = attachmentBlock(
+					attachment,
+					blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+					innerWidth,
+				);
+				if (block) {
+					blocks.push(block);
+					hasAttachments = true;
+				}
+			}
+		};
+		const pushQuotes = (quotes: readonly ComposerQuote[]) => {
+			if (quotes.length)
+				blocks.push(
+					quoteChipBlock(quotes, innerWidth, blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP),
+				);
+		};
+		pushAttachments(layout.leadingAttachments);
+		// Trailing rows count toward the attachment width floor before the body is fitted.
+		hasAttachments ||= layout.trailingAttachments.some((attachment) =>
+			attachmentBlock(attachment, 0, innerWidth),
+		);
+		pushQuotes(layout.leadingQuotes);
+		if (layout.inline) {
+			const attachments = input.attachments ?? [];
+			blocks.push(
+				inlineFlowBlock(
+					layout.inline,
+					{
+						images: attachments.filter((attachment) => attachment.type === "image"),
+						files: attachments.filter((attachment) => attachment.type === "text_file"),
+					},
+					innerWidth,
+					blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
+				),
 			);
-			if (block) blocks.push(block);
 		}
-		hasAttachments = blocks.some((block) => block.kind === "fixed" && block.tag !== "user-quote");
 		// User body text is PLAIN pre-wrap (not markdown): a single pre-wrap block.
 		// An attachment-only message has no text block at all (an empty pre-wrap block
 		// would still reserve one line, leaving a blank gap under the image).
-		if (input.bodyFormat === "markdown" && input.text.length > 0) {
-			let body = measureMarkdown(input.text, innerWidth);
+		if (input.bodyFormat === "markdown" && bodyText.length > 0) {
+			let body = measureMarkdown(bodyText, innerWidth);
 			// Paragraph-only chat messages should hug their content, like plain user
 			// turns. A full-column bubble makes self/other alignment indistinguishable.
 			// Keep structural Markdown (tables, code, media, etc.) at the column width.
@@ -472,7 +823,7 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 				);
 				// Re-measure at the width we actually paint. Rounding a natural width
 				// down can otherwise introduce an extra line outside the reserved box.
-				body = measureMarkdown(input.text, bodyWidth, { preparedBlocks: body.blocks });
+				body = measureMarkdown(bodyText, bodyWidth, { preparedBlocks: body.blocks });
 			}
 			blocks.push({
 				kind: "fixed",
@@ -487,16 +838,16 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 				markerLeft: null,
 				markerClassName: null,
 			});
-		} else if (input.text.length > 0 || !hasAttachments) {
+		} else if (
+			!layout.inline &&
+			(bodyText.length > 0 ||
+				(!hasAttachments && !layout.leadingQuotes.length && !layout.trailingQuotes.length))
+		) {
 			const bodyBlock: PreparedCodeBlock = {
 				kind: "code",
 				// Cross-width memo (see prepared-markdown-cache): the segment precompute is
 				// width-independent and is the dominant cost of a user bubble.
-				prepared: getPreparedTextWithSegments(
-					input.text,
-					typographyMetrics().font.body,
-					"pre-wrap",
-				),
+				prepared: getPreparedTextWithSegments(bodyText, typographyMetrics().font.body, "pre-wrap"),
 				lineHeight: typographyMetrics().line.body,
 				lang: null,
 				marginTop: blocks.length === 0 ? 0 : USER_ATTACHMENT_GAP,
@@ -508,6 +859,8 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 			};
 			blocks.push(bodyBlock);
 		}
+		pushQuotes(layout.trailingQuotes);
+		pushAttachments(layout.trailingAttachments);
 	}
 	// No code-box padding for plain user text (it's not a fenced block).
 	const frame = accumulateFrame(blocks, innerWidth, pretextLineMetrics, {
@@ -535,7 +888,13 @@ function measureUserMessage(input: MeasureMessageInput, contentWidth: number): M
 	);
 	const usedWidth = Math.min(contentWidth, USER_BUBBLE_PADDING * 2 + innerUsed);
 
-	return { height, blocks, frame, contentWidth: innerWidth, usedWidth };
+	return {
+		height,
+		blocks,
+		frame,
+		contentWidth: innerWidth,
+		usedWidth,
+	};
 }
 
 // ── user + slash command: command line, folded expansion ─────────────────────
@@ -720,6 +1079,8 @@ export const MEASURE_MESSAGE_CONSTANTS = {
 	USER_ATTACHMENT_GAP,
 	USER_ATTACHMENT_MIN_CONTENT_WIDTH,
 	USER_QUOTE_GAP,
+	USER_QUOTE_CHIP_HEIGHT,
+	USER_QUOTE_CHIP_GAP,
 	USER_QUOTE_RAIL,
 	USER_IMAGE_HEIGHT: IMAGE_FIXED_HEIGHT,
 	USER_TEXT_FILE_HEIGHT: TEXT_FILE_HEIGHT,

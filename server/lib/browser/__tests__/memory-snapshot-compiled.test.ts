@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { compiledWorkerBuildEntrypoints } from "../../compiled-worker";
 
 const execute = promisify(execFile);
 const root = resolve(import.meta.dir, "../../../..");
@@ -11,10 +12,21 @@ const workerEntry = "./server/lib/browser/memory-snapshot-worker.ts";
 
 test("production compile arguments register snapshot worker", async () => {
 	const source = await readFile(join(root, "scripts/build-cross-platform.ts"), "utf8");
-	const command = source.match(/const compile = Bun\.spawnSync\(\s*\[([\s\S]*?)\],\s*\{/);
+	const command = source.match(/const compile = await runBuildStep\(\s*\[([\s\S]*?)\]\s*,?\s*\)/);
 	expect(command).not.toBeNull();
 	const args = command?.[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "") ?? "";
-	expect(args).toContain(`"${workerEntry}"`);
+	expect(args).toMatch(/^\s*process\.execPath\s*,\s*"build"\s*,/);
+	expect(args).toContain("...compiledWorkerBuildEntrypoints()");
+	const { stdout } = await execute(
+		process.execPath,
+		["--eval", "process.stdout.write(Bun.version)"],
+		{
+			timeout: 10_000,
+			maxBuffer: 1024,
+		},
+	);
+	expect(stdout).toBe(Bun.version);
+	expect(compiledWorkerBuildEntrypoints()).toContain(workerEntry);
 });
 
 test("real minified compiled binary loads worker outside source cwd; omitted entry fails safely", async () => {

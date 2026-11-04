@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:t
 import { z } from "zod/v4";
 import { diskSpaceMonitor } from "../../disk-safety";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, CodexRebuildHistoryRetryError } from "../codex-errors";
-import type { ProviderAdapter } from "../provider";
+import type { DbMessage, ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
@@ -16,6 +16,7 @@ let providerScenario:
 	| "streaming_field_boundaries"
 	| "codex_rebuild_after_text"
 	| "codex_rebuild_after_tool"
+	| "relaxed_plan_multiple_turns"
 	| "soft_stop_serial"
 	| "soft_stop_parallel"
 	| "soft_stop_interleaved"
@@ -24,6 +25,7 @@ let providerScenario:
 	| "enter_plan_prepared_order"
 	| "interleaved_tool_chunk_order" = "abort";
 let providerAttempts = 0;
+let enterPlanPermissionRequested = false;
 let streamingBoundaryClock = 0;
 let streamingBoundaryTool = "Write";
 let streamingBoundaryChunks: Array<{
@@ -35,9 +37,33 @@ let streamingBoundaryChunks: Array<{
 }> = [];
 const executedToolValues: string[] = [];
 const completedToolValues: string[] = [];
-const formattedToolResultOrder: string[] = [];
-const modelToolResultOrder: string[] = [];
-const assistantToolUseOrders: string[][] = [];
+/** Rows of the latest projected request: what the fake history builder received. */
+let lastBuiltRows: DbMessage[] = [];
+
+function toolUseIds(row: DbMessage): string[] {
+	return Array.isArray(row.contentJson)
+		? row.contentJson.flatMap((block) => (block?.type === "tool_use" ? [String(block.id)] : []))
+		: [];
+}
+
+/** The calls whose results the model reads, in the order the projection sends them. */
+function modelResultOrder(rows: readonly DbMessage[]): string[] {
+	return rows.flatMap((row) =>
+		row.role === "assistant"
+			? toolUseIds(row).filter((id) =>
+					row.toolCalls?.some(
+						(call) =>
+							call.toolUseId === id && (call.status === "success" || call.status === "fail"),
+					),
+				)
+			: [],
+	);
+}
+
+/** The tool_use order of every assistant step in the rows. */
+function stepToolUseOrders(rows: readonly DbMessage[]): string[][] {
+	return rows.filter((row) => row.role === "assistant").map(toolUseIds);
+}
 let enterPlanStopEmitted = false;
 let readStartedBeforeEnterPlanStop = false;
 let releasePendingTool: (() => void) | undefined;
@@ -92,7 +118,10 @@ function releaseParallelAbortTools(): void {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => {
+		lastBuiltRows = rows;
+		return { history: [] };
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
@@ -142,6 +171,20 @@ const testProvider: ProviderAdapter = {
 					input: "nline2",
 				},
 			};
+			return;
+		}
+		if (providerScenario === "relaxed_plan_multiple_turns") {
+			if (providerAttempts <= 2) {
+				yield {
+					toolUses: [1, 2].map((index) => ({
+						toolUseId: `tu_plan_${providerAttempts}_${index}`,
+						name: TEST_TOOL_NAME,
+						input: { value: `plan-${providerAttempts}-${index}` },
+					})),
+				};
+			} else {
+				yield { text: "Planning complete" };
+			}
 			return;
 		}
 		if (providerScenario === "soft_stop_serial") {
@@ -228,11 +271,6 @@ const testProvider: ProviderAdapter = {
 				enterPlanStopEmitted = true;
 				yield { toolUseChunk: { toolUseId: "tu_enter_plan_interleaved", stop: true } };
 			} else {
-				modelToolResultOrder.push(
-					...(params.toolResults as Array<{ toolUseId?: string }>).map((result) =>
-						String(result.toolUseId),
-					),
-				);
 				yield { text: "interleaved tools complete" };
 			}
 			return;
@@ -276,6 +314,11 @@ const testProvider: ProviderAdapter = {
 			yield {
 				toolUses: [{ toolUseId: "tu_enter_plan", name: "EnterPlanMode", input: {} }],
 			};
+			// Keep the response open until the call asked for permission: it starts mid-stream.
+			while (!enterPlanPermissionRequested) {
+				if (params.signal.aborted) throw new Error("Aborted");
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
 			return;
 		}
 		yield {
@@ -309,16 +352,6 @@ const testProvider: ProviderAdapter = {
 			await new Promise((resolve) => setTimeout(resolve, 1));
 		}
 		throw new Error("Aborted");
-	},
-	formatToolResult: (toolUseId, output, isError) => {
-		formattedToolResultOrder.push(toolUseId);
-		return { toolUseId, output, isError };
-	},
-	pushUserTurn: () => {},
-	pushAssistantTurn: (_history, _text, toolUses) => {
-		if (providerScenario === "interleaved_tool_chunk_order" && toolUses.length > 0) {
-			assistantToolUseOrders.push(toolUses.map((toolUse) => toolUse.toolUseId));
-		}
 	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
@@ -462,7 +495,9 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "run tools then answer", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "run tools then answer", {
+			rows: [],
+		})) {
 			events.push(event);
 			if (event.type === "stream_text") {
 				expect(executedToolValues).toEqual(["serial:one", "serial:two"]);
@@ -490,7 +525,9 @@ describe("agentLoop abort result draining", () => {
 		const startedAt = Date.now();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "interrupt pending tool", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "interrupt pending tool", {
+			rows: [],
+		})) {
 			events.push(event);
 			if (event.type === "stream_text") ac.abort();
 		}
@@ -514,7 +551,7 @@ describe("agentLoop abort result draining", () => {
 				shouldStop: () => true,
 			}),
 			"stop after first tool",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -526,7 +563,7 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(toolResults.map((event) => event.toolUseId)).toEqual(["tu_stop_1", "tu_stop_2"]);
 		expect(toolResults.map((event) => event.isError)).toEqual([false, true]);
-		expect(toolResults[1]?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults[1]?.metadata).toEqual({ skippedForPassEnd: true });
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
@@ -546,7 +583,7 @@ describe("agentLoop abort result draining", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { shouldStop: () => ++asks > 1 }),
 			"finish tools that already started",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -560,9 +597,9 @@ describe("agentLoop abort result draining", () => {
 		expect(toolResults.map((event) => event.toolUseId)).toEqual(["tu_stop_1", "tu_stop_2"]);
 		// The already-started tool keeps its real success result…
 		expect(toolResults[0]?.isError).toBe(false);
-		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		expect(toolResults[0]?.metadata?.skippedForPassEnd).toBeUndefined();
 		// …while the one that never ran is explicitly reported as skipped.
-		expect(toolResults[1]?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults[1]?.metadata).toEqual({ skippedForPassEnd: true });
 	});
 
 	test("after-tools 阶段到达的 soft-stop 会阻止下一轮模型请求", async () => {
@@ -586,7 +623,7 @@ describe("agentLoop abort result draining", () => {
 				},
 			}),
 			"stop before the next provider turn",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -609,7 +646,7 @@ describe("agentLoop abort result draining", () => {
 				shouldStop: () => true,
 			}),
 			"finish parallel reads then stop",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -624,7 +661,7 @@ describe("agentLoop abort result draining", () => {
 			"tu_read_2",
 			"tu_stop_3",
 		]);
-		expect(toolResults.at(-1)?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults.at(-1)?.metadata).toEqual({ skippedForPassEnd: true });
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
@@ -633,7 +670,6 @@ describe("agentLoop abort result draining", () => {
 		providerAttempts = 0;
 		executedToolValues.length = 0;
 		completedToolValues.length = 0;
-		formattedToolResultOrder.length = 0;
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
@@ -653,7 +689,7 @@ describe("agentLoop abort result draining", () => {
 				shouldStop: () => stopRequested,
 			}),
 			"stop without running an unstarted edit",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -669,7 +705,7 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(toolResults.find((event) => event.toolUseId === "tu_edit_must_skip")).toMatchObject({
 			isError: true,
-			metadata: { skippedForSoftStop: true },
+			metadata: { skippedForPassEnd: true },
 		});
 		expect(toolResults.map((event) => event.toolUseId)).toEqual([
 			"tu_write_before_stop",
@@ -677,10 +713,10 @@ describe("agentLoop abort result draining", () => {
 			"tu_read_must_skip",
 		]);
 		expect(toolResults[0]).toMatchObject({ isError: false, output: "write:first.txt" });
-		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		expect(toolResults[0]?.metadata?.skippedForPassEnd).toBeUndefined();
 		expect(toolResults[2]).toMatchObject({
 			isError: true,
-			metadata: { skippedForSoftStop: true },
+			metadata: { skippedForPassEnd: true },
 		});
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
@@ -690,14 +726,14 @@ describe("agentLoop abort result draining", () => {
 		providerAttempts = 0;
 		executedToolValues.length = 0;
 		completedToolValues.length = 0;
-		formattedToolResultOrder.length = 0;
+		lastBuiltRows = [];
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel reads",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -709,7 +745,8 @@ describe("agentLoop abort result draining", () => {
 			})
 			.map((event) => event.toolUseId);
 		expect(toolResultIds).toEqual(["tu_parallel_fast", "tu_parallel_slow"]);
-		expect(formattedToolResultOrder).toEqual(["tu_parallel_slow", "tu_parallel_fast"]);
+		// The next request reads the results in call order: the step's order, not completion's.
+		expect(modelResultOrder(lastBuiltRows)).toEqual(["tu_parallel_slow", "tu_parallel_fast"]);
 	});
 
 	test("并行组完成后进入下一串行组前中断不会重复 drain 已即时产出的结果", async () => {
@@ -724,7 +761,9 @@ describe("agentLoop abort result draining", () => {
 		// installed their resolvers, without blocking the event consumer itself.
 		const releaseReads = parallelToolsStarted.promise.then(releaseParallelAbortTools);
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "abort between tool groups", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "abort between tool groups", {
+			rows: [],
+		})) {
 			events.push(event);
 			if (
 				event.type === "tool_result" &&
@@ -762,7 +801,7 @@ describe("agentLoop abort result draining", () => {
 		test(
 			abortAfterFirstResult
 				? "受控逆序磁盘预检：并行完成后中断不重复 drain，也不启动后续串行工具"
-				: "受控逆序磁盘预检：soft-stop 仍等待完整并行组，并按调用顺序组装模型结果",
+				: "受控逆序磁盘预检：soft-stop 仍等待完整并行组，结果按完成顺序产出",
 			async () => {
 				providerScenario = abortAfterFirstResult
 					? "parallel_then_serial_abort"
@@ -770,7 +809,6 @@ describe("agentLoop abort result draining", () => {
 				providerAttempts = 0;
 				executedToolValues.length = 0;
 				completedToolValues.length = 0;
-				formattedToolResultOrder.length = 0;
 				parallelToolsStarted = createGate();
 				const gate: ParallelPreflightGate = {
 					firstPath: abortAfterFirstResult ? "parallel-1.txt" : "first.txt",
@@ -808,7 +846,7 @@ describe("agentLoop abort result draining", () => {
 							},
 						}),
 						"parallel preflight completes out of order",
-						[],
+						{ rows: [] },
 					)) {
 						events.push(event);
 						if (event.type !== "tool_result" || event.toolUseId !== secondId) continue;
@@ -842,8 +880,7 @@ describe("agentLoop abort result draining", () => {
 						expect(results[2]).toMatchObject({ isError: true, durationMs: 0 });
 						expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 					} else {
-						expect(results[2]?.metadata).toEqual({ skippedForSoftStop: true });
-						expect(formattedToolResultOrder).toEqual([firstId, secondId, serialId]);
+						expect(results[2]?.metadata).toEqual({ skippedForPassEnd: true });
 						expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 					}
 				} finally {
@@ -858,15 +895,15 @@ describe("agentLoop abort result draining", () => {
 		providerScenario = "interleaved_tool_chunk_order";
 		providerAttempts = 0;
 		executedToolValues.length = 0;
-		formattedToolResultOrder.length = 0;
-		modelToolResultOrder.length = 0;
-		assistantToolUseOrders.length = 0;
+		lastBuiltRows = [];
 		enterPlanStopEmitted = false;
 		readStartedBeforeEnterPlanStop = false;
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "run interleaved tools", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "run interleaved tools", {
+			rows: [],
+		})) {
 			events.push(event);
 		}
 
@@ -892,34 +929,47 @@ describe("agentLoop abort result draining", () => {
 			"serial:unindexed-first",
 			"serial:unindexed-second",
 		]);
-		expect(formattedToolResultOrder).toEqual(expectedToolOrder);
-		expect(modelToolResultOrder).toEqual(expectedToolOrder);
-		expect(assistantToolUseOrders).toContainEqual(expectedToolOrder);
+		// The follow-up request reads the step and its results in the same start order.
+		expect(stepToolUseOrders(lastBuiltRows)).toEqual([expectedToolOrder]);
+		expect(modelResultOrder(lastBuiltRows)).toEqual(expectedToolOrder);
 		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
-	test("EnterPlanMode 在 assistant_message 建立准备态之后才请求执行权限", async () => {
+	test("EnterPlanMode 在自身 block_complete 建立准备态之后、流结束之前请求执行权限", async () => {
 		providerScenario = "enter_plan_prepared_order";
 		providerAttempts = 0;
-		formattedToolResultOrder.length = 0;
+		enterPlanPermissionRequested = false;
 		const ac = new AbortController();
 		const order: string[] = [];
 
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, {
-				shouldStop: () => true,
+				maxTurns: 1,
 				permissionHandler: async (toolName) => {
-					if (toolName === "EnterPlanMode") order.push("permission");
+					if (toolName === "EnterPlanMode") {
+						order.push("permission");
+						enterPlanPermissionRequested = true;
+					}
 					return { behavior: "deny" };
 				},
 			}),
 			"enter plan mode",
-			[],
+			{ rows: [] },
 		)) {
+			// The host prepares plan-mode state while consuming the call's own block_complete
+			// (asynchronously); the loop must not start the call before that returns.
+			if (
+				event.type === "block_complete" &&
+				event.block.type === "tool_use" &&
+				event.block.name === "EnterPlanMode"
+			) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				order.push("prepared");
+			}
 			if (event.type === "assistant_message") order.push("assistant_message");
 		}
 
-		expect(order).toEqual(["assistant_message", "permission"]);
+		expect(order).toEqual(["prepared", "permission", "assistant_message"]);
 	});
 
 	test("宽松计划模式下的计划提醒不会污染工具输出，且被中断时不投递", async () => {
@@ -946,7 +996,7 @@ describe("agentLoop abort result draining", () => {
 				},
 			}),
 			"run tools while planning",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 			if (event.type === "stream_text") {
@@ -987,7 +1037,7 @@ describe("agentLoop abort result draining", () => {
 				},
 			}),
 			"run tools while planning",
-			[],
+			{ rows: [] },
 		)) {
 			// drain
 		}
@@ -998,6 +1048,34 @@ describe("agentLoop abort result draining", () => {
 		).toBe(true);
 	});
 
+	test("宽松计划提醒每次运行只投递一次，跨工具和回合去重，下次运行重新提醒", async () => {
+		providerScenario = "relaxed_plan_multiple_turns";
+		for (let run = 0; run < 2; run++) {
+			providerAttempts = 0;
+			const delivered: string[] = [];
+			const completed: string[] = [];
+			for await (const event of agentLoop(
+				makeConfig(new AbortController().signal, {
+					planMode: true,
+					relaxedPlan: true,
+					deliverInjectionRow: (injection) => {
+						delivered.push(injection.source);
+						return injection.content;
+					},
+				}),
+				"continue planning",
+				{ rows: [] },
+			)) {
+				if (event.type === "tool_result") completed.push(event.toolUseId);
+			}
+			// Four distinct eligible calls over two provider turns, not just repeated
+			// processing of the same tool result. Each fresh run gets its own nudge.
+			expect(completed).toHaveLength(4);
+			expect(providerAttempts).toBe(3);
+			expect(delivered.filter((source) => source === "relaxed_plan")).toHaveLength(1);
+		}
+	});
+
 	test("流式工具参数跨 chunk 的换行转义会被正确还原", async () => {
 		providerScenario = "split_streaming_escape";
 		providerAttempts = 0;
@@ -1005,7 +1083,9 @@ describe("agentLoop abort result draining", () => {
 		let streamedText = "";
 		const startsField: Array<boolean | undefined> = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", {
+			rows: [],
+		})) {
 			if (event.type === "tool_use_chunk" && event.streamingField?.delta) {
 				startsField.push(event.streamingField.startsField);
 				streamedText += event.streamingField.delta;
@@ -1086,7 +1166,7 @@ describe("agentLoop abort result draining", () => {
 				for await (const event of agentLoop(
 					makeConfig(new AbortController().signal),
 					"stream tool arguments",
-					[],
+					{ rows: [] },
 				)) {
 					if (event.type !== "tool_use_chunk" || !event.streamingField) continue;
 					deltas.push(event.streamingField);
@@ -1168,7 +1248,7 @@ describe("agentLoop abort result draining", () => {
 				for await (const event of agentLoop(
 					makeConfig(new AbortController().signal),
 					"stream complete tool",
-					[],
+					{ rows: [] },
 				)) {
 					events.push(event);
 					if (event.type === "tool_call") break;
@@ -1219,7 +1299,7 @@ describe("agentLoop abort result draining", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { maxTransientRetries: 2 }),
 			"run tools then truncate",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -1253,7 +1333,7 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "answer then quota", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "answer then quota", { rows: [] })) {
 			events.push(event);
 		}
 
@@ -1273,11 +1353,20 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(textBlock?.block).toMatchObject({ type: "text", text: "partial codex output" });
 		const lastEvent = events.at(-1);
+		const requestEnd = events.find((event) => event.type === "api_request_end");
+		if (lastEvent?.type !== "retryable_error" || !requestEnd?.diagnostics) {
+			throw new Error("missing correlated Codex failover events");
+		}
+		expect(lastEvent.diagnostics).toBe(requestEnd.diagnostics);
+		expect(lastEvent.diagnostics?.recordingRequestId).toBe(requestEnd.requestId);
+		// This fixture has no API consumer: the loop must not invent a durable row ID.
+		expect(lastEvent.diagnostics?.apiRequestId).toBeUndefined();
 		expect(lastEvent).toEqual({
 			type: "retryable_error",
 			message: "The usage limit has been reached",
 			code: CODEX_REBUILD_HISTORY_RETRY_CODE,
 			bypassRetryLimit: true,
+			diagnostics: requestEnd.diagnostics,
 		});
 	});
 
@@ -1290,7 +1379,7 @@ describe("agentLoop abort result draining", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "tool then quota", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "tool then quota", { rows: [] })) {
 			events.push(event);
 		}
 		serialToolsCompleted = undefined;
@@ -1302,11 +1391,20 @@ describe("agentLoop abort result draining", () => {
 		expect(toolResults).toHaveLength(2);
 		expect(toolResults.map((event) => event.output)).toEqual(["completed:one", "completed:two"]);
 		const lastEvent = events.at(-1);
+		const requestEnd = events.find((event) => event.type === "api_request_end");
+		if (lastEvent?.type !== "retryable_error" || !requestEnd?.diagnostics) {
+			throw new Error("missing correlated Codex failover events");
+		}
+		expect(lastEvent.diagnostics).toBe(requestEnd.diagnostics);
+		expect(lastEvent.diagnostics?.recordingRequestId).toBe(requestEnd.requestId);
+		// This fixture has no API consumer: the loop must not invent a durable row ID.
+		expect(lastEvent.diagnostics?.apiRequestId).toBeUndefined();
 		expect(lastEvent).toEqual({
 			type: "retryable_error",
 			message: "The usage limit has been reached",
 			code: CODEX_REBUILD_HISTORY_RETRY_CODE,
 			bypassRetryLimit: true,
+			diagnostics: requestEnd.diagnostics,
 		});
 	});
 });

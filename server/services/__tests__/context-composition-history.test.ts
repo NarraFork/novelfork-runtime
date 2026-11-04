@@ -17,7 +17,7 @@ beforeEach(() => {
 	database.run(`CREATE TABLE narrator_message_refs (narrator_id TEXT, message_id TEXT, seq INTEGER, is_compact INTEGER DEFAULT 0, segment_compact_id TEXT);
 	 CREATE INDEX refs_seq ON narrator_message_refs(narrator_id,seq);
 	 CREATE UNIQUE INDEX refs_message ON narrator_message_refs(narrator_id,message_id);
-	 CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, role TEXT, parent_tool_use_id TEXT, context_chars_json TEXT);
+	 CREATE TABLE narrator_message_context_stats (message_id TEXT PRIMARY KEY, role TEXT, parent_tool_use_id TEXT, segments_json TEXT);
 	 CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, tool_use_id TEXT, execution_attempt INTEGER DEFAULT 0, created_at TEXT DEFAULT '2026-01-01', input_chars INTEGER DEFAULT 0, output_chars INTEGER DEFAULT 0);
 	 CREATE INDEX tools_message ON narrator_tool_calls(message_id);
 	 CREATE INDEX tools_use ON narrator_tool_calls(tool_use_id);
@@ -62,7 +62,9 @@ function message(
 	role = "assistant",
 ) {
 	database
-		.query("INSERT INTO narrator_messages(id,role,context_chars_json) VALUES (?,?,?)")
+		.query(
+			"INSERT INTO narrator_message_context_stats(message_id,role,segments_json) VALUES (?,?,?)",
+		)
 		.run(id, role, segments === null ? null : JSON.stringify({ segments }));
 	database
 		.query("INSERT INTO narrator_message_refs(narrator_id,message_id,seq) VALUES ('n',?,?)")
@@ -84,9 +86,9 @@ function tool(
 		)
 		.run(id, owner, messageId, call, attempt, time, input, output);
 }
-async function segments(options: { profile?: "primary" | "subagent"; check?: () => void } = {}) {
+async function segments(options: { topLevelToolUseId?: string | null; check?: () => void } = {}) {
 	return Array.fromAsync(
-		readContextHistory(counted, "n", { profile: "primary", check: () => {}, ...options }),
+		readContextHistory(counted, "n", { topLevelToolUseId: null, check: () => {}, ...options }),
 	);
 }
 
@@ -110,6 +112,33 @@ test("1000 legacy NULL messages use bounded batch reads, not per-message SQL/che
 	console.info(
 		`1000 legacy history: ${elapsed.toFixed(1)}ms, ${reads.length} SQL, ${checks} checks`,
 	);
+});
+
+test("thousands of refs checkpoint on the unit budget, not once per batch", async () => {
+	const count = 4096;
+	const insert = database.transaction(() => {
+		for (let i = 0; i < count; i++) message(`m${i}`, i, [{ category: "user", chars: 1 }]);
+	});
+	insert();
+	const now = performance.now.bind(performance);
+	const frozen = now();
+	performance.now = () => frozen;
+	let checks = 0;
+	try {
+		const result = await segments({
+			check: () => {
+				checks++;
+			},
+		});
+		expect(result).toHaveLength(count);
+	} finally {
+		performance.now = now;
+	}
+	const batches = Math.ceil(count / CONTEXT_COMPOSITION_LIMITS.batch);
+	// A timer turn per batch calls check() at least twice per batch on top of the
+	// batch and tool probes. The unit budget must stay well under that.
+	expect(checks).toBeGreaterThanOrEqual(batches);
+	expect(checks).toBeLessThan(batches * 3);
 });
 
 test("bulk attempts and marker order preserve cross-narrator latest identity and result packet", async () => {
@@ -149,7 +178,9 @@ test("targeted entries emit hidden/display/excluded/before-compact empties and o
 	);
 	message("display", 4, [{ category: "other", chars: 70 }], "disp");
 	message("child", 5, [{ category: "assistant", chars: 60 }]);
-	database.run("UPDATE narrator_messages SET parent_tool_use_id='parent' WHERE id='child'");
+	database.run(
+		"UPDATE narrator_message_context_stats SET parent_tool_use_id='parent' WHERE message_id='child'",
+	);
 	message(
 		"summary",
 		6,
@@ -162,7 +193,7 @@ test("targeted entries emit hidden/display/excluded/before-compact empties and o
 	message("sys", 7, [{ category: "system", chars: 7 }], "sys");
 	const entries = await Array.fromAsync(
 		readContextHistoryEntries(counted, "n", {
-			profile: "primary",
+			topLevelToolUseId: null,
 			check: () => {},
 			messageIds: ["old", "compact", "hidden", "display", "child", "summary", "sys", "missing"],
 		}),
@@ -176,7 +207,7 @@ test("targeted entries emit hidden/display/excluded/before-compact empties and o
 		["summary", [{ category: "summary", chars: 5 }]],
 		["sys", [{ category: "system", chars: 7 }]],
 	]);
-	expect(await segments({ profile: "subagent" })).toEqual([
+	expect(await segments({ topLevelToolUseId: "parent" })).toEqual([
 		{ category: "assistant", chars: 60 },
 		{ category: "summary", chars: 5 },
 		{ category: "system", chars: 7 },
@@ -187,14 +218,18 @@ test("linked child compact cannot advance primary boundary; tail reader skips ol
 	message("top", 1, [{ category: "user", chars: 3 }]);
 	message("child", 2, [], "system");
 	database.run(`UPDATE narrator_message_refs SET is_compact=1 WHERE message_id='child';
-	 UPDATE narrator_messages SET parent_tool_use_id='parent' WHERE id='child'`);
+	 UPDATE narrator_message_context_stats SET parent_tool_use_id='parent' WHERE message_id='child'`);
 	message("last", 3, [{ category: "assistant", chars: 5 }]);
 	expect(await segments()).toEqual([
 		{ category: "user", chars: 3 },
 		{ category: "assistant", chars: 5 },
 	]);
 	const entries = await Array.fromAsync(
-		readContextHistoryEntries(counted, "n", { profile: "primary", check: () => {}, afterSeq: 2 }),
+		readContextHistoryEntries(counted, "n", {
+			topLevelToolUseId: null,
+			check: () => {},
+			afterSeq: 2,
+		}),
 	);
 	expect(entries.map((entry) => entry.messageId)).toEqual(["last"]);
 });
@@ -332,8 +367,8 @@ test("actual common/fallback SQL needs message-leading indexes under large globa
 	expect(oldCollision.result.every((row) => (row as { isLatest: number }).isLatest === 0)).toBe(
 		true,
 	);
-	// These indexes are fixture-only: no production schema or user database changes.
-	database.run(`CREATE INDEX idx_toolcalls_context_id ON narrator_tool_calls(message_id,id);
+	// Fixture copies of the production numeric indexes. The id index covers the character columns.
+	database.run(`CREATE INDEX idx_toolcalls_context_id ON narrator_tool_calls(message_id,id,tool_use_id,created_at,execution_attempt,input_chars,output_chars);
 	 CREATE INDEX idx_toolcalls_context_order ON narrator_tool_calls(message_id,created_at,id);
 	 CREATE INDEX idx_toolcalls_context_latest ON narrator_tool_calls(message_id,tool_use_id,execution_attempt,created_at,id);`);
 	const indexedTuplePlan = plan(common, commonBindings);
@@ -343,7 +378,7 @@ test("actual common/fallback SQL needs message-leading indexes under large globa
 	expect(indexedTuple.result).toEqual(oldTuple.result);
 	expect(indexedCollision.result).toEqual(oldCollision.result);
 	expect(indexedTuplePlan.join("\n")).not.toContain("TEMP B-TREE");
-	expect(indexedTuplePlan.join("\n")).toContain("idx_toolcalls_context_id");
+	expect(indexedTuplePlan.join("\n")).toContain("COVERING INDEX idx_toolcalls_context_id");
 	expect(indexedCollisionPlan.join("\n")).not.toContain("TEMP B-TREE");
 	expect(indexedCollisionPlan.join("\n")).toContain("idx_toolcalls_context_latest");
 	expect(indexedCollisionPlan.join("\n")).toContain("execution_attempt>?");
@@ -363,7 +398,7 @@ test("actual common/fallback SQL needs message-leading indexes under large globa
 		try {
 			const entries = await Array.fromAsync(
 				readContextHistoryEntries(counted, "n", {
-					profile: "primary",
+					topLevelToolUseId: null,
 					check: () => {},
 					messageIds: ["collision"],
 				}),

@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recent-tabs";
 import { Hono } from "hono";
 import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
-import type { JwtPayload } from "../../../server/lib/auth";
+import type { SessionPayload } from "../../../server/lib/auth";
 import { updateUserPreferencesSchema } from "../../../server/lib/validators/settings";
 import { cleanDb, getTestDb } from "../../setup";
 
@@ -30,7 +30,7 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 
 const { userPreferencesRoutes } = await import("../../../server/routes/user-preferences");
 
-const authUser: JwtPayload = {
+const authUser: SessionPayload = {
 	sub: "user-1",
 	role: "user",
 	iat: 1735689600,
@@ -821,5 +821,30 @@ describe("recent-tabs route contracts", () => {
 		expect(restored.status).toBe(200);
 		expect(restored.body).toMatchObject({ changed: true, revision: 2 });
 		expect(db.select().from(userRecentTabs).all()).toHaveLength(2);
+	});
+
+	it("mints an undo token for a user-initiated single-tab DELETE and restores it", async () => {
+		seedPreferences([tab("n-1"), tab("n-2")]);
+		const removed = await requestJson("/recent-tabs/narrator/n-1", { method: "DELETE" });
+		expect(removed.status).toBe(200);
+		const token = (removed.body as RecentTabsMutationResult).undoToken;
+		expect(token).toBeString();
+		expect(db.select().from(userRecentTabs).all()).toHaveLength(1);
+
+		const restored = await requestJson("/recent-tabs/restore", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ token }),
+		});
+		expect(restored.status).toBe(200);
+		expect(db.select().from(userRecentTabs).all()).toHaveLength(2);
+	});
+
+	it("mints no undo token for a cascade DELETE", async () => {
+		seedPreferences([tab("n-1"), tab("n-2")]);
+		const removed = await requestJson("/recent-tabs/narrator/n-1?cascade=1", { method: "DELETE" });
+		expect(removed.status).toBe(200);
+		expect((removed.body as RecentTabsMutationResult).undoToken).toBeUndefined();
+		expect(db.select().from(userRecentTabs).all()).toHaveLength(1);
 	});
 });

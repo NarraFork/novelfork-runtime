@@ -31,6 +31,14 @@ import type { Locale } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	flushQueuedSince,
+	newEnvelopeColumns,
+	newEnvelopeFormat,
+	syncQueueMark,
+} from "./narrator-block-sync";
+import { bodyColumns, fillBodies } from "./narrator-body-reads";
+import { insertEnvelope, insertEnvelopeQueued } from "./narrator-body-writes";
+import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
 	withSeqFloorRaiseScope,
@@ -57,8 +65,8 @@ type WriteAudience = "owner" | "project" | "public";
 /**
  * Resolve visibility/writeAudience for the extract.
  * Prefer the parent primary's audiences; clamp standalone extracts away from
- * "project" visibility (no chapterId means project resolution has nothing to
- * read). Missing parent → private/owner.
+ * "project" visibility (an extract carries no project, so project resolution has
+ * nothing to read). Missing parent → private/owner.
  */
 async function resolveExtractAudiences(source: {
 	parentNarratorId: string | null;
@@ -73,7 +81,7 @@ async function resolveExtractAudiences(source: {
 		if (parent?.visibility) visibility = parent.visibility as Visibility;
 		if (parent?.writeAudience) writeAudience = parent.writeAudience as WriteAudience;
 	}
-	// Extract is always standalone in v1; project-visible without a chapter is a trap.
+	// Extract is always standalone in v1; project-visible without a project is a trap.
 	if (visibility === "project") visibility = "private";
 	if (writeAudience === "project") writeAudience = "owner";
 	return { visibility, writeAudience };
@@ -143,10 +151,12 @@ export async function extractSubagentToPrimary(
 		const byId = new Map<string, typeof narratorMessages.$inferSelect>();
 		for (let i = 0; i < sourceRefs.length; i += CHUNK) {
 			const chunk = sourceRefs.slice(i, i + CHUNK).map((row) => row.messageId);
-			const rows = await db
-				.select()
-				.from(narratorMessages)
-				.where(inArray(narratorMessages.id, chunk));
+			const rows = fillBodies(
+				await db.query.narratorMessages.findMany({
+					...bodyColumns(),
+					where: inArray(narratorMessages.id, chunk),
+				}),
+			);
 			for (const msg of rows) byId.set(msg.id, msg);
 		}
 		for (const row of sourceRefs) {
@@ -161,79 +171,85 @@ export async function extractSubagentToPrimary(
 			? (await resolveSubagentModelForRun(source, source.ownerUserId)).model
 			: (source.model ?? FOLLOW_DEFAULT_MODEL);
 	const audiences = await resolveExtractAudiences(source);
+	const { ensureReplyContext } = await import("./narrator-reply-context");
 	const now = new Date().toISOString();
 	const id = generateId();
 	const title = opts?.title?.trim() || defaultExtractTitle(source.title, subagentType, locale);
 
 	const workspace = {
-		chapterId: null,
 		cwd: source.cwd ?? null,
 		defaultDeviceId: source.defaultDeviceId ?? null,
 	};
 	const admissionTargets = await narratorCreationWorkspaceTarget(workspace);
-	const newNarrator = await withWorkspaceAdmission(admissionTargets, async () =>
-		withSeqFloorRaiseScope(() =>
-			db.transaction((tx) => {
-				const created = tx
-					.insert(narrators)
-					.values({
-						id,
-						chapterId: null,
-						type: "primary",
-						variant: "primary",
-						subagentType: null,
-						traits: ["standalone", "extracted-from-subagent"],
-						model: storedModel,
-						// Never inherit the subagent system prompt — primary control plane.
-						systemPrompt: null,
-						// Do not inherit explore/plan readOnly lockdown.
-						permissionMode: "default",
-						reasoningEffort: source.reasoningEffort ?? null,
-						fastModeOverride: normalizeBooleanOverride(source.fastModeOverride),
-						fastMode: legacyFastModeMirror(source.fastModeOverride),
-						relaxedPlan: resolveInitialRelaxedPlan({
+	const newNarrator = await withWorkspaceAdmission(admissionTargets, async () => {
+		// Reject retired/reserved workspaces before legacy reply policy initialization writes.
+		const replyContext = await ensureReplyContext(source.id);
+		return withSeqFloorRaiseScope(() =>
+			db.transaction(
+				(tx) => {
+					const queueMark = syncQueueMark();
+					const created = tx
+						.insert(narrators)
+						.values({
+							id,
+							type: "primary",
+							variant: "primary",
+							subagentType: null,
+							traits: ["standalone", "extracted-from-subagent"],
+							model: storedModel,
+							replyContext,
+							// Never inherit the subagent system prompt — primary control plane.
+							systemPrompt: null,
+							// Do not inherit explore/plan readOnly lockdown.
 							permissionMode: "default",
-							explicit: source.relaxedPlan ?? undefined,
-							defaultRelaxedPlan: false,
-						}),
-						planReflectionAutoApproveOverride:
-							source.planReflectionAutoApproveOverride ?? "inherit",
-						dangerReflectionOverride: source.dangerReflectionOverride ?? "inherit",
-						autoContinuationOverride: source.autoContinuationOverride ?? "inherit",
-						behaviorFenceIntervalOverride: source.behaviorFenceIntervalOverride ?? null,
-						behaviorFenceAttachOverride: source.behaviorFenceAttachOverride ?? "inherit",
-						// Independence: never join the source/parent deletion cascade.
-						parentNarratorId: null,
-						refsInheritedFrom: null,
-						refsBackfillCursor: null,
-						originToolCallId: null,
-						subagentOriginKind: null,
-						// Primary convention: judged on its own columns, not a delegation root.
-						aclRootNarratorId: null,
-						ownerUserId: source.ownerUserId,
-						visibility: audiences.visibility,
-						writeAudience: audiences.writeAudience,
-						inheritMode,
-						apiConversationId: null,
-						contextSummary,
-						contextSummaryChars: measureSummaryCharacters(contextSummary),
-						contextSystemChars: 0,
-						contextToolsChars: 0,
-						status: "idle",
-						title,
-						cwd: workspace.cwd,
-						defaultDeviceId: source.defaultDeviceId ?? null,
-						createdAt: now,
-						updatedAt: now,
-					})
-					.returning()
-					.get();
+							reasoningEffort: source.reasoningEffort ?? null,
+							fastModeOverride: normalizeBooleanOverride(source.fastModeOverride),
+							fastMode: legacyFastModeMirror(source.fastModeOverride),
+							relaxedPlan: resolveInitialRelaxedPlan({
+								permissionMode: "default",
+								explicit: source.relaxedPlan ?? undefined,
+								defaultRelaxedPlan: false,
+							}),
+							planReflectionAutoApproveOverride:
+								source.planReflectionAutoApproveOverride ?? "inherit",
+							dangerReflectionOverride: source.dangerReflectionOverride ?? "inherit",
+							autoContinuationOverride: source.autoContinuationOverride ?? "inherit",
+							behaviorFenceIntervalOverride: source.behaviorFenceIntervalOverride ?? null,
+							behaviorFenceAttachOverride: source.behaviorFenceAttachOverride ?? "inherit",
+							// The work it carries on is its session's: same task backend (D31).
+							taskBackend: source.taskBackend,
+							// Independence: never join the source/parent deletion cascade.
+							parentNarratorId: null,
+							refsInheritedFrom: null,
+							refsBackfillCursor: null,
+							originToolCallId: null,
+							subagentOriginKind: null,
+							// Primary convention: judged on its own columns, not a delegation root.
+							aclRootNarratorId: null,
+							ownerUserId: source.ownerUserId,
+							visibility: audiences.visibility,
+							writeAudience: audiences.writeAudience,
+							inheritMode,
+							apiConversationId: null,
+							contextSummary,
+							contextSummaryChars: measureSummaryCharacters(contextSummary),
+							contextSystemChars: 0,
+							contextToolsChars: 0,
+							status: "idle",
+							title,
+							cwd: workspace.cwd,
+							defaultDeviceId: source.defaultDeviceId ?? null,
+							createdAt: now,
+							updatedAt: now,
+						})
+						.returning()
+						.get();
 
-				if (inheritMode === "full") {
-					for (const msg of orderedSourceMessages) {
-						const newMessageId = generateId();
-						tx.insert(narratorMessages)
-							.values({
+					if (inheritMode === "full") {
+						for (const msg of orderedSourceMessages) {
+							const newMessageId = generateId();
+							// Up to EXTRACT_FULL_MAX_MESSAGES copies: their rows are built by the sweep.
+							insertEnvelopeQueued(tx, {
 								id: newMessageId,
 								narratorId: id,
 								// Detach from the parent Agent tool-call tree so primary history
@@ -242,6 +258,11 @@ export async function extractSubagentToPrimary(
 								// New identity: never reuse the source SDK uuid.
 								messageUuid: null,
 								role: msg.role,
+								bodyFormat: newEnvelopeFormat(),
+								// A copy stays in the run that produced it.
+								turnId: msg.turnId,
+								// The subagent still authored what the new narrator holds (§6.3).
+								authorNarratorId: msg.authorNarratorId ?? msg.narratorId,
 								contentJson: msg.contentJson,
 								contextCharsJson: msg.contextCharsJson,
 								contentText: msg.contentText,
@@ -275,29 +296,28 @@ export async function extractSubagentToPrimary(
 								editedBy: msg.editedBy,
 								originalContentJson: msg.originalContentJson,
 								createdAt: msg.createdAt,
-							})
-							.run();
+							});
 
-						const seq = claimNextRefSeq(tx, id);
-						tx.insert(narratorMessageRefs)
-							.values({
-								id: generateId(),
-								narratorId: id,
-								messageId: newMessageId,
-								seq,
-								isCompact: 0,
-								segmentCompactId: null,
-							})
-							.run();
-					}
-				} else if (contextSummary) {
-					const compactMsgId = generateId();
-					tx.insert(narratorMessages)
-						.values({
+							const seq = claimNextRefSeq(tx, id);
+							tx.insert(narratorMessageRefs)
+								.values({
+									id: generateId(),
+									narratorId: id,
+									messageId: newMessageId,
+									seq,
+									isCompact: 0,
+									segmentCompactId: null,
+								})
+								.run();
+						}
+					} else if (contextSummary) {
+						const compactMsgId = generateId();
+						insertEnvelope(tx, {
 							id: compactMsgId,
 							narratorId: id,
 							parentToolUseId: null,
 							role: "system",
+							...newEnvelopeColumns(id),
 							contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
 							contextCharsJson: { segments: [] },
 							contentText:
@@ -307,25 +327,27 @@ export async function extractSubagentToPrimary(
 							origin: "system",
 							originLabel: `extractFromSubagent:${sourceId}`,
 							createdAt: now,
-						})
-						.run();
-					const seq = claimNextRefSeq(tx, id);
-					tx.insert(narratorMessageRefs)
-						.values({
-							id: generateId(),
-							narratorId: id,
-							messageId: compactMsgId,
-							seq,
-							isCompact: 1,
-						})
-						.run();
-				}
+						});
+						const seq = claimNextRefSeq(tx, id);
+						tx.insert(narratorMessageRefs)
+							.values({
+								id: generateId(),
+								narratorId: id,
+								messageId: compactMsgId,
+								seq,
+								isCompact: 1,
+							})
+							.run();
+					}
 
-				initializeRefSeqFloor(tx, id);
-				return created;
-			}),
-		),
-	);
+					initializeRefSeqFloor(tx, id);
+					flushQueuedSince(queueMark);
+					return created;
+				},
+				{ behavior: "immediate" },
+			),
+		);
+	});
 
 	queueContextCharacterRefresh(id);
 	// Spec namespace fork is best-effort; extract must not fail on it.
@@ -339,6 +361,11 @@ export async function extractSubagentToPrimary(
 			error: err instanceof Error ? err.message : String(err),
 		});
 	}
+
+	// An outline session extracted from a subagent gets its root's behavior page (outline plan
+	// PR 4), as a fork does; never rejects.
+	const { copyOutlineBehaviorPage } = await import("./task-source/outline-behavior");
+	await copyOutlineBehaviorPage(sourceId, id);
 
 	// Keep `narrator:forked` so project-db-sync / WS refresh still fire. The DB
 	// parent is null (independence); `parentNarratorId` on the event is the SOURCE

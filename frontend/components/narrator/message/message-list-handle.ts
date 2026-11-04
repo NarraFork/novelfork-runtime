@@ -7,13 +7,28 @@
  * list component.
  */
 
+import type { BlockSourceMessage } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
+
+/** What the reader was looking for when they asked for the jump. */
+export interface MessageJumpOptions {
+	/**
+	 * Text the target row should show (a quoted excerpt, a search query). One
+	 * message renders as several rows; this picks the row that contains it.
+	 */
+	needle?: string;
+}
+
+/** A dock bridge that scrolls to and highlights a message in the chat panel. */
+export type ScrollToMessageFn = (messageId: string, options?: MessageJumpOptions) => void;
 
 export interface MessageListHandle {
 	scrollToMessageTarget: (args: {
 		domIds: string[];
 		targetIds: string[];
 		highlightId?: string;
+		/** Text the target row should show; picks among the message's rows. */
+		needle?: string;
 	}) => Promise<boolean>;
 	scrollToBottom: (instant?: boolean) => void;
 	refreshStructure: (mode?: "diff" | "full") => void;
@@ -25,6 +40,11 @@ export interface MessageListHandle {
 	 * steppers) have no gesture to capture from and call this instead.
 	 */
 	prepareLodChange: (clientY: number) => void;
+	/**
+	 * A loaded message's row, for the blocks an action names (§5.5); undefined when the
+	 * message is not loaded.
+	 */
+	messageOf: (messageId: string) => BlockSourceMessage<unknown> | undefined;
 }
 
 export interface MessageListTailMeta {

@@ -1,3 +1,4 @@
+import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { canOperatorShutdown, scheduleOperatorShutdown } from "../lib/server-restart";
 import { createSystemLifecycle } from "../lib/system-lifecycle";
@@ -12,16 +13,20 @@ import {
 	UpdateCancelledError,
 	waitForBackgroundBashDrain,
 	waitForOrdinaryToolDrain,
-	writePlannedUpdateRecoverySnapshot,
+	waitForScheduledRecoveryHandoff,
+	writePreparedUpdateRecoverySnapshot,
 } from "./update-coordinator";
 import { checkpointPreparedUpdateFence, failPreparedUpdateAttempt } from "./update-service";
 
 export const systemLifecycle = hotSafe("systemLifecycle", () =>
 	createSystemLifecycle({
+		changed: () => eventBus.emit({ type: "system:lifecycle_changed" }),
 		coordination: getUpdateCoordinationStatus,
 		canShutdown: canOperatorShutdown,
 		schedule: () => scheduleUpdate(undefined, "system_shutdown"),
 		drain: async (epoch) => {
+			await waitForScheduledRecoveryHandoff();
+			assertUpdateNotCancelled();
 			await waitForBackgroundBashDrain();
 			assertUpdateNotCancelled();
 			beginQuiescingTools();
@@ -29,7 +34,7 @@ export const systemLifecycle = hotSafe("systemLifecycle", () =>
 			return checkpointPreparedUpdateFence(epoch);
 		},
 		persist: (snapshot) => {
-			writePlannedUpdateRecoverySnapshot(snapshot, { expectedEpoch: snapshot.updateEpoch });
+			writePreparedUpdateRecoverySnapshot(snapshot, { expectedEpoch: snapshot.updateEpoch });
 		},
 		assertNotCancelled: assertUpdateNotCancelled,
 		markClosing: markUpdateRestarting,

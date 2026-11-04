@@ -1,4 +1,5 @@
 import type { OptimizeStyle } from "@frontend/hooks/usePromptOptimize";
+import { Z } from "@frontend/lib/z-index";
 import { ActionIcon, Group, Menu, NumberInput, Text, Tooltip } from "@mantine/core";
 import {
 	IconArrowsMaximize,
@@ -43,6 +44,8 @@ export function textareaOptimizeControlsWidth(hasExpand: boolean): number {
 }
 
 export interface TextareaOptimizeControlsProps {
+	/** False hides the optimize menu (no session to bill or read context from). */
+	optimizeAvailable?: boolean;
 	disabled?: boolean;
 	loading?: boolean;
 	withContext: boolean;
@@ -52,6 +55,14 @@ export interface TextareaOptimizeControlsProps {
 	onExpand?: () => void;
 	/** Number of context messages (for display in hint), default 10 */
 	contextMessageCount?: number;
+	/**
+	 * False hides the "optimize with context" entry.
+	 *
+	 * A surface with no conversation to read — the new-session dialog's project prompt —
+	 * must not offer a toggle it cannot honour; the server-side draft route does not
+	 * accept `withContext` at all.
+	 */
+	contextAvailable?: boolean;
 	/** Allow user to change context message count in dropdown */
 	onContextMessageCountChange?: (count: number) => void;
 }
@@ -62,7 +73,7 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 
 	return (
 		<Group gap={4} wrap="nowrap" pr={8} style={{ pointerEvents: "auto" }}>
-			{props.loading ? (
+			{props.optimizeAvailable === false ? null : props.loading ? (
 				<Tooltip label={t("optimizeCancel")} position="top">
 					<ActionIcon
 						size="sm"
@@ -75,7 +86,14 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 					</ActionIcon>
 				</Tooltip>
 			) : (
-				<Menu position="top-end" withArrow withinPortal offset={{ mainAxis: 8, crossAxis: 8 }}>
+				<Menu
+					position="top-end"
+					withArrow
+					withinPortal
+					offset={{ mainAxis: 8, crossAxis: 8 }}
+					// 必须高于全屏编辑器(Z.fullscreenEditor),否则全屏时本菜单画在编辑器下面。
+					zIndex={Z.dropdown}
+				>
 					<Menu.Target>
 						<Tooltip label={t("optimizePrompt")} position="top">
 							<ActionIcon
@@ -104,14 +122,16 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 							{t("optimizeStyleTranslateEn")}
 						</Menu.Item>
 						<Menu.Divider />
-						<Menu.Item
-							leftSection={<IconMessageCircle size={16} />}
-							rightSection={props.withContext ? <IconCheck size={16} /> : null}
-							onClick={props.onToggleContext}
-						>
-							{t("optimizeWithContext")}
-						</Menu.Item>
-						{props.onContextMessageCountChange && (
+						{props.contextAvailable === false ? null : (
+							<Menu.Item
+								leftSection={<IconMessageCircle size={16} />}
+								rightSection={props.withContext ? <IconCheck size={16} /> : null}
+								onClick={props.onToggleContext}
+							>
+								{t("optimizeWithContext")}
+							</Menu.Item>
+						)}
+						{props.contextAvailable !== false && props.onContextMessageCountChange && (
 							<Menu.Item closeMenuOnClick={false}>
 								<NumberInput
 									label={t("optimizeContextMessageCount")}
@@ -140,11 +160,13 @@ export function TextareaOptimizeControls(props: TextareaOptimizeControlsProps) {
 								/>
 							</Menu.Item>
 						)}
-						<Text size="xs" c="dimmed" px="sm" py={4} style={{ maxWidth: 280 }}>
-							{props.withContext
-								? t("optimizeWithContextHintEnabled", { count: contextCount })
-								: t("optimizeWithContextHint")}
-						</Text>
+						{props.contextAvailable === false ? null : (
+							<Text size="xs" c="dimmed" px="sm" py={4} style={{ maxWidth: 280 }}>
+								{props.withContext
+									? t("optimizeWithContextHintEnabled", { count: contextCount })
+									: t("optimizeWithContextHint")}
+							</Text>
+						)}
 					</Menu.Dropdown>
 				</Menu>
 			)}

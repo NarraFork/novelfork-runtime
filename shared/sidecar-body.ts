@@ -61,13 +61,25 @@ export interface SideCarTaskEntry {
 	role: "doing" | "next" | "todo" | "blocked";
 	text: string;
 	protected?: boolean;
+	/** The task's address in its backend, when it has one (outline: `key/sid`). */
+	ref?: string;
 }
 
 /** One knowledge-base entry the injection surfaced. */
 export interface SideCarKnowledgeHit {
+	scope?: "personal" | "global";
 	entryId: string;
 	title: string;
 	summary: string;
+}
+
+/** Model-facing knowledge hints shared by direct injections and sidecar projection. */
+export function formatKnowledgeInjections(hits: SideCarKnowledgeHit[], heading: string): string {
+	const lines = hits.map(
+		(hit) =>
+			`- [${hit.scope ?? "global"}:${hit.entryId}] ${hit.title}: ${hit.summary} (KnowledgeRead ${JSON.stringify(hit.scope === "personal" ? { personalEntryId: hit.entryId } : { entryId: hit.entryId })})`,
+	);
+	return `${heading}\n${lines.join("\n")}`;
 }
 
 /** One finished background task (subagent or bash). */
@@ -180,6 +192,13 @@ export type SideCarBody =
 	| {
 			kind: "tasks";
 			variant: "current" | "emptyNever" | "emptyDone" | "tooMany";
+			/**
+			 * Where the tasks live, when not Dynamic Spec: an outline session's interrupt note (and
+			 * the periodic digest outline sessions had before their built-in views, outline plan
+			 * PR 4) is headed in outline words for the reader. Its model text was written with the
+			 * row; no model template renders it. Absent on every spec digest.
+			 */
+			taskBackend?: "outline";
 			tasks?: SideCarTaskEntry[];
 			/** `tooMany` only: how many tasks tripped the threshold. */
 			taskCount?: number;
@@ -336,11 +355,20 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	noticeSilentProgress: "You have made {count} tool calls without a visible reply",
 	noticeRelaxedPlan: "Still planning — write the plan to {planFile}, do not implement yet",
 	noticePipelineExit: "Pipeline is still active — confirm whether it is still needed",
+	noticeTurnNudge: "Turn {turnIndex} of {maxTurns} — time to wrap up",
+	noticeBrokenCall: "Invalid {toolNames} call removed from context — retry with valid input",
+	noticeContinue: "Asked to continue after an empty reply",
+	noticeWorkspaceChanged: "Working directory changed — continuing in the new workspace",
 	// Dynamic Spec digests.
 	tasksCurrent: "Dynamic Spec — {n} open task(s)",
 	tasksEmptyNever: "Dynamic Spec — no tasks created yet",
 	tasksEmptyDone: "Dynamic Spec — all tasks done, time to reorganize",
 	tasksTooMany: "Dynamic Spec — {n} tasks, over the reorganize threshold",
+	// Outline task digests (`taskBackend: "outline"`).
+	outlineTasksCurrent: "Outline tasks — {n} open",
+	outlineTasksEmptyNever: "Outline tasks — none written yet",
+	outlineTasksEmptyDone: "Outline tasks — none open",
+	outlineTaskHumanCreated: "set by a person",
 	taskRoleDoing: "doing",
 	taskRoleNext: "next",
 	taskRoleTodo: "todo",
@@ -476,6 +504,17 @@ function noticeHeadline(
 			});
 		case "pipeline_exit_confirmation":
 			return label(labels, "noticePipelineExit");
+		case "turn_nudge":
+			return labelWith(labels, "noticeTurnNudge", {
+				turnIndex: params?.turnIndex ?? 0,
+				maxTurns: params?.maxTurns ?? 0,
+			});
+		case "broken_call":
+			return labelWith(labels, "noticeBrokenCall", { toolNames: params?.toolNames ?? "" });
+		case "continue_prompt":
+			return label(labels, "noticeContinue");
+		case "workspace_changed":
+			return label(labels, "noticeWorkspaceChanged");
 		default:
 			// An unmapped notice source: the caller's own source label is the best we
 			// can say, and it is already painted beside the headline.
@@ -526,14 +565,18 @@ function projectSideCarBody(
 
 		case "tasks": {
 			const tasks = body.tasks ?? [];
+			const outline = body.taskBackend === "outline";
 			const headline =
 				body.variant === "current"
-					? labelWith(labels, "tasksCurrent", { n: tasks.length })
+					? labelWith(labels, outline ? "outlineTasksCurrent" : "tasksCurrent", {
+							n: tasks.length,
+						})
 					: body.variant === "emptyNever"
-						? label(labels, "tasksEmptyNever")
+						? label(labels, outline ? "outlineTasksEmptyNever" : "tasksEmptyNever")
 						: body.variant === "emptyDone"
-							? label(labels, "tasksEmptyDone")
+							? label(labels, outline ? "outlineTasksEmptyDone" : "tasksEmptyDone")
 							: labelWith(labels, "tasksTooMany", { n: body.taskCount ?? 0 });
+			const protectedLabel = label(labels, outline ? "outlineTaskHumanCreated" : "taskProtected");
 			// Only the tasks are projected. The digest's other half — "keep tasks.json to
 			// only text/status/protected", "do not add IDs" — is instruction aimed at the
 			// model; showing it to the reader is the noise this redesign removes.
@@ -545,7 +588,7 @@ function projectSideCarBody(
 			const lines: SideCarLine[] = tasks.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((task) => ({
 				kind: "bullet" as const,
 				text: `${label(labels, taskRoleKey(task.role))}: ${task.text}${
-					task.protected ? ` · ${label(labels, "taskProtected")}` : ""
+					task.protected ? ` · ${protectedLabel}` : ""
 				}`,
 			}));
 			return { headline, lines };
@@ -730,15 +773,8 @@ export function renderSideCarBodyToText(
 		case "tasks":
 			return renderTasksToText(body, templates);
 
-		case "knowledge": {
-			// `formatInjectionsBare`: heading, one `- [id] title: summary` per hit, then a
-			// blank line and the read-more hint.
-			const lines = body.hits.map((hit) => `- [${hit.entryId}] ${hit.title}: ${hit.summary}`);
-			return `${tpl(templates, "knowledgeHeading")}\n${lines.join("\n")}\n\n${tpl(
-				templates,
-				"knowledgeReadHint",
-			)}`;
-		}
+		case "knowledge":
+			return formatKnowledgeInjections(body.hits, tpl(templates, "knowledgeHeading"));
 
 		case "tasksDone":
 			return body.items
@@ -862,6 +898,14 @@ function noticeModelKey(source: string): string {
 			return "noticeRelaxedPlan";
 		case "pipeline_exit_confirmation":
 			return "noticePipelineExit";
+		case "turn_nudge":
+			return "noticeTurnNudge";
+		case "broken_call":
+			return "noticeBrokenCall";
+		case "continue_prompt":
+			return "noticeContinue";
+		case "workspace_changed":
+			return "noticeWorkspaceChanged";
 		default:
 			return "";
 	}

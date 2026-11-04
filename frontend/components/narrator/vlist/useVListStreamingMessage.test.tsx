@@ -1,6 +1,9 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { MantineProvider } from "@mantine/core";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { act, useEffect, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
@@ -20,18 +23,19 @@ const VIEW = () => ({ scrollTop: 0, viewportHeight: 600, pinnedToBottom: true })
 const REASON = "分析甲";
 const TEXT = "正文乙";
 function message(contentJson: unknown[], id = "assistant-1"): TreeMessage {
-	return {
-		id,
-		seq: 1,
-		narratorId: "handoff-n",
-		role: "assistant",
-		parentToolUseId: null,
+	return rowWithElements(
+		{
+			id,
+			seq: 1,
+			narratorId: "handoff-n",
+			role: "assistant",
+			parentToolUseId: null,
+			contentText: null,
+			toolCalls: [],
+			createdAt: "2026-09-20T00:00:00Z",
+		},
 		contentJson,
-		contentText: null,
-		toolCalls: [],
-		children: [],
-		createdAt: "2026-09-20T00:00:00Z",
-	} as TreeMessage;
+	) as TreeMessage;
 }
 function content(
 	type: "text" | "reasoning",
@@ -129,6 +133,8 @@ async function withStream(
 		() => () => {},
 	);
 	const coordinator = new PretextLayoutCoordinator();
+	// Each lane's raw end, so a delta given without an offset appends as the server's does.
+	const rawEnds = new Map<string, number>();
 	await coordinator.load(
 		"handoff-n",
 		build,
@@ -259,15 +265,18 @@ async function withStream(
 					root.render(<Harness />);
 				});
 			},
-			delta: (block) =>
-				frame({
+			delta: (block) => {
+				const textOffset = block.textOffset ?? rawEnds.get(block.id) ?? 0;
+				rawEnds.set(block.id, Math.max(rawEnds.get(block.id) ?? 0, textOffset + block.text.length));
+				return frame({
 					type: "stream_event",
 					event: {
 						type: "content_block_delta",
 						outputIndex: block.outputIndex,
-						delta: { ...block, type: `${block.type}_delta` },
+						delta: { ...block, textOffset, type: `${block.type}_delta` },
 					},
-				}),
+				});
+			},
 			commit: (blocks, final = false) =>
 				frame({ type: final ? "message" : "message_updated", message: message(blocks) }),
 		});
@@ -365,7 +374,7 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 	it("seals an offscreen snapshot block on late mount but animates a genuinely new live block", async () => {
 		await withStream(
 			async (h) => {
-				await h.showOnlyKeys(["__streaming__-b0"]);
+				await h.showOnlyKeys(["__streaming__-blk[__streaming__:0]"]);
 				await h.frame({
 					type: "streaming_snapshot",
 					streamingBlocks: [
@@ -383,11 +392,11 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 				await h.delta(content("text", "new-live-block", "真正实时的新块", 1, 0));
 				await h.raf();
 				expect(h.animationText()).toBe("真正实时的新块");
-				expect(h.live()?.contentJson.find((block) => block.id === "snapshot-b")).toHaveProperty(
+				expect(messageBody(h.live()).find((block) => block.id === "snapshot-b")).toHaveProperty(
 					"_streamAnimSnapshotEpoch",
 				);
 				expect(
-					h.live()?.contentJson.find((block) => block.id === "new-live-block"),
+					messageBody(h.live()).find((block) => block.id === "new-live-block"),
 				).not.toHaveProperty("_streamAnimSnapshotEpoch");
 			},
 			{ animateStreaming: true },
@@ -416,7 +425,7 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 						await snapshot();
 					}
 					await h.raf();
-					expect(h.live()?.contentJson).toEqual([
+					expect(messageBody(h.live())).toEqual([
 						expect.objectContaining({ text: `${body}+TAIL`, textOffset: 0 }),
 					]);
 					expect(h.text()).toContain("PREFIX-CATCHUP");
@@ -555,7 +564,7 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 
 	it("restores request identity from snapshots and refreshes unchanged text on identity change", async () => {
 		await withStream(async (h) => {
-			const streamingBlocks = [content("reasoning", "r", "Reasoning")];
+			const streamingBlocks = [content("reasoning", "r", "Reasoning", 1, 0)];
 			await h.frame({
 				type: "streaming_snapshot",
 				model: "gpt-reconnected",
@@ -841,13 +850,13 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 					});
 					if (!deltaFirst) await delta();
 					await h.raf();
-					expect(h.live()?.contentJson).toEqual([
+					expect(messageBody(h.live())).toEqual([
 						expect.objectContaining({ type, text: "PREFIX+TAIL", textOffset: 0 }),
 					]);
 					await h.commit([content(type, "active-block", "PREFIX+TAIL", 2, 0)]);
 					await h.delta(content(type, "active-block", "+NEXT", 3, 11));
 					await h.raf();
-					expect(h.live()?.contentJson).toEqual([
+					expect(messageBody(h.live())).toEqual([
 						expect.objectContaining({ type, text: "PREFIX+TAIL+NEXT", textOffset: 0 }),
 					]);
 				});
@@ -879,7 +888,7 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			expect(h.text()).not.toContain("INTERNAL-MARKER");
 			await h.delta(content("text", "t", "+TAIL", 3, raw.length));
 			await h.raf();
-			expect(h.live()?.contentJson).toEqual([
+			expect(messageBody(h.live())).toEqual([
 				expect.objectContaining({ text: `${raw}+TAIL`, revision: 3 }),
 			]);
 			await h.commit([content("text", "t", "RAW+TAIL", 4)], true);
@@ -1010,5 +1019,60 @@ describe("hidden reasoning waiting shimmer through WS / coordinator / DOM", () =
 			},
 			{ keepEmptyReasoningLive: true },
 		);
+	});
+});
+describe("streaming Write source ownership", () => {
+	it("retires a complete local Write on reset without switching narrators", async () => {
+		await withStream(async (h) => {
+			const body = `FIRST${"source-row\n".repeat(5000)}LAST`;
+			await h.frame({
+				type: "tool_started",
+				toolCallId: null,
+				toolUseId: "memory-reset-write",
+				toolName: "Write",
+				input: { file_path: "memory-reset.ts", content: body },
+			});
+			await h.raf();
+			const input = h.live()?.toolCalls?.find((call) => call.toolUseId === "memory-reset-write")
+				?.inputJson as { textDocument?: unknown } | undefined;
+			if (!isTextDocumentRef(input?.textDocument)) throw new Error("Write source missing");
+			const document = input.textDocument;
+			expect(await textDocumentStore.readAll(document.id)).toBe(body);
+			expect(textDocumentStore.stats().sourceOwners).toBeGreaterThan(0);
+			await h.frame({ type: "streaming_reset" });
+			await h.raf();
+			expect(h.live()).toBeNull();
+			expect(textDocumentStore.getSnapshot(document.id)).toBeUndefined();
+		});
+	});
+
+	it("keeps an offscreen incomplete source pinned until an explicit tool discard", async () => {
+		await withStream(async (h) => {
+			const body = "still-streaming-source\n".repeat(500);
+			const document = {
+				id: "memory-offscreen-write",
+				epoch: "memory-offscreen-epoch",
+				revision: 1,
+				length: body.length,
+				complete: false,
+				originKnown: true,
+				source: { narratorId: "handoff-n", toolUseId: "memory-offscreen-tool", field: "content" },
+			};
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: "memory-offscreen-tool",
+				toolName: "Write",
+				inputCharsTotal: body.length,
+				streamingField: { name: "content", delta: body, startsField: true },
+				inputDocument: { ref: document, offset: 0 },
+			});
+			await h.raf();
+			await h.showOnlyKeys([]);
+			textDocumentStore.discard(document.id, document.epoch);
+			expect(await textDocumentStore.readAll(document.id)).toBe(body);
+			await h.frame({ type: "tool_use_discarded", toolUseIds: ["memory-offscreen-tool"] });
+			await h.raf();
+			expect(textDocumentStore.getSnapshot(document.id)).toBeUndefined();
+		});
 	});
 });

@@ -1,5 +1,11 @@
-import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ModelCard } from "@shared/model-catalog/card";
+import { modelProfile } from "@shared/model-catalog/profile";
+import {
+	clampReasoningEffort,
+	migrateLegacyReasoningEffort,
+	REASONING_EFFORT_VALUES,
+	type ReasoningEffort,
+} from "@shared/reasoning-effort";
 import {
 	claudeVersionAtLeast,
 	GENERIC_REASONING_EFFORT_TIERS,
@@ -8,10 +14,20 @@ import {
 	type ReasoningEffortBlocklistEntry,
 } from "@shared/reasoning-effort-support";
 import { useCallback, useMemo } from "react";
-import type { useModelCardIndex } from "../../../hooks/useModelCards";
 import type { ModelOption } from "../../../lib/constants";
 
-type ModelCardIndex = ReturnType<typeof useModelCardIndex>;
+/**
+ * Reasoning tiers a resolved catalog card declares, ascending, never `none`. A card that
+ * matched nothing, or declares no tier, is not evidence about the model's tiers.
+ */
+export function catalogEffortTiers(card: ModelCard | null | undefined): ReasoningEffort[] | null {
+	if (!card || card.matchedVia === "none") return null;
+	const tiers = modelProfile(card).reasoning.levels?.filter(
+		(level): level is ReasoningEffort =>
+			level !== "none" && REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
+	);
+	return tiers?.length ? tiers : null;
+}
 
 type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -25,13 +41,6 @@ const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = 
 	"low",
 	"medium",
 	"high",
-];
-
-/** DeepSeek only supports two effective tiers: high and max (mapped from xhigh). */
-const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
-	"none",
-	"high",
-	"xhigh",
 ];
 
 /**
@@ -137,6 +146,7 @@ function hasGatewayReportedEffortLevels(modelOption?: ModelOption): boolean {
 /**
  * Map a gateway-reported effort list onto the UI's unified enum.
  *
+ * Applies to every NUG channel type: the gateway reports the real
  * per-model tiers for all of them, and that beats guessing from the model id.
  * Relay ids in particular (k3, GLM-5.1, MiniMax-M2) match no vendor naming rule,
  * so id-based inference produced no menu at all for models that do accept the
@@ -176,8 +186,9 @@ function getGatewayReportedEffortOptions(
  *
  * Kept as an explicit list mirroring the delegate switch in
  * server/lib/agent/nug-provider.ts (createDelegate). Channels absent from it
- * so "none" is dropped in transit and a menu entry for it would promise a
- * control that does nothing.
+ * fall through to a native delegate that only forwards effort hints it
+ * recognizes (low..max) — so "none" is dropped in transit and a menu entry
+ * for it would promise a control that does nothing.
  *
  * The delegates listed here do implement it: the Anthropic delegate maps "none"
  * to `thinking: { type: "disabled" }`, and the Codex/Responses path returns
@@ -196,11 +207,6 @@ function gatewayChannelCanDisableThinking(channelType?: string): boolean {
 	}
 }
 
-function isDeepSeekModel(model?: string): boolean {
-	if (!model) return false;
-	return model.toLowerCase().includes("deepseek");
-}
-
 /**
  * Whether an Anthropic model has the `xhigh` tier (Opus 4.7+ / 5 series).
  * A tier question, not an access question — the parsing it relies on lives in
@@ -215,17 +221,8 @@ function anthropicModelSupportsXhigh(model?: string): boolean {
 	return claudeVersionAtLeast(parsed, 4, 7);
 }
 
-function normalizeReasoningEffortForModel(
-	model: string | undefined,
-	effort: string | null | undefined,
-): string {
-	if (!effort) return "";
-	if (isDeepSeekModel(model) && (effort === "low" || effort === "medium")) return "high";
-	return effort;
-}
-
 /** Minimal settings surface this hook reads. */
-interface ModelSelectionSettings {
+export interface ModelSelectionSettings {
 	codexAvailable?: boolean;
 	openaiProviders?: Array<{ prefix?: string; apiMode?: string }>;
 	anthropicProviders?: Array<{ prefix?: string }>;
@@ -234,6 +231,153 @@ interface ModelSelectionSettings {
 		reasoningEffortBlocklist?: readonly ReasoningEffortBlocklistEntry[] | null;
 		defaultReasoningEffort?: string;
 	};
+}
+
+/**
+ * Whether a reasoning-effort menu is offered at all, and which tiers it lists.
+ * Session-independent: a composer that creates the session on send needs the same
+ * answer as the status bar of a narrator that already exists.
+ */
+export interface ReasoningEffortSupport {
+	supportsReasoningEffort: boolean;
+	reasoningEffortOptions: readonly ReasoningEffortValue[];
+}
+
+/** Providers whose models always accept a thinking tier, whatever the model id. */
+export function resolveCodexCapableProviders(
+	settingsData: ModelSelectionSettings | undefined,
+): Set<string> {
+	const providers = new Set<string>();
+	if (settingsData?.codexAvailable) providers.add("codex");
+	for (const provider of settingsData?.openaiProviders ?? []) {
+		if (provider?.prefix && (provider.apiMode ?? "responses") === "codex") {
+			providers.add(provider.prefix);
+		}
+	}
+	return providers;
+}
+
+/**
+ * Resolve the reasoning-effort menu for one model reference.
+ *
+ * Pure on purpose: {@link useModelSelection} derives a live narrator's menu from
+ * it, and the dashboard composer derives a not-yet-created session's menu from
+ * the same code, so the two can never disagree about a model.
+ */
+export function resolveReasoningEffortSupport(args: {
+	resolvedModel: string;
+	resolvedBareModel: string;
+	resolvedModelOption: ModelOption | undefined;
+	settingsData: ModelSelectionSettings | undefined;
+	modelCard: ModelCard | null | undefined;
+	codexCapableProviders: ReadonlySet<string>;
+}): ReasoningEffortSupport {
+	const {
+		resolvedModel,
+		resolvedBareModel,
+		resolvedModelOption,
+		settingsData,
+		modelCard,
+		codexCapableProviders,
+	} = args;
+	const isCodexChannelModel =
+		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
+		resolvedBareModel.startsWith("codex:");
+
+	/**
+	 * Whether to offer the reasoning-effort menu at all.
+	 *
+	 * Blacklist policy, mirroring the backend: effort is near-universal, so any
+	 * configured model gets the menu unless it is excluded. The previous
+	 * whitelist demanded a recognizable Claude/Codex/Gemini/DeepSeek id, which
+	 * hid the menu for every third-party model behind a generic relay (GLM,
+	 * Kimi, MiniMax, ...) even though those upstreams accept the parameter.
+	 *
+	 * Two exclusions, both shared with the backend via
+	 * `modelAcceptsReasoningEffort`: pre-4.6 Claude, and the user's
+	 * `agent.reasoningEffortBlocklist`.
+	 */
+	const supportsReasoningEffort = (() => {
+		const providerPrefix = resolvedModel?.split(":")[0];
+		if (!providerPrefix) return false;
+		// A gateway that reports tiers is authoritative for any channel type, and
+		// is checked before the Codex shortcut below: the gateway knows the specific
+		// routed model, whereas "this is a Codex-capable provider" is an assumption
+		// about the whole channel that a reported [] directly contradicts.
+		//
+		// Three states, deliberately distinguished:
+		//   - non-empty list → supported
+		//   - []             → NOT supported; the gateway explicitly says this model
+		//                      has no thinking tiers, so do not fall back to
+		//                      inference that would offer a menu it would reject
+		//   - absent field   → no claim was made; fall through to id-based inference
+		if (hasGatewayReportedEffortLevels(resolvedModelOption)) {
+			return !!getGatewayReportedEffortOptions(resolvedModelOption);
+		}
+		// Codex always has tiers, regardless of the model id.
+		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
+		return modelAcceptsReasoningEffort(
+			getBareModelForReasoning(resolvedModel, resolvedModelOption),
+			settingsData?.agent?.reasoningEffortBlocklist,
+		);
+	})();
+
+	const reasoningEffortOptions = ((): readonly ReasoningEffortValue[] => {
+		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
+		// Gateway-reported tiers win over every table below, including model
+		// cards: those infer capability from the model id, while the gateway
+		// states it per routed model. Checked first so a relay-hosted model whose id
+		// resembles a known vendor's still gets the tiers its actual upstream
+		// accepts. A model reporting [] never reaches here — supportsReasoningEffort
+		// hides the menu entirely for it.
+		const gatewayOptions = getGatewayReportedEffortOptions(resolvedModelOption);
+		if (gatewayOptions) return gatewayOptions;
+		// Missing catalog data is not evidence that a new model lacks a tier.
+		if (!modelCard || modelCard.matchedVia === "none") return GENERIC_REASONING_EFFORT_TIERS;
+		// Catalog tiers: the editable replacement for the hardcoded per-model tables.
+		// `none` is appended here rather than stored in the catalog, because there it
+		// would become a clamp target able to silently turn a requested `low` into
+		// thinking switched off.
+		const cardTiers = catalogEffortTiers(modelCard);
+		if (cardTiers?.length) {
+			return modelProfile(modelCard).reasoning.canDisable !== false &&
+				codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
+				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
+				: (cardTiers as readonly ReasoningEffortValue[]);
+		}
+		const providerPrefix = resolvedModel.split(":")[0];
+		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
+			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);
+		}
+		// Anthropic (official, compatible/cc relay, or NUG anthropic channel).
+		// Opus 4.7+ and the 5 series add the xhigh tier; 4.6 stays on four tiers.
+		const isAnthropic =
+			resolvedModelOption?.channelType === "anthropic" ||
+			(!!providerPrefix &&
+				(settingsData?.anthropicProviders ?? []).some(
+					(p: { prefix?: string }) => p.prefix === providerPrefix,
+				));
+		if (isAnthropic) {
+			return anthropicModelSupportsXhigh(
+				getBareModelForReasoning(resolvedModel, resolvedModelOption),
+			)
+				? ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS
+				: ANTHROPIC_REASONING_EFFORT_OPTIONS;
+		}
+		// Gemini (gemini-compatible): low/medium/high plus none.
+		const isGemini =
+			!!providerPrefix &&
+			(settingsData?.geminiProviders ?? []).some(
+				(p: { prefix?: string }) => p.prefix === providerPrefix,
+			);
+		if (isGemini) {
+			return GEMINI_REASONING_EFFORT_OPTIONS;
+		}
+		// No declared tier table: keep all efforts available on generic relays.
+		return GENERIC_REASONING_EFFORT_TIERS;
+	})();
+
+	return { supportsReasoningEffort, reasoningEffortOptions };
 }
 
 interface ReasoningEffortMutation {
@@ -259,7 +403,8 @@ export interface UseModelSelectionOptions {
 	 */
 	inheritedReasoningEffort?: string | null;
 	settingsData: ModelSelectionSettings | undefined;
-	modelCardIndex: ModelCardIndex;
+	/** The catalog card the effective model resolves to (server-side, provider-aware). */
+	modelCard: ModelCard | null | undefined;
 	reasoningEffortMutation: ReasoningEffortMutation;
 	updateSettingsMutation: UpdateSettingsMutation;
 }
@@ -297,21 +442,15 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		narratorReasoningEffort,
 		inheritedReasoningEffort,
 		settingsData,
-		modelCardIndex,
+		modelCard,
 		reasoningEffortMutation,
 		updateSettingsMutation,
 	} = options;
 
-	const codexCapableProviders = useMemo(() => {
-		const providers = new Set<string>();
-		if (settingsData?.codexAvailable) providers.add("codex");
-		for (const provider of settingsData?.openaiProviders ?? []) {
-			if (provider?.prefix && (provider.apiMode ?? "responses") === "codex") {
-				providers.add(provider.prefix);
-			}
-		}
-		return providers;
-	}, [settingsData]);
+	const codexCapableProviders = useMemo(
+		() => resolveCodexCapableProviders(settingsData),
+		[settingsData],
+	);
 	const isCodexChannelModel =
 		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
 		resolvedBareModel.startsWith("codex:");
@@ -321,118 +460,25 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	}, [codexCapableProviders, isCodexChannelModel, resolvedModel]);
 	const isBuiltInCodexModel = resolvedModel?.split(":")[0] === "codex";
 
-	/**
-	 * Whether to offer the reasoning-effort menu at all.
-	 *
-	 * Blacklist policy, mirroring the backend: effort is near-universal, so any
-	 * configured model gets the menu unless it is excluded. The previous
-	 * whitelist demanded a recognizable Claude/Codex/Gemini/DeepSeek id, which
-	 * hid the menu for every third-party model behind a generic relay (GLM,
-	 * Kimi, MiniMax, ...) even though those upstreams accept the parameter.
-	 *
-	 * Two exclusions, both shared with the backend via
-	 * `modelAcceptsReasoningEffort`: pre-4.6 Claude, and the user's
-	 * `agent.reasoningEffortBlocklist`.
-	 */
-	const supportsReasoningEffort = useMemo(() => {
-		const providerPrefix = resolvedModel?.split(":")[0];
-		if (!providerPrefix) return false;
-		// A gateway that reports tiers is authoritative for any channel type, and
-		// is checked before the Codex shortcut below: the gateway knows the specific
-		// routed model, whereas "this is a Codex-capable provider" is an assumption
-		// about the whole channel that a reported [] directly contradicts.
-		//
-		// Three states, deliberately distinguished:
-		//   - non-empty list → supported
-		//   - []             → NOT supported; the gateway explicitly says this model
-		//                      has no thinking tiers, so do not fall back to
-		//                      inference that would offer a menu it would reject
-		//   - absent field   → no claim was made; fall through to id-based inference
-		if (hasGatewayReportedEffortLevels(resolvedModelOption)) {
-			return !!getGatewayReportedEffortOptions(resolvedModelOption);
-		}
-		// Codex always has tiers, regardless of the model id.
-		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
-		return modelAcceptsReasoningEffort(
-			getBareModelForReasoning(resolvedModel, resolvedModelOption),
-			settingsData?.agent?.reasoningEffortBlocklist,
-		);
-	}, [
-		codexCapableProviders,
-		isCodexChannelModel,
-		resolvedModelOption,
-		settingsData?.agent?.reasoningEffortBlocklist,
-		resolvedModel,
-	]);
-	const reasoningEffortOptions = useMemo(() => {
-		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
-		// Gateway-reported tiers win over every table below, including DeepSeek's and
-		// model cards: those infer capability from the model id, while the gateway
-		// states it per routed model. Checked first so a relay-hosted model whose id
-		// resembles a known vendor's still gets the tiers its actual upstream
-		// accepts. A model reporting [] never reaches here — supportsReasoningEffort
-		// hides the menu entirely for it.
-		const gatewayOptions = getGatewayReportedEffortOptions(resolvedModelOption);
-		if (gatewayOptions) return gatewayOptions;
-		const card = modelCardIndex
-			? lookupModelCard(
-					getBareModelForReasoning(resolvedModel, resolvedModelOption),
-					modelCardIndex,
-				)?.card
-			: undefined;
-		// Missing catalog data is not evidence that a new model lacks a tier.
-		if (!card) return GENERIC_REASONING_EFFORT_TIERS;
-		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
-		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
-		// Model cards: the editable replacement for the hardcoded per-model tables.
-		// `none` is appended here rather than stored on the card, because on a card
-		// it would become a clamp target able to silently turn a requested `low`
-		// into thinking switched off.
-		const cardTiers = cardEffortLevels(card);
-		if (cardTiers?.length) {
-			return codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
-				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
-				: (cardTiers as readonly ReasoningEffortValue[]);
-		}
-		const providerPrefix = resolvedModel.split(":")[0];
-		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
-			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);
-		}
-		// Anthropic (official, compatible/cc relay, or NUG anthropic channel).
-		// Opus 4.7+ and the 5 series add the xhigh tier; 4.6 stays on four tiers.
-		const isAnthropic =
-			resolvedModelOption?.channelType === "anthropic" ||
-			(!!providerPrefix &&
-				(settingsData?.anthropicProviders ?? []).some(
-					(p: { prefix?: string }) => p.prefix === providerPrefix,
-				));
-		if (isAnthropic) {
-			return anthropicModelSupportsXhigh(
-				getBareModelForReasoning(resolvedModel, resolvedModelOption),
-			)
-				? ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS
-				: ANTHROPIC_REASONING_EFFORT_OPTIONS;
-		}
-		// Gemini (gemini-compatible): low/medium/high plus none.
-		const isGemini =
-			!!providerPrefix &&
-			(settingsData?.geminiProviders ?? []).some(
-				(p: { prefix?: string }) => p.prefix === providerPrefix,
-			);
-		if (isGemini) {
-			return GEMINI_REASONING_EFFORT_OPTIONS;
-		}
-		// No declared tier table: keep all efforts available on generic relays.
-		return GENERIC_REASONING_EFFORT_TIERS;
-	}, [
-		codexCapableProviders,
-		isCodexChannelModel,
-		modelCardIndex,
-		resolvedModel,
-		resolvedModelOption,
-		settingsData?.anthropicProviders,
-		settingsData?.geminiProviders,
-	]);
+	const { supportsReasoningEffort, reasoningEffortOptions } = useMemo(
+		() =>
+			resolveReasoningEffortSupport({
+				resolvedModel,
+				resolvedBareModel,
+				resolvedModelOption,
+				settingsData,
+				modelCard,
+				codexCapableProviders,
+			}),
+		[
+			codexCapableProviders,
+			modelCard,
+			resolvedBareModel,
+			resolvedModel,
+			resolvedModelOption,
+			settingsData,
+		],
+	);
 
 	// The global default reasoning effort (single source of truth). Applied to
 	// every model when the narrator has no explicit override.
@@ -454,14 +500,18 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		const desired = reasoningFollowsDefault
 			? ((inheritedReasoningEffort as ReasoningEffort | null | undefined) ??
 				globalDefaultReasoningEffort)
-			: (normalizeReasoningEffortForModel(
-					resolvedModel,
-					narratorReasoningEffort,
-				) as ReasoningEffort);
+			: (narratorReasoningEffort as ReasoningEffort);
 		if (!desired) return "";
-		return clampReasoningEffort(desired, opts);
+		const source = modelCard?.provenance.reasoning_effort_levels?.layer;
+		const legacyModel =
+			!hasGatewayReportedEffortLevels(resolvedModelOption) &&
+			(source === "preset-model" || source === "preset-variant")
+				? modelCard?.modelId
+				: undefined;
+		return clampReasoningEffort(migrateLegacyReasoningEffort(legacyModel, desired, opts), opts);
 	}, [
-		resolvedModel,
+		resolvedModelOption,
+		modelCard,
 		narratorReasoningEffort,
 		reasoningEffortOptions,
 		reasoningFollowsDefault,

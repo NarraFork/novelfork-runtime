@@ -1,3 +1,4 @@
+import { applyMcpLoadingPatch } from "@shared/mcp-loading-mode";
 import { z } from "zod/v4";
 import { type NarraForkSettings, SETTING_DOCS } from "../../../lib/settings/index";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -19,6 +20,28 @@ async function getSettingsModule() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Raw settings array replacements use PATCH semantics for matching server IDs. */
+function prepareMcpServersWrite(
+	current: unknown,
+	incoming: unknown,
+): Array<Record<string, unknown>> {
+	if (!Array.isArray(incoming)) throw new Error("MCP servers must be an array");
+	const previous = new Map<string, Record<string, unknown>>();
+	for (const server of Array.isArray(current) ? current : []) {
+		if (server && typeof server === "object" && typeof server.id === "string")
+			previous.set(server.id, server);
+	}
+	return incoming.map((server: unknown) => {
+		if (!server || typeof server !== "object" || Array.isArray(server))
+			throw new Error("Invalid MCP server configuration");
+		const input = server as Record<string, unknown>;
+		const existing = typeof input.id === "string" ? previous.get(input.id) : undefined;
+		// For a new entry, using the entry as its own base both validates the explicit
+		// write and retains creation defaults (notably legacy enabled=true → resident).
+		return { ...input, ...applyMcpLoadingPatch(existing ?? input, input) };
+	});
+}
 
 /** Mask sensitive fields before returning settings to the agent */
 function maskSensitive(obj: Record<string, unknown>): Record<string, unknown> {
@@ -42,6 +65,48 @@ function maskSensitive(obj: Record<string, unknown>): Record<string, unknown> {
 		}
 	}
 	return result;
+}
+
+/**
+ * Whether a setting key name holds a credential whose value must never be returned raw.
+ *
+ * Suffix-based so it matches `jwtSecret`, `oauthClientSecret`, `clientSecret`, any
+ * `apiKey`, `relayToken` / other `*Token`, and `*password`. Only applied to STRING
+ * values, so numeric settings like `maxTokens` are never affected.
+ */
+function isSensitiveSettingKey(key: string): boolean {
+	const lower = key.toLowerCase();
+	return (
+		lower.endsWith("secret") ||
+		lower.endsWith("apikey") ||
+		lower.endsWith("token") ||
+		lower.endsWith("password")
+	);
+}
+
+/**
+ * Recursively replace string values held under a sensitive key with the mask.
+ *
+ * `maskSensitive` masks by the known settings STRUCTURE (auth.jwtSecret, provider
+ * apiKeys); this masks by key NAME, so a single `get_setting` value — including a nested
+ * object or one of the credential keys that structural masking does not model — is never
+ * returned in the clear.
+ */
+function maskSensitiveByKey(key: string, value: unknown): unknown {
+	if (typeof value === "string" && value.length > 0 && isSensitiveSettingKey(key)) {
+		return "***MASKED***";
+	}
+	if (Array.isArray(value)) {
+		return value.map((item) => maskSensitiveByKey(key, item));
+	}
+	if (value && typeof value === "object") {
+		const out: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+			out[k] = maskSensitiveByKey(k, v);
+		}
+		return out;
+	}
+	return value;
 }
 
 /** Get a nested value by dot-path (e.g. "agent.defaultModel") */
@@ -175,7 +240,7 @@ export const narraforkAdminTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe(
-				"Dot-separated path to a setting key (e.g. 'agent.defaultModel', 'chapters.maxActiveWorktrees'). " +
+				"Dot-separated path to a setting key (e.g. 'agent.defaultModel', 'workspace.treeSnapshotsEnabled'). " +
 					"Required for 'get_setting' and 'reset_setting'.",
 			),
 		value: z
@@ -225,13 +290,20 @@ export const narraforkAdminTool: ToolDefinition = {
 					return { output: "Error: 'path' is required for get_setting.", isError: true };
 				}
 				const current = settingsMod.loadSettings();
-				const val = getByPath(current as unknown as Record<string, unknown>, path);
-				if (val === undefined) {
+				// Apply the SAME structural masking as get_settings, then read the path from
+				// the masked object so provider apiKeys and auth.jwtSecret come back masked.
+				const maskedSettings = maskSensitive(current as unknown as Record<string, unknown>);
+				const rawVal = getByPath(maskedSettings, path);
+				if (rawVal === undefined) {
 					return {
 						output: `Setting '${path}' not found.`,
 						isError: true,
 					};
 				}
+				// Defense in depth: also mask by key name, covering credential keys the
+				// structural mask does not model (oauthClientSecret, clientSecret, relayToken, …).
+				const leafKey = path.split(".").pop() ?? path;
+				const val = maskSensitiveByKey(leafKey, rawVal);
 				const doc = SETTING_DOCS[path];
 				const defVal = getByPath(
 					settingsMod.getDefaults() as unknown as Record<string, unknown>,
@@ -276,7 +348,21 @@ export const narraforkAdminTool: ToolDefinition = {
 					return { output: "Error: 'value' is required for update_settings.", isError: true };
 				}
 				const current = settingsMod.loadSettings();
-				const merged = settingsMod.deepMerge(current as unknown as Record<string, unknown>, value);
+				let patch = value;
+				if (Object.hasOwn(value, "mcpServers")) {
+					try {
+						patch = {
+							...value,
+							mcpServers: prepareMcpServersWrite(current.mcpServers, value.mcpServers),
+						};
+					} catch (error) {
+						return {
+							output: `Error: ${error instanceof Error ? error.message : String(error)}`,
+							isError: true,
+						};
+					}
+				}
+				const merged = settingsMod.deepMerge(current as unknown as Record<string, unknown>, patch);
 				settingsMod.saveSettings(merged as unknown as NarraForkSettings);
 				return {
 					output: `Settings updated successfully. Changed keys: ${Object.keys(value).join(", ")}`,

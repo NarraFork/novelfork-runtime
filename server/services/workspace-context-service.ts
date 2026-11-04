@@ -1,22 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, constants, realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import type { SwitchWorkingDirectoryRequest, WorkspaceContext } from "@shared/workspace-context";
-import { and, eq } from "drizzle-orm";
+import {
+	type SwitchWorkingDirectoryRequest,
+	serializeWorkspaceContext,
+	type WorkspaceContext,
+} from "@shared/workspace-context";
+import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects } from "../db/schema";
+import { narrators, projects } from "../db/schema";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { hotSafe } from "../lib/hot-safe";
+import { logger } from "../lib/logger";
 import { isKnowledgeStewardNarrator } from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
-import { isInsidePath } from "../lib/platform-path";
 import { narraforkDir } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	type ActiveNarrator,
 	activeNarrators,
@@ -29,6 +33,7 @@ import {
 	withNarratorMutationAdmission,
 } from "./narrator-session-state";
 import { resolveOAuthNarratorRuntimePolicy } from "./oauth-narrator-runtime-policy";
+import { syncNarratorProjectLinksSafely } from "./project-index";
 import { transitionWorkspaceContext, workspaceConflict } from "./workspace-context-transition";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
@@ -80,7 +85,6 @@ async function loadWorkspaceRow(id: string) {
 			workspaceRevision: true,
 			workspaceContext: true,
 			defaultDeviceId: true,
-			chapterId: true,
 			contextProjectId: true,
 			variant: true,
 			traits: true,
@@ -117,6 +121,7 @@ export async function prepareLocalWorkspaceContext(
 					workspaceKey: gitWorkspaceIdentity(localBackend, probe.rootPath),
 					repositoryKey: gitWorkspaceIdentity(localBackend, probe.repositoryPath),
 					rootPath: probe.rootPath,
+					repositoryPath: probe.repositoryPath,
 				}
 			: undefined;
 	if (
@@ -126,6 +131,16 @@ export async function prepareLocalWorkspaceContext(
 		probe.state !== "git_unavailable"
 	)
 		throw new ValidationError(probe.reason ?? "Cannot safely resolve working directory");
+	return localWorkspaceContext(canonical, revision, contextProjectId, git);
+}
+
+/** Construct from an already-authoritative probe; never re-probe to cache facts. */
+export function localWorkspaceContext(
+	canonical: string,
+	revision: number,
+	contextProjectId: string | undefined,
+	git: WorkspaceContext["git"],
+): WorkspaceContext {
 	return {
 		revision,
 		deviceId: "local",
@@ -145,6 +160,40 @@ export async function prepareLocalWorkspaceContext(
 			.digest("hex"),
 		capabilities: { switchDirectory: true },
 	};
+}
+
+/** Discovery must not overwrite a concurrently committed directory or device transition. */
+export async function cacheLocalWorkspaceContext(
+	id: string,
+	row: Pick<
+		typeof narrators.$inferSelect,
+		"workspaceRevision" | "workspaceContext" | "cwd" | "defaultDeviceId"
+	>,
+	context: WorkspaceContext,
+): Promise<boolean> {
+	if (
+		row.workspaceContext &&
+		serializeWorkspaceContext(context) === serializeWorkspaceContext(row.workspaceContext)
+	)
+		return true;
+	const saved = await db
+		.update(narrators)
+		.set({ workspaceContext: context })
+		.where(
+			and(
+				eq(narrators.id, id),
+				eq(narrators.workspaceRevision, row.workspaceRevision),
+				row.workspaceContext
+					? eq(narrators.workspaceContext, row.workspaceContext)
+					: isNull(narrators.workspaceContext),
+				row.cwd === null ? isNull(narrators.cwd) : eq(narrators.cwd, row.cwd),
+				row.defaultDeviceId === null
+					? isNull(narrators.defaultDeviceId)
+					: eq(narrators.defaultDeviceId, row.defaultDeviceId),
+			),
+		)
+		.returning({ id: narrators.id });
+	return saved.length === 1;
 }
 
 function prepareRemoteWorkspaceContext(
@@ -170,6 +219,35 @@ function prepareRemoteWorkspaceContext(
 				: "Remote device is unavailable; no local fallback",
 		},
 	};
+}
+
+/**
+ * The manual cwd change card. Restored after the workspace-context rewrite dropped it:
+ * the details panel still promises "writes a reminder message into history", and the
+ * vlist still renders `role=disp` info cards of this shape.
+ *
+ * Agent-origin switches skip this on purpose — that path injects
+ * "Working directory changed..." as the next pass's user text instead.
+ */
+async function writeCwdChangeReminder(
+	narratorId: string,
+	previousCwd: string | null | undefined,
+	cwd: string,
+	userId?: string | null,
+): Promise<void> {
+	const { getUserLanguage } = await import("../lib/i18n");
+	const locale = userId ? await getUserLanguage(userId) : "en";
+	const from = previousCwd?.trim() || null;
+	const reminder =
+		locale === "zh-CN"
+			? from
+				? `工作目录已更新：${from} → ${cwd}`
+				: `工作目录已设置为：${cwd}`
+			: from
+				? `Working directory updated: ${from} → ${cwd}`
+				: `Working directory set to: ${cwd}`;
+	const { narratorService } = await import("./narrator-service");
+	await narratorService.persistDisplayMessage(narratorId, reminder);
 }
 
 async function assertTargetAllowed(narratorId: string, cwd: string) {
@@ -258,13 +336,7 @@ export const workspaceContextService = {
 	},
 	async get(id: string): Promise<WorkspaceContext> {
 		const row = await loadWorkspaceRow(id);
-		const chapter = row.chapterId
-			? await db.query.chapters.findFirst({
-					where: eq(chapters.id, row.chapterId),
-					columns: { worktreePath: true, projectId: true },
-				})
-			: undefined;
-		const projectId = chapter?.projectId ?? row.contextProjectId ?? undefined;
+		const projectId = row.contextProjectId ?? undefined;
 		const project = projectId
 			? await db.query.projects.findFirst({
 					where: eq(projects.id, projectId),
@@ -305,19 +377,36 @@ export const workspaceContextService = {
 		}
 		const committed =
 			row.workspaceContext?.revision === row.workspaceRevision &&
+			(!row.cwd || localBackend.paths.equals(row.cwd, row.workspaceContext.cwd)) &&
 			row.workspaceContext.deviceId === "local"
 				? row.workspaceContext
 				: null;
 		const cwd =
 			committed?.cwd ??
 			activeNarrators.get(id)?.cwd ??
-			resolveNarratorSessionCwd(row.cwd, chapter?.worktreePath, project?.gitPath, getHome());
-		const context =
-			row.workspaceContext?.cwd === cwd &&
-			row.workspaceContext.deviceId === deviceId &&
-			row.workspaceContext.revision === row.workspaceRevision
-				? { ...row.workspaceContext, contextProjectId: projectId }
-				: await prepareLocalWorkspaceContext(cwd, row.workspaceRevision, projectId, true);
+			(isFormerChapterSessionWithoutDirectory(row)
+				? null
+				: resolveNarratorSessionCwd(row.cwd, project?.gitPath, getHome()));
+		if (!cwd)
+			throw new AppError(
+				"This legacy workspace has no directory. Choose a working directory to continue.",
+				409,
+				"WORKSPACE_DIRECTORY_REQUIRED",
+			);
+		let context = committed
+			? { ...committed, contextProjectId: projectId }
+			: await prepareLocalWorkspaceContext(cwd, row.workspaceRevision, projectId, true);
+		if (committed && !committed.git?.repositoryPath) {
+			const discovered = await prepareLocalWorkspaceContext(
+				cwd,
+				row.workspaceRevision,
+				projectId,
+				true,
+			);
+			// A missing checkout must retain its last known identity, not erase it.
+			if (discovered.git) context = discovered;
+		}
+		if (context.git && !(await cacheLocalWorkspaceContext(id, row, context))) return this.get(id);
 		return {
 			...context,
 			capabilities: {
@@ -368,12 +457,12 @@ export const workspaceContextService = {
 						);
 					}
 					// cwd remains the narrator's selected local directory across remote visits.
-					const chapter = row.chapterId
-						? await db.query.chapters.findFirst({
-								where: eq(chapters.id, row.chapterId),
-								columns: { worktreePath: true },
-							})
-						: undefined;
+					if (isFormerChapterSessionWithoutDirectory(row))
+						throw new AppError(
+							"This legacy workspace has no directory. Choose a working directory to continue.",
+							409,
+							"WORKSPACE_DIRECTORY_REQUIRED",
+						);
 					const project = previous.contextProjectId
 						? await db.query.projects.findFirst({
 								where: eq(projects.id, previous.contextProjectId),
@@ -381,7 +470,7 @@ export const workspaceContextService = {
 							})
 						: undefined;
 					const target = await prepareLocalWorkspaceContext(
-						resolveNarratorSessionCwd(row.cwd, chapter?.worktreePath, project?.gitPath, getHome()),
+						resolveNarratorSessionCwd(row.cwd, project?.gitPath, getHome()),
 						previous.revision,
 						previous.contextProjectId,
 						true,
@@ -421,7 +510,6 @@ export const workspaceContextService = {
 									defaultDeviceId: deviceId,
 									workspaceRevision: current.revision,
 									workspaceContext: current,
-									apiConversationId: null,
 									updatedAt: new Date().toISOString(),
 								})
 								.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, old.revision)))
@@ -441,8 +529,6 @@ export const workspaceContextService = {
 					active._bashBeforeStatus?.clear();
 					if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 					active._gitTrackTimer = undefined;
-					active.conversationId = randomUUID();
-					active._resetUpstreamSessionOnNextRequest = true;
 				},
 				pause: () => {
 					const active = activeNarrators.get(id);
@@ -452,13 +538,15 @@ export const workspaceContextService = {
 						active.abortController.abort("Workspace installation failed");
 					}
 				},
-				publish: ({ previous: old, current }) =>
+				publish: ({ previous: old, current }) => {
 					broadcastToNarrator(id, {
 						type: "workspace_context_changed",
 						narratorId: id,
 						previous: old,
 						current,
-					}),
+					});
+					void syncNarratorProjectLinksSafely(id);
+				},
 			},
 		);
 	},
@@ -467,7 +555,7 @@ export const workspaceContextService = {
 		request: SwitchWorkingDirectoryRequest,
 		options: WorkspaceSwitchOptions,
 	) {
-		return transitionWorkspaceContext(request, {
+		const result = await transitionWorkspaceContext(request, {
 			read: () => this.get(id),
 			checkAdmission: () => assertSwitchAdmission(id, options),
 			prepare: async (previous, input) => {
@@ -492,26 +580,6 @@ export const workspaceContextService = {
 					previous.contextProjectId,
 				);
 				await assertTargetAllowed(id, target.cwd);
-				if (row.chapterId) {
-					const chapter = await db.query.chapters.findFirst({
-						where: eq(chapters.id, row.chapterId),
-						columns: { worktreePath: true },
-					});
-					const root = chapter?.worktreePath
-						? await realpath(chapter.worktreePath).catch(() => null)
-						: null;
-					if (
-						!root ||
-						!isInsidePath(root, target.cwd) ||
-						previous.git?.workspaceKey !== target.git?.workspaceKey
-					)
-						throw workspaceConflict(
-							"Chapter cross-worktree switching is unsupported",
-							"WORKSPACE_CONTEXT_UNSUPPORTED",
-						);
-				}
-				if (input.expectedWorktreeKey && input.expectedWorktreeKey !== target.git?.workspaceKey)
-					throw workspaceConflict("Target worktree identity changed");
 				return target;
 			},
 			admit: (action) => withNarratorMutationAdmission(id, action, { failIfBusy: true }),
@@ -539,7 +607,6 @@ export const workspaceContextService = {
 								cwd: current.cwd,
 								workspaceRevision: current.revision,
 								workspaceContext: current,
-								apiConversationId: null,
 							})
 							.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, previous.revision)))
 							.returning({ id: narrators.id });
@@ -561,8 +628,6 @@ export const workspaceContextService = {
 				await updateActiveNarratorCwdAndSkillContext(id, current.cwd);
 				active._workspaceContext = current;
 				active._workspaceInstallFailed = false;
-				active.conversationId = randomUUID();
-				active._resetUpstreamSessionOnNextRequest = true;
 			},
 			pause: () => {
 				const active = activeNarrators.get(id);
@@ -572,13 +637,29 @@ export const workspaceContextService = {
 					active.abortController.abort("Workspace installation failed");
 				}
 			},
-			publish: ({ previous, current }) =>
+			publish: ({ previous, current }) => {
 				broadcastToNarrator(id, {
 					type: "workspace_context_changed",
 					narratorId: id,
 					previous,
 					current,
-				}),
+				});
+				// The directory may now belong to another project.
+				void syncNarratorProjectLinksSafely(id);
+			},
 		});
+		// Manual HTTP switch: the UI still promises a history reminder card. Agent-origin
+		// switches skip this — the orchestrator injects the pass-continuation text instead.
+		if (result.changed && options.origin === "http") {
+			try {
+				await writeCwdChangeReminder(id, result.previous.cwd, result.current.cwd, options.userId);
+			} catch (error) {
+				logger.warn("Failed to persist working-directory change reminder", {
+					narratorId: id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return result;
 	},
 };

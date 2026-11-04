@@ -15,8 +15,10 @@ import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import type { KnowledgeSubmissionListItem, KnowledgeSubmissionOutcome } from "../../lib/api";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import knowledgeEn from "../../locales/en/knowledge.json";
 import narratorEn from "../../locales/en/narrator.json";
 import navEn from "../../locales/en/nav.json";
 import navZh from "../../locales/zh-CN/nav.json";
@@ -30,7 +32,7 @@ await i18n.init({
 	initImmediate: false,
 	interpolation: { escapeValue: false },
 	resources: {
-		en: { nav: navEn, narrator: narratorEn },
+		en: { nav: navEn, narrator: narratorEn, knowledge: knowledgeEn },
 		"zh-CN": { nav: navZh },
 	},
 });
@@ -132,12 +134,20 @@ async function settle() {
 	});
 }
 
+async function waitForDom(predicate: () => boolean, description: string) {
+	const deadline = performance.now() + 2000;
+	do {
+		await settle();
+		if (predicate()) return;
+	} while (performance.now() < deadline);
+	throw new Error(`Timed out waiting for ${description}`);
+}
+
 function sampleItem(overrides: Partial<NotificationListPage["items"][number]> = {}) {
 	return {
 		id: "n-chat",
 		kind: "chat_message" as const,
 		projectId: null,
-		chapterId: null,
 		narratorId: null,
 		title: "Alice",
 		preview: "Hey there",
@@ -147,7 +157,6 @@ function sampleItem(overrides: Partial<NotificationListPage["items"][number]> = 
 		notificationIds: [overrides.id ?? "n-chat"],
 		groupSize: 1,
 		projectTitle: null,
-		chapterTitle: null,
 		sourceState: "active" as const,
 		createdAt: Date.now() - 60_000,
 		readAt: null,
@@ -160,6 +169,9 @@ let attentionPayload: HumanAttentionPage = { items: [], nextCursor: null };
 const originalUnread = api.getNotificationUnreadCounts;
 const originalList = api.listNotifications;
 const originalMarkRead = api.markNotificationsRead;
+const originalReviewInbox = api.getKnowledgeReviewInboxCount;
+const originalOutcomes = api.listMyKnowledgeSubmissionOutcomes;
+const originalSubmissions = api.listKnowledgeSubmissions;
 
 let restoreDom: (() => void) | null = null;
 let queryClient: QueryClient | null = null;
@@ -173,6 +185,9 @@ let unreadPayload: NotificationUnreadCounts = {
 	conversationsLowerBound: false,
 	activitiesLowerBound: false,
 };
+let reviewInboxPayload = { count: 0, capped: false, limit: 100 };
+let outcomePayload: KnowledgeSubmissionOutcome[] = [];
+let submissionPayload: KnowledgeSubmissionListItem[] = [];
 
 type TestRouter = ReturnType<typeof testRouter>;
 
@@ -218,12 +233,19 @@ beforeEach(async () => {
 	};
 
 	attentionPayload = { items: [], nextCursor: null };
+	reviewInboxPayload = { count: 0, capped: false, limit: 100 };
+	outcomePayload = [];
+	submissionPayload = [];
 	api.getHumanAttention = async () => attentionPayload;
 	api.getNotificationUnreadCounts = async () => unreadPayload;
 	api.listNotifications = async () => listPayload;
 	api.markNotificationsRead = async (body) => ({
 		updated: body.scope === "items" ? body.ids.length : 0,
 	});
+	api.getKnowledgeReviewInboxCount = async () => reviewInboxPayload;
+	api.listMyKnowledgeSubmissionOutcomes = async () => outcomePayload;
+	api.listKnowledgeSubmissions = async (opts = {}) =>
+		submissionPayload.filter((row) => !opts.status || row.status === opts.status);
 
 	spyOn(narratorWSManager, "addListener").mockImplementation((() => ({
 		_id: 1,
@@ -255,6 +277,9 @@ afterEach(async () => {
 	api.getNotificationUnreadCounts = originalUnread;
 	api.listNotifications = originalList;
 	api.markNotificationsRead = originalMarkRead;
+	api.getKnowledgeReviewInboxCount = originalReviewInbox;
+	api.listMyKnowledgeSubmissionOutcomes = originalOutcomes;
+	api.listKnowledgeSubmissions = originalSubmissions;
 	restoreDom?.();
 	restoreDom = null;
 });
@@ -275,7 +300,6 @@ function pendingItem(id: string, question = false): HumanAttentionPage["items"][
 		narratorTitle: "Actual owner",
 		parentNarratorId: null,
 		rootNarratorId: null,
-		chapterId: null,
 		createdAt: new Date().toISOString(),
 		blocking: !question,
 		canAct: false,
@@ -317,6 +341,13 @@ describe("new center integration", () => {
 			document.querySelector('[data-testid="notification-bell"]')?.getAttribute("aria-label"),
 		).toContain("pending items");
 		await clickElement('[data-testid="notification-bell"]');
+		// The Drawer can render before its nested lazy inbox has committed.
+		await waitForDom(
+			() =>
+				!!document.querySelector('[data-attention-id="permission"]') &&
+				!!document.querySelector('[data-attention-id="question"]'),
+			"the permission and question attention rows",
+		);
 		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
 		expect(
 			[...document.querySelectorAll("[data-attention-id]")].map((row) =>
@@ -356,6 +387,20 @@ describe("new center integration", () => {
 		expect(document.body.textContent).toContain(navEn.notificationCountUnknown);
 		expect(document.body.textContent).toContain(narratorEn.humanAttentionLoadError);
 		expect(document.body.textContent).not.toContain(narratorEn.humanAttentionEmpty);
+	});
+
+	test("a retained drawer adopts the latest initial tab on reopen", async () => {
+		const view = (opened: boolean, initialTab: "activity" | "attention") => (
+			<NotificationCenterDrawer opened={opened} initialTab={initialTab} onClose={() => {}} />
+		);
+		await renderWithProviders(view(true, "activity"));
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).not.toBeNull();
+		await clickText(navEn.notificationTabAttention);
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).toBeNull();
+
+		await renderWithProviders(view(false, "activity"));
+		await renderWithProviders(view(true, "activity"));
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).not.toBeNull();
 	});
 
 	test("activity bulk read uses server boundary/current kind, preserves pending authority and shows errors", async () => {
@@ -451,7 +496,6 @@ describe("new center integration", () => {
 					title: "secret",
 					preview: "secret-body",
 					projectTitle: "secret-project",
-					chapterTitle: "secret-chapter",
 				}),
 			],
 			nextCursor: null,
@@ -516,6 +560,15 @@ describe("NotificationBell badge", () => {
 		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("7");
 	});
 
+	test("shows the knowledge review count when chat and attention are empty", async () => {
+		reviewInboxPayload = { count: 2, capped: false, limit: 100 };
+		await renderWithProviders(<NotificationBell />);
+		expect(textOf('[data-testid="notification-bell-badge"]')).toContain("2");
+		expect(
+			document.querySelector('[data-testid="notification-bell"]')?.getAttribute("aria-label"),
+		).toContain("2 knowledge review updates");
+	});
+
 	test("shows 99+ when lowerBound/capped", async () => {
 		unreadPayload = {
 			unreadConversations: 99,
@@ -529,6 +582,119 @@ describe("NotificationBell badge", () => {
 });
 
 describe("NotificationCenterDrawer", () => {
+	test("activity lists knowledge review rows when the notification feed is empty", async () => {
+		reviewInboxPayload = { count: 1, capped: false, limit: 100 };
+		submissionPayload = [
+			{
+				id: "-T3FW1KB",
+				draftId: "draft-1",
+				entryId: "entry-1",
+				collectionId: null,
+				title: "classified title",
+				submitterUserId: "author",
+				baseRevisionId: null,
+				proposedContent: "secret body",
+				changeNote: "secret note",
+				status: "pending",
+				reviewerUserId: null,
+				verdict: null,
+				findingsJson: null,
+				reviewedAt: null,
+				mergedRevisionId: null,
+				createdAt: new Date().toISOString(),
+				entryTitle: "classified title",
+				targetCollectionId: "col-1",
+				collectionName: "secret collection",
+				submitterUsername: "author",
+				drifted: false,
+			},
+		];
+		outcomePayload = [
+			{
+				id: "outcome-1",
+				draftId: "draft-2",
+				entryId: "entry-2",
+				status: "changes_requested",
+				verdict: "request_changes",
+				findingsJson: [{ severity: "minor", message: "spell out the grant" }],
+				reviewedAt: new Date().toISOString(),
+				createdAt: new Date().toISOString(),
+			},
+		];
+		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
+		expect(document.body.textContent).toContain("1 submission is waiting for your review");
+		expect(document.body.textContent).toContain("spell out the grant");
+		expect(document.body.textContent).not.toContain("classified title");
+		expect(document.body.textContent).not.toContain("secret body");
+		expect(document.body.textContent).not.toContain("secret note");
+		expect(container?.querySelector('[data-testid="notification-empty"]')).toBeNull();
+	});
+
+	test("reviewer and author knowledge rows open the request page (linked and standalone)", async () => {
+		reviewInboxPayload = { count: 1, capped: false, limit: 100 };
+		const base = {
+			draftId: "draft-1",
+			collectionId: null,
+			title: null,
+			submitterUserId: "author",
+			baseRevisionId: null,
+			proposedContent: "",
+			changeNote: null,
+			status: "pending" as const,
+			reviewerUserId: null,
+			verdict: null,
+			findingsJson: null,
+			reviewedAt: null,
+			mergedRevisionId: null,
+			createdAt: new Date().toISOString(),
+			entryTitle: null,
+			targetCollectionId: null,
+			collectionName: null,
+			submitterUsername: null,
+			drifted: null,
+		};
+		submissionPayload = [
+			{ ...base, id: "linked-sub", entryId: "entry-1" },
+			{ ...base, id: "standalone-sub", entryId: null, collectionId: "col-1" },
+		];
+		outcomePayload = [
+			{
+				id: "author-sub",
+				draftId: "draft-2",
+				entryId: null,
+				status: "changes_requested",
+				verdict: "request_changes",
+				findingsJson: null,
+				reviewedAt: new Date().toISOString(),
+				createdAt: new Date().toISOString(),
+			},
+		];
+		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);
+		const click = async (selector: string) => {
+			const el = container?.querySelector(selector) as HTMLElement;
+			expect(el).not.toBeNull();
+			await act(async () => {
+				el.click();
+			});
+			await settle();
+		};
+		for (const id of ["linked-sub", "standalone-sub"]) {
+			navigations = [];
+			await click(`[data-testid="knowledge-review-notice"][data-submission-id="${id}"]`);
+			expect(navigations).toEqual([
+				{ to: "/knowledge/requests/$submissionId", params: { submissionId: id } },
+			]);
+		}
+		navigations = [];
+		await click('[data-testid="knowledge-review-outcome"][data-submission-id="author-sub"]');
+		expect(navigations).toEqual([
+			{ to: "/knowledge/requests/$submissionId", params: { submissionId: "author-sub" } },
+		]);
+		navigations = [];
+		await click('[data-testid="knowledge-review-inbox"]');
+		expect(navigations).toEqual([{ to: "/knowledge/review" }]);
+	});
+
 	test("activity empty state has source filters, not duplicate approval forms", async () => {
 		listPayload = { items: [], nextCursor: null, asOf: 1234 };
 		await renderWithProviders(<NotificationCenterDrawer opened onClose={() => {}} />);

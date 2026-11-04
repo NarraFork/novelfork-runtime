@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -7,26 +7,40 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
-mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
-const takeover = { ...(await import("../subagent-takeover")) };
-const taken = new Set<string>();
-mock.module("../subagent-takeover", () => ({
-	...takeover,
-	isTakenOver: (id: string) => taken.has(id),
+const broadcasts: Array<{ narratorId: string; type: string; model?: string }> = [];
+mock.module("../../websocket/narrator-ws", () => ({
+	...ws,
+	broadcastToNarrator: (narratorId: string, message: { type: string; model?: string }) => {
+		broadcasts.push({ narratorId, type: message.type, model: message.model });
+	},
 }));
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
+const inbox = await import("../agent-runtime/inbox");
+const settingsModule = await import("../../lib/settings");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
-const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
-const { getForegroundAbortControllers } = await import("../subagent-detach");
-const { registerAgentReplyWait, clearPendingAgentReplyWaits, getPendingAgentReplyCount } =
-	await import("../agent-reply-waiter");
+const { getExecutionOwner, setRunHold, tryClaimExecution } = await import(
+	"../agent-runtime/ownership"
+);
+const { activeNarrators } = await import("../narrator-session-state");
 const { sendTool } = await import("../../lib/agent/tools/send");
+const { compileDelegationCeiling } = await import("../custom-subagent-service");
+const ceiling = await compileDelegationCeiling("general");
 const store = createMailboxStore(db);
+/** A turn in flight: the session's live abort controller (the same for every session). */
+function liveTurn(narratorId: string, controller: AbortController) {
+	activeNarrators.set(narratorId, {
+		narratorId,
+		alive: true,
+		abortController: controller,
+	} as unknown as import("../narrator-session-state").ActiveNarrator);
+}
 const ids = [
 	"parent-root",
 	"sender-child",
@@ -38,21 +52,29 @@ const ids = [
 const time = "2026-09-09T00:00:00.000Z";
 let serial = 0;
 beforeEach(() => {
-	clearPendingAgentReplyWaits();
-	taken.clear();
-	for (const id of ids) getExecutionOwner(id)?.release();
-	getForegroundAbortControllers().clear();
+	broadcasts.length = 0;
+	for (const id of ids) {
+		setRunHold(id, undefined);
+		getExecutionOwner(id)?.release();
+		activeNarrators.delete(id);
+	}
 	cleanDb(sqlite);
 	for (const id of ids) {
 		const primary = id.endsWith("root");
+		const parent = primary ? null : id === "foreign-child" ? "foreign-root" : "parent-root";
 		db.insert(narrators)
 			.values({
 				id,
 				title: id === "sibling-a" ? "Alpha analyst" : id,
 				type: primary ? "primary" : "subagent",
 				variant: primary ? "primary" : "subagent:general",
-				parentNarratorId: primary ? null : id === "foreign-child" ? "foreign-root" : "parent-root",
-				traits: id === "sibling-a" ? ["subagent-alias:alpha"] : [],
+				parentNarratorId: parent,
+				policySourceNarratorId: parent,
+				runtimeRegistrationJson: parent ? delegationRegistration(parent, "general") : null,
+				traits: withRuntimePolicyTrait(
+					id === "sibling-a" ? ["subagent-alias:alpha"] : [],
+					parent ? ceiling : null,
+				),
 				status: "working",
 				isBackground: false,
 				createdAt: time,
@@ -60,12 +82,14 @@ beforeEach(() => {
 			})
 			.run();
 	}
-	tryClaimExecution("parent-root", "primary");
+	tryClaimExecution("parent-root", "run");
 });
 afterAll(() => {
-	clearPendingAgentReplyWaits();
-	for (const id of ids) getExecutionOwner(id)?.release();
-	getForegroundAbortControllers().clear();
+	for (const id of ids) {
+		setRunHold(id, undefined);
+		getExecutionOwner(id)?.release();
+		activeNarrators.delete(id);
+	}
 	sqlite.close();
 });
 function input(
@@ -201,7 +225,7 @@ test("full parent queue does not prevent sibling delivery and no old entry is ev
 test("a taken-over target still receives the message, alongside parent and later sibling", async () => {
 	// Rejecting a Send to a taken-over subagent silently dropped the instruction:
 	// nothing was queued. It must be delivered like to any running subagent.
-	taken.add("sibling-a");
+	setRunHold("sibling-a", { released: false });
 	const result = await sendSubagentMessageDetailed(
 		input("sender-child", ["sibling-a", "parent", "sibling-b"]),
 	);
@@ -212,10 +236,10 @@ test("a taken-over target still receives the message, alongside parent and later
 });
 
 test("doInterrupt is ignored for a taken-over child: queued, user's turn untouched", async () => {
-	taken.add("sibling-a");
+	setRunHold("sibling-a", { released: false });
 	const turn = new AbortController();
-	getForegroundAbortControllers().set("sibling-a", turn);
-	tryClaimExecution("sibling-a", "subagent");
+	liveTurn("sibling-a", turn);
+	tryClaimExecution("sibling-a", "run");
 	const request = input("parent-root", ["sibling-a"]);
 	const result = await sendSubagentMessageDetailed({ ...request, doInterrupt: true });
 	expect(result.targets.map((target) => target.status)).toEqual(["queued"]);
@@ -224,94 +248,7 @@ test("doInterrupt is ignored for a taken-over child: queued, user's turn untouch
 	expect(result.output).toContain("doInterrupt was ignored");
 });
 
-test("explicit replyTo mixed fanout rejects the entire call without settling waiter or enqueue", async () => {
-	const wait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	const result = await sendSubagentMessageDetailed({ ...input(), replyTo: wait.requestId });
-	expect(result.targets.every((target) => target.status === "failed")).toBe(true);
-	expect(getPendingAgentReplyCount("parent-root", "sender-child", wait.scope)).toBe(1);
-	expect(rows()).toHaveLength(0);
-	wait.cancel();
-});
-
-test.each([
-	"parent",
-	"sibling",
-])("implicit %s reply mixed with ordinary target has zero delivery side effects", async (replyTarget) => {
-	const requesterId = replyTarget === "parent" ? "parent-root" : "sibling-a";
-	const wait = registerAgentReplyWait({
-		requesterId,
-		responderId: "sender-child",
-		scope:
-			replyTarget === "parent"
-				? { type: "parent-child", id: "parent-root\u0000sender-child" }
-				: { type: "team", id: "parent-root" },
-	});
-	const result = await sendSubagentMessageDetailed(input());
-	expect(result.targets.every((target) => target.status === "failed")).toBe(true);
-	expect(getPendingAgentReplyCount(requesterId, "sender-child", wait.scope)).toBe(1);
-	expect(rows()).toHaveLength(0);
-	wait.cancel();
-});
-
-test("later implicit ambiguity rejects the complete batch before the earlier unique waiter settles", async () => {
-	const parentWait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	const siblingFirst = registerAgentReplyWait({
-		requesterId: "sibling-a",
-		responderId: "sender-child",
-		scope: { type: "team", id: "parent-root" },
-	});
-	const siblingSecond = registerAgentReplyWait({
-		requesterId: "sibling-a",
-		responderId: "sender-child",
-		scope: { type: "team", id: "parent-root" },
-	});
-	const result = await sendSubagentMessageDetailed(input());
-	expect(result.targets.map((target) => [target.id, target.status])).toEqual([
-		["parent-root", "failed"],
-		["sibling-a", "failed"],
-	]);
-	expect(result.output).toContain("Multiple Send reply requests");
-	expect(getPendingAgentReplyCount("parent-root", "sender-child", parentWait.scope)).toBe(1);
-	expect(getPendingAgentReplyCount("sibling-a", "sender-child", siblingFirst.scope)).toBe(2);
-	expect(rows()).toHaveLength(0);
-	siblingSecond.cancel();
-	const retried = await sendSubagentMessageDetailed(input());
-	expect(retried.targets.map((target) => [target.id, target.status])).toEqual([
-		["parent-root", "completed"],
-		["sibling-a", "completed"],
-	]);
-	expect((await parentWait.promise).status).toBe("replied");
-	expect((await siblingFirst.promise).status).toBe("replied");
-	expect(retried.output).toContain(parentWait.requestId);
-	expect(retried.output).toContain(siblingFirst.requestId);
-	expect(rows()).toHaveLength(0);
-});
-
-test("single parent reply still settles the independent waiter without mailbox entry", async () => {
-	const wait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	const result = await sendSubagentMessageDetailed({
-		...input("sender-child", ["parent", "main"]),
-		replyTo: wait.requestId,
-	});
-	expect(result.targets[0]?.status).toBe("completed");
-	expect((await wait.promise).status).toBe("replied");
-	expect(rows()).toHaveLength(0);
-});
-
-test("child await/interrupt and primary foreign interrupt fail whole-call before enqueue", async () => {
-	await expect(sendSubagentMessageDetailed({ ...input(), shouldAwait: true })).rejects.toThrow();
+test("child interrupt and primary foreign interrupt fail whole-call before enqueue", async () => {
 	await expect(sendSubagentMessageDetailed({ ...input(), doInterrupt: true })).rejects.toThrow();
 	await expect(
 		sendSubagentMessageDetailed({
@@ -331,12 +268,12 @@ test("same attempt fanout retry reuses each delivery and never re-interrupts chi
 	);
 	expect(rows()).toHaveLength(2);
 	const controller = new AbortController();
-	getForegroundAbortControllers().set("sibling-b", controller);
+	liveTurn("sibling-b", controller);
 	const primary = { ...input("parent-root", ["sibling-b"]), doInterrupt: true };
 	await sendSubagentMessageDetailed(primary);
 	expect(controller.signal.aborted).toBe(true);
 	const replacement = new AbortController();
-	getForegroundAbortControllers().set("sibling-b", replacement);
+	liveTurn("sibling-b", replacement);
 	await sendSubagentMessageDetailed(primary);
 	expect(replacement.signal.aborted).toBe(false);
 });
@@ -370,20 +307,6 @@ test("retry after one archived recipient becomes eligible preserves previous suc
 	expect(rows("sibling-a")).toHaveLength(1);
 });
 
-test("a valid reply target plus unauthorized selector cannot settle the reply early", async () => {
-	const wait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	await expect(
-		sendSubagentMessageDetailed(input("sender-child", ["parent", "foreign-child"])),
-	).rejects.toThrow();
-	expect(getPendingAgentReplyCount("parent-root", "sender-child", wait.scope)).toBe(1);
-	expect(rows()).toHaveLength(0);
-	wait.cancel();
-});
-
 test("parent aliases cannot be captured by a sibling title", async () => {
 	db.update(narrators).set({ title: "parent" }).where(eq(narrators.id, "sibling-b")).run();
 	const result = await sendSubagentMessageDetailed(input("sender-child", ["parent", "sibling-b"]));
@@ -400,6 +323,153 @@ test("missing or stale exact receipt never falls back to text/provider tool-use 
 		toolCallBinding: { toolCallId: request.toolCallBinding?.toolCallId ?? "missing", attempt: 2 },
 	});
 	expect(stale.targets.every((target) => target.status === "failed")).toBe(true);
+	expect(rows()).toHaveLength(0);
+});
+
+function stopTarget(reason: "error" | "user_interrupt", id = "sibling-a") {
+	db.update(narrators)
+		.set({ status: "idle", lastStopReason: reason })
+		.where(eq(narrators.id, id))
+		.run();
+}
+async function settled(condition: () => boolean) {
+	for (let i = 0; i < 100 && !condition(); i++) await Bun.sleep(5);
+	expect(condition()).toBe(true);
+}
+
+test("Send to an error-stopped child reports blocked, keeps the message and tells its page", async () => {
+	stopTarget("error");
+	const result = await sendSubagentMessageDetailed(input("parent-root", ["sibling-a"]));
+	expect(result.targets).toEqual([
+		expect.objectContaining({ id: "sibling-a", status: "blocked", blockedReason: "error" }),
+	]);
+	expect(result.output).toContain("NOT running");
+	expect(result.output).toContain("resume=true");
+	expect(result.output).not.toContain("retained for the next eligible turn");
+	expect(rows("sibling-a").map((row) => row.state)).toEqual(["queued"]);
+	await settled(() =>
+		broadcasts.some((b) => b.narratorId === "sibling-a" && b.type === "agent_inbox_changed"),
+	);
+	expect((await inbox.listPendingAgentMessages("sibling-a")).messages).toEqual([
+		expect.objectContaining({ preview: "same report", truncated: false }),
+	]);
+});
+
+test("resume=true restarts an error-stopped child through the explicit override only", async () => {
+	stopTarget("error");
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			resume: true,
+		});
+		expect(wake).toHaveBeenCalledWith("sibling-a", "en", { resumeStopped: ["error"] });
+		expect(result.targets[0]).toMatchObject({ status: "started", resumed: true });
+		expect(result.output).toContain("resumed after its failed last turn");
+	} finally {
+		wake.mockRestore();
+	}
+});
+
+test("resume=true cannot override a stop the user made", async () => {
+	stopTarget("user_interrupt");
+	const result = await sendSubagentMessageDetailed({
+		...input("parent-root", ["sibling-a"]),
+		resume: true,
+	});
+	expect(result.targets[0]).toMatchObject({ status: "blocked", blockedReason: "user_interrupt" });
+	expect(result.output).toContain("cannot override the user's stop");
+	expect(rows("sibling-a")).toHaveLength(1);
+});
+
+test("resume and model require control of the target: a child cannot steer its sibling", async () => {
+	stopTarget("error");
+	for (const extra of [{ resume: true }, { model: "test:other" }])
+		await expect(
+			sendSubagentMessageDetailed({ ...input("sender-child", ["sibling-a"]), ...extra }),
+		).rejects.toThrow("not a direct child");
+	expect(rows()).toHaveLength(0);
+});
+
+test("model switches a child before delivery and announces it to an idle page", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:other",
+	]);
+	try {
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			model: "test:other",
+		});
+		expect(result.targets[0]).toMatchObject({ status: "queued", model: "test:other" });
+		expect(result.output).toContain("Model switched to test:other (applies from its next");
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
+			"test:other",
+		);
+		expect(broadcasts).toContainEqual({
+			narratorId: "sibling-a",
+			type: "model_changed",
+			model: "test:other",
+		});
+		await sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "parent" });
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
+			"__parent__",
+		);
+	} finally {
+		visible.mockRestore();
+	}
+});
+
+test("an unknown or out-of-pool model rejects the whole call before any write", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:pooled",
+	]);
+	const pools = settingsModule.settings.agent.subagentAllowedModels;
+	const siblingModels = () =>
+		db
+			.select()
+			.from(narrators)
+			.all()
+			.filter((row) => row.id.startsWith("sibling"))
+			.map((row) => row.model);
+	const before = siblingModels();
+	try {
+		await expect(
+			sendSubagentMessageDetailed({
+				...input("parent-root", ["sibling-a", "sibling-b"]),
+				model: "test:missing",
+			}),
+		).rejects.toThrow("not available to subagents");
+		settingsModule.settings.agent.subagentAllowedModels = {
+			explore: [],
+			plan: [],
+			general: ["test:pooled"],
+		};
+		await expect(
+			sendSubagentMessageDetailed({
+				...input("parent-root", ["sibling-a"]),
+				model: "test:model",
+			}),
+		).rejects.toThrow('not in the allowed "general" subagent model pool');
+		expect(rows()).toHaveLength(0);
+		expect(siblingModels()).toEqual(before);
+		const allowed = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			model: "test:pooled",
+		});
+		expect(allowed.targets[0]).toMatchObject({ status: "queued", model: "test:pooled" });
+	} finally {
+		settingsModule.settings.agent.subagentAllowedModels = pools;
+		visible.mockRestore();
+	}
+});
+
+test("model cannot change a child the user has taken over", async () => {
+	setRunHold("sibling-a", { released: false });
+	await expect(
+		sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "test:other" }),
+	).rejects.toThrow("taken over by the user");
 	expect(rows()).toHaveLength(0);
 });
 

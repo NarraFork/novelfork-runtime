@@ -39,6 +39,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
+import * as modelHistoryDatabase from "../db";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -51,28 +52,70 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { OUTLINE_EDIT_TOOL } from "../lib/agent/tools/outline-names";
 import {
 	measureMessageCharacters,
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
+import {
+	isTopLevelMessage,
+	type OwnTurnPlacement,
+	ownTurnPlacementOf,
+	ownTurnSql,
+	RUNTIME_SOURCE_COLUMNS,
+} from "../lib/runtime-source";
 import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings";
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
+	type LoadModelHistoryOptions,
+	loadModelHistorySource,
+} from "./agent-runtime/model-history-source";
+import { isRunHeldForDisplay, listRunHolds } from "./agent-runtime/ownership";
+import {
 	AWAIT_AGENT_RESOLVED_FIELD,
+	type AwaitAgentResolution,
 	attachAwaitAgentNarratorIds,
 	attachTakenOverFlags,
 	resolveAwaitAgentIdsForToolCalls,
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
-import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
+import { newEnvelopeColumns, withRetiredBlocks } from "./narrator-block-sync";
+import {
+	MAX_BLOCK_DELETE_ELEMENTS,
+	materializeTargets,
+	resolveBlockTargets,
+	targetElements,
+} from "./narrator-block-targets";
+import {
+	bodyColumns,
+	contentJsonSql,
+	envelopeStoredBytesSql,
+	fillBodies,
+	fillBody,
+	hasStoredElementSql,
+	storedBodyBytesSql,
+} from "./narrator-body-reads";
+import { insertEnvelope, readEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
+import {
+	createPostgresNarratorDisplayPagePort,
+	readDisplayFixtureMessages,
+	readNarratorDisplayMessages,
+} from "./narrator-display-page-reader";
+import {
+	cowEnvelopeTx,
+	deleteRecipientMessageRefs,
+	updateRecipientMessageRef,
+} from "./narrator-persistence";
+import { attachPrefixHistorySource } from "./narrator-prefix-state";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
 	ensureRefsCoverMessage,
@@ -80,21 +123,20 @@ import {
 	hasUnmaterializedRefsBelow,
 } from "./narrator-refs-backfill";
 import {
+	authorizeRevertHistory,
 	revertNarratorScopedForMessages,
 	revertNarratorScopedForToolUses,
+	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
-	attachActiveSendDeliveryTargets,
-	attachSendTargetDetails,
-} from "./send-delivery-resolution";
-import {
-	commitSnapshotRevert,
+	assertSnapshotRevertComplete,
 	DEFAULT_REVERT_SCOPE,
 	type RevertResult,
 	type RevertScope,
 	type RevertWarning,
-	revertForMessagesTree,
+	snapshotHistoryFailure,
 	unavailableSnapshotRevert,
 } from "./snapshot-revert";
 // Pure in-memory state module (no imports of its own), so importing it here
@@ -105,7 +147,6 @@ import {
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
-import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent-takeover";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -132,17 +173,16 @@ async function revertForDeletedMessages(
 	narratorId: string,
 	messageIds: string[],
 	scope: RevertScope | undefined,
+	options?: ScopedRevertOptions,
 ): Promise<RevertResult> {
-	const selectedScope = scope ?? DEFAULT_REVERT_SCOPE;
-	const result =
-		selectedScope === "workspace"
-			? await revertForMessagesTree(narratorId, messageIds)
-			: await revertNarratorScopedForMessages(narratorId, messageIds);
+	if ((scope ?? DEFAULT_REVERT_SCOPE) === "workspace") {
+		return unavailableSnapshotRevert(
+			"Workspace-wide restore requires a verified per-file plan; original history was retained.",
+		);
+	}
 	return (
-		result ??
-		unavailableSnapshotRevert(
-			`No verified ${selectedScope} rollback is available for these messages; history was retained.`,
-		)
+		(await revertNarratorScopedForMessages(narratorId, messageIds, options)) ??
+		unavailableSnapshotRevert("Selected message history is unavailable.")
 	);
 }
 
@@ -150,7 +190,7 @@ async function revertForDeletedBlock(
 	narratorId: string,
 	removedBlock: { type: string; id?: string },
 	messageId: string,
-	opts?: { skipRevert?: boolean; scope?: RevertScope },
+	opts?: BlockDeleteOptions,
 ): Promise<RevertResult | null> {
 	if (opts?.skipRevert || removedBlock.type !== "tool_use") return null;
 	if (!removedBlock.id) {
@@ -160,6 +200,7 @@ async function revertForDeletedBlock(
 		narratorId,
 		[{ messageId, toolUseId: removedBlock.id }],
 		opts?.scope,
+		opts,
 	);
 }
 
@@ -167,6 +208,7 @@ async function revertForDeletedBlocks(
 	narratorId: string,
 	toolUses: Array<{ messageId: string; toolUseId: string }>,
 	scope: RevertScope | undefined,
+	options?: ScopedRevertOptions,
 ): Promise<RevertResult> {
 	// A message-wide workspace restore cannot express an arbitrary block selection.
 	// Replay is not a safe substitute, even when workspace scope was requested.
@@ -176,17 +218,15 @@ async function revertForDeletedBlocks(
 		);
 	}
 	return (
-		(await revertNarratorScopedForToolUses(narratorId, toolUses)) ??
-		unavailableSnapshotRevert(
-			"No verified narrator rollback is available for these tool blocks; history was retained.",
-		)
+		(await revertNarratorScopedForToolUses(narratorId, toolUses, options)) ??
+		unavailableSnapshotRevert("Selected tool history is unavailable.")
 	);
 }
 
 type MessageTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 type DeletableBlock = { type: string; id?: string; text?: string };
 type BlockSelection = { messageId: string; blockIndex: number };
-type BlockDeleteOptions = {
+type BlockDeleteOptions = ScopedRevertOptions & {
 	skipRevert?: boolean;
 	skipNarratorUpdate?: boolean;
 	preserveConversationId?: boolean;
@@ -455,7 +495,7 @@ function planDerivedHistoryCleanup(
 				.select({
 					id: narratorMessages.id,
 					parentToolUseId: narratorMessages.parentToolUseId,
-					bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))),
+					bytes: envelopeStoredBytesSql(),
 				})
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, child.id))
@@ -522,12 +562,14 @@ function planDerivedHistoryCleanup(
 function assertNoRunningCompactMessagesTx(tx: MessageTx, messageIds: string[]) {
 	if (messageIds.length === 0) return [];
 	// All selected message bytes have already been admitted by the caller.
-	const rows = tx
-		.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.id, messageIds))
-		.limit(BLOCK_DELETE_ROW_LIMIT + 1)
-		.all();
+	const rows = fillBodies(
+		tx
+			.select({ id: narratorMessages.id, contentJson: contentJsonSql() })
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.id, messageIds))
+			.limit(BLOCK_DELETE_ROW_LIMIT + 1)
+			.all(),
+	);
 	const toolBlocks: Array<{ messageId: string; toolUseId: string }> = [];
 	for (const row of rows) {
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
@@ -596,16 +638,14 @@ function planBlockDeletions(
 			.sync();
 		if (!ref) throw new NotFoundError("Message", messageId);
 		const size = tx
-			.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))) })
+			.select({ bytes: envelopeStoredBytesSql() })
 			.from(narratorMessages)
 			.where(eq(narratorMessages.id, messageId))
 			.get();
 		if (!size) throw new NotFoundError("Message", messageId);
 		// Check bytes in SQL before materializing any large JSON/text field.
 		reserve(4, size.bytes);
-		const message = tx.query.narratorMessages
-			.findFirst({ where: eq(narratorMessages.id, messageId) })
-			.sync();
+		const message = readEnvelope(tx, messageId);
 		if (!message) throw new NotFoundError("Message", messageId);
 		const blocks = Array.isArray(message.contentJson)
 			? (message.contentJson as DeletableBlock[])
@@ -836,67 +876,52 @@ function applyBlockDeletionTx(
 			: {}),
 	};
 	if (isShared) {
-		const newId = generateId();
-		tx.insert(narratorMessages)
-			.values({ ...message, ...patch, id: newId })
-			.run();
-		tx.update(narratorMessageRefs)
-			.set({ messageId: newId })
-			.where(eq(narratorMessageRefs.id, ref.id))
-			.run();
-		updateRecipientMessageRef(tx, narratorId, ref.id, {
-			kind: "semantic_edit",
-			messageId: newId,
-		});
 		const retainedIds = new Set(
 			remaining.filter((block) => block.type === "tool_use").map((block) => block.id),
 		);
-		const retainedCalls = plan.toolCalls.filter((call) => retainedIds.has(call.toolUseId));
-		if (retainedCalls.length > 0) {
-			tx.insert(narratorToolCalls)
-				.values(
-					retainedCalls.map((call) => ({
-						...call,
-						id: generateId(),
-						messageId: newId,
-						executionOriginToolCallId: call.executionOriginToolCallId ?? call.id,
-					})),
-				)
-				.run();
-		}
-		// The fork boundary follows this narrator's COW ref, not the shared original.
-		tx.update(narrators)
-			.set({ forkMessageId: newId })
-			.where(and(eq(narrators.id, narratorId), eq(narrators.forkMessageId, message.id)))
-			.run();
-		return newId;
+		return cowEnvelopeTx(tx, {
+			original: message,
+			ref: { id: ref.id, narratorId },
+			changes: patch,
+			toolCalls: plan.toolCalls.filter((call) => retainedIds.has(call.toolUseId)),
+			receipt: "semantic_edit",
+		});
 	} else {
-		tx.update(narratorMessages).set(patch).where(eq(narratorMessages.id, message.id)).run();
+		writeEnvelopeBody(tx, message.id, remaining, {
+			set: patch,
+			rows: () => {
+				if (removedToolIds.length > 0)
+					tx.delete(narratorToolCalls)
+						.where(
+							and(
+								eq(narratorToolCalls.messageId, message.id),
+								inArray(narratorToolCalls.toolUseId, removedToolIds),
+							),
+						)
+						.run();
+			},
+		});
 		updateRecipientMessageRef(tx, narratorId, ref.id, {
 			kind: "semantic_edit",
 			messageId: message.id,
 		});
-		if (removedToolIds.length > 0) {
-			tx.delete(narratorToolCalls)
-				.where(
-					and(
-						eq(narratorToolCalls.messageId, message.id),
-						inArray(narratorToolCalls.toolUseId, removedToolIds),
-					),
-				)
-				.run();
-		}
 		return message.id;
 	}
 }
 
-/** One bounded history transaction, so SQL failure compensates the entire rollback. */
+/**
+ * File attempts finish first; a separate bounded history transaction retains COW and selection checks.
+ * A delete by block id (`byBlock`) selects whole blocks, whose elements may outnumber the block
+ * cap, and names the rows it removes: the transaction rebuilds the envelopes' rows with those
+ * retired, so no remaining block takes over a removed block's id.
+ */
 async function deleteBlockSelection(
 	narratorId: string,
 	blocks: BlockSelection[],
 	opts?: BlockDeleteOptions,
+	byBlock?: { retiredRows: readonly string[] },
 ) {
-	if (blocks.length > MAX_BATCH_DELETE_BLOCKS) {
+	if (blocks.length > (byBlock ? MAX_BLOCK_DELETE_ELEMENTS : MAX_BATCH_DELETE_BLOCKS)) {
 		throw new ValidationError(`Select at most ${MAX_BATCH_DELETE_BLOCKS} blocks`);
 	}
 	const grouped = new Map<string, number[]>();
@@ -933,6 +958,7 @@ async function deleteBlockSelection(
 				narratorId,
 				toolUses as Array<{ messageId: string; toolUseId: string }>,
 				opts?.scope,
+				opts,
 			);
 		}
 	}
@@ -982,8 +1008,16 @@ async function deleteBlockSelection(
 					.run();
 			}
 		});
-	if (snapshotRevert) await commitSnapshotRevert(snapshotRevert, mutate);
-	else mutate();
+	if (snapshotRevert) assertSnapshotRevertComplete(snapshotRevert);
+	try {
+		if (snapshotRevert && opts?.principal) await authorizeRevertHistory(narratorId, opts);
+		opts?.signal?.throwIfAborted();
+		withRetiredBlocks(byBlock?.retiredRows ?? [], mutate);
+	} catch (error) {
+		if (snapshotRevert) throw snapshotHistoryFailure(snapshotRevert, error);
+		throw error;
+	}
+	if (snapshotRevert) snapshotRevert = { ...snapshotRevert, historyCommitted: true };
 	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
 
 	// Persisted block edits must reach already-open narrators. Broadcast the exact
@@ -992,12 +1026,15 @@ async function deleteBlockSelection(
 	try {
 		const uniqueUpdated = [...new Map(updatedMessageIds.map((item) => [item.id, item])).values()];
 		for (const item of uniqueUpdated) {
-			const message = db.query.narratorMessages
-				.findFirst({
-					where: eq(narratorMessages.id, item.id),
-					with: { toolCalls: true },
-				})
-				.sync();
+			const message = fillBody(
+				db.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: eq(narratorMessages.id, item.id),
+						with: { toolCalls: true },
+					})
+					.sync(),
+			);
 			if (!message) throw new Error("updated message disappeared after commit");
 			broadcastToNarrator(narratorId, {
 				type: "message_updated",
@@ -1039,6 +1076,7 @@ async function deleteBlockSelection(
 		deleted: results.length,
 		failed: 0,
 		results,
+		...(snapshotRevert ? { revertResult: snapshotRevert } : {}),
 		...(snapshotRevert?.warnings?.length ? { revertWarnings: snapshotRevert.warnings } : {}),
 		...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
 		...(planned.derived.subagentNarratorIds.length
@@ -1059,44 +1097,29 @@ function copySharedCompactMessageTx(
 		.where(eq(narratorMessageRefs.messageId, message.id))
 		.all();
 	if (refs.length <= 1) return { messageId: message.id, copied: false };
-
-	const newMessageId = generateId();
-	tx.insert(narratorMessages)
-		.values({
-			...message,
-			id: newMessageId,
-			narratorId,
-			createdAt: message.createdAt,
-		})
-		.run();
-	tx.update(narratorMessageRefs)
-		.set({ messageId: newMessageId })
-		.where(eq(narratorMessageRefs.id, ref.id))
-		.run();
-	const narrator = tx.query.narrators
-		.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { forkMessageId: true },
-		})
-		.sync();
-	const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
-	if (narrator?.forkMessageId === message.id) narratorUpdates.forkMessageId = newMessageId;
-	if (Object.keys(narratorUpdates).length > 0) {
-		tx.update(narrators).set(narratorUpdates).where(eq(narrators.id, narratorId)).run();
-	}
-	return { messageId: newMessageId, copied: true };
+	const messageId = cowEnvelopeTx(tx, {
+		original: message,
+		ref: { id: ref.id, narratorId },
+		toolCalls: [],
+	});
+	return { messageId, copied: true };
 }
 
 function assertNoRunningCompactRefsTx(tx: MessageTx, narratorId: string, refIds: string[]): void {
 	if (refIds.length === 0) return;
-	const rows = tx
-		.select({ contentJson: narratorMessages.contentJson })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), inArray(narratorMessageRefs.id, refIds)),
-		)
-		.all();
+	const rows = fillBodies(
+		tx
+			.select({ id: narratorMessages.id, contentJson: contentJsonSql() })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessageRefs.id, refIds),
+				),
+			)
+			.all(),
+	);
 	for (const row of rows) {
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
 		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
@@ -1126,20 +1149,23 @@ function deleteOutputlessAssistantMessage(
 			})
 			.sync();
 		if (!ref) return false;
-		const msg = tx.query.narratorMessages
-			.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: {
-					role: true,
-					contentJson: true,
-					contentText: true,
-					parentToolUseId: true,
-					treeHashAfter: true,
-					snapshotCommitSha: true,
-				},
-				with: { toolCalls: { columns: { id: true }, limit: 1 } },
-			})
-			.sync();
+		const msg = fillBody(
+			tx.query.narratorMessages
+				.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					...bodyColumns({
+						id: true,
+						role: true,
+						contentJson: true,
+						contentText: true,
+						parentToolUseId: true,
+						treeHashAfter: true,
+						snapshotCommitSha: true,
+					}),
+					with: { toolCalls: { columns: { id: true }, limit: 1 } },
+				})
+				.sync(),
+		);
 		if (!msg) return false;
 		const valid =
 			kind === "reasoning-only"
@@ -1379,7 +1405,7 @@ function planMessageRangeDeletion(
 						WHERE ${narratorMessages.id} = ${narratorMessageRefs.messageId}
 						AND ${narratorMessageRefs.segmentCompactId} = ${narratorMessageRefs.messageId}
 						AND ${narratorMessages.role} = 'disp'
-						AND ${narratorMessages.contentJson} = ${JSON.stringify([{ type: "file_history_checkpoint" }])}
+						AND ${hasStoredElementSql("file_history_checkpoint")}
 					)`
 					: undefined,
 			),
@@ -1396,7 +1422,7 @@ function planMessageRangeDeletion(
 					.select({
 						id: narratorMessages.id,
 						narratorId: narratorMessages.narratorId,
-						bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))),
+						bytes: envelopeStoredBytesSql(),
 					})
 					.from(narratorMessages)
 					.where(inArray(narratorMessages.id, messageIds))
@@ -1466,84 +1492,167 @@ function planMessageRangeDeletion(
 	};
 }
 
+/** Every file effect hangs off a tool call (own or delegated). A range with none owns
+ * no file history: there is nothing to restore and no principal to require. Kept out of
+ * the plan object, whose serialized form is the stale-history check. */
+function ownsFileHistory(plan: ReturnType<typeof planMessageRangeDeletion>): boolean {
+	return plan.tools.length > 0 || plan.derived.toolCallIds.length > 0;
+}
+
 async function deleteMessageRange(
 	narratorId: string,
 	messageId: string,
 	inclusive: boolean,
 	opts?: BlockDeleteOptions,
 ) {
-	let affectedQuestionIds: string[] = [];
-	const apply = (tx: MessageTx, planned: ReturnType<typeof planMessageRangeDeletion>) => {
-		if (planned.refs.length === 0) return;
-		affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
-			deletedMessageIds: planned.refs.map((ref) => ref.messageId),
-		}).affectedQuestionIds;
-		insertFileHistoryCheckpoints(tx, narratorId, planned.checkpoints);
-		deleteRecipientMessageRefs(tx)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(
-						narratorMessageRefs.id,
-						planned.refs.map((ref) => ref.id),
-					),
-				),
-			)
-			.run();
-		deleteOrphanedMessages(tx, planned.orphanIds);
-		tx.update(narrators)
-			.set({
-				...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-				messageVersion: sql`${narrators.messageVersion} + 1`,
-				contextUsageSnapshotJson: null,
-				updatedAt: new Date().toISOString(),
-			})
-			.where(eq(narrators.id, narratorId))
-			.run();
+	const timingId = generateId();
+	const startedAt = new Date().toISOString();
+	const context = { timingId, narratorId, messageId, inclusive, skipRevert: !!opts?.skipRevert };
+	logger.info("Message history truncation started", { ...context, startedAt });
+	const started = performance.now();
+	const phaseDurationsMs: Record<string, number> = {};
+	let success = false;
+	let selectedMessageCount = 0;
+	const recordPhase = (phase: string, phaseStarted: number) => {
+		phaseDurationsMs[phase] = (phaseDurationsMs[phase] ?? 0) + performance.now() - phaseStarted;
 	};
-	const planned = db.transaction((tx) => {
-		const plan = planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts);
-		// History-only deletion needs no async gap: plan and mutation share this tx.
-		if (opts?.skipRevert) apply(tx, plan);
-		return plan;
-	});
-	const messageIds = planned.refs.map((ref) => ref.messageId);
-	let revertWarnings: RevertWarning[] = [];
-	if (!opts?.skipRevert && messageIds.length > 0) {
-		const version = JSON.stringify(planned);
-		const result = await revertForDeletedMessages(narratorId, messageIds, opts?.scope);
-		await commitSnapshotRevert(result, () =>
+	const measureSync = <T>(phase: string, fn: () => T): T => {
+		const phaseStarted = performance.now();
+		try {
+			return fn();
+		} finally {
+			recordPhase(phase, phaseStarted);
+		}
+	};
+	const measureAsync = async <T>(phase: string, fn: () => Promise<T>): Promise<T> => {
+		const phaseStarted = performance.now();
+		try {
+			return await fn();
+		} finally {
+			recordPhase(phase, phaseStarted);
+		}
+	};
+	try {
+		let affectedQuestionIds: string[] = [];
+		const apply = (tx: MessageTx, planned: ReturnType<typeof planMessageRangeDeletion>) => {
+			if (planned.refs.length === 0) return;
+			measureSync("questions", () => {
+				affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+					deletedMessageIds: planned.refs.map((ref) => ref.messageId),
+				}).affectedQuestionIds;
+			});
+			measureSync("checkpoints", () =>
+				insertFileHistoryCheckpoints(tx, narratorId, planned.checkpoints),
+			);
+			measureSync("deleteRefs", () =>
+				deleteRecipientMessageRefs(tx)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							inArray(
+								narratorMessageRefs.id,
+								planned.refs.map((ref) => ref.id),
+							),
+						),
+					)
+					.run(),
+			);
+			measureSync("deleteOrphans", () => deleteOrphanedMessages(tx, planned.orphanIds));
+			measureSync("updateNarrator", () =>
+				tx
+					.update(narrators)
+					.set({
+						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(eq(narrators.id, narratorId))
+					.run(),
+			);
+		};
+		const planned = measureSync("transaction", () =>
 			db.transaction((tx) => {
-				if (
-					JSON.stringify(planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts)) !==
-					version
-				) {
-					throw new AppError(
-						"Message history changed during deletion; retry the selection",
-						409,
-						"HISTORY_DELETE_STALE",
-					);
-				}
-				apply(tx, planned);
+				const plan = measureSync("plan", () =>
+					planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+				);
+				// History-only deletion needs no async gap: plan and mutation share this tx.
+				// A range with no file history needs no restore, so it commits the same way.
+				if (opts?.skipRevert || !ownsFileHistory(plan)) apply(tx, plan);
+				return plan;
 			}),
 		);
-		revertWarnings = result.warnings ?? [];
+		selectedMessageCount = planned.refs.length;
+		const messageIds = planned.refs.map((ref) => ref.messageId);
+		let revertWarnings: RevertWarning[] = [];
+		let revertResult: RevertResult | undefined;
+		if (!opts?.skipRevert && messageIds.length > 0 && ownsFileHistory(planned)) {
+			const version = JSON.stringify(planned);
+			const result = await measureAsync("fileRevert", () =>
+				revertForDeletedMessages(narratorId, messageIds, opts?.scope, opts),
+			);
+			assertSnapshotRevertComplete(result);
+			try {
+				if (opts?.principal) await authorizeRevertHistory(narratorId, opts);
+				opts?.signal?.throwIfAborted();
+				measureSync("transaction", () =>
+					db.transaction((tx) => {
+						const current = measureSync("plan", () =>
+							planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+						);
+						if (JSON.stringify(current) !== version) {
+							throw new AppError(
+								"Message history changed during deletion; retry the selection",
+								409,
+								"HISTORY_DELETE_STALE",
+							);
+						}
+						apply(tx, planned);
+					}),
+				);
+			} catch (error) {
+				throw snapshotHistoryFailure(result, error);
+			}
+			revertResult = { ...result, historyCommitted: true };
+			revertWarnings = result.warnings ?? [];
+		}
+		await measureAsync("questionNotifications", () =>
+			notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds),
+		);
+		// A removed Agent/Task card archives its subagent after the transaction commits.
+		if (planned.derived.subagentNarratorIds.length > 0) {
+			await measureAsync("archiveSubagents", async () => {
+				const { archiveRetiredSubagents } = await import("./subagent-lifecycle");
+				await archiveRetiredSubagents(planned.derived.subagentNarratorIds);
+			});
+		}
+		success = true;
+		return {
+			deletedCount: planned.refs.length,
+			deletedMessageIds: messageIds,
+			revertWarnings,
+			...(revertResult ? { revertResult } : {}),
+			...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
+			...(planned.derived.subagentNarratorIds.length
+				? { archivedSubagentIds: planned.derived.subagentNarratorIds }
+				: {}),
+		};
+	} finally {
+		const round = (ms: number) => Math.round(ms * 100) / 100;
+		const durationMs = round(performance.now() - started);
+		const log = durationMs >= 100 || !success ? logger.warn : logger.info;
+		log("Message history truncation completed", {
+			...context,
+			startedAt,
+			durationMs,
+			success,
+			selectedMessageCount,
+			// Transaction and revertCommit contain their child phases; do not sum them.
+			phaseDurationsMs: Object.fromEntries(
+				Object.entries(phaseDurationsMs).map(([phase, ms]) => [phase, round(ms)]),
+			),
+		});
 	}
-	await notifyQuestionHistoryAfterCommit(narratorId, affectedQuestionIds);
-	// Same retire rule as block delete: a removed Agent/Task card archives its subagent.
-	if (planned.derived.subagentNarratorIds.length > 0) {
-		const { archiveRetiredSubagents } = await import("./subagent-lifecycle");
-		await archiveRetiredSubagents(planned.derived.subagentNarratorIds);
-	}
-	return {
-		deletedCount: planned.refs.length,
-		deletedMessageIds: messageIds,
-		revertWarnings,
-		...(planned.derived.warnings.length ? { historyWarnings: planned.derived.warnings } : {}),
-		...(planned.derived.subagentNarratorIds.length
-			? { archivedSubagentIds: planned.derived.subagentNarratorIds }
-			: {}),
-	};
 }
 
 function insertFileHistoryCheckpoints(
@@ -1554,17 +1663,16 @@ function insertFileHistoryCheckpoints(
 	for (const group of groups) {
 		if (group.toolCalls.length === 0) continue;
 		const checkpointId = generateId();
-		tx.insert(narratorMessages)
-			.values({
-				id: checkpointId,
-				narratorId,
-				role: "disp",
-				contentJson: [{ type: "file_history_checkpoint" }],
-				contextCharsJson: { segments: [] },
-				contentText: null,
-				createdAt: new Date().toISOString(),
-			})
-			.run();
+		insertEnvelope(tx, {
+			id: checkpointId,
+			narratorId,
+			role: "disp",
+			...newEnvelopeColumns(narratorId),
+			contentJson: [{ type: "file_history_checkpoint" }],
+			contextCharsJson: { segments: [] },
+			contentText: null,
+			createdAt: new Date().toISOString(),
+		});
 		tx.insert(narratorMessageRefs)
 			.values({
 				id: generateId(),
@@ -1880,8 +1988,11 @@ export const EXACT_TOOL_IO_BUDGET = TOOL_IO_BUDGETS.leaf;
 /** Tool names whose inputJson/outputJson should never be truncated in message lists */
 const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 
-/** Tool names whose inputJson should not be truncated */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send"]);
+/**
+ * Tool names whose inputJson should not be truncated. OutlineEdit's input is the markdown it
+ * writes, bounded by the tool (200 edits, 256 KiB of text), and its card renders it whole.
+ */
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
 
 const SPEC_TASKS_URI = "spec://tasks.json";
 
@@ -1970,7 +2081,9 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function enrichToolUseBlocks(tree: any[]): any[] {
 	return tree.map((msg) => {
-		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) return msg;
+		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) {
+			return msg.children?.length ? { ...msg, children: enrichToolUseBlocks(msg.children) } : msg;
+		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const tcMap = new Map<string, any>(
 			latestToolCallAttempts(msg.toolCalls).map((tc) => [tc.toolUseId, tc]),
@@ -1996,6 +2109,14 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				streamCompletedAt: tc.streamCompletedAt,
 				permissionStartedAt: tc.permissionStartedAt,
 				executionStartedAt: tc.executionStartedAt,
+				// Exact-history pages drop toolCalls after enrichment. Copy only this
+				// selected attempt's frozen facts, overwriting any stale block snapshot.
+				executionDeviceId: tc.executionDeviceId,
+				executionCwd: tc.executionCwd,
+				resolvedFilePath: tc.resolvedFilePath,
+				executionTarget: tc.executionTarget,
+				executionTargets: tc.executionTargets,
+				deviceSelectionSource: tc.deviceSelectionSource,
 				completedAt: tc.completedAt,
 				errorMessage: tc.errorMessage,
 				permissionDecisionReason: tc.permissionDecisionReason,
@@ -2112,13 +2233,18 @@ export function stripProviderMetadata(tree: any[]): any[] {
 	const stripBlock = (block: any) => {
 		const providerMetadata = block?.providerMetadata;
 		if (!providerMetadata || typeof providerMetadata !== "object") return block;
-		const hadEncrypted = Object.values(providerMetadata as Record<string, unknown>).some(
-			(metadata) => {
+		if (
+			providerMetadata.hasEncryptedReasoning === true &&
+			Object.keys(providerMetadata).length === 1
+		)
+			return block;
+		const hadEncrypted =
+			providerMetadata.hasEncryptedReasoning === true ||
+			Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
 				if (!metadata || typeof metadata !== "object") return false;
 				const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;
 				return typeof encrypted === "string" && encrypted.length > 0;
-			},
-		);
+			});
 		const { providerMetadata: _dropped, ...rest } = block;
 		return hadEncrypted ? { ...rest, providerMetadata: { hasEncryptedReasoning: true } } : rest;
 	};
@@ -2184,7 +2310,7 @@ export interface SubagentActivity {
 	fileChanges?: SubagentFileChanges;
 	/**
 	 * The child is currently TAKEN OVER by the user, so the parent's tool call is
-	 * blocked until the user stops it (`subagent-takeover.ts`).
+	 * blocked until the user stops it (the run hold in `agent-runtime/ownership.ts`).
 	 *
 	 * Carried on the activity snapshot because that snapshot is the reconnect
 	 * catch-up channel: without it a client that reconnects mid-takeover would keep
@@ -2269,8 +2395,21 @@ function parseSubagentSummary(raw: unknown): SubagentToolInputSummary | null {
 	}
 }
 
+/**
+ * Latest tool calls of each narrator, oldest first, as short summary rows — the
+ * dashboard activity cards' snapshot. Same bounded projection as a subagent
+ * card's recent calls: never reads `input_json` or outputs into JS.
+ */
+export function loadRecentToolCallActivity(
+	narratorIds: string[],
+	limit: number,
+): Promise<Map<string, SubagentActivityToolCall[]>> {
+	return loadLatestSubagentToolCalls(narratorIds, limit);
+}
+
 async function loadLatestSubagentToolCalls(
 	narratorIds: string[],
+	limit = SUBAGENT_ACTIVITY_LIMIT,
 ): Promise<Map<string, SubagentActivityToolCall[]>> {
 	const result = new Map<string, SubagentActivityToolCall[]>();
 	const uniqueNarratorIds = [...new Set(narratorIds)];
@@ -2303,7 +2442,7 @@ async function loadLatestSubagentToolCalls(
 					),
 				)
 				.orderBy(desc(narratorToolCalls.createdAt), desc(narratorToolCalls.id))
-				.limit(SUBAGENT_ACTIVITY_LIMIT);
+				.limit(limit);
 			return { narratorId, rows: rows.reverse() };
 		}),
 	);
@@ -2384,7 +2523,7 @@ async function buildSubagentActivities(
 			// still-working subagent the release is DEFERRED to its loop end, and the
 			// takeover set stays populated on purpose. Reading the raw set here re-lit
 			// the badge on every page load in that window.
-			...(isTakenOverForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
+			...(isRunHeldForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
 		});
 	}
 	return activities;
@@ -2620,7 +2759,7 @@ function loadAggregateRefMessagesTx(tx: MessageTx, narratorId: string, messageId
 	assertAggregateBudget(ids.length);
 	if (ids.length === 0) return [];
 	const refs = tx
-		.select({ messageId: narratorMessageRefs.messageId })
+		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 		.from(narratorMessageRefs)
 		.where(
 			and(
@@ -2629,6 +2768,7 @@ function loadAggregateRefMessagesTx(tx: MessageTx, narratorId: string, messageId
 				isNull(narratorMessageRefs.segmentCompactId),
 			),
 		)
+		.orderBy(narratorMessageRefs.messageId)
 		.limit(AGGREGATE_METADATA_LIMIT + 1)
 		.all();
 	if (refs.length !== ids.length)
@@ -2637,63 +2777,180 @@ function loadAggregateRefMessagesTx(tx: MessageTx, narratorId: string, messageId
 			409,
 			"HISTORY_AGGREGATE_UNAVAILABLE",
 		);
-	const messages = tx
-		.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorMessages))) })
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.id, ids))
-		.limit(AGGREGATE_METADATA_LIMIT + 1)
-		.all();
-	const tools = tx
-		.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorToolCalls))) })
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.messageId, ids))
-		.limit(AGGREGATE_METADATA_LIMIT + 1)
-		.all();
-	assertAggregateBudget(
-		messages.length + tools.length,
-		[...messages, ...tools].reduce((sum, row) => sum + row.bytes, 0),
-	);
-	return tx.query.narratorMessages
-		.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true, creator: true },
-			orderBy: (m, { asc }) => [asc(m.createdAt)],
-			limit: AGGREGATE_METADATA_LIMIT,
-		})
-		.sync();
+	// Payload/attempt byte limits are checked by the off-main reader before decoding.
+	return refs;
 }
 
-function loadAggregateInlineMessages(narratorId: string, toolUseIds: string[]) {
-	return db.transaction((tx) => {
-		const scope = resolveAggregateScopeTx(tx, narratorId, toolUseIds);
-		return loadAggregateRefMessagesTx(
-			tx,
-			narratorId,
-			scope.inlineRows.map((row) => row.id),
+function assertDisplayReadActive(signal?: AbortSignal, deadlineAt?: number): void {
+	if (signal?.aborted)
+		throw new AppError("History display read was cancelled", 499, "DISPLAY_PAGE_CANCELLED");
+	if (deadlineAt !== undefined && deadlineAt <= Date.now())
+		throw new AppError(
+			"History display read exceeded its total deadline",
+			504,
+			"DISPLAY_PAGE_DEADLINE",
+		);
+}
+
+function sameTransportWindow(
+	left: ReadonlyArray<{ messageId: string; seq: number }>,
+	right: ReadonlyArray<{ messageId: string; seq: number }>,
+): boolean {
+	if (left.length !== right.length) return false;
+	return left.every(
+		(row, index) => row.messageId === right[index]?.messageId && row.seq === right[index]?.seq,
+	);
+}
+
+/** Total builds (first try included) an unpinned exact-layout page gets under version drift. */
+export const PRETEXT_PAGE_DRIFT_ATTEMPTS = 4;
+
+/**
+ * Short jittered pause before rebuilding a page whose revision moved mid-build. Writes on a
+ * live narrator come in bursts (a block commit, then its tool row, then the parent bump), so
+ * an immediate rebuild would mostly collide with the same burst. Never sleeps past the read's
+ * own deadline, and wakes early on cancellation.
+ */
+async function waitForPretextDriftRetry(
+	attempt: number,
+	signal: AbortSignal | undefined,
+	deadlineAt: number,
+): Promise<void> {
+	const delayMs = Math.min(
+		25 * 2 ** (attempt - 1) + Math.floor(Math.random() * 25),
+		Math.max(0, deadlineAt - Date.now()),
+	);
+	if (delayMs > 0) {
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(done, delayMs);
+			function done() {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", done);
+				resolve();
+			}
+			signal?.addEventListener("abort", done, { once: true });
+		});
+	}
+	assertDisplayReadActive(signal, deadlineAt);
+}
+
+async function loadAggregateRefMessages(
+	narratorId: string,
+	messageIds: string[],
+	ioBudget = DEFAULT_TOOL_IO_BUDGET,
+	signal?: AbortSignal,
+	deadlineAt?: number,
+	maxRawBytes = AGGREGATE_BODY_BYTE_LIMIT,
+) {
+	assertDisplayReadActive(signal, deadlineAt);
+	const refs = db.transaction((tx) => loadAggregateRefMessagesTx(tx, narratorId, messageIds));
+	const options = {
+		ioBudget,
+		signal,
+		maxRawBytes,
+		timeoutMs: deadlineAt === undefined ? undefined : Math.max(1, deadlineAt - Date.now()),
+	};
+	const displayDatabase = modelHistoryDatabase;
+	const read =
+		displayDatabase.activeDatabaseBackend === "postgres"
+			? readNarratorDisplayMessages(
+					{
+						backend: "postgres",
+						port: displayDatabase.activePostgresReadUrl
+							? createPostgresNarratorDisplayPagePort(displayDatabase.activePostgresReadUrl)
+							: undefined,
+					},
+					messageIds,
+					options,
+				)
+			: process.env.NODE_ENV === "test" && displayDatabase.sqlite.filename === ":memory:"
+				? readDisplayFixtureMessages(displayDatabase.sqlite, messageIds, options)
+				: readNarratorDisplayMessages(
+						{ backend: "sqlite", dbPath: displayDatabase.sqlite.filename },
+						messageIds,
+						options,
+					);
+	const messages = await read.catch((error: unknown) => {
+		if (error instanceof AppError && error.code === "DISPLAY_PAGE_BUDGET_EXCEEDED")
+			throw new AppError(
+				"History aggregation exceeds its bounded metadata/body budget; open an explicit detail instead.",
+				409,
+				"HISTORY_AGGREGATE_UNAVAILABLE",
+			);
+		throw error;
+	});
+	assertDisplayReadActive(signal, deadlineAt);
+	const current = db.transaction((tx) => loadAggregateRefMessagesTx(tx, narratorId, messageIds));
+	if (!sameAggregateRows(refs, current))
+		throw new AppError(
+			"History aggregation references changed; reload the history window.",
+			409,
+			"HISTORY_AGGREGATE_UNAVAILABLE",
+		);
+	return messages;
+}
+
+async function loadAggregateInlineMessages(narratorId: string, toolUseIds: string[]) {
+	const scope = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
+	const messages = await loadAggregateRefMessages(
+		narratorId,
+		scope.inlineRows.map((row) => row.id),
+	);
+	assertAggregateScopeUnchanged(
+		scope,
+		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds)),
+	);
+	return messages;
+}
+
+function sameAggregateRows<T extends object>(left: readonly T[], right: readonly T[]): boolean {
+	if (left.length !== right.length) return false;
+	return left.every((row, index) => {
+		const other = right[index];
+		const keys = Object.keys(row) as Array<keyof T>;
+		return (
+			keys.length === Object.keys(other).length && keys.every((key) => row[key] === other[key])
 		);
 	});
 }
 
-async function loadSubagentActivitiesForToolUseIds(
-	narratorId: string,
-	toolUseIds: string[],
-): Promise<Map<string, SubagentActivity>> {
-	if (toolUseIds.length === 0) return new Map();
-	const scope = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
-	const activities = await buildSubagentActivities(scope.owners, toolUseIds);
-	// Summary/file aggregation can await other services. A removed caller/child
-	// ref must revoke this response too, rather than publishing a stale owner.
-	const current = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, toolUseIds));
+function assertAggregateScopeUnchanged(
+	scope: ReturnType<typeof resolveAggregateScopeTx>,
+	current: ReturnType<typeof resolveAggregateScopeTx>,
+): void {
+	const sortedParents = (value: typeof scope) =>
+		[...value.parents].sort(([a], [b]) => a.localeCompare(b)).map(([, row]) => row);
+	const sortedOwners = (value: typeof scope) =>
+		[...value.owners].sort((a, b) => a.subagentNarratorId.localeCompare(b.subagentNarratorId));
+	const sortedInline = (value: typeof scope) =>
+		[...value.inlineRows].sort((a, b) => a.id.localeCompare(b.id));
 	if (
-		JSON.stringify(current.owners) !== JSON.stringify(scope.owners) ||
-		JSON.stringify([...current.parents]) !== JSON.stringify([...scope.parents])
-	) {
+		!sameAggregateRows(sortedOwners(current), sortedOwners(scope)) ||
+		!sameAggregateRows(sortedParents(current), sortedParents(scope)) ||
+		!sameAggregateRows(sortedInline(current), sortedInline(scope))
+	)
 		throw new AppError(
 			"History aggregation scope changed; reload the history window.",
 			409,
 			"HISTORY_AGGREGATE_UNAVAILABLE",
 		);
-	}
+}
+
+async function loadSubagentActivitiesForToolUseIds(
+	narratorId: string,
+	toolUseIds: string[],
+	initialScope?: ReturnType<typeof resolveAggregateScopeTx>,
+	scopeToolUseIds = toolUseIds,
+): Promise<Map<string, SubagentActivity>> {
+	if (toolUseIds.length === 0 && !initialScope) return new Map();
+	const scope =
+		initialScope ??
+		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+	const activities = await buildSubagentActivities(scope.owners, toolUseIds);
+	// Summary/file aggregation can await other services. A removed caller/child
+	// ref must revoke this response too, rather than publishing a stale owner.
+	const current = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+	assertAggregateScopeUnchanged(scope, current);
 	return activities;
 }
 
@@ -2741,33 +2998,58 @@ function attachSubagentActivities(
 async function buildTreeFromTopLevelRefs(
 	narratorId: string,
 	refRows: Array<{ messageId: string; seq: number }>,
-	isSubagent: boolean,
+	/** The session's own-turn placement (`ownTurnPlacementOf`). */
+	placement: OwnTurnPlacement,
 	ioBudget: number,
+	signal?: AbortSignal,
+	deadlineAt = Date.now() + 10_000,
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 ): Promise<any[]> {
 	if (refRows.length === 0) return [];
 
+	const started = performance.now();
 	const messageIds = refRows.map((r) => r.messageId);
-	const topMessages = await db.query.narratorMessages.findMany({
-		where: inArray(narratorMessages.id, messageIds),
-		with: { toolCalls: true, creator: true },
-	});
+	const topMessages = await loadAggregateRefMessages(
+		narratorId,
+		messageIds,
+		ioBudget,
+		signal,
+		deadlineAt,
+		DISPLAY_PAGE_LIMITS.maxRawBytes,
+	);
 	const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 	topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 	attachMessageSeqs(topMessages, seqMap);
-	if (isSubagent) {
-		for (const message of topMessages) message.parentToolUseId = null;
-	}
+	// Own turns placed under the session's destination are not nesting on its own page.
+	for (const message of topMessages)
+		if (isTopLevelMessage(message, placement)) message.parentToolUseId = null;
 
 	const subagentToolUseIds = collectSubagentToolUseIds(topMessages);
 	const subagentToolUseIdSet = new Set(subagentToolUseIds);
 	const inlineToolUseIds = collectToolUseIds(topMessages).filter(
 		(toolUseId) => !subagentToolUseIdSet.has(toolUseId),
 	);
-	const [activities, childMessages] = await Promise.all([
-		loadSubagentActivitiesForToolUseIds(narratorId, subagentToolUseIds),
-		loadAggregateInlineMessages(narratorId, inlineToolUseIds),
-	]);
+	const hydratedAt = performance.now();
+	const aggregateToolUseIds = [...subagentToolUseIds, ...inlineToolUseIds];
+	const scope = db.transaction((tx) =>
+		resolveAggregateScopeTx(tx, narratorId, aggregateToolUseIds),
+	);
+	const childMessages = await loadAggregateRefMessages(
+		narratorId,
+		scope.inlineRows.map((row) => row.id),
+		ioBudget,
+		signal,
+		deadlineAt,
+	);
+	const scopedAt = performance.now();
+	const activities = await loadSubagentActivitiesForToolUseIds(
+		narratorId,
+		subagentToolUseIds,
+		scope,
+		aggregateToolUseIds,
+	);
+	assertDisplayReadActive(signal, deadlineAt);
+	const summarizedAt = performance.now();
 	attachSubagentActivities(topMessages, activities);
 	const enriched = enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
@@ -2777,12 +3059,25 @@ async function buildTreeFromTopLevelRefs(
 	// A still-waiting Await knows its target only as a selector; resolve it so the
 	// row can open the child's session before the wait returns.
 	const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]);
-	return attachTakenOverFlags(
-		await attachSendTargetDetails(
-			attachActiveSendDeliveryTargets(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
-		),
+	const result = attachTakenOverFlags(
+		await attachSendTargetDetails(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
 		collectTakenOverToolUseIds(activities, awaitAgentIds),
 	);
+	assertDisplayReadActive(signal, deadlineAt);
+	const elapsedMs = Math.round(performance.now() - started);
+	if (elapsedMs >= 250)
+		logger.warn("Slow narrator display page hydration", {
+			narratorId,
+			elapsedMs,
+			topRows: topMessages.length,
+			inlineRows: childMessages.length,
+			aggregateGroups: aggregateToolUseIds.length,
+			hydrateMs: Math.round(hydratedAt - started),
+			scopeMs: Math.round(scopedAt - hydratedAt),
+			summaryMs: Math.round(summarizedAt - scopedAt),
+			projectionMs: Math.round(performance.now() - summarizedAt),
+		});
+	return result;
 }
 
 /**
@@ -2792,7 +3087,7 @@ async function buildTreeFromTopLevelRefs(
  *   - `activities`   → an Agent/Task/Send card's child narrator id
  *   - `awaitAgentIds`→ a running `Await({type:"agent"})`'s resolved child id
  *
- * Takeover authority is the in-memory Set (`subagent-takeover.ts`), so the
+ * Takeover authority is the in-memory Set (the run hold in `agent-runtime/ownership.ts`), so the
  * membership test is synchronous. A finished Await needs no flag: its output
  * already states `taken_over` in words.
  *
@@ -2801,17 +3096,17 @@ async function buildTreeFromTopLevelRefs(
  */
 function collectTakenOverToolUseIds(
 	activities: ReadonlyMap<string, SubagentActivity>,
-	awaitAgentIds: ReadonlyMap<string, string>,
+	awaitAgentIds: ReadonlyMap<string, AwaitAgentResolution>,
 ): Set<string> {
 	const flagged = new Set<string>();
-	const takenOver = new Set(listDisplayTakenOverSubagents());
+	const takenOver = new Set(listRunHolds().filter(isRunHeldForDisplay));
 	if (takenOver.size === 0) return flagged;
 	for (const [toolUseId, activity] of activities) {
 		const child = activity.subagentNarratorId;
 		if (child && takenOver.has(child)) flagged.add(toolUseId);
 	}
 	for (const [toolUseId, child] of awaitAgentIds) {
-		if (takenOver.has(child)) flagged.add(toolUseId);
+		if (takenOver.has(child.id)) flagged.add(toolUseId);
 	}
 	return flagged;
 }
@@ -2827,7 +3122,7 @@ function collectTakenOverToolUseIds(
 async function resolveAwaitAgentIdsForMessages(
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	messages: any[],
-): Promise<Map<string, string>> {
+): Promise<Map<string, AwaitAgentResolution>> {
 	const candidates: Array<{
 		toolUseId: string;
 		toolName: string;
@@ -3062,10 +3357,13 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((row) => row.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		const seqMap = new Map(refRows.map((row) => [row.messageId, row.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		return messages.map((message) => ({
@@ -3086,6 +3384,23 @@ const narratorMessageQueriesUnlocked = {
 		return lastCompactRow[0]?.seq ?? null;
 	},
 
+	/**
+	 * When the narrator's latest compact marker was written (its message's `created_at`), or null
+	 * without one: one indexed read on the refs, one primary-key join.
+	 */
+	async getLatestCompactCreatedAt(narratorId: string): Promise<string | null> {
+		const rows = await db
+			.select({ createdAt: narratorMessages.createdAt })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+		return rows[0]?.createdAt ?? null;
+	},
+
 	async getMessagesSinceLastCompact(narratorId: string) {
 		const compactSeq = await this.getLatestCompactSeq(narratorId);
 
@@ -3104,10 +3419,13 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 
 		if (messages.length !== refRows.length) {
 			const foundIds = new Set(messages.map((m) => m.id));
@@ -3154,11 +3472,7 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					ne(narratorMessages.role, "disp"),
 					isNull(narratorMessageRefs.segmentCompactId),
-					sql`NOT EXISTS (
-						SELECT 1
-						FROM json_each(${narratorMessages.contentJson}) AS compact_block
-						WHERE json_extract(compact_block.value, '$.type') = 'compact'
-					)`,
+					sql`NOT ${hasStoredElementSql("compact")}`,
 				),
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -3317,83 +3631,39 @@ const narratorMessageQueriesUnlocked = {
 	 * remains the complete row shape used by display/compatibility paths, while the
 	 * agent loop does not need audit, billing, permission timeline, or UI metadata.
 	 */
-	async getModelHistorySinceLastCompact(narratorId: string, limit?: number) {
-		const compactSeq = await this.getLatestCompactSeq(narratorId);
-		const refQuery = db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
-					ne(narratorMessages.role, "disp"),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
+	async getModelHistorySinceLastCompact(
+		narratorId: string,
+		limit?: number,
+		options: Omit<LoadModelHistoryOptions, "limit"> = {},
+	) {
+		const postgres = modelHistoryDatabase.postgresRuntime;
+		if (
+			modelHistoryDatabase.activeDatabaseBackend === "postgres" &&
+			(!postgres || !modelHistoryDatabase.activePostgresReadUrl)
+		)
+			throw new Error("Model history PostgreSQL read source is unavailable");
+		const backend =
+			modelHistoryDatabase.activeDatabaseBackend === "postgres" && postgres
+				? {
+						backend: "postgres" as const,
+						sql: postgres.client.sql,
+						url: modelHistoryDatabase.activePostgresReadUrl ?? "",
+					}
+				: { backend: "sqlite" as const, sqlite: modelHistoryDatabase.sqlite };
+		const source = await loadModelHistorySource(backend, narratorId, { ...options, limit });
+		// Lifecycle/metadata-only rows are control-plane data, never provider boundaries.
+		const messages = source.messages
+			.filter(
+				(message) =>
+					!isCompactLifecycleMessage(message) &&
+					!isMetadataOnlyEmptyReasoningAssistantMessage(message),
 			)
-			.orderBy(narratorMessageRefs.seq);
-		const refRows = await (limit == null
-			? refQuery
-			: refQuery.limit(Math.min(Math.max(Math.trunc(limit), 1), 2000)));
-		if (refRows.length === 0) return [];
-
-		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			columns: {
-				id: true,
-				narratorId: true,
-				role: true,
-				contentJson: true,
-				contentText: true,
-				parentToolUseId: true,
-				messageUuid: true,
-				createdBy: true,
-				origin: true,
-				originLabel: true,
-			},
-			with: {
-				// Only public identity fields, never credentials or the complete user row.
-				creator: { columns: { username: true } },
-				narrator: { columns: { title: true } },
-				toolCalls: {
-					columns: {
-						id: true,
-						executionAttempt: true,
-						createdAt: true,
-						toolUseId: true,
-						toolName: true,
-						inputJson: true,
-						outputJson: true,
-						status: true,
-					},
-				},
-			},
-		});
-		if (messages.length !== refRows.length) {
-			const foundIds = new Set(messages.map((message) => message.id));
-			const missingMessageIds = messageIds.filter((id) => !foundIds.has(id)).slice(0, 20);
-			logger.warn("Narrator model history refs point to missing messages", {
-				narratorId,
-				refCount: refRows.length,
-				messageCount: messages.length,
-				missingMessageIds,
-			});
-		}
-		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
-		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		// Compact lifecycle markers and metadata-only empty reasoning records are
-		// UI/control-plane data. They remain in the database and display history,
-		// but must not become model-history boundaries or hide trailing tool results.
-		const modelMessages = messages.filter(
-			(message) =>
-				!isCompactLifecycleMessage(message) &&
-				!isMetadataOnlyEmptyReasoningAssistantMessage(message),
-		);
-		return modelMessages.map((message) => ({
-			...message,
-			toolCalls: latestToolCallAttempts(message.toolCalls),
-		}));
+			.map((message) => ({
+				...message,
+				toolCalls: latestToolCallAttempts(message.toolCalls),
+			}));
+		attachPrefixHistorySource(messages, source);
+		return messages;
 	},
 
 	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
@@ -3437,22 +3707,48 @@ const narratorMessageQueriesUnlocked = {
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: {
-				toolCalls: true,
-				creator: { columns: { username: true } },
-				narrator: { columns: { title: true } },
-			},
-		});
+		const messages = fillBodies(
+			await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, messageIds),
+				...bodyColumns(),
+				with: {
+					toolCalls: true,
+					creator: { columns: { username: true } },
+					narrator: { columns: { title: true } },
+				},
+			}),
+		);
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		// A failed earlier compact marker may sit inside this retry range. Keep it
 		// visible in the transcript, but never summarize it into a later compact.
 		const compactableMessages = messages.filter((message) => !isCompactLifecycleMessage(message));
+		// A copy keeps its author: the sender label is the author's title, not the holder's.
+		const authorIds = [
+			...new Set(
+				compactableMessages.flatMap((message) =>
+					message.authorNarratorId && message.authorNarratorId !== message.narratorId
+						? [message.authorNarratorId]
+						: [],
+				),
+			),
+		];
+		const authorTitles = new Map(
+			authorIds.length
+				? (
+						await db
+							.select({ id: narrators.id, title: narrators.title })
+							.from(narrators)
+							.where(inArray(narrators.id, authorIds))
+					).map((row) => [row.id, row.title])
+				: [],
+		);
 		return compactableMessages.map((message) => ({
 			...message,
+			...(message.authorNarratorId && authorTitles.has(message.authorNarratorId)
+				? { narrator: { title: authorTitles.get(message.authorNarratorId) ?? null } }
+				: {}),
 			toolCalls: latestToolCallAttempts(message.toolCalls),
 		}));
 	},
@@ -3463,7 +3759,7 @@ const narratorMessageQueriesUnlocked = {
 				id: narratorMessages.id,
 				narratorId: narratorMessages.narratorId,
 				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 				contentText: narratorMessages.contentText,
 				createdAt: narratorMessages.createdAt,
 			})
@@ -3478,14 +3774,12 @@ const narratorMessageQueriesUnlocked = {
 			)
 			.orderBy(narratorMessageRefs.seq)
 			.limit(limit);
-		return rows;
+		return fillBodies(rows);
 	},
 
-	async _getPostCompactTopLevelRefs(
-		narratorId: string,
-		options?: { includeChildMessages?: boolean },
-	) {
-		const includeChildMessages = options?.includeChildMessages ?? false;
+	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
+	async _getPostCompactTopLevelRefs(narratorId: string) {
+		const ownTurn = ownTurnSql(await this.ownTurnPlacement(narratorId));
 
 		const lastCompactRow = await db
 			.select({ seq: narratorMessageRefs.seq })
@@ -3511,17 +3805,14 @@ const narratorMessageQueriesUnlocked = {
 					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
 					inArray(narratorMessages.role, ["user", "assistant"]),
 					isNull(narratorMessageRefs.segmentCompactId),
-					...(includeChildMessages ? [] : [isNull(narratorMessages.parentToolUseId)]),
+					ownTurn,
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
 	},
 
 	async getCompactBoundaryMessage(narratorId: string, keepPairs = 2): Promise<string | null> {
-		const includeChildMessages = await this.isSubagentNarrator(narratorId);
-		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
-			includeChildMessages,
-		});
+		const refs = await this._getPostCompactTopLevelRefs(narratorId);
 		const keepCount = Math.max(1, Math.floor(keepPairs)) * 2;
 		if (refs.length < keepCount + 2) return null;
 		const boundaryRef = refs[refs.length - keepCount];
@@ -3540,10 +3831,7 @@ const narratorMessageQueriesUnlocked = {
 	 * post-compact messages), in which case no summary can reduce the context.
 	 */
 	async getEmergencyCompactBoundaryMessage(narratorId: string): Promise<string | null> {
-		const includeChildMessages = await this.isSubagentNarrator(narratorId);
-		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
-			includeChildMessages,
-		});
+		const refs = await this._getPostCompactTopLevelRefs(narratorId);
 		// Need at least 2 messages: one to summarize + one to keep as the boundary.
 		if (refs.length < 2) return null;
 		// Keep only the most recent message; compact everything before it.
@@ -3557,7 +3845,7 @@ const narratorMessageQueriesUnlocked = {
 				id: narratorMessages.id,
 				narratorId: narratorMessages.narratorId,
 				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 				contentText: narratorMessages.contentText,
 				createdAt: narratorMessages.createdAt,
 			})
@@ -3572,7 +3860,7 @@ const narratorMessageQueriesUnlocked = {
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(limit);
-		return rows.reverse();
+		return fillBodies(rows).reverse();
 	},
 
 	/**
@@ -3597,7 +3885,7 @@ const narratorMessageQueriesUnlocked = {
 		const rows = await db
 			.select({
 				id: narratorMessages.id,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -3612,7 +3900,7 @@ const narratorMessageQueriesUnlocked = {
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(Math.max(1, Math.floor(scanLimit)));
 
-		for (const row of rows) {
+		for (const row of fillBodies(rows)) {
 			const blocks = Array.isArray(row.contentJson)
 				? (row.contentJson as Array<{ type: string; text?: string }>)
 				: [];
@@ -3637,7 +3925,7 @@ const narratorMessageQueriesUnlocked = {
 		const rows = await db
 			.select({
 				id: narratorMessages.id,
-				contentJson: narratorMessages.contentJson,
+				contentJson: contentJsonSql(),
 			})
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -3647,7 +3935,7 @@ const narratorMessageQueriesUnlocked = {
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(1);
 
-		const row = rows[0];
+		const row = fillBody(rows[0]);
 		if (!row) return null;
 		const blocks = Array.isArray(row.contentJson) ? row.contentJson : [];
 		const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
@@ -3680,7 +3968,7 @@ const narratorMessageQueriesUnlocked = {
 			WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
 				AND narrator_tool_calls.is_file_history_checkpoint = 0
 		)`;
-		const byteSize = sql<number>`length(CAST(${narratorMessages.contentJson} AS BLOB))`;
+		const byteSize = storedBodyBytesSql();
 		const rows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -3702,7 +3990,7 @@ const narratorMessageQueriesUnlocked = {
 						 WHERE narrator_tool_calls.message_id = ${narratorMessages.id}
 						   AND narrator_tool_calls.is_file_history_checkpoint = 0)
 						> ${HISTORY_RECOVERY_TOOL_COUNT}
-						OR length(CAST(${narratorMessages.contentJson} AS BLOB)) > ${HISTORY_RECOVERY_BYTE_SIZE}
+						OR ${byteSize} > ${HISTORY_RECOVERY_BYTE_SIZE}
 					)`,
 				),
 			)
@@ -3730,12 +4018,16 @@ const narratorMessageQueriesUnlocked = {
 		};
 	},
 
-	async isSubagentNarrator(narratorId: string): Promise<boolean> {
+	/**
+	 * Where this session's own turns are placed (`ownTurnPlacementOf`): the tool call its
+	 * run delivers to, `null` for none.
+	 */
+	async ownTurnPlacement(narratorId: string): Promise<OwnTurnPlacement> {
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { variant: true },
+			columns: RUNTIME_SOURCE_COLUMNS,
 		});
-		return narrator != null && isSubagentVariant(narrator.variant);
+		return narrator ? ownTurnPlacementOf(narrator) : null;
 	},
 
 	/**
@@ -3765,11 +4057,10 @@ const narratorMessageQueriesUnlocked = {
 	 *
 	 * This is the lightweight replacement for the old around-window query: it only
 	 * reads narrow indexed columns and never returns content_json/message trees.
-	 * For primary narrators, child messages are resolved by walking parent
-	 * tool-use ownership until a referenced top-level message is found. For a
-	 * subagent narrator, its own refs are already top-level from that page's point
-	 * of view, even when messages carry parentToolUseId pointing to the parent
-	 * narrator.
+	 * A session's own turns (`isTopLevelMessage`: no placement, or placed under the
+	 * tool call its run delivers to) are their own location. A nested message is
+	 * resolved by walking parent tool-use ownership until a referenced top-level
+	 * message is found.
 	 */
 	async getMessageLocation(
 		narratorId: string,
@@ -3779,8 +4070,8 @@ const narratorMessageQueriesUnlocked = {
 		topLevelMessageId: string;
 		seq: number;
 	}> {
-		const [isSubagent, target] = await Promise.all([
-			this.isSubagentNarrator(narratorId),
+		const [placement, target] = await Promise.all([
+			this.ownTurnPlacement(narratorId),
 			db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
 				columns: { id: true, parentToolUseId: true },
@@ -3805,7 +4096,7 @@ const narratorMessageQueriesUnlocked = {
 			});
 
 		const directRef = await findVisibleRef(target.id);
-		if (directRef && (isSubagent || !target.parentToolUseId)) {
+		if (directRef && isTopLevelMessage(target, placement)) {
 			return { messageId: target.id, topLevelMessageId: target.id, seq: directRef.seq };
 		}
 
@@ -3859,8 +4150,16 @@ const narratorMessageQueriesUnlocked = {
 	 */
 	async getPretextDocumentPage(
 		narratorId: string,
-		opts: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number } = {},
+		opts: {
+			afterSeq?: number;
+			beforeSeq?: number;
+			limit?: number;
+			messageVersion?: number;
+			signal?: AbortSignal;
+		} = {},
 	) {
+		const deadlineAt = Date.now() + 10_000;
+		assertDisplayReadActive(opts.signal, deadlineAt);
 		const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 100), 1), 100);
 		// A lazy fork only materialized the refs after its parent's last compact.
 		// Reading older than `beforeSeq` means reading rows BELOW it, so the backfill
@@ -3871,161 +4170,212 @@ const narratorMessageQueriesUnlocked = {
 		if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
 			await ensureRefsCoverSeq(narratorId, Math.trunc(opts.beforeSeq as number) - limit);
 		}
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-		const messageVersion = await this.getMessageVersion(narratorId);
-		if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
-			throw new AppError(
-				"Narrator document changed before the exact-layout page was built",
-				409,
-				"PRETEXT_DOCUMENT_CHANGED",
-			);
-		const assertDocumentUnchanged = async () => {
-			if ((await this.getMessageVersion(narratorId)) !== messageVersion)
+		// The version check below is an optimistic-concurrency guard, and on a live
+		// narrator it loses often: every committed block, tool completion and child
+		// subagent row bumps `messageVersion`, while one page build awaits dozens of
+		// reads. Surfacing each lost race as a 409 made the first screen of a running
+		// narrator fail routinely. An unpinned read accepts drift that left its window
+		// in place (see `assertDocumentUnchanged`) and rebuilds against the new
+		// revision when the window moved — bounded by attempts and the shared
+		// deadline. A pinned read (`opts.messageVersion`) still fails fast.
+		const driftErrors = new WeakSet<AppError>();
+		const markDrift = (error: AppError) => {
+			driftErrors.add(error);
+			return error;
+		};
+		const maxAttempts = opts.messageVersion == null ? PRETEXT_PAGE_DRIFT_ATTEMPTS : 1;
+		const buildPage = async () => {
+			const narratorMeta = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { ...RUNTIME_SOURCE_COLUMNS, messageVersion: true },
+			});
+			const placement = narratorMeta ? ownTurnPlacementOf(narratorMeta) : null;
+			const messageVersion = narratorMeta?.messageVersion ?? 0;
+			if (opts.messageVersion != null && opts.messageVersion !== messageVersion)
 				throw new AppError(
-					"Narrator document changed while the exact-layout page was being built",
+					"Narrator document changed before the exact-layout page was built",
 					409,
 					"PRETEXT_DOCUMENT_CHANGED",
 				);
-		};
-		// "Top-level message" is expressed as a correlated EXISTS rather than the
-		// inner join this used to be, because the join form admitted a catastrophic
-		// plan: SQLite drove from `narrator_messages` through
-		// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL`
-		// predicate matches ~90% of all messages, re-looked-up every ref and sorted
-		// the whole set in a temp B-tree merely to read the newest `limit` rows.
-		// That is the FIRST request of every narrator open, and it measured 306ms
-		// on a 131k-message library (p50 8.1s end to end in the logs).
-		//
-		// As EXISTS the planner walks `idx_narrator_refs_seq` in `seq DESC` order
-		// and stops after `limit + 1` rows, since the subquery is answered by the
-		// message primary key. Measured 0.07ms — row-for-row identical on the 12
-		// largest narrators, for the tail page and the `beforeSeq` scroll-up page
-		// alike. Deliberately NOT an `INDEXED BY` hint: this spelling needs no
-		// SQLite-only syntax, so it stays off the dialect-migration ledger.
-		const isTopLevelRef = () =>
-			exists(
-				db
-					.select({ one: sql`1` })
-					.from(narratorMessages)
-					.where(
-						and(
-							eq(narratorMessages.id, narratorMessageRefs.messageId),
-							isNull(narratorMessages.parentToolUseId),
-						),
-					),
-			);
-		const baseConditions = [
-			eq(narratorMessageRefs.narratorId, narratorId),
-			isNull(narratorMessageRefs.segmentCompactId),
-			...(isSubagent ? [] : [isTopLevelRef()]),
-		];
+			// "Top-level message" is expressed as a correlated EXISTS rather than the
+			// inner join this used to be, because the join form admitted a catastrophic
+			// plan: SQLite drove from `narrator_messages` through
+			// `idx_messages_parent_tool_use_lookup`, whose `parent_tool_use_id IS NULL`
+			// predicate matches ~90% of all messages, re-looked-up every ref and sorted
+			// the whole set in a temp B-tree merely to read the newest `limit` rows.
+			// That is the FIRST request of every narrator open, and it measured 306ms
+			// on a 131k-message library (p50 8.1s end to end in the logs).
+			//
+			// As EXISTS the planner walks `idx_narrator_refs_seq` in `seq DESC` order
+			// and stops after `limit + 1` rows, since the subquery is answered by the
+			// message primary key. Measured 0.07ms — row-for-row identical on the 12
+			// largest narrators, for the tail page and the `beforeSeq` scroll-up page
+			// alike. Deliberately NOT an `INDEXED BY` hint: this spelling needs no
+			// SQLite-only syntax, so it stays off the dialect-migration ledger.
+			// The session's own turns (`isTopLevelMessage`).
+			const ownTurn = ownTurnSql(placement);
+			const isTopLevelRef = (condition: SQL) =>
+				exists(
+					db
+						.select({ one: sql`1` })
+						.from(narratorMessages)
+						.where(and(eq(narratorMessages.id, narratorMessageRefs.messageId), condition)),
+				);
+			const baseConditions = [
+				eq(narratorMessageRefs.narratorId, narratorId),
+				isNull(narratorMessageRefs.segmentCompactId),
+				...(ownTurn ? [isTopLevelRef(ownTurn)] : []),
+			];
 
-		// `afterSeq` → ascending page after the cursor (kept for compatibility with
-		// the legacy full-document loader/tests). Otherwise the newest `limit` rows
-		// are taken descending and reversed to ascending: no argument = tail page
-		// (first screen), `beforeSeq` = the page immediately older than that seq
-		// (reverse infinite scroll toward the top).
-		const ascending = opts.afterSeq != null && Number.isFinite(opts.afterSeq);
-		const conditions = [...baseConditions];
-		if (ascending) {
-			conditions.push(gt(narratorMessageRefs.seq, Math.trunc(opts.afterSeq as number)));
-		} else if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
-			conditions.push(lt(narratorMessageRefs.seq, Math.trunc(opts.beforeSeq)));
-		}
+			// `afterSeq` → ascending page after the cursor (kept for compatibility with
+			// the legacy full-document loader/tests). Otherwise the newest `limit` rows
+			// are taken descending and reversed to ascending: no argument = tail page
+			// (first screen), `beforeSeq` = the page immediately older than that seq
+			// (reverse infinite scroll toward the top).
+			const ascending = opts.afterSeq != null && Number.isFinite(opts.afterSeq);
+			const conditions = [...baseConditions];
+			if (ascending) {
+				conditions.push(gt(narratorMessageRefs.seq, Math.trunc(opts.afterSeq as number)));
+			} else if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
+				conditions.push(lt(narratorMessageRefs.seq, Math.trunc(opts.beforeSeq)));
+			}
 
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(and(...conditions))
-			.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
-			.limit(limit + 1);
-		const hasMoreInDirection = refRows.length > limit;
-		const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
-		// Descending queries return newest-first; flip to the ascending order the
-		// exact-layout builder always consumes.
-		if (!ascending) pageRows.reverse();
-
-		if (pageRows.length === 0) {
-			await assertDocumentUnchanged();
-			// An empty window is NOT necessarily the start of history. A lazy fork's
-			// ancestors can still hold older messages while this narrator has no visible
-			// ref in the requested range — e.g. a segment-compact hole wider than one
-			// page, which the backfill cursor skips past without copying anything. The
-			// legacy chunk reader probed for that case; reporting `hasPrev: false` here
-			// instead ends the client's upward scroll permanently (the loader latches it),
-			// silently hiding history that does exist.
-			const hasPrevBelowEmptyWindow =
-				opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)
-					? await hasUnmaterializedRefsBelow(narratorId, Math.trunc(opts.beforeSeq))
-					: false;
-			return {
-				messages: [],
-				minSeq: null,
-				maxSeq: null,
-				// Mirrors the non-empty descending branch: a `beforeSeq` page is by
-				// definition preceded by newer rows the caller already holds.
-				hasNext: !ascending && opts.beforeSeq != null,
-				hasPrev: hasPrevBelowEmptyWindow,
-				messageVersion,
+			const loadWindow = async () => {
+				const refRows = await db
+					.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(and(...conditions))
+					.orderBy(ascending ? asc(narratorMessageRefs.seq) : desc(narratorMessageRefs.seq))
+					.limit(limit + 1);
+				const hasMoreInDirection = refRows.length > limit;
+				const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
+				// Descending queries return newest-first; flip to the ascending order the
+				// exact-layout builder always consumes.
+				if (!ascending) pageRows.reverse();
+				return { pageRows, hasMoreInDirection };
 			};
-		}
+			const { pageRows, hasMoreInDirection } = await loadWindow();
+			// Most version bumps on a live narrator rewrite bodies in place (a block
+			// commit, a tool result, a child row's parent bump) and leave the page's
+			// ordered top-level ids untouched. Such a page is not torn: its content is
+			// at least as new as the snapshot it reports, and sync catch-up from that
+			// snapshot replays the rest. So an unpinned read only rebuilds when the
+			// window itself moved (insert, delete, compact). A pinned read is one page
+			// of a multi-page walk and must observe exactly one revision.
+			const assertDocumentUnchanged = async () => {
+				assertDisplayReadActive(opts.signal, deadlineAt);
+				if ((await this.getMessageVersion(narratorId)) === messageVersion) return;
+				const drift = () =>
+					markDrift(
+						new AppError(
+							"Narrator document changed while the exact-layout page was being built",
+							409,
+							"PRETEXT_DOCUMENT_CHANGED",
+						),
+					);
+				if (opts.messageVersion != null) throw drift();
+				const current = await loadWindow();
+				if (
+					current.hasMoreInDirection !== hasMoreInDirection ||
+					!sameTransportWindow(pageRows, current.pageRows)
+				)
+					throw drift();
+			};
 
-		// Transport-only projections, applied AFTER enrichment so both are safe: the
-		// tool rows are pure duplicates of the enriched blocks, and `providerMetadata`
-		// is replay state the browser can neither display nor send back (its one
-		// display-relevant bit is preserved as a flag). Together they removed ~46% of
-		// the page on the six largest narrators measured.
-		const tree = stripProviderMetadata(
-			stripRedundantToolCallRows(
-				await buildTreeFromTopLevelRefs(
-					narratorId,
-					pageRows,
-					isSubagent,
-					// The ONLY path whose bodies are measured for the exact layout: the budget
-					// must fill the detail caps, or a card reserves a box it cannot fill.
-					EXACT_TOOL_IO_BUDGET,
+			if (pageRows.length === 0) {
+				await assertDocumentUnchanged();
+				// An empty window is NOT necessarily the start of history. A lazy fork's
+				// ancestors can still hold older messages while this narrator has no visible
+				// ref in the requested range — e.g. a segment-compact hole wider than one
+				// page, which the backfill cursor skips past without copying anything. The
+				// legacy chunk reader probed for that case; reporting `hasPrev: false` here
+				// instead ends the client's upward scroll permanently (the loader latches it),
+				// silently hiding history that does exist.
+				const hasPrevBelowEmptyWindow =
+					opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)
+						? await hasUnmaterializedRefsBelow(narratorId, Math.trunc(opts.beforeSeq))
+						: false;
+				return {
+					messages: [],
+					minSeq: null,
+					maxSeq: null,
+					// Mirrors the non-empty descending branch: a `beforeSeq` page is by
+					// definition preceded by newer rows the caller already holds.
+					hasNext: !ascending && opts.beforeSeq != null,
+					hasPrev: hasPrevBelowEmptyWindow,
+					messageVersion,
+				};
+			}
+
+			// Transport-only projections, applied AFTER enrichment so both are safe: the
+			// tool rows are pure duplicates of the enriched blocks, and `providerMetadata`
+			// is replay state the browser can neither display nor send back (its one
+			// display-relevant bit is preserved as a flag). Together they removed ~46% of
+			// the page on the six largest narrators measured.
+			const tree = stripProviderMetadata(
+				stripRedundantToolCallRows(
+					await buildTreeFromTopLevelRefs(
+						narratorId,
+						pageRows,
+						placement,
+						// The ONLY path whose bodies are measured for the exact layout: the budget
+						// must fill the detail caps, or a card reserves a box it cannot fill.
+						EXACT_TOOL_IO_BUDGET,
+						opts.signal,
+						deadlineAt,
+					),
 				),
-			),
-		);
-		const minSeq = pageRows[0]?.seq ?? null;
-		const maxSeq = pageRows.at(-1)?.seq ?? null;
+			);
+			const minSeq = pageRows[0]?.seq ?? null;
+			const maxSeq = pageRows.at(-1)?.seq ?? null;
 
-		let hasPrev: boolean;
-		let hasNext: boolean;
-		// A lazy fork can be out of local refs while its parent still holds older
-		// history, so "no more rows here" is not the same as "start of history" —
-		// the lazy-aware probe keeps hasPrev true until the lineage is exhausted.
-		const probeUnmaterializedBelow = async (): Promise<boolean> =>
-			minSeq != null && (await hasUnmaterializedRefsBelow(narratorId, minSeq));
-		if (ascending) {
-			// Ascending page after `afterSeq`: more-in-direction means newer rows
-			// remain; probe once (indexed LIMIT 1) for anything older than the window.
-			hasNext = hasMoreInDirection;
-			hasPrev =
-				(minSeq != null &&
-					(
-						await db
-							.select({ seq: narratorMessageRefs.seq })
-							.from(narratorMessageRefs)
-							.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-							.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
-							.limit(1)
-					).length > 0) ||
-				(await probeUnmaterializedBelow());
-		} else {
-			// Descending newest page: more-in-direction means older rows remain. The
-			// tail page has nothing newer; a `beforeSeq` page is by definition
-			// preceded by the newer rows the caller already holds.
-			hasPrev = hasMoreInDirection || (await probeUnmaterializedBelow());
-			hasNext = opts.beforeSeq != null;
+			let hasPrev: boolean;
+			let hasNext: boolean;
+			// A lazy fork can be out of local refs while its parent still holds older
+			// history, so "no more rows here" is not the same as "start of history" —
+			// the lazy-aware probe keeps hasPrev true until the lineage is exhausted.
+			const probeUnmaterializedBelow = async (): Promise<boolean> =>
+				minSeq != null && (await hasUnmaterializedRefsBelow(narratorId, minSeq));
+			if (ascending) {
+				// Ascending page after `afterSeq`: more-in-direction means newer rows
+				// remain; probe once (indexed LIMIT 1) for anything older than the window.
+				hasNext = hasMoreInDirection;
+				hasPrev =
+					(minSeq != null &&
+						(
+							await db
+								.select({ seq: narratorMessageRefs.seq })
+								.from(narratorMessageRefs)
+								.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+								.where(and(...baseConditions, lt(narratorMessageRefs.seq, minSeq)))
+								.limit(1)
+						).length > 0) ||
+					(await probeUnmaterializedBelow());
+			} else {
+				// Descending newest page: more-in-direction means older rows remain. The
+				// tail page has nothing newer; a `beforeSeq` page is by definition
+				// preceded by the newer rows the caller already holds.
+				hasPrev = hasMoreInDirection || (await probeUnmaterializedBelow());
+				hasNext = opts.beforeSeq != null;
+			}
+
+			await assertDocumentUnchanged();
+			return { messages: tree, minSeq, maxSeq, hasNext, hasPrev, messageVersion };
+		};
+		for (let attempt = 1; ; attempt++) {
+			try {
+				return await buildPage();
+			} catch (error) {
+				if (!(error instanceof AppError) || !driftErrors.has(error) || attempt >= maxAttempts)
+					throw error;
+			}
+			await waitForPretextDriftRetry(attempt, opts.signal, deadlineAt);
 		}
-
-		await assertDocumentUnchanged();
-		return { messages: tree, minSeq, maxSeq, hasNext, hasPrev, messageVersion };
 	},
 
 	async getMessagesAfter(narratorId: string, after: CatchUpCursor, limit = 200) {
-		const isSubagent = await this.isSubagentNarrator(narratorId);
+		const placement = await this.ownTurnPlacement(narratorId);
+		const ownTurn = ownTurnSql(placement);
 		const inputCursor: CatchUpCursor = after;
 
 		let parentAnchorSeq: number | null = null;
@@ -4056,7 +4406,7 @@ const narratorMessageQueriesUnlocked = {
 				where: eq(narratorMessages.id, parentLastMessageId),
 				columns: { narratorId: true, parentToolUseId: true },
 			});
-			if (!isSubagent && parentMessage?.parentToolUseId) {
+			if (parentMessage?.parentToolUseId && !isTopLevelMessage(parentMessage, placement)) {
 				const childAnchorMessageId = parentLastMessageId;
 				const scope = db.transaction((tx) =>
 					resolveAggregateScopeTx(tx, narratorId, [parentMessage.parentToolUseId as string]),
@@ -4085,12 +4435,10 @@ const narratorMessageQueriesUnlocked = {
 			if (anchor.parentToolUseId) upsertCursorChildAnchor(baseChildAnchors, anchor);
 		}
 
-		const resolvedAnchors = !isSubagent
-			? await resolveCatchUpChildAnchors(narratorId, trimCursorChildAnchors(baseChildAnchors))
-			: {
-					messageAnchors: new Map<string, ResolvedChildAnchor>(),
-					subagentAnchors: new Map<string, CatchUpChildAnchor>(),
-				};
+		const resolvedAnchors = await resolveCatchUpChildAnchors(
+			narratorId,
+			trimCursorChildAnchors(baseChildAnchors),
+		);
 		const resolvedChildAnchors = resolvedAnchors.messageAnchors;
 		const cursorChildAnchors = trimCursorChildAnchors(
 			new Map<string, CatchUpChildAnchor>([
@@ -4138,7 +4486,7 @@ const narratorMessageQueriesUnlocked = {
 				gt(narratorMessageRefs.seq, parentAnchorSeq),
 				isNull(narratorMessageRefs.segmentCompactId),
 			];
-			if (!isSubagent) rowConditions.push(sql`${narratorMessages.parentToolUseId} IS NULL`);
+			if (ownTurn) rowConditions.push(ownTurn);
 			refRows = await db
 				.select({
 					messageId: narratorMessageRefs.messageId,
@@ -4183,9 +4531,7 @@ const narratorMessageQueriesUnlocked = {
 
 		const allRefRows = [...refRows, ...childRefRows];
 		const messageIds = [...new Set(allRefRows.map((r) => r.messageId))];
-		const allMessages = db.transaction((tx) =>
-			loadAggregateRefMessagesTx(tx, narratorId, messageIds),
-		);
+		const allMessages = await loadAggregateRefMessages(narratorId, messageIds);
 
 		const seqMap = new Map(allRefRows.map((r) => [r.messageId, r.seq]));
 		allMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -4194,13 +4540,11 @@ const narratorMessageQueriesUnlocked = {
 		const topMsgs = [] as typeof allMessages;
 		const childMsgs = [] as typeof allMessages;
 		for (const msg of allMessages) {
-			if (isSubagent) {
+			if (isTopLevelMessage(msg, placement)) {
 				msg.parentToolUseId = null;
 				topMsgs.push(msg);
-			} else if (msg.parentToolUseId) {
-				childMsgs.push(msg);
 			} else {
-				topMsgs.push(msg);
+				childMsgs.push(msg);
 			}
 		}
 
@@ -4211,7 +4555,7 @@ const narratorMessageQueriesUnlocked = {
 		);
 		const existingChildIds = new Set(childMsgs.map((m) => m.id));
 		if (inlineTopToolUseIds.length > 0) {
-			const extraChildren = loadAggregateInlineMessages(narratorId, inlineTopToolUseIds);
+			const extraChildren = await loadAggregateInlineMessages(narratorId, inlineTopToolUseIds);
 			for (const child of extraChildren) {
 				if (!existingChildIds.has(child.id)) childMsgs.push(child);
 			}
@@ -4223,18 +4567,16 @@ const narratorMessageQueriesUnlocked = {
 		attachSubagentActivities(topMsgs, topActivities);
 		const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMsgs, ...childMsgs]);
 		const takenOverToolUseIds = collectTakenOverToolUseIds(topActivities, awaitAgentIds);
-		const tree = attachActiveSendDeliveryTargets(
-			attachTakenOverFlags(
-				attachAwaitAgentNarratorIds(
-					enrichToolUseBlocks(
-						filterExitPlanBeforePlanCompact(
-							truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
-						),
+		const tree = attachTakenOverFlags(
+			attachAwaitAgentNarratorIds(
+				enrichToolUseBlocks(
+					filterExitPlanBeforePlanCompact(
+						truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
 					),
-					awaitAgentIds,
 				),
-				takenOverToolUseIds,
+				awaitAgentIds,
 			),
+			takenOverToolUseIds,
 		);
 
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
@@ -4256,14 +4598,12 @@ const narratorMessageQueriesUnlocked = {
 		return {
 			topLevel: await attachSendTargetDetails(tree),
 			orphanChildren: await attachSendTargetDetails(
-				attachActiveSendDeliveryTargets(
-					attachTakenOverFlags(
-						attachAwaitAgentNarratorIds(
-							enrichToolUseBlocks(truncateToolIO(orphanChildren)),
-							awaitAgentIds,
-						),
-						takenOverToolUseIds,
+				attachTakenOverFlags(
+					attachAwaitAgentNarratorIds(
+						enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+						awaitAgentIds,
 					),
+					takenOverToolUseIds,
 				),
 			),
 			subagentActivities,
@@ -4295,11 +4635,14 @@ const narratorMessageQueriesUnlocked = {
 
 	async getCompactSummary(narratorId: string, messageId: string) {
 		return db.transaction((tx) => {
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-				})
-				.sync();
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					})
+					.sync(),
+			);
 			const ref = tx.query.narratorMessageRefs
 				.findFirst({
 					where: and(
@@ -4379,11 +4722,14 @@ const narratorMessageQueriesUnlocked = {
 					),
 				})
 				.sync();
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-				})
-				.sync();
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					})
+					.sync(),
+			);
 			if (!msg || !currentRef) throw new NotFoundError("Message", messageId);
 
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -4447,14 +4793,11 @@ const narratorMessageQueriesUnlocked = {
 		return result;
 	},
 
-	async deleteMessage(
-		narratorId: string,
-		messageId: string,
-		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) {
+	async deleteMessage(narratorId: string, messageId: string, opts?: BlockDeleteOptions) {
 		const result = await deleteMessageRange(narratorId, messageId, true, opts);
 		return {
 			deletedCount: result.deletedCount,
+			...(result.revertResult ? { revertResult: result.revertResult } : {}),
 			...(result.historyWarnings ? { historyWarnings: result.historyWarnings } : {}),
 			...(result.archivedSubagentIds ? { archivedSubagentIds: result.archivedSubagentIds } : {}),
 		};
@@ -4469,10 +4812,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
 			: [];
@@ -4529,10 +4874,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		// Unreachable while foreign keys are on: `narrator_message_refs.message_id` is a
 		// NOT NULL reference to `narrator_messages.id`, so a ref cannot outlive its
 		// message. Treated as "already gone" (like the missing-ref case above) rather
@@ -4577,110 +4924,6 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	/**
-	 * Mark a review-feedback card as acted on.
-	 *
-	 * Only a UI latch: the conclusion is already in the history (the row IS the user
-	 * message), so this records that a turn was started for it and stops the button
-	 * offering the same thing twice. Nothing to compensate on failure — no content is
-	 * written or delivered here.
-	 *
-	 * `alreadyApplied` lets the caller skip starting a second loop while still reporting
-	 * success: the reader's intent is satisfied either way.
-	 */
-	async markReviewFeedbackApplied(
-		narratorId: string,
-		messageId: string,
-	): Promise<{ alreadyApplied: boolean; message?: typeof narratorMessages.$inferSelect }> {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		if (!ref) throw new NotFoundError("Message", messageId);
-
-		return db.transaction((tx) => {
-			const msg = tx.query.narratorMessages
-				.findFirst({ where: eq(narratorMessages.id, messageId) })
-				.sync();
-			const blocks = Array.isArray(msg?.contentJson)
-				? (msg.contentJson as Array<Record<string, unknown>>)
-				: [];
-			const index = blocks.findIndex((block) => block?.type === "review_feedback");
-			if (!msg || index < 0) {
-				throw new ValidationError("Message is not a review feedback card");
-			}
-			if ((blocks[index] as Record<string, unknown>).applied === true) {
-				return { alreadyApplied: true };
-			}
-
-			const patched = blocks.map((entry, i) => (i === index ? { ...entry, applied: true } : entry));
-			const updated = tx
-				.update(narratorMessages)
-				.set({ contentJson: patched })
-				.where(eq(narratorMessages.id, messageId))
-				.returning()
-				.get();
-			tx.update(narrators)
-				.set({
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-			return { alreadyApplied: false, message: updated };
-		});
-	},
-
-	/**
-	 * Release a review-feedback claim when no turn was actually started for it.
-	 *
-	 * The latch is what disables the card's button, and it is taken BEFORE the turn is
-	 * attempted. So every path where the attempt does not result in someone reading the
-	 * row has to give it back: plan mode, a status row that is not idle, or a throw
-	 * inside the continuation. Without this the button reads "Handled" for findings the
-	 * model never saw, and the reader has no way to ask again.
-	 *
-	 * A narrator that was ALREADY running is not such a path — it rebuilds history on
-	 * its next pass and takes the row up on its own — so the caller keeps the latch
-	 * there (see the apply route's `busy` vs `not_started`).
-	 *
-	 * Returns undefined when the row is not a review card or no longer exists: this runs
-	 * on a failure path and must not turn one failure into two.
-	 */
-	async releaseReviewFeedbackClaim(narratorId: string, messageId: string) {
-		return db.transaction((tx) => {
-			const msg = tx.query.narratorMessages
-				.findFirst({ where: eq(narratorMessages.id, messageId) })
-				.sync();
-			const blocks = Array.isArray(msg?.contentJson)
-				? (msg.contentJson as Array<Record<string, unknown>>)
-				: [];
-			const index = blocks.findIndex((block) => block?.type === "review_feedback");
-			if (!msg || index < 0) return undefined;
-			const patched = blocks.map((entry, i) =>
-				i === index ? { ...entry, applied: false } : entry,
-			);
-			const updated = tx
-				.update(narratorMessages)
-				.set({ contentJson: patched })
-				.where(eq(narratorMessages.id, messageId))
-				.returning()
-				.get();
-			tx.update(narrators)
-				.set({
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-			return updated;
-		});
-	},
-
-	/**
 	 * Drop a single reasoning-only assistant record left behind by a turn that died
 	 * after streaming its thinking.
 	 *
@@ -4713,10 +4956,12 @@ const narratorMessageQueriesUnlocked = {
 		});
 		if (!ref) return;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 		const blocks = Array.isArray(msg?.contentJson)
 			? (msg.contentJson as Array<{ type?: unknown }>)
 			: [];
@@ -4751,11 +4996,78 @@ const narratorMessageQueriesUnlocked = {
 		});
 	},
 
-	async dismissErrorMessage(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
+	/**
+	 * Dismiss the post-error subagent recovery card (role="disp", block type
+	 * `subagent_recovery`).
+	 *
+	 * The card's close button means "leave these subagents stopped, stop asking me":
+	 * nothing is resumed and no state outside this display row changes. Same
+	 * three-step pattern as dismissCwdRecoveryMessage — the row is UI-only (never
+	 * part of the model history), so removing this narrator's ref, and the message
+	 * itself when no other narrator references it, is all a dismissal needs.
+	 * Idempotent when the row or the ref is already gone.
+	 */
+	async dismissSubagentRecoveryMessage(narratorId: string, messageId: string) {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
 		});
+		if (!ref) return;
+
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
+		// Unreachable while foreign keys are on (a ref cannot outlive its message);
+		// treated as "already gone" rather than as an error, like the missing-ref case.
+		if (!msg) return;
+		const blocks = Array.isArray(msg.contentJson)
+			? (msg.contentJson as Array<{ type?: unknown }>)
+			: [];
+		const isSubagentRecovery = blocks.some((block) => block.type === "subagent_recovery");
+		// Role is checked as well as the block: an assistant message could otherwise
+		// carry a matching block and become deletable through this route.
+		if (msg.role !== "disp" || !isSubagentRecovery) {
+			throw new ValidationError("Message is not a subagent recovery notice");
+		}
+
+		db.transaction((tx) => {
+			deleteRecipientMessageRefs(tx)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				)
+				.run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+				.sync();
+			if (!otherRef) {
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
+	},
+
+	async dismissErrorMessage(narratorId: string, messageId: string) {
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				...bodyColumns({ id: true, role: true, contentJson: true }),
+			}),
+		);
 
 		// The message may already be gone (e.g. a historical "message without ref"
 		// orphan that disappeared on reload, or a double-dismiss). Treat that as an
@@ -4832,11 +5144,7 @@ const narratorMessageQueriesUnlocked = {
 		});
 	},
 
-	async deleteMessagesAfter(
-		narratorId: string,
-		messageId: string,
-		opts?: { preserveConversationId?: boolean; skipRevert?: boolean; scope?: RevertScope },
-	) {
+	async deleteMessagesAfter(narratorId: string, messageId: string, opts?: BlockDeleteOptions) {
 		return deleteMessageRange(narratorId, messageId, false, opts);
 	},
 
@@ -4849,6 +5157,7 @@ const narratorMessageQueriesUnlocked = {
 		const result = await deleteBlockSelection(narratorId, [{ messageId, blockIndex }], opts);
 		return {
 			messageDeleted: result.results[0]?.messageDeleted ?? false,
+			...(result.revertResult ? { revertResult: result.revertResult } : {}),
 			...(result.historyWarnings ? { historyWarnings: result.historyWarnings } : {}),
 			...(result.archivedSubagentIds ? { archivedSubagentIds: result.archivedSubagentIds } : {}),
 		};
@@ -4857,46 +5166,36 @@ const narratorMessageQueriesUnlocked = {
 	async deleteMessageBlocks(
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
-		opts?: { preserveConversationId?: boolean; skipRevert?: boolean; scope?: RevertScope },
+		opts?: BlockDeleteOptions,
 	) {
 		return deleteBlockSelection(narratorId, blocks, opts);
 	},
 
-	async removeCompactingMessage(narratorId: string, messageId: string) {
-		db.transaction((tx) => {
-			const ref = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				})
-				.sync();
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-					columns: { contentJson: true },
-				})
-				.sync();
-			if (!ref || !msg) return;
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (compactBlock?.status === "compacting") {
-				throw new AppError(
-					"A running compact must be cancelled before its marker can be removed",
-					409,
-					"COMPACT_IN_PROGRESS",
-				);
-			}
-			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, ref.id)).run();
-			const remainingRef = tx.query.narratorMessageRefs
-				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
-				.sync();
-			if (!remainingRef) {
-				tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
-				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
-			}
-		});
+	/**
+	 * Delete blocks named by id (docs/BLOCK_STORAGE-DESIGN.md §5.5): each block whole, so a
+	 * tool block goes with every ledger attempt of its call, an input with all its
+	 * attachments, and a reasoning run is the ids of all its blocks.
+	 */
+	async deleteBlocks(narratorId: string, blockIds: string[], opts?: BlockDeleteOptions) {
+		const targets = materializeTargets(resolveBlockTargets(narratorId, blockIds));
+		const { results, ...outcome } = await deleteBlockSelection(
+			narratorId,
+			targetElements(targets),
+			opts,
+			{ retiredRows: targets.flatMap((target) => (target.rowId ? [target.rowId] : [])) },
+		);
+		const deletedMessages = new Set(
+			results.filter((result) => result.messageDeleted).map((result) => result.messageId),
+		);
+		return {
+			...outcome,
+			deleted: targets.length,
+			results: targets.map((target) => ({
+				blockId: target.blockId,
+				messageId: target.messageId,
+				messageDeleted: deletedMessages.has(target.messageId),
+			})),
+		};
 	},
 
 	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
@@ -4909,11 +5208,14 @@ const narratorMessageQueriesUnlocked = {
 					),
 				})
 				.sync();
-			const msg = tx.query.narratorMessages
-				.findFirst({
-					where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
-				})
-				.sync();
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns(),
+						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+					})
+					.sync(),
+			);
 			if (!msg || !ref) throw new NotFoundError("Message", messageId);
 
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -4928,14 +5230,12 @@ const narratorMessageQueriesUnlocked = {
 			const now = new Date().toISOString();
 			const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
 
-			tx.update(narratorMessages)
-				.set({
-					contentJson: [newBlock],
+			writeEnvelopeBody(tx, copied.messageId, [newBlock], {
+				set: {
 					contextCharsJson: { segments: [] },
 					contentText: `${prefix} ${summary.slice(0, 200)}...`,
-				})
-				.where(eq(narratorMessages.id, copied.messageId))
-				.run();
+				},
+			});
 
 			tx.update(narrators)
 				.set({
@@ -5043,13 +5343,13 @@ export const narratorMessageQueries = {
 	deleteMessagesAfter: admittedMutation(narratorMessageQueriesUnlocked.deleteMessagesAfter),
 	deleteMessageBlock: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlock),
 	deleteMessageBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteMessageBlocks),
+	deleteBlocks: admittedMutation(narratorMessageQueriesUnlocked.deleteBlocks),
 	deleteEmptyRetryPlaceholder: admittedMutation(
 		narratorMessageQueriesUnlocked.deleteEmptyRetryPlaceholder,
 	),
 	deleteDanglingReasoningMessage: admittedMutation(
 		narratorMessageQueriesUnlocked.deleteDanglingReasoningMessage,
 	),
-	removeCompactingMessage: admittedMutation(narratorMessageQueriesUnlocked.removeCompactingMessage),
 	updateCompactSummary: admittedMutation(narratorMessageQueriesUnlocked.updateCompactSummary),
 	dismissSpecCarryoverMessage: admittedMutation(
 		narratorMessageQueriesUnlocked.dismissSpecCarryoverMessage,
@@ -5060,11 +5360,8 @@ export const narratorMessageQueries = {
 	dismissCwdRecoveryMessage: admittedMutation(
 		narratorMessageQueriesUnlocked.dismissCwdRecoveryMessage,
 	),
+	dismissSubagentRecoveryMessage: admittedMutation(
+		narratorMessageQueriesUnlocked.dismissSubagentRecoveryMessage,
+	),
 	dismissErrorMessage: admittedMutation(narratorMessageQueriesUnlocked.dismissErrorMessage),
-	markReviewFeedbackApplied: admittedMutation(
-		narratorMessageQueriesUnlocked.markReviewFeedbackApplied,
-	),
-	releaseReviewFeedbackClaim: admittedMutation(
-		narratorMessageQueriesUnlocked.releaseReviewFeedbackClaim,
-	),
 };

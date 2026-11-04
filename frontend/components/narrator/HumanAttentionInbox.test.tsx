@@ -29,7 +29,7 @@ import commonEn from "../../locales/en/common.json";
 import dashboardEn from "../../locales/en/dashboard.json";
 import narratorEn from "../../locales/en/narrator.json";
 import navEn from "../../locales/en/nav.json";
-import { NeedsAttention } from "../dashboard/NeedsAttention";
+import { DashboardSessions, useDashboardSessions } from "../dashboard/DashboardSessions";
 import { NotificationCenterDrawer } from "../notifications/NotificationCenterDrawer";
 import {
 	HumanAttentionInboxButton,
@@ -60,7 +60,6 @@ function item(id: string, overrides: Partial<HumanAttentionItem> = {}): HumanAtt
 		narratorTitle: `Source ${id}`,
 		parentNarratorId: null,
 		rootNarratorId: null,
-		chapterId: null,
 		createdAt: "2026-01-01T00:00:00.000Z",
 		blocking: true,
 		canAct: true,
@@ -264,7 +263,6 @@ for (const state of ["empty", "pending", "history"] as const) {
 			status: "answered" as const,
 			context: "Stored context",
 			narratorTitle: "Owner",
-			chapterId: null,
 			resolution:
 				state === "history"
 					? { answerMessageId: "m", note: "Handled", actor: "agent", resolvedAt: "2026-01-01" }
@@ -301,7 +299,6 @@ test("the shared drawer retains other attention items and paginates pending and 
 		status: "answered" as const,
 		context: "Frozen context",
 		narratorTitle: "Owner",
-		chapterId: null,
 	};
 	const page = track(
 		spyOn(api, "getGlobalQuestionPage").mockImplementation(async (filter, cursor) => ({
@@ -374,7 +371,6 @@ describe("human attention global listener and pagination", () => {
 			"narrator_access_changed",
 			"project_access_changed",
 			"narrator_deleted",
-			"chapter_deleted",
 			"project_deleted",
 		]) {
 			const calls = list.mock.calls.length;
@@ -636,6 +632,73 @@ test("notification pending panel reuses decision form, draft recovery and keyboa
 	expect(row(child.id).textContent).toContain("Retry answer");
 	expect(readSession("ask-draft", child.toolCallId)).not.toBeNull();
 	await assertIsolated(button(navEn.notificationTabActivity));
+});
+
+test("notification question stays editable and submits during a background authority refresh", async () => {
+	const child = item("live-question", {
+		source: "question",
+		kind: "async_question",
+		toolName: "AskUserQuestion",
+		blocking: false,
+	});
+	const value = question(child);
+	value.questions[0].options = [
+		{ header: "Option A", description: "First choice" },
+		{ header: "Option B", description: "Second choice" },
+	];
+	listPage = { items: [child], nextCursor: null };
+	details.set(child.id, { item: child, question: value });
+	writeSession("ask-draft", child.toolCallId, draft);
+	track(
+		spyOn(api, "listNotifications").mockResolvedValue({ items: [], nextCursor: null, asOf: 123 }),
+	);
+	await render(<NotificationCenterDrawer opened initialTab="attention" onClose={() => {}} />);
+	await click("Review decision", row(child.id));
+	const input = row(child.id).querySelector("textarea");
+	const fieldset = row(child.id).querySelector("fieldset");
+	expect(input?.value).toBe("Keep this answer");
+	let finishRefresh: (detail: HumanAttentionDetail) => void = () => {};
+	track(
+		spyOn(api, "getHumanAttentionDetail").mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					finishRefresh = resolve;
+				}),
+		),
+	);
+	await act(async () => {
+		void qc.invalidateQueries({ queryKey: ["human-attention"] });
+	});
+	await settle();
+	expect(qc.isFetching({ queryKey: ["human-attention", "detail", child.id] })).toBe(1);
+	expect(fieldset?.hasAttribute("disabled")).toBe(false);
+	expect(row(child.id).querySelector("textarea")).toBe(input);
+	expect(input?.value).toBe("Keep this answer");
+	let finishAnswer: () => void = () => {};
+	const answer = track(
+		spyOn(api, "answerAsyncQuestion").mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					finishAnswer = () => resolve({ ok: true, question: value });
+				}),
+		),
+	);
+	await click(narratorEn.submitAnswer, row(child.id));
+	expect(answer).toHaveBeenCalledWith(child.narratorId, child.requestId, {
+		answers: { notes: "Keep this answer" },
+	});
+	// An actual submission still locks the form; a background read never does.
+	expect(fieldset?.hasAttribute("disabled")).toBe(true);
+	await act(async () => finishRefresh({ item: child, question: value }));
+	await settle();
+	expect(row(child.id).querySelector("textarea")).toBe(input);
+	await act(async () => {
+		finishAnswer();
+	});
+	await settle();
+	await act(async () => finishRefresh({ item: child, question: value }));
+	await settle();
+	expect(fieldset?.hasAttribute("disabled")).toBe(false);
 });
 
 test("notification tab switches retain the expanded plan editor and unsubmitted draft", async () => {
@@ -1052,7 +1115,7 @@ test("failed blocking question reflection keeps its draft and explicit retry", a
 	expect(readSession("ask-draft", blocking.toolCallId)).not.toBeNull();
 });
 
-test("Dashboard uses summaries only and View all opens notification center pending tab", async () => {
+test("Dashboard uses summaries only and Open inbox opens notification center pending tab", async () => {
 	addPermission(item("dashboard"));
 	const narrators = track(
 		spyOn(api, "listNarratorsPaginated").mockResolvedValue({
@@ -1064,12 +1127,19 @@ test("Dashboard uses summaries only and View all opens notification center pendi
 	);
 	const permissions = track(spyOn(api, "getPendingPermissions"));
 	const detail = spyOn(api, "getHumanAttentionDetail");
-	await render(<NeedsAttention />);
-	expect(narrators).toHaveBeenCalledTimes(1);
-	expect(narrators.mock.calls[0][0]?.status).toBeUndefined();
+	function Dashboard() {
+		return <DashboardSessions data={useDashboardSessions()} />;
+	}
+	await render(<Dashboard />);
+	// Live lists are status-filtered server-side; only the recent list is unfiltered.
+	expect(narrators.mock.calls.map((call) => call[0]?.status ?? "all").sort()).toEqual([
+		"all",
+		"waiting",
+		"working",
+	]);
 	expect(permissions).not.toHaveBeenCalled();
 	expect(detail).not.toHaveBeenCalled();
-	await click("View all");
+	await click("Open inbox");
 	expect(document.body.textContent).toContain("Notifications");
 	expect(document.body.textContent).not.toContain("Human attention center");
 	expect(document.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Pending");

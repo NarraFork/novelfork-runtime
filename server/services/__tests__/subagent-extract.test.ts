@@ -11,7 +11,8 @@ import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:t
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
-import { resolveRuntimePolicy } from "../agent-runtime/policy";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -64,9 +65,10 @@ function seedSubagent(
 		.prepare(
 			`INSERT INTO narrators (
 				id, type, variant, subagent_type, status, permission_mode, inherit_mode,
-				traits, system_prompt, parent_narrator_id, title, owner_user_id,
-				visibility, write_audience, created_at, updated_at
-			) VALUES (?, 'subagent', 'subagent:explore', 'explore', ?, ?, 'fresh', ?, ?, ?, ?, 'u1', 'private', 'owner', ?, ?)`,
+				traits, system_prompt, parent_narrator_id, policy_source_narrator_id,
+				runtime_registration_json, title, owner_user_id, visibility, write_audience,
+				created_at, updated_at
+			) VALUES (?, 'subagent', 'subagent:explore', 'explore', ?, ?, 'fresh', ?, ?, ?, ?, ?, ?, 'u1', 'private', 'owner', ?, ?)`,
 		)
 		.run(
 			id,
@@ -75,6 +77,8 @@ function seedSubagent(
 			JSON.stringify([]),
 			opts?.systemPrompt ?? "You are a subagent explorer.",
 			parent,
+			parent,
+			parent ? JSON.stringify(delegationRegistration(parent, "explore")) : null,
 			opts?.title ?? "Explore auth",
 			now,
 			now,
@@ -166,7 +170,7 @@ describe("extractSubagentToPrimary", () => {
 		expect(extracted.systemPrompt).toBeNull();
 		expect(extracted.contextSystemChars).toBe(0);
 		expect(extracted.contextToolsChars).toBe(0);
-		expect(extracted.chapterId).toBeNull();
+		expect(extracted.contextProjectId).toBeNull();
 		expect(extracted.permissionMode).toBe("default");
 		expect(extracted.refsInheritedFrom).toBeNull();
 		expect(extracted.aclRootNarratorId).toBeNull();
@@ -180,11 +184,11 @@ describe("extractSubagentToPrimary", () => {
 		expect(extracted.writeAudience).toBe("owner");
 
 		// Acceptance: primary runtime policy unlocks AskUserQuestion + full builtin tools.
-		const policy = resolveRuntimePolicy({ variant: "primary" });
+		const policy = resolveRuntimePolicy([]);
 		expect(policy.capabilities.askUserQuestion).toBe("sync-or-async");
 		expect(policy.tools.builtin).toBe("all");
 
-		const subPolicy = resolveRuntimePolicy({ variant: "subagent", subagentType: "explore" });
+		const subPolicy = resolveRuntimePolicy([compileDelegationPolicy({ template: "explore" })]);
 		expect(subPolicy.capabilities.askUserQuestion).toBe("disabled");
 	});
 
@@ -211,7 +215,9 @@ describe("extractSubagentToPrimary", () => {
 		for (const msg of copied) {
 			expect(msg.parentToolUseId).toBeNull();
 			expect(msg.messageUuid).toBeNull();
-			expect(msg.id.startsWith("m")).toBe(false);
+			// A fresh copy, never the source row. (Checking a letter prefix was flaky: random
+			// nanoids start with "m" about once in 64 extractions.)
+			expect(["m0", "m1"]).not.toContain(msg.id);
 		}
 		const texts = copied.map((m) => m.contentText).sort();
 		expect(texts).toEqual(["found route A", "found route B"]);

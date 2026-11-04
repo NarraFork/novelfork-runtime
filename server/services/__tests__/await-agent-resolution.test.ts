@@ -17,6 +17,7 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -33,6 +34,14 @@ const { clearAliasRegistry, registerTaskAlias } = await import("../subagent-alia
 const PARENT_ID = "parent-narrator-000";
 const SUB_A = "subagent-aaaaaaaaaaa";
 const SUB_B = "subagent-bbbbbbbbbbb";
+
+/** Relations a delegation stores when it is created. */
+function delegated(parent: string, pool = "general") {
+	return {
+		policySourceNarratorId: parent,
+		runtimeRegistrationJson: delegationRegistration(parent, pool),
+	};
+}
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -55,6 +64,7 @@ async function seedTeam(
 			type: "subagent" as const,
 			variant: "subagent:general",
 			parentNarratorId: PARENT_ID,
+			...delegated(PARENT_ID),
 			title: sub.title ?? null,
 			...(sub.traits ? { traits: sub.traits } : {}),
 			createdAt: now,
@@ -133,6 +143,7 @@ describe("running Send navigation", () => {
 				id: "foreign-child",
 				variant: "subagent:general",
 				parentNarratorId: "foreign-parent",
+				...delegated("foreign-parent"),
 				createdAt: now,
 				updatedAt: now,
 			},
@@ -164,7 +175,7 @@ describe("running Send navigation", () => {
 				narratorId: PARENT_ID,
 			})),
 		);
-		expect([...resolved]).toEqual([["task-alias", SUB_A]]);
+		expect([...resolved]).toEqual([["task-alias", { id: SUB_A, title: null }]]);
 	});
 	test("collects single selectors but never parent, fanout, or completed calls", () => {
 		const inputs = [
@@ -199,7 +210,10 @@ describe("running Send navigation", () => {
 	});
 
 	test("resolves aliases and ids in bulk while rejecting self and foreign teams", async () => {
-		await seedTeam([{ id: SUB_A, traits: ["subagent-alias:worker"] }, { id: SUB_B }]);
+		await seedTeam([
+			{ id: SUB_A, title: "Worker", traits: ["subagent-alias:worker"] },
+			{ id: SUB_B },
+		]);
 		const calls = [
 			{ toolUseId: "alias", narratorId: PARENT_ID, inputJson: { name: "worker" } },
 			{ toolUseId: "id", narratorId: PARENT_ID, inputJson: { ids: [SUB_B] } },
@@ -209,8 +223,8 @@ describe("running Send navigation", () => {
 		].map((call) => ({ ...call, toolName: "Send" }));
 		const resolved = await resolveAwaitAgentIdsForToolCalls(calls);
 		expect([...resolved]).toEqual([
-			["alias", SUB_A],
-			["id", SUB_B],
+			["alias", { id: SUB_A, title: "Worker" }],
+			["id", { id: SUB_B, title: null }],
 		]);
 		expect(calls.every((call) => !("outputJson" in call))).toBe(true);
 		const tree = attachAwaitAgentNarratorIds(
@@ -233,6 +247,8 @@ describe("running Send navigation", () => {
 			"../../../frontend/components/narrator/vlist/vlist-tool-meta"
 		);
 		expect(deriveToolMeta(tree[0].contentJson[0])?.sendTargetNarratorId).toBe(SUB_A);
+		// The title rides along as a cosmetic transport field; a null title adds nothing.
+		expect(tree[0].contentJson[0]._awaitAgentTitle).toBe("Worker");
 		expect(tree[0].contentJson[0].outputJson).toBeUndefined();
 		expect(tree[0].contentJson[0].status).toBe("running");
 	});
@@ -246,7 +262,7 @@ describe("resolveAwaitAgentNarratorIds", () => {
 		const resolved = await resolveAwaitAgentNarratorIds(PARENT_ID, [
 			{ toolUseId: "t1", selector: "paper-extract" },
 		]);
-		expect(resolved.get("t1")).toBe(SUB_A);
+		expect(resolved.get("t1")).toEqual({ id: SUB_A, title: "Extract papers" });
 	});
 
 	test("resolves a slugified title", async () => {
@@ -254,7 +270,7 @@ describe("resolveAwaitAgentNarratorIds", () => {
 		const resolved = await resolveAwaitAgentNarratorIds(PARENT_ID, [
 			{ toolUseId: "t1", selector: "extract-papers" },
 		]);
-		expect(resolved.get("t1")).toBe(SUB_A);
+		expect(resolved.get("t1")).toEqual({ id: SUB_A, title: "Extract Papers" });
 	});
 
 	test("resolves an exact id and an id prefix", async () => {
@@ -263,8 +279,8 @@ describe("resolveAwaitAgentNarratorIds", () => {
 			{ toolUseId: "t1", selector: SUB_A },
 			{ toolUseId: "t2", selector: SUB_A.slice(0, 8) },
 		]);
-		expect(resolved.get("t1")).toBe(SUB_A);
-		expect(resolved.get("t2")).toBe(SUB_A);
+		expect(resolved.get("t1")).toEqual({ id: SUB_A, title: null });
+		expect(resolved.get("t2")).toEqual({ id: SUB_A, title: null });
 	});
 
 	test("resolves through the in-memory alias registry", async () => {
@@ -273,7 +289,7 @@ describe("resolveAwaitAgentNarratorIds", () => {
 		const resolved = await resolveAwaitAgentNarratorIds(PARENT_ID, [
 			{ toolUseId: "t1", selector: "run-tests" },
 		]);
-		expect(resolved.get("t1")).toBe(SUB_A);
+		expect(resolved.get("t1")).toEqual({ id: SUB_A, title: null });
 	});
 
 	/**
@@ -297,7 +313,7 @@ describe("resolveAwaitAgentNarratorIds", () => {
 		const resolved = await resolveAwaitAgentNarratorIds(PARENT_ID, [
 			{ toolUseId: "t1", selector: "detached-worker" },
 		]);
-		expect(resolved.get("t1")).toBe(SUB_A);
+		expect(resolved.get("t1")).toEqual({ id: SUB_A, title: null });
 	});
 
 	/**
@@ -339,6 +355,7 @@ describe("resolveAwaitAgentNarratorIds", () => {
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: "other-parent-00000000",
+				...delegated("other-parent-00000000"),
 				title: "Theirs",
 				createdAt: now,
 				updatedAt: now,
@@ -369,7 +386,7 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 				narratorId: PARENT_ID,
 			},
 		]);
-		expect(resolved.get("t1")).toBe(SUB_A);
+		expect(resolved.get("t1")).toEqual({ id: SUB_A, title: "Extract papers" });
 	});
 
 	/**
@@ -389,7 +406,7 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 				narratorId: SUB_A,
 			},
 		]);
-		expect(resolved.get("t1")).toBe(SUB_B);
+		expect(resolved.get("t1")).toEqual({ id: SUB_B, title: "Sibling" });
 	});
 
 	test("returns empty when no Await-agent call is present", async () => {
@@ -435,6 +452,7 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: FORKED,
+				...delegated(FORKED),
 				title: "Compare runtime build",
 				createdAt: now,
 				updatedAt: now,
@@ -447,6 +465,7 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 				type: "subagent",
 				variant: "subagent:general",
 				parentNarratorId: FORK_SOURCE,
+				...delegated(FORK_SOURCE),
 				title: "Compare runtime build",
 				createdAt: now,
 				updatedAt: now,
@@ -461,6 +480,6 @@ describe("resolveAwaitAgentIdsForToolCalls", () => {
 				narratorId: FORKED,
 			},
 		]);
-		expect(resolved.get("t1")).toBe(SUB_A);
+		expect(resolved.get("t1")).toEqual({ id: SUB_A, title: "Compare runtime build" });
 	});
 });

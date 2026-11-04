@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 
 const execFileAsync = promisify(execFile);
 const root = resolve(import.meta.dir, "../..");
@@ -11,13 +12,33 @@ const manifestEntry = "./server/services/revert-transaction-manifest-worker.ts";
 const mainEntry = "./server/index.ts";
 const maxBuffer = 1024 * 1024;
 
-/** Read actual compile arguments, not a comment that merely mentions the entry. */
+/** The production compile command spreads the shared worker registry, not a local path list. */
 async function productionCompileArguments(): Promise<string[]> {
 	const source = await readFile(join(root, "scripts/build-cross-platform.ts"), "utf8");
-	const command = source.match(/const compile = Bun\.spawnSync\(\s*\[([\s\S]*?)\],\s*\{/);
+	const command = source.match(/const compile = await runBuildStep\(\s*\[([\s\S]*?)\]\s*,?\s*\)/);
 	if (!command) throw new Error("Production Bun compile argument array was not found");
 	const withoutComments = command[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
-	return [...withoutComments.matchAll(/"([^"\r\n]+)"/g)].map((match) => match[1]);
+	expect(withoutComments).toMatch(/^\s*process\.execPath\s*,/);
+	expect(withoutComments).toContain('"./server/index.ts"');
+	expect(withoutComments).toContain("...compiledWorkerBuildEntrypoints()");
+	const { stdout } = await execFileAsync(
+		process.execPath,
+		["--eval", "process.stdout.write(Bun.version)"],
+		{
+			timeout: 10_000,
+			maxBuffer: 1024,
+		},
+	);
+	expect(stdout).toBe(Bun.version);
+	const literals = [...withoutComments.matchAll(/"([^"\r\n]+)"/g)].map((match) => match[1]);
+	const index = literals.indexOf("./server/index.ts");
+	const compileFlag = literals.indexOf("--compile");
+	return [
+		process.execPath,
+		...literals.slice(0, index + 1),
+		...compiledWorkerBuildEntrypoints(),
+		...literals.slice(compileFlag),
+	];
 }
 
 // This fixture imports the real runner, never a mocked worker or a database singleton.
@@ -97,7 +118,7 @@ function assertNoPublicPaths(value: unknown, privatePaths: string[]) {
 describe("revert manifest worker in a real compiled executable", () => {
 	test("production compilation registers the manifest worker as an executable entry", async () => {
 		const args = await productionCompileArguments();
-		expect(args.slice(0, 3)).toEqual(["bun", "build", mainEntry]);
+		expect(args.slice(0, 3)).toEqual([process.execPath, "build", mainEntry]);
 		expect(args).toContain("--compile");
 		expect(args).toContain("--minify");
 		expect(args.slice(2, args.indexOf("--compile"))).toContain(manifestEntry);

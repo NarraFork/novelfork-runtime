@@ -9,6 +9,7 @@ import {
 	extractNumericField,
 	isTruncated,
 	MEDIA_IMAGE_CONTENT_PX,
+	parseLiveOutputChars,
 	resolveDisplayText,
 	resolveFileDiffStats,
 	type ToolAskDetail,
@@ -94,6 +95,13 @@ function metaTexts(detail: ToolDetailData | null): string[] {
 	return metaRowsOf(detail)
 		.rows.map((r) => r.text)
 		.filter((t) => t.length > 0);
+}
+
+/** Every meta row identity line, flattened (an Await card's resolved child). */
+function metaIdentities(detail: ToolDetailData | null): string[] {
+	return metaRowsOf(detail)
+		.rows.map((r) => r.identity)
+		.filter((t): t is string => typeof t === "string" && t.length > 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -772,7 +780,7 @@ describe("protocol receipts stay out of displayed tool output", () => {
 		expect(body.text).toContain(
 			text.includes("Still running") ? "Still running" : "# Result\nDone",
 		);
-		expect(metaTexts(d)).toContain("subagent: real-id");
+		expect(metaIdentities(d)).toEqual(["real-id"]);
 	});
 
 	it("does not strip tags quoted in reports or shell stdout", () => {
@@ -802,11 +810,11 @@ describe("protocol receipts stay out of displayed tool output", () => {
 				_text:
 					"<background_task_id>tests</background_task_id>\n\nBackground bash task started. Use Await...",
 			},
-		labels: { backgroundTaskStarted: "已在后台启动" },
-	});
-	expect(metaBadgeLabels(d)).toEqual([]);
-	expect(metaTexts(d)).toContain("已在后台启动");
-	expect(metaTexts(d)).not.toContain("tests");
+			labels: { backgroundTaskStarted: "已在后台启动" },
+		});
+		expect(metaBadgeLabels(d)).toEqual([]);
+		expect(metaTexts(d)).toContain("已在后台启动");
+		expect(metaTexts(d)).not.toContain("tests");
 		expect(asSections(d).sections.some((part) => part.key === "output.main")).toBe(false);
 		expect((sectionBody(d, "command") as ToolCappedDetail).text).toBe("$ bun test");
 	});
@@ -825,6 +833,22 @@ describe("protocol receipts stay out of displayed tool output", () => {
 			outputJson: text,
 		});
 		expect((sectionBody(d, "output") as ToolCappedDetail).text).toBe(text);
+	});
+});
+
+describe("parseLiveOutputChars", () => {
+	it("parses the bare cumulative-count payload", () => {
+		expect(parseLiveOutputChars("1240")).toBe(1240);
+		expect(parseLiveOutputChars(" 7 ")).toBe(7);
+		expect(parseLiveOutputChars("0")).toBe(0);
+	});
+	it("rejects bodies that are not a bare count", () => {
+		expect(parseLiveOutputChars("thinking…")).toBeNull();
+		expect(parseLiveOutputChars("12 lines")).toBeNull();
+		expect(parseLiveOutputChars("")).toBeNull();
+		expect(parseLiveOutputChars(undefined)).toBeNull();
+		expect(parseLiveOutputChars(null)).toBeNull();
+		expect(parseLiveOutputChars(42)).toBeNull();
 	});
 });
 
@@ -851,7 +875,7 @@ describe("classifyToolDetail — await", () => {
 		expect(body.cap).toBe("code");
 		expect(body.format).toBe("markdown");
 	});
-	it("surfaces the badge row plus waitFor / subagent rows", () => {
+	it("keeps one identity row plus the wait_for line, dropping the redundant badges", () => {
 		const d = classifyToolDetail({
 			previewId: "classifier-fixture",
 			toolName: "Await",
@@ -859,8 +883,83 @@ describe("classifyToolDetail — await", () => {
 			inputJson: { type: "agent", id: "t-9", timeout: 600000, wait_for_text: "done" },
 			metadata: { resolvedId: "n-1", status: "completed", subagentId: "sa-1" },
 		});
-		expect(metaBadgeLabels(d)).toEqual(["agent", "t-9", "→ n-1", "completed", "timeout: 10m"]);
-		expect(metaTexts(d)).toEqual(['wait_for: "done"', "subagent: sa-1"]);
+		// Type / target / status / timeout all live on the card's header line
+		// already — the old badge row repeated them, so it is gone entirely.
+		expect(metaBadgeLabels(d)).toEqual([]);
+		expect(metaIdentities(d)).toEqual(["sa-1"]);
+		expect(metaTexts(d)).toEqual(['wait_for: "done"']);
+	});
+	it("prefixes the slug on the identity row only when it differs from the title", () => {
+		const withDistinctSlug = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "t-9" },
+			metadata: {
+				subagentId: "sa-1",
+				targetLabel: "plan-sdk-review",
+				targetTitle: "SDK review 修复方案",
+			},
+		});
+		expect(metaIdentities(withDistinctSlug)).toEqual(["plan-sdk-review · sa-1"]);
+		// A title equal to the slug (or no title at all) shows the id alone — the
+		// header already displays that same text.
+		const sameTitle = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "t-9" },
+			metadata: { subagentId: "sa-1", targetLabel: "worker", targetTitle: "worker" },
+		});
+		expect(metaIdentities(sameTitle)).toEqual(["sa-1"]);
+		const noTitle = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			inputJson: { type: "agent", id: "t-9" },
+			metadata: { subagentId: "sa-1", targetLabel: "worker" },
+		});
+		expect(metaIdentities(noTitle)).toEqual(["sa-1"]);
+	});
+	it("falls back to the live transport id while the wait is running", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			status: "running",
+			inputJson: { type: "agent", id: "worker-1" },
+			outputJson: undefined,
+			metadata: { _awaitAgentNarratorId: "live-id", _awaitAgentTitle: "Worker" },
+		});
+		expect(metaIdentities(d)).toEqual(["live-id"]);
+	});
+	it("shows the awaited child's live output counter while running", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			status: "running",
+			inputJson: { type: "agent", id: "worker-1" },
+			outputJson: undefined,
+			metadata: { _streamingOutput: "512" },
+		});
+		const body = sectionBody(d, "result") as ToolStructuredDetail;
+		expect(body.kind).toBe("structured");
+		expect(body.bodyLines).toEqual(["512 chars"]);
+	});
+	it("never paints the counter once the wait is terminal", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "Await",
+			category: "await",
+			status: "success",
+			inputJson: { type: "agent", id: "worker-1" },
+			outputJson: "done",
+			metadata: { _streamingOutput: "512" },
+		});
+		const body = sectionBody(d, "result") as ToolCappedDetail;
+		expect(body.kind).toBe("capped");
+		expect(body.text).toBe("done");
 	});
 });
 
@@ -1733,6 +1832,40 @@ describe("classifyToolDetail — knowledge", () => {
 		expect(rows[0]?.text).toBe("Doc");
 		expect(rows[0]?.href).toBe("/knowledge/e9");
 		expect(metaBadgeLabels(d)).toEqual(["#x", "kw"]);
+	});
+	it("links personal versions to their own page, not to a global entry", () => {
+		const search = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "KnowledgeSearch",
+				category: "knowledge",
+				metadata: {
+					results: [{ id: "p1", personalEntryId: "p1", title: "Mine", snippet: "" }],
+				},
+			}),
+			"structured",
+		);
+		expect(search.entries?.[0]?.href).toBe("/knowledge/mine/p1");
+
+		const read = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "KnowledgeRead",
+			category: "knowledge",
+			inputJson: { personalEntryId: "p2" },
+			outputJson: "body",
+			metadata: { personalEntryId: "p2", linkedEntryId: "e2", title: "My copy" },
+		});
+		expect(metaRowsOf(read).rows[0]?.href).toBe("/knowledge/mine/p2");
+
+		const edit = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "KnowledgeEdit",
+			category: "knowledge",
+			inputJson: { action: "save", personalEntryId: "p3" },
+			outputJson: "Saved content to your personal entry (p3).",
+			metadata: { tool: "KnowledgeEdit", personalEntryId: "p3" },
+		});
+		expect(metaRowsOf(edit).rows[0]).toMatchObject({ text: "p3", href: "/knowledge/mine/p3" });
 	});
 });
 
@@ -2705,5 +2838,163 @@ describe("resolveFileDiffStats — non-file tools", () => {
 			resolveFileDiffStats("Bash", { command: "ls" }, { linesAdded: 1, linesRemoved: 1 }),
 		).toBeUndefined();
 		expect(resolveFileDiffStats("Read", { file_path: "/a.ts" }, null)).toBeUndefined();
+	});
+});
+
+describe("classifyToolDetail — outline", () => {
+	it("renders an OutlineRead as markdown under its address, space and size", () => {
+		const outline = "‹space Kx81mPqa · project›\n- [Ab3dEf9Q] Auth\n  - [Pq83nXcB] refresh";
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			inputJson: { address: "Ab3dEf9Q" },
+			outputJson: outline,
+			metadata: {
+				address: "Kx81mPqa/Ab3dEf9Q",
+				space: { key: "Kx81mPqa", kind: "project" },
+				blocks: 2,
+				truncated: true,
+			},
+		});
+		const body = cappedSectionBody(d, "knowledge");
+		expect(body.format).toBe("markdown");
+		expect(body.text).toBe(outline);
+		expect(metaTexts(d)).toEqual(["Kx81mPqa/Ab3dEf9Q"]);
+		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa", "2 blocks", "more not shown"]);
+	});
+
+	it("lists OutlineSearch hits with their address, path and process mark", () => {
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "OutlineSearch",
+				category: "outline",
+				metadata: {
+					results: [
+						{
+							address: "Kx81mPqa/Ab3dEf9Q",
+							title: "Token refresh",
+							path: ["Auth", "Tokens"],
+							snippet: "refresh has a race",
+							alias: "Q7",
+							process: true,
+						},
+					],
+				},
+			}),
+			"structured",
+		);
+		expect(d.badges).toEqual([{ label: "1 results", color: "teal" }]);
+		expect(d.entries?.[0]).toMatchObject({
+			title: "Token refresh",
+			meta: "Kx81mPqa/Ab3dEf9Q · Auth › Tokens",
+			snippet: "refresh has a race",
+			badges: [
+				{ label: "Q7", color: "teal" },
+				{ label: "process", color: "gray" },
+			],
+		});
+	});
+
+	it("shows what an OutlineEdit wrote and its commit", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineEdit",
+			category: "outline",
+			inputJson: {
+				edits: [
+					{ add: "/", markdown: "- [ ] step one\n- step two" },
+					{ set: "Ab3dEf9Q", checkbox: "x" },
+					{ move: "Q1", to: "Kx81mPqa/" },
+				],
+			},
+			outputJson: "Committed #4 to Kx81mPqa",
+			metadata: { space: { key: "Kx81mPqa" }, commit: { id: "c1", seq: 4 } },
+		});
+		const input = sectionBody(d, "input") as ToolCappedDetail;
+		expect(input.format).toBe("markdown");
+		expect(input.text).toBe(
+			[
+				"**add** `/`",
+				"",
+				"- [ ] step one\n- step two",
+				"",
+				'**set** `Ab3dEf9Q`: checkbox "x"',
+				"**move** `Q1` → Kx81mPqa/",
+			].join("\n"),
+		);
+		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("Committed #4 to Kx81mPqa");
+		// The commit is a link to the page it changed (as of the commit), not a badge.
+		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa"]);
+		expect(metaTexts(d)).toEqual(["commit #4"]);
+		expect(metaRowsOf(d).rows.find((row) => row.text === "commit #4")?.href).toBe(
+			"/outline/ref?space=Kx81mPqa&commit=4",
+		);
+	});
+
+	it("links an OutlineEdit's targets to the blocks it changed or created", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineEdit",
+			category: "outline",
+			inputJson: {
+				edits: [
+					{ add: "/", markdown: "- new" },
+					{ set: "Ab3dEf9Q", checkbox: "x" },
+					{ delete: "Q1" },
+				],
+			},
+			outputJson: "Committed #5",
+			metadata: {
+				space: { key: "Kx81mPqa" },
+				commit: { id: "c2", seq: 5 },
+				edits: [
+					{ op: "add", created: ["Kx81mPqa/Nw1Blk00"] },
+					{ op: "set", address: "Kx81mPqa/Ab3dEf9Q" },
+					{ op: "delete", address: "Kx81mPqa/Qq1Sid00" },
+				],
+			},
+		});
+		const input = sectionBody(d, "input") as ToolCappedDetail;
+		expect(input.text).toBe(
+			[
+				"**add** [/](/outline/ref?a=Kx81mPqa%2FNw1Blk00)",
+				"",
+				"- new",
+				"",
+				'**set** [Ab3dEf9Q](/outline/ref?a=Kx81mPqa%2FAb3dEf9Q): checkbox "x"',
+				"**delete** [Q1](/outline/ref?a=Kx81mPqa%2FQq1Sid00)",
+			].join("\n"),
+		);
+	});
+
+	it("links OutlineRead's address and each OutlineSearch hit, but not a space read", () => {
+		const read = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			outputJson: "- [Ab3dEf9Q] Auth",
+			metadata: { address: "Kx81mPqa/Ab3dEf9Q", space: { key: "Kx81mPqa" } },
+		});
+		expect(metaRowsOf(read).rows[0]?.href).toBe("/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
+		const spaceRead = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			outputJson: "pages",
+			metadata: { address: "Kx81mPqa/", space: { key: "Kx81mPqa" } },
+		});
+		expect(metaRowsOf(spaceRead).rows[0]?.href).toBeUndefined();
+		const search = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "OutlineSearch",
+				category: "outline",
+				metadata: { results: [{ address: "Kx81mPqa/Ab3dEf9Q", title: "Auth" }] },
+			}),
+			"structured",
+		);
+		expect(search.entries?.[0]?.href).toBe("/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
 	});
 });

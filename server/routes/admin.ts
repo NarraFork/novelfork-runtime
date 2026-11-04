@@ -1,8 +1,8 @@
 import { normalizeLocale } from "@shared/i18n-locales";
-import { count, eq, inArray } from "drizzle-orm";
+import { and, count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { narratorMessages, narrators, userPluginThemes, userPreferences, users } from "../db/schema";
+import { narrators, userPreferences, users } from "../db/schema";
 import { revokeUserSessions } from "../lib/auth";
 import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
 import { randomAvatarColor } from "../lib/avatar-colors";
@@ -21,14 +21,14 @@ import {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 } from "../lib/validators";
-import { invalidateUserCache, requireAdmin, requireAuth } from "../middleware/auth";
+import { notifyAuthChanged, requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
 import { purgeNarratorGrantsForUser } from "../services/narrator-sharing";
 import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocation";
 import { purgeProjectGrantsForUser } from "../services/project-membership";
 import { registrationCodeService } from "../services/registration-code-service";
 import { terminalService } from "../services/terminal-service";
-import { worktreeWatcher } from "../services/worktree-watcher";
+import { releaseUserForeignKeys } from "../services/user-deletion";
 import { ProcessSnapshot } from "../terminal/dtach-service";
 import { getExternalNarratorConnectionSnapshot } from "../websocket/oauth-connection-registry";
 
@@ -128,12 +128,10 @@ adminRoutes.patch("/users/:id", async (c) => {
 		throw new AppError("Cannot demote yourself", 400, "SELF_DEMOTE");
 	}
 
-	// Read the live role once: it decides both the last-administrator guard below and
-	// whether this request is a DEMOTION, which has to end the target's sessions.
+	// Read the live role once for the last-administrator guard below.
 	const targetBefore = role
 		? await db.query.users.findFirst({ where: eq(users.id, id), columns: { role: true } })
 		: undefined;
-	const isDemotion = role === "user" && targetBefore?.role === "admin";
 
 	// Prevent demoting the last administrator
 	if (role === "user" && id !== caller.sub && targetBefore?.role === "admin") {
@@ -176,24 +174,14 @@ adminRoutes.patch("/users/:id", async (c) => {
 		.returning({ id: users.id, username: users.username, role: users.role });
 	if (!updated) throw new AppError("User not found", 404, "NOT_FOUND");
 	// An administrator resets a password when they believe the old one is compromised, so the
-	// sessions opened with it must die too. Session JWTs are self-contained, so only bumping the
-	// token generation can end them — a new password alone would leave a stolen token valid for
-	// up to its remaining lifetime.
-	//
-	// A DEMOTION needs the same treatment, for the same reason: the presented JWT carries its
-	// own `role`, and `assertAdmin` reads that claim. Clearing the existence cache alone is not
-	// enough — the version check the cache serves compares `tokenVersion`, not the role — so a
-	// just-demoted user's existing token would keep passing `requireAdmin` until it expired
-	// (up to 7 days). Sliding renewal does re-read the live role, but only for tokens that
-	// happen to be inside the renewal window, so it cannot be relied on as the boundary.
-	if (password || isDemotion) {
+	// sessions opened with it must die too: bumping the token generation ends every one of
+	// them on its next request. A new password alone would leave a stolen token valid.
+	// A role change needs no such step: the role is read live on every request.
+	if (password) {
 		await revokeUserSessions(id);
 	}
-	// A role or password change must take effect on the next request rather than
-	// after the 60s existence-cache window: the cache is what lets a request skip
-	// the live `users` lookup, and sliding renewal re-reads the role from there.
 	if (role || password) {
-		invalidateUserCache(id);
+		notifyAuthChanged(id);
 	}
 	return c.json(updated);
 });
@@ -210,7 +198,6 @@ adminRoutes.post("/users/:id/revoke-sessions", async (c) => {
 	});
 	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
 	const tokenVersion = await revokeUserSessions(id);
-	invalidateUserCache(id);
 	logger.info("Administrator revoked all sessions for a user", {
 		userId: id,
 		actorUserId: c.get("user").sub,
@@ -244,15 +231,15 @@ adminRoutes.delete("/users/:id", async (c) => {
 	}
 
 	await prepareOAuthUserHardDeletion(id);
-	// 两处外键没有 ON DELETE：消息保留（属于叙述者），只去掉作者标记；插件主题启用记录随用户删除。
-	await db.update(narratorMessages).set({ createdBy: null }).where(eq(narratorMessages.createdBy, id));
-	await db.update(narratorMessages).set({ editedBy: null }).where(eq(narratorMessages.editedBy, id));
-	await db.delete(userPluginThemes).where(eq(userPluginThemes.userId, id));
-	const [deleted] = await db.delete(users).where(eq(users.id, id)).returning();
+	// 没有级联的外键必须先释放，否则删除会以 FOREIGN KEY constraint failed 失败；
+	// 两步放在同一个同步事务里，避免清理成功而删除失败留下的半成品。
+	const deleted = db.transaction((tx) => {
+		releaseUserForeignKeys(tx, id);
+		return tx.delete(users).where(eq(users.id, id)).returning().all();
+	})[0];
 	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
-	// Drop the existence cache immediately; otherwise the deleted user's token
-	// keeps passing (and renewing) for the rest of the cache window.
-	invalidateUserCache(id);
+	// The user's sessions went with the row (cascade); tell live subscribers.
+	notifyAuthChanged(id);
 	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).
 	await knowledgeAcl.purgeUserGrants(id);
 	// Cascade: remove narrator shares held by this user. `principal_id` is not a
@@ -468,14 +455,13 @@ adminRoutes.get("/diagnostics", async (c) => {
 	const narratorStatusCounts = await db
 		.select({ status: narrators.status, value: count() })
 		.from(narrators)
-		.where(inArray(narrators.status, ["working", "waiting"]))
+		.where(
+			and(inArray(narrators.status, ["working", "waiting"]), eq(narrators.hiddenFromLists, false)),
+		)
 		.groupBy(narrators.status);
 	const narratorCountByStatus = new Map(narratorStatusCounts.map((row) => [row.status, row.value]));
 	const workingNarratorCount = narratorCountByStatus.get("working") ?? 0;
 	const waitingNarratorCount = narratorCountByStatus.get("waiting") ?? 0;
-
-	// Worktree watchers
-	const watcherPaths = worktreeWatcher.getActivePaths();
 
 	// Terminals
 	const allTerminals = await terminalService.listAll();
@@ -506,10 +492,6 @@ adminRoutes.get("/diagnostics", async (c) => {
 		narrators: {
 			thinking: workingNarratorCount,
 			waiting: waitingNarratorCount,
-		},
-		worktreeWatchers: {
-			count: worktreeWatcher.getActiveCount(),
-			paths: watcherPaths,
 		},
 		terminals: {
 			total: allTerminals.length,

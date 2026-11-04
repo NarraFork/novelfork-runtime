@@ -15,6 +15,7 @@ import {
 	type WhitelistDir,
 } from "../lib/api";
 import {
+	type BlockTarget,
 	type RevertAction,
 	type RevertActionConfirmOptions,
 	type RevertActionPreview,
@@ -33,7 +34,13 @@ import type {
 	DirectoryWhitelistRuleInput,
 	RuleTargetSelector,
 } from "../lib/api/types";
-import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
+import {
+	formatRevertFailure,
+	formatRevertSuccessWarning,
+	invalidateRevertQueries,
+	isRevertHistoryCommitted,
+} from "../lib/revert-result";
+import { removeRecentTabCascade } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
@@ -41,7 +48,6 @@ const NARRATOR_DETAIL_QUERY_GC_TIME_MS = 60_000;
 const TOOL_CALL_DETAIL_QUERY_GC_TIME_MS = 5 * 60_000;
 
 export function useNarrators(opts?: {
-	chapterId?: string;
 	standalone?: boolean;
 	status?: string;
 	sortBy?: string;
@@ -50,7 +56,7 @@ export function useNarrators(opts?: {
 	return useQuery({
 		queryKey: ["narrators", { ...opts }],
 		queryFn: () => api.listNarrators(opts),
-		enabled: !!(opts?.chapterId || opts?.standalone),
+		enabled: !!opts?.standalone,
 		gcTime: NARRATORS_LIST_GC_TIME_MS,
 	});
 }
@@ -83,14 +89,17 @@ export function useNarratorsPaginated(opts?: {
 
 export interface FileTreeStatusFile {
 	path: string;
-	linesAdded: number;
-	linesRemoved: number;
+	status?: string;
+	oldPath?: string;
+	linesAdded?: number;
+	linesRemoved?: number;
 }
 
 export interface FileTreeStatus {
 	isGitRepo: boolean;
 	files: FileTreeStatusFile[];
 	totalFiles: number;
+	totalFilesExact?: boolean;
 	truncated: boolean;
 }
 
@@ -104,56 +113,6 @@ export function useFileTreeStatus(narratorId: string, enabled = true, root?: str
 		queryKey: ["narrators", narratorId, "file-tree-status", root ?? ""],
 		queryFn: () => api.getFileTreeStatus(narratorId),
 		enabled: enabled && !!narratorId,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-// --- File rollback previews ---
-
-export function useRollbackPreview(
-	narratorId: string,
-	messageId: string | null,
-	blockIndex: number | null,
-	enabled = false,
-) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "rollback-preview", messageId, blockIndex],
-		queryFn: () => api.getRollbackPreview(narratorId, messageId as string, blockIndex as number),
-		enabled: enabled && !!messageId && blockIndex != null,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-/**
- * What editing a user message and regenerating would roll back.
- *
- * Prefetched as soon as the editor opens, so the submit handler already knows
- * whether there is anything to confirm rather than deciding after the fact.
- */
-export function useEditRegeneratePreview(
-	narratorId: string,
-	messageId: string | null,
-	enabled = false,
-) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "edit-regenerate-preview", messageId],
-		queryFn: () => api.getEditRegeneratePreview(narratorId, messageId as string),
-		enabled: enabled && !!messageId,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-/** What deleting one tool_use block would roll back, for its confirm dialog. */
-export function useBlockDeletePreview(
-	narratorId: string,
-	messageId: string | null,
-	blockIndex: number | null,
-	enabled = false,
-) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "block-delete-preview", messageId, blockIndex],
-		queryFn: () => api.blockDeletePreview(narratorId, messageId as string, blockIndex as number),
-		enabled: enabled && !!messageId && blockIndex != null,
 		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});
 }
@@ -206,7 +165,8 @@ function validPlanFile(file: RevertPlanFile): boolean {
 		boundedText(identity?.lexicalPath) &&
 		boundedText(identity?.canonicalPath) &&
 		knownState(file?.expectedStateJson?.kind) &&
-		knownState(file?.desiredStateJson?.kind)
+		(knownState(file?.desiredStateJson?.kind) ||
+			(file?.desiredStateJson?.kind === "unknown" && boundedText(file.desiredStateJson.reason)))
 	);
 }
 
@@ -321,6 +281,7 @@ export function useRevertActionPreview(
 				);
 				const expectedKind = {
 					rollback_to_block: "rollback_to_block",
+					edit_and_regenerate: "rollback_to_block",
 					delete_tool_block: "history_delete",
 					revert_files: "revert",
 				}[request.action];
@@ -331,7 +292,7 @@ export function useRevertActionPreview(
 					typeof plan.planHash !== "string" ||
 					!plan.planHash ||
 					plan.kind !== expectedKind ||
-					plan.coverageComplete !== true
+					typeof plan.coverageComplete !== "boolean"
 				) {
 					update({ loading: false, issue: "not_prepared" });
 					return;
@@ -430,6 +391,7 @@ export function useRevertActionPreview(
 			deviceId: file.identityJson.deviceId,
 			filePath: file.identityJson.displayPath,
 			willBeDeleted: file.desiredStateJson.kind === "absent",
+			unavailable: file.desiredStateJson.kind === "unknown",
 		}));
 		const issue = revoked ? "reload_required" : current?.issue;
 		return {
@@ -499,18 +461,14 @@ export function useRevertHistoryAction(narratorId: string) {
 			opts,
 		}: {
 			action: "rollback_to_block" | "delete_tool_block";
-			target: { messageId: string; blockIndex: number };
+			target: BlockTarget;
 			opts: RevertActionConfirmOptions;
 		}) => {
 			if (opts.skipRevert) {
 				const result =
 					action === "rollback_to_block"
-						? await api.rollbackToBlock(narratorId, target.messageId, target.blockIndex, {
-								skipRevert: true,
-							})
-						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex, {
-								skipRevert: true,
-							});
+						? await api.rollbackToBlock(narratorId, target, { skipRevert: true })
+						: await api.deleteMessageBlock(narratorId, target);
 				if (result.ok !== true) throw new Error(t("deleteMessageFailedDesc"));
 				return { reason: null };
 			}
@@ -519,54 +477,33 @@ export function useRevertHistoryAction(narratorId: string) {
 				throw new Error(t("revertPlanReloadRequired"));
 			}
 			const result = await api.applyRevertPlan(narratorId, plan);
-			if (
-				result.planId !== plan.planId ||
-				result.status !== "committed" ||
-				result.journalStatus !== "committed" ||
-				result.settling !== false
-			) {
+			if (result.planId !== plan.planId || !isRevertHistoryCommitted(result)) {
 				throw new ApiError(result.reason ?? t("revertPlanApplyFailed"), 409, { ...result });
 			}
 			return result;
 		},
 		onSuccess: (result) => {
-			if (result.reason) {
+			const warning = formatRevertSuccessWarning(t, result);
+			if (warning) {
 				notifications.show({
 					title: t("rollbackPartialTitle"),
-					message: result.reason,
+					message: warning,
 					color: "yellow",
 					autoClose: false,
 				});
 			}
 		},
 		onError: (error, { opts }) => {
-			const status = error instanceof ApiError ? error.data?.status : undefined;
-			const settling = error instanceof ApiError && error.data?.settling === true;
-			const reloadRequired =
-				error instanceof ApiError && error.data?.code === "REVERT_RUNTIME_RELOAD_REQUIRED";
-			const explanation = opts.skipRevert
-				? t("deleteMessageFailedDesc")
-				: reloadRequired
-					? t("revertScopeRuntimeReloadRequired")
-					: settling
-						? t("revertPlanSettling")
-						: status === "recovery_required"
-							? t("revertPlanRecoveryRequired")
-							: status === "compensated"
-								? t("revertPlanCompensated")
-								: t("revertPlanApplyFailed");
 			notifications.show({
 				title: t(opts.skipRevert ? "deleteMessageFailed" : "rollbackFailed"),
-				message: `${explanation}\n${error.message}`,
+				message: formatRevertFailure(t, error, { skipRevert: opts.skipRevert }),
 				color: "red",
 				autoClose: false,
 			});
 		},
 		onSettled: () => {
-			// A lost response or a compensated result can still change what is visible.
-			for (const resource of ["messages", "file-tree-status", "tool-calls"]) {
-				void qc.invalidateQueries({ queryKey: ["narrators", narratorId, resource] });
-			}
+			// Applied and unknown outcomes both invalidate files, including lost responses.
+			invalidateRevertQueries(qc, narratorId);
 		},
 	});
 }
@@ -644,11 +581,13 @@ export function useAskInPassing() {
 			narratorId,
 			question,
 			pendingMessageId,
+			quote,
 		}: {
 			narratorId: string;
 			question: string;
 			pendingMessageId: string;
-		}) => api.askInPassing(narratorId, { question, pendingMessageId }),
+			quote?: { label: string; text: string; anchor?: string };
+		}) => api.askInPassing(narratorId, { question, pendingMessageId, quote }),
 		// Only the narrator LISTS need refreshing (a new standalone narrator now
 		// exists). Invalidating the whole `["narrators"]` prefix also dropped every
 		// open session's messages/tool-calls/preview caches — including the panel the
@@ -765,6 +704,18 @@ export function useNarrator(id: string) {
 	});
 }
 
+/** Presentation only: decisions always go through fresh WS/REST reconciliation and server authorization. */
+export function useNarratorPanelState(narratorId: string, userId: string | null, enabled = true) {
+	return useQuery({
+		queryKey: ["narrator-panel-state", userId, narratorId],
+		queryFn: ({ signal }) => api.getNarratorPanelState(narratorId, { signal }),
+		enabled: !!narratorId && !!userId && enabled,
+		staleTime: 0,
+		retry: false,
+		gcTime: 30_000,
+	});
+}
+
 export function useNarratorUsageStats(narratorId: string, includeSubagents = true, enabled = true) {
 	return useQuery({
 		queryKey: ["narrators", narratorId, "usage-stats", { includeSubagents }],
@@ -794,7 +745,7 @@ export function useCreateNarrator() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (data: {
-			chapterId?: string | null;
+			contextProjectId?: string;
 			type?: string;
 			model?: string;
 			systemPrompt?: string;
@@ -806,9 +757,10 @@ export function useCreateNarrator() {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			cwd?: string;
+			title?: string;
 			makeNamed?: boolean;
 			handle?: string;
-			kind?: "knowledge";
+			kind?: "knowledge" | "bot";
 		}) =>
 			// No fast-mode default is injected here: new narrators keep the "inherit"
 			// override and the server resolves it against the user's fastModeDefault
@@ -823,28 +775,16 @@ export function useCreateNarrator() {
 
 export function useArchiveNarrator() {
 	const qc = useQueryClient();
+	const { t } = useTranslation("narrator");
 	return useMutation({
 		mutationFn: (id: string) => api.archiveNarrator(id),
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			// Remove all tabs associated with the archived narrator from the sidebar
-			const tabs =
-				qc.getQueryData<
-					{ type: "chapter" | "narrator" | "project"; id: string; narratorId?: string }[]
-				>(RECENT_TABS_QUERY_KEY) ?? [];
-			const isMatch = (t: (typeof tabs)[number]) =>
-				(t.type === "narrator" && t.id === narratorId) ||
-				(t.type === "chapter" && t.narratorId === narratorId);
-			const matched = tabs.filter(isMatch);
-			if (matched.length > 0) {
-				for (const tab of matched) {
-					api.removeRecentTab(tab.type, tab.id).catch(() => {});
-				}
-				qc.setQueryData(
-					RECENT_TABS_QUERY_KEY,
-					tabs.filter((t) => !isMatch(t)),
-				);
-			}
+			// Cascade cleanup after archive — no undo token for entities that are gone.
+			void removeRecentTabCascade(qc, "narrator", narratorId);
+		},
+		onError: () => {
+			notifications.show({ color: "red", message: t("archiveFailed") });
 		},
 	});
 }
@@ -1268,6 +1208,8 @@ export function useNarratorCustomTraits(id: string, enabled = true) {
 		queryKey: ["narrators", id, "custom-traits"],
 		queryFn: () => api.getCustomTraits(id),
 		enabled: !!id && enabled,
+		// Tool/model changes already invalidate this domain; avoid duplicate drawer reads.
+		staleTime: 5_000,
 		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
 	});
 }

@@ -89,7 +89,7 @@ describe("删除有数据的用户", () => {
 			updatedAt: new Date().toISOString(),
 		} as never);
 
-		const adminToken = await createToken(ADMIN, "admin");
+		const adminToken = await createToken(ADMIN);
 		const res = await appFor().request(`/api/admin/users/${TARGET}`, {
 			method: "DELETE",
 			headers: { Authorization: `Bearer ${adminToken}` },

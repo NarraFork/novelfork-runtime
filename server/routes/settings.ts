@@ -1,22 +1,38 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
+import {
+	proxyOverrideSchema,
+	proxyUrlSchema as webFetchProxyUrlSchema,
+} from "@shared/proxy-settings";
+import {
+	MAX_RECORDING_REQUEST_BYTES,
+	MAX_RECORDING_RESPONSE_BYTES,
+	MIN_RECORDING_WINDOW_BYTES,
+	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
+} from "@shared/request-recording";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
+import { updateSettingsKey } from "@shared/update-settings";
 import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMetaResolved } from "../lib/agent";
 import { serializeDiagnosticError } from "../lib/agent/diagnostic-fetch";
-import { resolveProviderAndModel } from "../lib/agent/provider";
+import { listProviderReadiness, resolveProviderAndModel } from "../lib/agent/provider";
 import { type CapturedRequest, createUrlCapture } from "../lib/agent/request-url-tracker";
-import { AsyncMutex } from "../lib/async-mutex";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
+import { peekCommandCodeModels } from "../lib/commandcode-models";
 import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
 } from "../lib/custom-api-quota-cache";
+import {
+	getDeepSeekBalanceGenerations,
+	refreshAllDeepSeekBalances,
+	syncDeepSeekBalanceCache,
+} from "../lib/deepseek-balance-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import {
@@ -29,11 +45,22 @@ import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
+import {
+	getOpencodeUsageGenerations,
+	refreshAllOpencodeUsages,
+	syncOpencodeUsageCache,
+} from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import { getHome } from "../lib/platform";
+import {
+	discoverPendingProviderBalances,
+	getProviderBalanceGenerations,
+	syncProviderBalanceCache,
+} from "../lib/provider-balance-cache";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
 import { listSearchChannels, testSearchChannel } from "../lib/search/router";
 import { normalizeSearchSettings } from "../lib/search/settings";
-import { scheduleServerRestart } from "../lib/server-restart";
+import { restartServerForResponse } from "../lib/server-restart";
 import {
 	customApiProvidersToAnthropic,
 	customApiProvidersToGemini,
@@ -43,27 +70,30 @@ import {
 	getBuiltinModelContextWindows,
 	getContextThresholds,
 	getProviderPrefixChanges,
+	hasConfiguredCommandCodeProvider,
 	isAnthropicCustomApiProtocol,
 	isGeminiCustomApiProtocol,
 	isOpenAICustomApiProtocol,
 	migrateProviderPrefixReferences,
 	type NarraForkSettings,
+	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
-	normalizeProxyUrl,
 	purgeStaleAgentModelRefs,
+	requestEvidenceFromLegacyAgent,
 	saveSettings,
 	settings,
+	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
-// Imported from lib (not the update service) so a route never depends on a service
-// for pure validation; update-service re-exports the same predicate.
-import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
+import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
+import { updateSourceSettingsSchema } from "../lib/settings/update-source";
+import { settingsUpdateLock } from "../lib/settings/write-lock";
+import { mergeSpeechSettingsPatch, redactSpeechSettings } from "../lib/speech-settings";
 import {
 	blacklistDirEntrySchema,
 	codexTierOrderSchema,
 	commandBlacklistEntrySchema,
 	commandWhitelistEntrySchema,
-	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import {
@@ -71,6 +101,7 @@ import {
 	defaultNarratorWriteAudienceSchema,
 	diskSafetySettingsSchema,
 } from "../lib/validators/settings";
+import { speechSettingsPatchSchema } from "../lib/validators/speech";
 import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
@@ -78,14 +109,15 @@ import {
 	CodexImageGenerationFixError,
 	disableCodexImageGenerationForPrefix,
 } from "../services/codex-image-generation-fix";
-import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { clearOAuthWsTickets } from "../services/oauth-ws-ticket-service";
 import { listPluginProviderModelGroups } from "../services/plugin-provider-model-source";
 import { pluginProviderRegistry } from "../services/plugin-provider-registry";
+import { getProjectDirStatus } from "../services/project-dir";
 import {
 	commitProviderPrefixMigration,
 	planProviderPrefixNarratorMigration,
 } from "../services/provider-prefix-migration-service";
+import { getTokenDanceConnection } from "../services/tokendance-service";
 import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
@@ -98,8 +130,6 @@ import {
 	purgeOpenaiProviderCache,
 } from "./openai";
 
-const settingsUpdateLock = new AsyncMutex();
-
 const modelOptionSchema = z.object({
 	value: z.string().min(1),
 	label: z.string().min(1),
@@ -110,43 +140,18 @@ const modelOptionSchema = z.object({
 
 const dangerReflectionLevelSchema = z.enum(["off", "light", "standard", "strict"]);
 
-const webFetchProxyUrlSchema = z.preprocess(
-	(value) => {
-		if (typeof value !== "string") return value;
-		const trimmed = value.trim();
-		if (!trimmed) return undefined;
-		return normalizeProxyUrl(trimmed) ?? trimmed;
-	},
-	z
-		.string()
-		.regex(/^https?:\/\//)
-		.optional(),
-);
-
-/** Per-location proxy override: default (inherit global) / direct / system / custom. */
-const proxyOverrideSchema = z
-	.object({
-		mode: z.enum(["default", "direct", "system", "custom"]),
-		url: webFetchProxyUrlSchema,
-	})
-	.superRefine((value, ctx) => {
-		if (value.mode === "custom" && !value.url) {
-			ctx.addIssue({
-				code: "custom",
-				path: ["url"],
-				message: "Custom proxy mode requires a valid HTTP or HTTPS URL",
-			});
-		}
-	})
-	.optional();
-
+// Accepts the current 4 protocols plus the 4 removed legacy values; inbound
+// payloads are normalized (legacy → current) before persistence/derivation.
 const customApiProtocolSchema = z.enum([
+	"anthropic-messages",
+	"openai-responses",
+	"completions-compatible",
+	"gemini-compatible",
+	// Legacy values, migrated by normalizeCustomApiProvider.
 	"anthropic-official",
 	"anthropic-compatible",
 	"codex-native",
 	"responses-compatible",
-	"completions-compatible",
-	"gemini-compatible",
 ]);
 
 const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom"]).optional();
@@ -243,6 +248,9 @@ const nugProviderSchema = z.object({
 });
 
 const geminiProviderSchema = z.object({
+	userAgentMode: userAgentModeSchema,
+	customUserAgent: customUserAgentSchema,
+	extraHeaders: extraHeadersSchema,
 	id: z.string().min(1),
 	name: z.string(),
 	prefix: z.string().min(1),
@@ -318,6 +326,8 @@ const externalWebSocketOriginSchema = z
  */
 export const updateSettingsSchema = z
 	.object({
+		// Optional request precondition, never a persisted setting.
+		expectedUpdateSettingsKey: z.string().max(2048).optional(),
 		server: z
 			.object({
 				port: z.number().int().min(1).max(65535),
@@ -326,6 +336,7 @@ export const updateSettingsSchema = z
 				tls: z
 					.object({
 						enabled: z.boolean(),
+						autoReissue: z.boolean().default(true),
 						certFile: z.string(),
 						keyFile: z.string(),
 						passphrase: z.string().optional(),
@@ -353,7 +364,8 @@ export const updateSettingsSchema = z
 		diskSafety: diskSafetySettingsSchema.optional(),
 		paths: z
 			.object({
-				defaultProjectDir: z.string().min(1),
+				// "" = unset; a non-empty value must name an existing directory (checked on save).
+				defaultProjectDir: z.string().trim(),
 				/**
 				 * Extra roots the in-browser editor may write to.
 				 *
@@ -401,6 +413,30 @@ export const updateSettingsSchema = z
 				promptOptimizeContextMaxMessages: z.number().int().min(1).max(50),
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
+				/** 逐模型的协议覆盖，键为带前缀的完整模型 ID。 */
+				modelProtocols: z
+					.record(
+						z.string(),
+						z.enum([
+							"anthropic-messages",
+							"openai-responses",
+							"completions-compatible",
+							"gemini-compatible",
+						]),
+					)
+					.optional(),
+				/** 「编辑此连接覆盖」里单独保存的协议，优先级高于 modelProtocols。 */
+				modelProtocolOverrides: z
+					.record(
+						z.string(),
+						z.enum([
+							"anthropic-messages",
+							"openai-responses",
+							"completions-compatible",
+							"gemini-compatible",
+						]),
+					)
+					.optional(),
 				maxTurns: z.number().int().min(1).max(1000),
 				subagentModels: z
 					.object({
@@ -423,8 +459,6 @@ export const updateSettingsSchema = z
 				legacyEncoding: z.boolean(),
 				freshShellEnv: z.boolean(),
 				translateReasoning: z.boolean(),
-				requestDumpEnabled: z.boolean(),
-				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				planModeAllowInlinePlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
@@ -496,8 +530,12 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
-				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
-				modelCards: z.array(modelCardSchema).max(500).optional(),
+				// Windows are edited through the model catalog now. A page loaded before the
+				// upgrade still sends its old map; reject it rather than drop its edits silently.
+				modelContextWindows: z.unknown().refine(() => false, {
+					message:
+						"Context windows are now saved from each model row; reload the page and set them again",
+				}),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),
@@ -555,28 +593,38 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		chapters: z
+		requestEvidence: z
 			.object({
-				maxActiveWorktrees: z.number().int().min(1),
-				maxActiveContainers: z.number().int().min(0),
-				worktreeSizeWarningMb: z.number().int().min(0),
-				autoSaveOnDormant: z.boolean(),
-				dormantAfterMinutes: z.number().int().min(0),
-				treeSnapshotsEnabled: z.boolean(),
+				ringEnabled: z.boolean(),
+				ringRequestBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_REQUEST_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				ringResponseBytes: z
+					.number()
+					.int()
+					.min(0)
+					.max(MAX_RECORDING_RESPONSE_BYTES)
+					.refine(
+						(value) => value === 0 || value >= MIN_RECORDING_WINDOW_BYTES,
+						"Use 0 to disable recording, or at least 1024 bytes",
+					),
+				autoPin: z.enum(REQUEST_EVIDENCE_AUTO_PIN_VALUES),
 			})
 			.partial()
 			.optional(),
-		containers: z
+		workspace: z.object({ treeSnapshotsEnabled: z.boolean() }).partial().optional(),
+		outline: z.object({ enabled: z.boolean() }).partial().optional(),
+		narratorBlocks: z
 			.object({
-				portRangeStart: z.number().int().min(1).max(65535),
-				portRangeEnd: z.number().int().min(1).max(65535),
-				proxy: z
-					.object({
-						enabled: z.boolean(),
-						port: z.number().int().min(1).max(65535),
-					})
-					.partial()
-					.optional(),
+				write: z.boolean(),
+				read: z.boolean(),
+				compactJson: z.boolean(),
 			})
 			.partial()
 			.optional(),
@@ -628,6 +676,21 @@ export const updateSettingsSchema = z
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 		nugProviders: z.array(nugProviderSchema).optional(),
 		geminiProviders: z.array(geminiProviderSchema).optional(),
+		commandCode: z
+			.object({
+				disabled: z.boolean().optional(),
+				apiKey: z.string().optional(),
+				baseUrl: z.string().optional(),
+				endpoints: z
+					.record(z.string(), z.enum(["messages", "completions", "responses"]))
+					.optional(),
+				proxy: proxyOverrideSchema,
+				userAgentMode: userAgentModeSchema,
+				customUserAgent: customUserAgentSchema,
+				extraHeaders: extraHeadersSchema,
+			})
+			.partial()
+			.optional(),
 		codex: z
 			.object({
 				proxy: proxyOverrideSchema,
@@ -651,6 +714,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		speech: speechSettingsPatchSchema.optional(),
 		search: searchSettingsSchema.optional(),
 		routines: z
 			.object({
@@ -660,31 +724,7 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		update: z
-			.object({
-				// "" clears the override so the built-in default server is used again.
-				//
-				// The https refine is a real gate, not cosmetics: update payloads are trusted
-				// on TLS alone (the expected SHA-512 ships in the same response as the
-				// binary), so a plaintext origin hands a man in the middle code execution.
-				// `getServerBaseUrl` already refuses to fetch from one, but without this an
-				// administrator typing `http://` would get a 200 and a silently disabled
-				// updater instead of being told why.
-				serverUrl: z
-					.union([
-						z.string().url().refine(isTrustedUpdateServerUrl, {
-							message: "Update server must use https (plaintext http is only allowed for loopback)",
-						}),
-						z.literal(""),
-					])
-					.optional(),
-				product: z.string().min(1).optional(),
-				channel: z.enum(["stable", "beta"]).optional(),
-				checkIntervalMinutes: z.number().int().min(0).optional(),
-				autoDownload: z.boolean().optional(),
-			})
-			.partial()
-			.optional(),
+		update: updateSourceSettingsSchema,
 		vnet: z
 			.object({
 				enabled: z.boolean(),
@@ -731,7 +771,7 @@ export const updateSettingsSchema = z
 	})
 	.strict();
 
-function normalizeLegacySettingsPatch(body: unknown): unknown {
+export function normalizeLegacySettingsPatch(body: unknown): unknown {
 	if (!body || typeof body !== "object" || Array.isArray(body)) return body;
 	const draft = { ...(body as Record<string, unknown>) };
 	stripObsoleteSettingsKeys(draft);
@@ -749,6 +789,16 @@ function normalizeLegacySettingsPatch(body: unknown): unknown {
 			agent.dangerReflectionEnabled = agent.dangerReflectionLevel !== "off";
 		} else if ("dangerReflectionEnabled" in agent) {
 			agent.dangerReflectionLevel = agent.dangerReflectionEnabled === false ? "off" : "standard";
+		}
+		// Legacy clients still send `agent.requestDump*`; an explicit section wins.
+		const legacyEvidence = requestEvidenceFromLegacyAgent(agent);
+		if (legacyEvidence) {
+			const explicit =
+				draft.requestEvidence && typeof draft.requestEvidence === "object"
+					? (draft.requestEvidence as Record<string, unknown>)
+					: {};
+			draft.requestEvidence = { ...legacyEvidence, ...explicit };
+			stripLegacyRequestDumpKeys(agent);
 		}
 		draft.agent = agent;
 	}
@@ -857,6 +907,7 @@ export function buildServerRestartUrl(
 	port: number,
 	tlsEnabled: boolean,
 ): string {
+	// host/port/protocol must come from the actual listener, never from configured auto-lan intent.
 	const redirectHost = isWildcardListenHost(host) ? new URL(requestUrl).hostname : host;
 	return `${tlsEnabled ? "https" : "http"}://${formatUrlHost(redirectHost)}:${port}`;
 }
@@ -876,15 +927,24 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
-function buildSettingsResponse(
+async function buildSettingsResponse(
 	source: NarraForkSettings,
 	extra?: { serverRestarting?: boolean; newUrl?: string },
 ) {
 	const codexManager = getCodexManager();
 	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
 	stripObsoleteSettingsKeys(safeSource);
+	const commandCodeCatalog = peekCommandCodeModels(
+		source.commandCode?.apiKey,
+		source.commandCode?.baseUrl,
+	);
 	return {
 		...safeSource,
+		providerReadiness: await listProviderReadiness(),
+		// Explicit override prevents backend credentials leaking through the spread.
+		tokendance: getTokenDanceConnection(),
+		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
+		providerBalanceGenerations: getProviderBalanceGenerations(),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -914,11 +974,17 @@ function buildSettingsResponse(
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
 		})),
+		// 与其它 provider 一致：只回传脱敏值，前端据此提示"已保存"。
+		commandCode: {
+			...source.commandCode,
+			apiKey: source.commandCode?.apiKey ? maskApiKey(source.commandCode.apiKey) : "",
+		},
 		geminiProviders: (source.geminiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
 		vnet: maskVNetSettings(source.vnet),
+		speech: redactSpeechSettings(source.speech),
 		search: maskSearchSettings(source.search),
 		// Executable-plugin providers, grouped per provider prefix. Read straight from
 		// the in-memory registry; no plugin process is started to build this.
@@ -938,8 +1004,15 @@ function buildSettingsResponse(
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		kimiUsages: getAllKimiCachedUsages(),
-		codexAvailable: codexManager.snapshot().available > 0,
+		// Opaque runtime tokens for the OpenCode Go usage cache. The panel compares
+		// them so an allowance fetched for a replaced account is never rendered
+		// under the new one.
+		opencodeUsageGenerations: getOpencodeUsageGenerations(),
+		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
+		commandcodeAvailable: hasConfiguredCommandCodeProvider(),
+		commandcodeModels: commandCodeCatalog.models,
+		commandcodeModelsPending: commandCodeCatalog.pending,
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
 		lanAddresses: getLanAddresses(),
 		summaryModelAvailable: checkSummaryModelAvailable(source.agent.summaryModel),
@@ -1141,7 +1214,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
-	// (summaryModel, hiddenModels, modelContextWindows, customModels) that reference stale models.
+	// (summaryModel, hiddenModels, provider-model overrides, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
 	const removedProviderGroups = [
 		{ ids: removedCustomApiIds, providers: prev.customApiProviders },
@@ -1168,8 +1241,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	}
 }
 
-settingsRoutes.get("/", (c) => {
-	return c.json(buildSettingsResponse(settings));
+settingsRoutes.get("/", async (c) => {
+	return c.json(await buildSettingsResponse(settings));
 });
 
 settingsRoutes.get("/context-thresholds", (c) => {
@@ -1359,14 +1432,32 @@ settingsRoutes.get("/search/protocols", (c) => {
 	return c.json(PROTOCOL_REGISTRY);
 });
 
-settingsRoutes.patch("/", requireAdmin, async (c) =>
-	settingsUpdateLock.acquire("settings", async () => {
+settingsRoutes.patch("/", requireAdmin, async (c) => {
+	const requestStartedAt = performance.now();
+	return settingsUpdateLock.acquire("settings", async () => {
+		const lockAcquiredAt = performance.now();
 		const body = normalizeLegacySettingsPatch(await c.req.json());
 		const parsed = updateSettingsSchema.safeParse(body);
-		if (!parsed.success) throw new ValidationError(parsed.error.message);
+		if (!parsed.success) {
+			// Never serialize speech credential-bearing validation paths or rejected input.
+			if (parsed.error.issues.some((issue) => issue.path[0] === "speech")) {
+				throw new ValidationError("Invalid speech settings patch");
+			}
+			throw new ValidationError(parsed.error.message);
+		}
 
 		const current = structuredClone(settings);
-		const validated = parsed.data;
+		const { expectedUpdateSettingsKey, ...validated } = parsed.data;
+		// Check inside the same lock as the save; a preceding GET cannot prevent races.
+		if (
+			expectedUpdateSettingsKey !== undefined &&
+			expectedUpdateSettingsKey !== updateSettingsKey(current.update)
+		) {
+			return c.json(
+				{ error: "Update settings changed. Check again.", code: "UPDATE_SOURCE_CHANGED" },
+				409,
+			);
+		}
 
 		const effectiveCustomApiProviders =
 			validated.customApiProviders ??
@@ -1378,19 +1469,42 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["codex"]);
-			const allPrefixes: Array<{ prefix: string; source: string }> = [];
+			const RESERVED_PREFIXES = new Set(["codex", "tokendance"]);
+			const allPrefixes: Array<{ prefix: string; source: string; legacyTokenDance?: boolean }> = [];
+			const previousCustomProviders = [
+				...(current.customApiProviders ?? []),
+				...(current.openaiProviders ?? []),
+				...(current.anthropicProviders ?? []),
+				...(current.geminiProviders ?? []),
+			];
 			for (const p of effectiveCustomApiProviders) {
 				if (p.prefix) {
-					allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
+					allPrefixes.push({
+						prefix: p.prefix,
+						source: `Custom API "${p.name || p.id}"`,
+						legacyTokenDance: isLegacyTokenDancePrefixAllowed(
+							p,
+							previousCustomProviders,
+							!!current.tokendance?.apiKey,
+						),
+					});
 				}
 			}
 			for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
-				if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
+				if (p.prefix)
+					allPrefixes.push({
+						prefix: p.prefix,
+						source: `NUG "${p.name || p.id}"`,
+						legacyTokenDance: isLegacyTokenDancePrefixAllowed(
+							p,
+							current.nugProviders ?? [],
+							!!current.tokendance?.apiKey,
+						),
+					});
 			}
 			// Check reserved prefix conflicts
-			for (const { prefix, source } of allPrefixes) {
-				if (RESERVED_PREFIXES.has(prefix)) {
+			for (const { prefix, source, legacyTokenDance } of allPrefixes) {
+				if (RESERVED_PREFIXES.has(prefix) && !legacyTokenDance) {
 					throw new ValidationError(
 						`Provider prefix "${prefix}" is reserved (built-in provider). ` +
 							`Please choose a different prefix for ${source}.`,
@@ -1411,8 +1525,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			}
 		}
 
-		const oldProxyEnabled = current.containers.proxy.enabled;
-		const oldProxyPort = current.containers.proxy.port;
 		const oldHost = current.server.host;
 		const oldPort = current.server.port;
 		const oldTls = current.server.tls;
@@ -1442,6 +1554,21 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		// Preserve real VNet relay token when the client sends a masked display value.
 		if (validated.vnet?.relayToken?.startsWith("*")) {
 			validated.vnet.relayToken = current.vnet?.relayToken;
+		}
+
+		// A newly chosen default project directory must already exist: nothing creates it,
+		// and a missing default leaves every new session without a working directory.
+		// Re-saving an unchanged value is allowed even if it has since disappeared, so an
+		// unrelated settings save never fails on it.
+		const nextProjectDir = validated.paths?.defaultProjectDir;
+		if (nextProjectDir && nextProjectDir !== current.paths.defaultProjectDir) {
+			const status = getProjectDirStatus(nextProjectDir, getHome());
+			if (status.state !== "valid") {
+				throw new ValidationError(
+					`Default project directory is not an existing directory: ${status.path ?? nextProjectDir}`,
+					"PROJECT_DIR_NOT_FOUND",
+				);
+			}
 		}
 
 		// Validate TLS cert/key files exist when enabling TLS
@@ -1474,16 +1601,21 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			current.geminiProviders?.find((p) => p.id === id)?.apiKey ??
 			"";
 
-		// Preserve real API keys for unified custom API providers.
+		// Preserve real API keys for unified custom API providers. Inbound protocols
+		// are normalized first so legacy values migrate before storage/derivation.
 		if (validated.customApiProviders) {
-			for (const p of validated.customApiProviders) {
+			const normalizedCustomApiProviders = validated.customApiProviders.map((p) =>
+				normalizeCustomApiProvider(p),
+			);
+			for (const p of normalizedCustomApiProviders) {
 				if (p.apiKey?.startsWith("*")) {
 					p.apiKey = findExistingCustomApiKey(p.id);
 				}
 			}
-			validated.openaiProviders = customApiProvidersToOpenAI(validated.customApiProviders);
-			validated.anthropicProviders = customApiProvidersToAnthropic(validated.customApiProviders);
-			validated.geminiProviders = customApiProvidersToGemini(validated.customApiProviders);
+			validated.customApiProviders = normalizedCustomApiProviders;
+			validated.openaiProviders = customApiProvidersToOpenAI(normalizedCustomApiProviders);
+			validated.anthropicProviders = customApiProvidersToAnthropic(normalizedCustomApiProviders);
+			validated.geminiProviders = customApiProvidersToGemini(normalizedCustomApiProviders);
 		}
 
 		// Preserve real API keys for OpenAI-compatible providers.
@@ -1544,6 +1676,12 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			}
 		}
 
+		// Preserve the real Command Code API key when the client echoes back the masked
+		// display value (the settings page submits the whole draft, edited or not).
+		if (validated.commandCode?.apiKey?.startsWith("*")) {
+			validated.commandCode.apiKey = current.commandCode?.apiKey ?? "";
+		}
+
 		// Preserve real API keys and sensitive headers for custom search providers.
 		if (validated.search?.customProviders) {
 			const currentProviders = current.search?.customProviders ?? [];
@@ -1567,6 +1705,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 				// Array — replace entirely, don't merge
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				(merged as any)[key] = val;
+			} else if (key === "speech") {
+				merged.speech = mergeSpeechSettingsPatch(current.speech, val);
 			} else if (key === "proxy") {
 				// Replace entirely so switching modes drops the stale custom url.
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1620,31 +1760,25 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		purgeRemovedProviderCaches(current, merged);
 		const prefixPlan = await planProviderPrefixNarratorMigration(prefixChanges);
 
-		// Apply container proxy runtime changes first, then persist settings.
-		// This keeps persisted config and runtime state consistent if start/restart fails.
-		const newProxyEnabled = merged.containers.proxy.enabled;
-		const newProxyPort = merged.containers.proxy.port;
-		if (oldProxyEnabled !== newProxyEnabled || oldProxyPort !== newProxyPort) {
-			try {
-				await ensureContainerProxyRuntime({
-					enabled: newProxyEnabled,
-					port: newProxyPort,
-				});
-			} catch (err) {
-				throw new ValidationError(`Container proxy runtime update failed: ${String(err)}`);
-			}
-		}
-
 		const vnetChanged = JSON.stringify(oldVNet ?? null) !== JSON.stringify(merged.vnet ?? null);
 
 		let migratedNarrators: Awaited<
 			ReturnType<typeof planProviderPrefixNarratorMigration>
 		>["narrators"] = [];
+		const persistStartedAt = performance.now();
 		if (prefixChanges.length > 0) {
 			migratedNarrators = commitProviderPrefixMigration(current, merged, prefixPlan);
 		} else {
 			saveSettings(merged);
 		}
+		// Invalidate account/transport identities immediately after a successful save.
+		syncDeepSeekBalanceCache();
+		syncProviderBalanceCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllDeepSeekBalances().catch(() => {});
+			discoverPendingProviderBalances();
+		}
+		const persistFinishedAt = performance.now();
 		// Reconcile client-egress relay channels with the saved NUG provider
 		// configs: new local-egress providers connect immediately, removed or
 		// reverted providers are torn down (docs/CODEX_CLIENT_RELAY.md).
@@ -1670,6 +1804,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			void refreshAllKimiUsages().catch(() => {});
 		}
 
+		// Invalidate account/transport identities immediately after a successful
+		// save, then warm the new ones so a freshly added (or replaced) OpenCode Go
+		// provider shows its allowance without waiting for the next staleness window.
+		syncOpencodeUsageCache();
+		if (validated.customApiProviders || validated.proxy) {
+			void refreshAllOpencodeUsages().catch(() => {});
+		}
+
 		if (vnetChanged) {
 			const closedConnections = closeVNetConnections("vnet settings changed");
 			const status = await startVNetUdpRendezvous(merged.vnet);
@@ -1681,18 +1823,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		const newPort = merged.server.port;
 		const newTls = merged.server.tls;
 		const serverAddressChanged = newHost !== oldHost || newPort !== oldPort;
-		// Compare TLS configs — treat undefined and {enabled:false} as equivalent (both mean "no TLS")
-		const oldTlsEffective = oldTls?.enabled ? oldTls : undefined;
-		const newTlsEffective = newTls?.enabled ? newTls : undefined;
+		// autoReissue only affects the next startup, not the running TLS listener.
+		// Disabled and absent TLS configs are equivalent.
+		const oldTlsEffective = oldTls?.enabled ? { ...oldTls, autoReissue: undefined } : undefined;
+		const newTlsEffective = newTls?.enabled ? { ...newTls, autoReissue: undefined } : undefined;
 		const tlsChanged = JSON.stringify(oldTlsEffective) !== JSON.stringify(newTlsEffective);
 		const needsRestart = serverAddressChanged || tlsChanged;
 
-		if (needsRestart) {
-			scheduleServerRestart(newHost, newPort);
-		}
-
-		const newUrl = needsRestart
-			? buildServerRestartUrl(c.req.url, newHost, newPort, newTls?.enabled === true)
+		const address = needsRestart ? await restartServerForResponse(newHost, newPort) : undefined;
+		const newUrl = address
+			? buildServerRestartUrl(c.req.url, address.host, address.port, address.protocol === "https")
 			: undefined;
 
 		// Observability: record who changed the instance-wide summary model and to
@@ -1708,14 +1848,28 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			});
 		}
 
-		return c.json(
-			buildSettingsResponse(merged, {
+		const responseStartedAt = performance.now();
+		const response = c.json(
+			await buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,
 				newUrl,
 			}),
 		);
-	}),
-);
+		const finishedAt = performance.now();
+		if (finishedAt - requestStartedAt >= 500) {
+			// Timings only: never log settings contents or provider credentials.
+			logger.warn("Slow settings PATCH", {
+				totalMs: Math.round(finishedAt - requestStartedAt),
+				lockWaitMs: Math.round(lockAcquiredAt - requestStartedAt),
+				prepareMs: Math.round(persistStartedAt - lockAcquiredAt),
+				persistMs: Math.round(persistFinishedAt - persistStartedAt),
+				runtimeMs: Math.round(responseStartedAt - persistFinishedAt),
+				responseMs: Math.round(finishedAt - responseStartedAt),
+			});
+		}
+		return response;
+	});
+});
 
 // Generate a TLS certificate and enable HTTPS.
 //
@@ -1743,12 +1897,10 @@ settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
 	};
 	saveSettings(merged);
 
-	// Schedule server restart to apply TLS
-	const host = merged.server.host;
-	const port = merged.server.port;
-	scheduleServerRestart(host, port);
-
-	const newUrl = buildServerRestartUrl(c.req.url, host, port, true);
+	const address = await restartServerForResponse(merged.server.host, merged.server.port);
+	const newUrl = address
+		? buildServerRestartUrl(c.req.url, address.host, address.port, address.protocol === "https")
+		: undefined;
 	return c.json({
 		certPath: result.certPath,
 		keyPath: result.keyPath,
@@ -1863,6 +2015,8 @@ settingsRoutes.post("/fix-provider-baseurl", requireAdmin, async (c) => {
 		geminiProviders: customApiProvidersToGemini(nextCustomApiProviders),
 	};
 	saveSettings(merged);
+	syncProviderBalanceCache();
+	discoverPendingProviderBalances();
 
 	logger.info("Provider base URL fixed with /v1 suffix", {
 		providerId: target.id,

@@ -197,6 +197,30 @@ export class MeasureCache {
  * Returns true if the spec key represents a streaming/transient item whose
  * content is still changing (height would be stale on next measure).
  */
+function toolTimingRevision(source: Record<string, unknown>): string {
+	let revision = "";
+	for (const key of [
+		"durationMs",
+		"execDurationMs",
+		"streamStartedAt",
+		"streamCompletedAt",
+		"permissionStartedAt",
+		"executionStartedAt",
+		"completedAt",
+		"createdAt",
+		"startedAt",
+	]) {
+		if (typeof source[key] === "number") revision += `|timing:${key}:${source[key]}`;
+	}
+	if (source.fileChangeTiming != null && typeof source.fileChangeTiming === "object") {
+		const file = source.fileChangeTiming as Record<string, unknown>;
+		for (const key of ["waitMs", "executionMs", "totalMs"]) {
+			if (typeof file[key] === "number") revision += `|fileTiming:${key}:${file[key]}`;
+		}
+	}
+	return revision;
+}
+
 export function isStreamingKey(key: string): boolean {
 	return key.includes("__streaming__");
 }
@@ -288,6 +312,8 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// rebuild serves the pre-update measured payload and the header keeps showing
 	// the OLD timeout even though the server already applied the new one.
 	if (typeof d.timeoutMs === "number") rev += `|to:${d.timeoutMs}`;
+	// Timing corrections can land on terminal records without changing their body/status.
+	rev += toolTimingRevision(d);
 	// Truncated-payload state. Height-AFFECTING (a non-zero count reserves the
 	// truncation notice row) and, more importantly, the ONLY key component that
 	// moves when a fetched payload lands: `status` is already terminal, and the
@@ -551,8 +577,7 @@ function traceRevision(d: Record<string, unknown>): string {
 		// with it (running → success arrives together with `durationMs`); this keys the
 		// value directly so a duration-only correction cannot serve a stale row.
 		if (r.timing != null && typeof r.timing === "object") {
-			const duration = (r.timing as Record<string, unknown>).durationMs;
-			if (typeof duration === "number") rev += `|tm:${duration}`;
+			rev += toolTimingRevision(r.timing as Record<string, unknown>);
 		}
 		// The figure actually PAINTED, which for bash is the pure execution time rather
 		// than `timing.durationMs` (see `@shared/tool-display-duration`). Keyed
@@ -664,6 +689,10 @@ function subagentRevision(d: Record<string, unknown>): string {
 	const inh = d.modelInheritance as { source?: string; model?: string } | undefined;
 	if (inh?.source) rev += `|gi:${inh.source}:${inh.model ?? ""}`;
 	if (typeof d.reasoningEffort === "string") rev += `|ge:${d.reasoningEffort}`;
+	// Live output count badge — same fixed badge row (height-neutral), but painted
+	// from the cached payload and advanced by the streaming channel alone, so it
+	// must re-key or the number freezes at whatever the first measure saw.
+	if (typeof d.liveOutputChars === "number") rev += `|gl:${d.liveOutputChars}`;
 	if (d.isBackground === true) rev += "|gg:1";
 	// Takeover badge — same fixed badge row as `isBackground`, so height-neutral,
 	// but the takeover patch writes it ALONE (the card stays `running` throughout),
@@ -926,6 +955,24 @@ function leafTextRevision(d: Record<string, unknown>): string {
 		rev += `|doc:${doc.id}:${doc.epoch}:${doc.revision}:${doc.length}:${doc.complete}`;
 	}
 	if (typeof d.text === "string") rev += `|tx:${textSignature(d.text)}`;
+	// Meta rows (an Await card's identity line / wait_for row, a Share card's
+	// actions): each row reserves its own block, so a row appearing — the awaited
+	// child's resolved id landing mid-wait — changes the measured height. Key the
+	// text-bearing fields plus the fixed-slot counts (badge/action rows reserve
+	// one block each); the badge/action payloads themselves are render-only.
+	if (Array.isArray(d.rows)) {
+		rev += `|rows:${d.rows
+			.map((r) => {
+				const row = r as Record<string, unknown> | null;
+				if (!row) return "-";
+				const text = typeof row.text === "string" ? textSignature(row.text) : "";
+				const identity = typeof row.identity === "string" ? textSignature(row.identity) : "";
+				return `${text}:${identity}:${Array.isArray(row.badges) ? row.badges.length : 0}:${
+					Array.isArray(row.actions) ? row.actions.length : 0
+				}`;
+			})
+			.join(";")}`;
+	}
 	for (const key of [
 		"id",
 		"source",

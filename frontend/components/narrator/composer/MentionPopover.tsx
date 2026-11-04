@@ -8,9 +8,10 @@ import {
 	useComputedColorScheme,
 } from "@mantine/core";
 import { foldHandle, HANDLE_CHAR_RE, HANDLE_START_RE } from "@shared/narrator-handle";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../../lib/z-index";
+import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
 
 export interface MentionCandidate {
 	id: string;
@@ -25,6 +26,7 @@ interface MentionPopoverProps {
 	/** The active @token query (text after @, without the @). null = not mentioning. */
 	query: string | null;
 	visible: boolean;
+	anchorRef?: RefObject<HTMLElement | null>;
 	/** Called with the chosen handle when the user selects/confirms. */
 	onSelect: (candidate: MentionCandidate) => void;
 	onClose: () => void;
@@ -67,6 +69,7 @@ export function MentionPopover({
 	candidates,
 	query,
 	visible,
+	anchorRef,
 	onSelect,
 	onClose,
 }: MentionPopoverProps) {
@@ -104,6 +107,12 @@ export function MentionPopover({
 	const handleKeyDown = useCallback(
 		(e: KeyboardEvent) => {
 			if (!visible || filtered.length === 0) return;
+			const anchor = anchorRef?.current;
+			if (
+				anchorRef &&
+				(!anchor || !e.target || !(e.target as Node).nodeType || !anchor.contains(e.target as Node))
+			)
+				return;
 			// The listener is capture-phase, so it sees the keystroke before the IME
 			// candidate list does. While a CJK query is being composed, Enter/Tab pick
 			// a candidate and the arrows move through them — stealing those left the
@@ -124,15 +133,19 @@ export function MentionPopover({
 				onClose();
 			}
 		},
-		[visible, filtered, selectedIndex, onSelect, onClose],
+		[visible, filtered, selectedIndex, onSelect, onClose, anchorRef],
 	);
 
 	useEffect(() => {
 		if (visible) {
-			document.addEventListener("keydown", handleKeyDown, true);
-			return () => document.removeEventListener("keydown", handleKeyDown, true);
+			const doc = anchorRef?.current?.ownerDocument ?? document;
+			doc.addEventListener("keydown", handleKeyDown, true);
+			return () => doc.removeEventListener("keydown", handleKeyDown, true);
 		}
-	}, [visible, handleKeyDown]);
+	}, [visible, handleKeyDown, anchorRef]);
+
+	// List cap (240) plus the gap to the composer.
+	const popoverSide = useComposerPopoverSide(anchorRef, visible, 248);
 
 	if (!visible || filtered.length === 0) return null;
 
@@ -143,10 +156,9 @@ export function MentionPopover({
 			withBorder
 			style={{
 				position: "absolute",
-				bottom: "100%",
+				...composerPopoverOffset(popoverSide),
 				left: 0,
 				right: 0,
-				marginBottom: 4,
 				maxHeight: 240,
 				overflow: "auto",
 				zIndex: Z.dropdown,
@@ -162,6 +174,7 @@ export function MentionPopover({
 					data-mention-item
 					// Prevent the textarea from losing focus before the click lands —
 					// otherwise onBlur tears down this popover and the click never fires.
+					onPointerDown={(e) => e.preventDefault()}
 					onMouseDown={(e) => e.preventDefault()}
 					onClick={() => onSelect(c)}
 					onMouseEnter={() => setSelectedIndex(i)}

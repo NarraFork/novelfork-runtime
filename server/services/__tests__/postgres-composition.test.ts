@@ -19,7 +19,6 @@ import {
 import { sqliteAuthMfaStore } from "../auth/sqlite-mfa-store";
 import { sqliteAuthSessionStore } from "../auth/sqlite-session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../auth/store";
-import { chapterWriteStore, setChapterWriteStore } from "../chapter-write/store";
 import {
 	knowledgeReadStore,
 	knowledgeWriteStore,
@@ -27,8 +26,8 @@ import {
 	setKnowledgeWriteStore,
 } from "../knowledge/store";
 import { bindNarratorMessageRefs, getNarratorMessageRefsPort } from "../narrator-refs/store";
+import { outlineAccessBackend, setOutlineAccessExecutor } from "../outline/access-reads";
 import { activatePostgresRuntimeQueue, composePostgresStores } from "../postgres-composition";
-import { projectArchiveMainStore, setProjectArchiveMainStore } from "../project-archive/store";
 import { projectReadAdapter, setProjectReadAdapter } from "../read";
 import { PostgresProjectReadAdapter } from "../read/postgres-project-read-adapter";
 import { sqliteRegistrationAccountStore } from "../registration/sqlite-account-store";
@@ -65,11 +64,10 @@ afterAll(() => {
 	setAuthStores(undefined);
 	setKnowledgeWriteStore(undefined);
 	setKnowledgeReadStore(undefined);
-	setChapterWriteStore(undefined);
-	setProjectArchiveMainStore(undefined);
 	setProjectReadAdapter(undefined);
 	setPostgresRuntimeQueue(undefined);
 	bindNarratorMessageRefs(undefined);
+	setOutlineAccessExecutor(undefined);
 	// `composePostgresStores` binds the module-level postgres search client; restore the
 	// fail-closed default so the search-backend contract's "fails closed before binding"
 	// assertion still holds when both files run in one process.
@@ -81,6 +79,7 @@ describe("composePostgresStores", () => {
 		expect(registrationAccountStore).toBe(sqliteRegistrationAccountStore);
 		expect(authSessionStore).toBe(sqliteAuthSessionStore);
 		expect(authMfaStore).toBe(sqliteAuthMfaStore);
+		expect(outlineAccessBackend()).toBe("sqlite");
 
 		composePostgresStores(stubRuntime());
 
@@ -90,6 +89,7 @@ describe("composePostgresStores", () => {
 		expect(authMfaStore).not.toBe(sqliteAuthMfaStore);
 		expect(projectReadAdapter()).toBeInstanceOf(PostgresProjectReadAdapter);
 		expect(isPostgresSearchBound()).toBe(true);
+		expect(outlineAccessBackend()).toBe("postgres");
 
 		// The write stores expose no class to assert on; the observable claim is that the
 		// binding was swapped away from the environment-resolved default and swapping back
@@ -99,21 +99,15 @@ describe("composePostgresStores", () => {
 		const injectedMfa = authMfaStore;
 		const injectedKnowledge = knowledgeWriteStore;
 		const injectedKnowledgeRead = knowledgeReadStore;
-		const injectedChapter = chapterWriteStore;
-		const injectedArchive = projectArchiveMainStore;
 		setAuthStores(undefined);
 		setKnowledgeWriteStore(undefined);
 		setKnowledgeReadStore(undefined);
-		setChapterWriteStore(undefined);
-		setProjectArchiveMainStore(undefined);
 		expect(authSessionStore).not.toBe(injectedSession);
 		expect(authMfaStore).not.toBe(injectedMfa);
 		expect(authSessionStore).toBe(sqliteAuthSessionStore);
 		expect(authMfaStore).toBe(sqliteAuthMfaStore);
 		expect(knowledgeWriteStore).not.toBe(injectedKnowledge);
 		expect(knowledgeReadStore).not.toBe(injectedKnowledgeRead);
-		expect(chapterWriteStore).not.toBe(injectedChapter);
-		expect(projectArchiveMainStore).not.toBe(injectedArchive);
 	});
 
 	test("binds the runtime queue and narrator refs ports without querying at construction", () => {

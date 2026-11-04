@@ -1,5 +1,6 @@
 import type { ExecutorPathRule } from "@shared/executor-path-rules";
 import type {
+	ExecutorInstallTarget,
 	ExecutorManifest,
 	ExecutorPlatform,
 	ExecutorPlatformInfo,
@@ -30,6 +31,10 @@ export interface RemoteDevice {
 	reportedPathRules: ExecutorPathRule[] | null;
 	scope: "global" | "project";
 	projectId: string | null;
+	/** Owner axis: a private device is usable only by the user who registered it. */
+	ownerScope?: "private" | "shared";
+	/** User id of the registrar. */
+	createdBy?: string | null;
 	/**
 	 * Set when the key was collected by the one-line installer rather than pasted by
 	 * hand. Attribution only; never used to authorize anything.
@@ -175,7 +180,7 @@ export interface ExecutorManifestResponse {
 export type ExecutorTokenDelivery = "enroll" | "prompt";
 
 export interface InstallScriptInput {
-	platform: ExecutorPlatform;
+	target: ExecutorInstallTarget;
 	mode: "system" | "user";
 	disableShell?: boolean;
 	/**
@@ -194,13 +199,12 @@ export interface InstallScriptResult {
 	script: string;
 	filename: string;
 	shell: "sh" | "powershell";
-	/** Public URL serving the script body; what the one-liner fetches. */
-	scriptUrl: string;
 	/** The single command to paste on the target machine. */
 	oneLiner: string;
 	tokenDelivery: ExecutorTokenDelivery;
 	executorVersion: string;
-	platform: ExecutorPlatform;
+	target: ExecutorInstallTarget;
+	platforms: ExecutorPlatform[];
 	/** The embedded enrollment ticket stops working after this time. */
 	expiresAt: string;
 }

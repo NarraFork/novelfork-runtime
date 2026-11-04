@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
@@ -11,7 +11,7 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
-const { appendSendReplyRequest, formatAgentAwaitResult } = await import("../agent-communication");
+const { formatAgentAwaitResult } = await import("../agent-communication");
 const { formatRecentSubagentActivity, summarizeSubagentToolCall } = await import(
 	"../subagent-activity"
 );
@@ -21,21 +21,41 @@ const {
 	getBackgroundTaskTerminalVersion,
 	resolveBackgroundTaskEffectiveStatus,
 } = await import("../background-task-service");
-const {
-	claimSubagentUpdateExecutionLease,
-	listRunningSubagentExecutions,
-	registerRunningSubagentExecution,
-	resolveBackgroundCompletionOutcome,
-	resolveSubagentExecutionTiming,
-} = await import("../subagent-runner");
+const { claimSubagentUpdateExecutionLease } = await import("../subagent-runner");
+const { listDeliveringRuns } = await import("../agent-runtime/run");
+const { setRunControl, tryClaimExecution } = await import("../agent-runtime/ownership");
+const { registerRun, runDeadlineAt } = await import("../../lib/validators/runtime-registration");
 const updateCoordinator = await import("../update-coordinator");
+const { getRuntimePublicationService, runtimePublication } = await import(
+	"../agent-runtime/publication"
+);
+const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+
+beforeEach(async () => {
+	// Wording/lifecycle fixtures have no model; keep publication durable without starting a loop.
+	runtimePublication.setWake(() => {});
+	backgroundOccupancyStore.resetForTests();
+	cleanDb(sqlite);
+	await backgroundOccupancyStore.start();
+});
 
 afterAll(() => {
+	runtimePublication.stop();
+	runtimePublication.setWake(async (narratorId) => {
+		await wakeInboxIfEligible(narratorId);
+	});
+	backgroundOccupancyStore.resetForTests();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await backgroundOccupancyStore.flush();
+	// Let the fire-and-forget list deltas finish before their database/index are reset.
+	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+	await backgroundOccupancyStore.flush();
+	backgroundOccupancyStore.resetForTests();
 	cleanDb(sqlite);
 	updateCoordinator.resetUpdateCoordinationForTests();
 });
@@ -157,26 +177,6 @@ describe("Await agent result wording", () => {
 	});
 });
 
-describe("Send reply request wording", () => {
-	test("explicitly asks for a reverse Send without asking the target to stop", () => {
-		const text = appendSendReplyRequest("Please check the API shape.", AGENT_ID, "request-1", "en");
-		expect(text).toContain(
-			`Send({ id: "${AGENT_ID}", message: "<your reply>", replyTo: "request-1" })`,
-		);
-		expect(text).toContain("waiting for your Send reply, not for your task to finish");
-		expect(text).toContain("do not interrupt ongoing work");
-	});
-
-	test("uses a localized reply instruction for Chinese sessions", () => {
-		const text = appendSendReplyRequest("请检查 API。", AGENT_ID, "request-2", "zh-CN");
-		expect(text).toContain("[请求回复 requestId=request-2]");
-		expect(text).toContain(
-			`Send({ id: "${AGENT_ID}", message: "<你的回复>", replyTo: "request-2" })`,
-		);
-		expect(text).toContain("不是等待你结束任务");
-	});
-});
-
 describe("Await bash result wording", () => {
 	test("aborted wait makes clear the task is still running and can be awaited again", () => {
 		const text = formatResult(TASK_ID, "aborted", null);
@@ -272,34 +272,35 @@ describe("Await question result wording", () => {
 	});
 });
 
-describe("recovered Agent execution deadline", () => {
-	test("uses remaining wall time while preserving the original timeout label", () => {
-		const timing = resolveSubagentExecutionTiming({
-			now: Date.parse("2026-07-20T12:00:04.000Z"),
-			timeoutMs: 6_000,
-			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
-			executionTimeoutMs: 10_000,
-		});
-
-		expect(timing).toEqual({
-			remainingTimeoutMs: 6_000,
-			timeoutLabelMs: 10_000,
-			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
-			expiredAtMount: false,
-		});
+describe("recovered run execution deadline", () => {
+	test("a run's deadline is absolute: re-registering the same run never restarts it", () => {
+		const startedAt = Date.parse("2026-07-20T12:00:00.000Z");
+		const deadlineAt = runDeadlineAt(10_000, startedAt);
+		expect(deadlineAt).toBe("2026-07-20T12:00:10.000Z");
+		const deliverTo = { narratorId: "parent-agent", toolUseId: "origin-tool" };
+		const first = registerRun(null, "run-1", { deliverTo, deadlineAt }, 0);
+		// Recovery (or detach) four seconds later restates the binding with a fresh timeout.
+		const recovered = registerRun(
+			first,
+			"run-1",
+			{ deliverTo, deadlineAt: runDeadlineAt(10_000, startedAt + 4_000) },
+			7,
+		);
+		expect(recovered.run?.deadlineAt).toBe("2026-07-20T12:00:10.000Z");
+		expect(recovered.run?.historyStartSeq).toBe(0);
+		// A new logical run starts its own deadline.
+		const next = registerRun(
+			recovered,
+			"run-2",
+			{ deliverTo, deadlineAt: runDeadlineAt(10_000, startedAt + 4_000) },
+			7,
+		);
+		expect(next.run?.deadlineAt).toBe("2026-07-20T12:00:14.000Z");
 	});
 
-	test("mounts an expired recovered Agent as an immediate original timeout", () => {
-		const timing = resolveSubagentExecutionTiming({
-			now: Date.parse("2026-07-20T12:00:11.000Z"),
-			timeoutMs: 0,
-			executionDeadlineAt: "2026-07-20T12:00:10.000Z",
-			executionTimeoutMs: 10_000,
-		});
-
-		expect(timing.remainingTimeoutMs).toBe(0);
-		expect(timing.timeoutLabelMs).toBe(10_000);
-		expect(timing.expiredAtMount).toBe(true);
+	test("no timeout registers no deadline", () => {
+		expect(runDeadlineAt(0)).toBeUndefined();
+		expect(runDeadlineAt(undefined)).toBeUndefined();
 	});
 });
 
@@ -345,55 +346,37 @@ describe("subagent update execution lease", () => {
 		claimed?.release();
 	});
 
-	test("exposes a running background Agent to planned-update checkpoint inventory", () => {
-		const unregister = registerRunningSubagentExecution({
-			subagentId: "background-checkpoint-agent",
-			parentNarratorId: "parent-agent",
-			toolUseId: "background-checkpoint-tool",
-			timeoutMs: 300_000,
-			executionDeadlineAt: "2026-07-20T12:05:00.000Z",
-			background: true,
-		});
+	test("exposes a running delivering run to planned-update checkpoint inventory", () => {
+		const id = "background-checkpoint-agent";
+		const owner = tryClaimExecution(id, "run");
+		if (!owner) throw new Error("expected a free execution slot");
 		try {
-			expect(listRunningSubagentExecutions()).toContainEqual(
-				expect.objectContaining({
-					subagentId: "background-checkpoint-agent",
-					toolUseId: "background-checkpoint-tool",
-					background: true,
-				}),
-			);
+			setRunControl(owner, {
+				startedAt: Date.now(),
+				cancel: new AbortController(),
+				timedOut: false,
+				terminal: new Promise(() => {}),
+				logicalRunId: "checkpoint-run",
+				deliverTo: { narratorId: "parent-agent", toolUseId: "background-checkpoint-tool" },
+				deadlineAt: "2026-07-20T12:05:00.000Z",
+			});
+			expect(listDeliveringRuns()).toContainEqual({
+				narratorId: id,
+				recipientId: "parent-agent",
+				toolUseId: "background-checkpoint-tool",
+				startedAt: expect.any(Number),
+				deadlineAt: "2026-07-20T12:05:00.000Z",
+				logicalRunId: "checkpoint-run",
+			});
 		} finally {
-			unregister();
+			owner.release();
 		}
-		expect(
-			listRunningSubagentExecutions().some(
-				(entry) => entry.subagentId === "background-checkpoint-agent",
-			),
-		).toBe(false);
+		// The run record is gone with its owner.
+		expect(listDeliveringRuns().some((entry) => entry.narratorId === id)).toBe(false);
 	});
 });
 
 describe("background task status resolution", () => {
-	test("execution timeout takes precedence over empty output or abort state", () => {
-		expect(
-			resolveBackgroundCompletionOutcome({
-				timedOut: true,
-				hasError: false,
-				aborted: true,
-			}),
-		).toBe("timeout");
-	});
-
-	test("an aborted task is not treated as completed", () => {
-		expect(
-			resolveBackgroundCompletionOutcome({
-				timedOut: false,
-				hasError: false,
-				aborted: true,
-			}),
-		).toBe("failed");
-	});
-
 	test("a completed historical run becomes continued while its narrator is active", () => {
 		expect(
 			resolveBackgroundTaskEffectiveStatus({
@@ -474,6 +457,8 @@ async function seedAgentTaskEntities(suffix: string): Promise<{
 			updatedAt: now,
 		},
 	]);
+	backgroundOccupancyStore.refreshNarrators([parentNarratorId, subagentNarratorId]);
+	await backgroundOccupancyStore.flush();
 	return { parentNarratorId, subagentNarratorId };
 }
 
@@ -482,10 +467,9 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("resume");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "origin-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "origin-tool" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
 		const timedOut = await backgroundTaskService.getById(subagentNarratorId);
@@ -509,10 +493,9 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("summary");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "summary-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "summary-tool" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "stale timeout");
 		await db
@@ -525,6 +508,8 @@ describe("background agent task lifecycle", () => {
 				errorMessage: null,
 			})
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 
 		const summaries = await backgroundTaskService.listSummariesByParent(parentNarratorId);
 		expect(summaries).toHaveLength(1);
@@ -535,10 +520,9 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("reuse");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "first-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "first-tool" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "first timeout");
 		const oldVersion = getBackgroundTaskTerminalVersion(
@@ -548,10 +532,9 @@ describe("background agent task lifecycle", () => {
 
 		const restarted = await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
-			toolUseId: "second-tool",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "second-tool" } },
 		});
 		expect(restarted.status).toBe("running");
 		expect(restarted.output).toBeNull();
@@ -575,11 +558,13 @@ describe("background agent task lifecycle", () => {
 			.update(narrators)
 			.set({ isBackground: true, backgroundStatus: "running", status: "working" })
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 		const staleController = new AbortController();
 		const controller = new AbortController();
@@ -611,15 +596,21 @@ describe("background agent task lifecycle", () => {
 		const { parentNarratorId, subagentNarratorId } = await seedAgentTaskEntities("cleanup-guard");
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 		await backgroundTaskService.markTimedOut(subagentNarratorId, "old timeout");
 		backgroundTaskService.beginAgentContinuation(subagentNarratorId);
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
 		await expect(backgroundTaskService.getById(subagentNarratorId)).resolves.not.toBeNull();
 		backgroundTaskService.endAgentContinuation(subagentNarratorId);
+		// Publication retention is independent of the foreground-continuation guard.
+		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(0);
+		const terminal = await backgroundTaskService.waitForCompletion(subagentNarratorId, 100);
+		expect(terminal.terminalResultReceived).toBe(true);
+		if (!terminal.publicationRun) throw new Error("Missing exact terminal run");
+		await getRuntimePublicationService().consumeAwaitedTerminal(terminal.publicationRun);
 		expect(await backgroundTaskService.cleanupCompleted(-1)).toBe(1);
 	});
 
@@ -629,11 +620,13 @@ describe("background agent task lifecycle", () => {
 			.update(narrators)
 			.set({ isBackground: true, backgroundStatus: "running", status: "working" })
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 
 		expect(
@@ -727,7 +720,8 @@ describe("background agent task lifecycle", () => {
 
 		expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
 		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
-			status: "cancelled",
+			status: "failed",
+			output: "Execution outcome unknown after restart; the command was not rerun.",
 			type: "bash",
 		});
 	});
@@ -748,7 +742,8 @@ describe("background agent task lifecycle", () => {
 
 		expect(await backgroundTaskService.recoverStaleTasksAfterRestart(new Set([taskId]))).toBe(1);
 		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
-			status: "cancelled",
+			status: "failed",
+			output: "Execution outcome unknown after restart; the command was not rerun.",
 		});
 	});
 
@@ -767,7 +762,11 @@ describe("background agent task lifecycle", () => {
 
 		const waiting = backgroundTaskService.waitForCompletion(taskId, 5_000);
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
-		await expect(waiting).resolves.toMatchObject({ status: "cancelled" });
+		await expect(waiting).resolves.toMatchObject({
+			status: "failed",
+			terminalResultReceived: true,
+			output: "Execution outcome unknown after restart; the command was not rerun.",
+		});
 	});
 
 	test("a reaped bash row satisfies the predicate cleanupCompleted reaps on", async () => {
@@ -809,11 +808,13 @@ describe("background agent task lifecycle", () => {
 			.update(narrators)
 			.set({ isBackground: true, backgroundStatus: "running" })
 			.where(eq(narrators.id, subagentNarratorId));
+		backgroundOccupancyStore.refreshNarrator(subagentNarratorId);
+		await backgroundOccupancyStore.flush();
 		await backgroundTaskService.createAgentTask({
 			id: subagentNarratorId,
-			parentNarratorId,
 			subagentNarratorId,
 			subagentType: "general",
+			binding: { deliverTo: { narratorId: parentNarratorId, toolUseId: "test-tool-use" } },
 		});
 
 		expect(await backgroundTaskService.recoverStaleAgentTasksAfterRestart()).toBe(1);

@@ -12,7 +12,7 @@ const CWD = "/home/user/project";
  * 断言失败。显式声明 POSIX 语义，与真实冻结执行目标携带的信息一致。
  */
 async function analyzeBashCommand(command: string, cwd: string) {
-	return analyzeBashCommandImpl(command, cwd, false, posixPathSemantics);
+	return analyzeBashCommandImpl(command, cwd, posixPathSemantics);
 }
 
 const resolve = posixPath.resolve;

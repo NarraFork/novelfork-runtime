@@ -36,6 +36,8 @@ interface ExitPlanReflectionMeta {
 	inputJson: Record<string, unknown>;
 	toolCallId?: string;
 	abortController?: AbortController;
+	/** Original persisted start time when restoring this gate. */
+	restoredStartedAt?: string;
 }
 
 interface ExitPlanReflectionPending extends ExitPlanReflectionMeta {
@@ -177,7 +179,10 @@ async function markExitPlanReflectionStatus(
 								: "fail",
 					inputJson: pending.inputJson,
 					permissionDecisionReason: message,
-					permissionSuggestions: planReflectionSuggestions(pending, status, message, compactAfter),
+					// Only the custom reflection text goes into `reason`. Status defaults
+					// stay in `permissionDecisionReason` for details/logs; the notice
+					// classifies and localizes them at display time (reflection-reason.ts).
+					permissionSuggestions: planReflectionSuggestions(pending, status, reason, compactAfter),
 					// A confirmed reflection skips the normal permission handler. Persist its
 					// approval source too, so the final-start gate can verify the receipt.
 					...(status === "confirmed" ? { permissionDecidedBy: "reflection" } : {}),
@@ -259,7 +264,10 @@ export function createExitPlanReflectionDecision(
 		requestId,
 		resolve,
 		resolved: false,
-		startedAt: Date.now(),
+		startedAt:
+			meta.restoredStartedAt && Number.isFinite(Date.parse(meta.restoredStartedAt))
+				? Date.parse(meta.restoredStartedAt)
+				: Date.now(),
 	});
 	notifyHumanAttentionChanged();
 	return promise;

@@ -6,13 +6,20 @@ import {
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessages, narrators } from "../db/schema";
+import { narratorMessages } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getAutoCompactKeepPairs, resolveDefaultReasoningEffort, settings } from "../lib/settings";
+import {
+	getAutoCompactKeepPairs,
+	getSummaryModelContextWindowDetail,
+	type ModelContextWindowSource,
+	resolveDefaultReasoningEffort,
+	settings,
+} from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { getExecutionOwner } from "./agent-runtime/ownership";
 import {
 	appendLiveCompactDelta,
 	finishLiveCompactProgress,
@@ -20,6 +27,7 @@ import {
 } from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
+import { compactEpochRecord } from "./narrator-epochs";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
@@ -28,8 +36,10 @@ import {
 	compactLocks,
 	markActiveHistoryCompactPending,
 	resetActiveUpstreamSession,
+	withNarratorMutationAdmission,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 
 /**
  * How long a compact may make NO observable progress before it is aborted.
@@ -90,6 +100,8 @@ interface CompactProgressReporter {
 	finish: () => void;
 	/** Close the on-demand text stream after the final marker state is persisted. */
 	close: (status: "compacted" | "failed") => void;
+	/** True once any thinking/output delta arrived — used to enrich stall failures. */
+	hasStreamedContent: () => boolean;
 }
 
 /**
@@ -105,6 +117,31 @@ function formatDuration(ms: number): string {
 	const minutes = ms / 60_000;
 	const rendered = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
 	return `${rendered} minutes`;
+}
+
+const CONTEXT_WINDOW_HINT =
+	" Check that the summary model's context window is set to its real value in Settings → Models.";
+
+/**
+ * When a compact dies having never streamed a single char, the cause is usually
+ * a mis-packed request (wrong/missing summary-model context window), not a slow
+ * model. Append an actionable hint so the user is not left staring at
+ * "no progress for 5 minutes" with no next step.
+ */
+function enrichCompactFailureMessage(
+	message: string,
+	info: {
+		hasStreamedContent: boolean;
+		timedOut: boolean;
+		contextWindowSource?: ModelContextWindowSource;
+	},
+): string {
+	if (info.hasStreamedContent) return message;
+	if (!info.timedOut && info.contextWindowSource !== "fallback") return message;
+	if (message.includes("context window")) return message;
+	const separator =
+		message.endsWith(".") || message.endsWith("!") || message.endsWith("?") ? "" : ".";
+	return `${message}${separator}${CONTEXT_WINDOW_HINT}`;
 }
 
 export interface CompactWatchdog {
@@ -266,6 +303,7 @@ export function createCompactProgressReporter(options: {
 	reasoningEffort?: string;
 	startedAt?: string;
 	isSegment?: boolean;
+	contextWindowSource?: ModelContextWindowSource;
 	/**
 	 * Called on every non-empty delta, BEFORE throttling. The stall watchdog uses
 	 * this as its liveness signal, so it must not be tied to the throttled
@@ -277,6 +315,9 @@ export function createCompactProgressReporter(options: {
 	// The retry broadcast carries the CURRENT counts, so the reporter mirrors the
 	// last published snapshot (the throttled accumulator does not expose one).
 	let lastSnapshot: ProgressSnapshot = { phase: "thinking", thinkingChars: 0, outputChars: 0 };
+	const contextWindowSourceFields = options.contextWindowSource
+		? { contextWindowSource: options.contextWindowSource }
+		: {};
 	startLiveCompactProgress(options.messageId, {
 		model: options.model ?? "",
 		...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
@@ -296,6 +337,7 @@ export function createCompactProgressReporter(options: {
 			...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
 			...(options.startedAt ? { startedAt: options.startedAt } : {}),
 			...(options.isSegment ? { isSegment: true } : {}),
+			...contextWindowSourceFields,
 		});
 	}, COMPACT_PROGRESS_THROTTLE_MS);
 	const reportRetry = (retryCount: number, error: string) => {
@@ -308,6 +350,7 @@ export function createCompactProgressReporter(options: {
 			outputChars: lastSnapshot.outputChars,
 			mode: options.mode,
 			...(options.isSegment ? { isSegment: true } : {}),
+			...contextWindowSourceFields,
 			retryCount,
 			retryError: error,
 		});
@@ -343,6 +386,7 @@ export function createCompactProgressReporter(options: {
 		onReasoningDelta: addThinking,
 		reportRetry,
 		finish: () => reporter.finish(),
+		hasStreamedContent: () => thinkingChars > 0 || outputChars > 0,
 		close: (status: "compacted" | "failed") => {
 			if (closed) return;
 			closed = true;
@@ -479,24 +523,23 @@ function currentHistoryCompactMode(narratorId: string, fallback: CompactMode): C
 export async function markCompactAsBlocking(narratorId: string) {
 	await setCompactingSubstatus(narratorId, "blocking", true);
 	try {
+		// patchState reads each marker's body itself.
 		const markers = await db.query.narratorMessages.findMany({
 			where: and(
 				eq(narratorMessages.narratorId, narratorId),
 				eq(narratorMessages.role, "system"),
 				eq(narratorMessages.contentText, "[Compacting]"),
 			),
-			columns: { id: true, contentJson: true },
+			columns: { id: true },
 		});
 		for (const marker of markers) {
-			const blocks = Array.isArray(marker.contentJson) ? marker.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (!compactBlock) continue;
-			await db
-				.update(narratorMessages)
-				.set({ contentJson: [{ ...compactBlock, mode: "blocking" }] })
-				.where(
-					and(eq(narratorMessages.id, marker.id), eq(narratorMessages.narratorId, narratorId)),
-				);
+			// The mode is compact state: it changes nothing the model reads (§5.4).
+			narratorStore.patchState(marker.id, (blocks) => {
+				const index = blocks.findIndex((block) => parseCompactMessageBlock(block));
+				if (index < 0) return null;
+				blocks[index] = { ...(blocks[index] as Record<string, unknown>), mode: "blocking" };
+				return blocks;
+			});
 		}
 	} catch (err) {
 		logger.warn("Failed to update compact marker mode", { narratorId, error: String(err) });
@@ -607,6 +650,7 @@ async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
 ): Promise<{ message: T; contextPercent?: number }> {
 	try {
 		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale);
+		if (!estimate) return { message };
 		const updated = await narratorService.updateMessageHistoryTokenEstimate(
 			message.id,
 			narratorId,
@@ -1015,22 +1059,24 @@ async function doRunCustomCompact({
 	await setCompactingSubstatus(narratorId, mode, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { variant: true },
-	});
-	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
-	const compactProgress = createCompactProgressReporter({
-		narratorId,
-		messageId: compactingMsg.id,
-		mode,
-		model: selectedModel,
-		reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
-		startedAt: "createdAt" in compactingMsg ? compactingMsg.createdAt : new Date().toISOString(),
-		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
-	});
+	let contextWindowSource: ModelContextWindowSource | undefined;
+	let compactProgress: CompactProgressReporter | undefined;
 
 	try {
+		// Metadata validation can throw after the running marker was persisted.
+		// Keep it inside the same failure cleanup as the summary request, without
+		// inventing a fallback provenance when resolution itself failed.
+		contextWindowSource = getSummaryModelContextWindowDetail(selectedModel).source;
+		compactProgress = createCompactProgressReporter({
+			narratorId,
+			messageId: compactingMsg.id,
+			mode,
+			model: selectedModel,
+			reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
+			startedAt: "createdAt" in compactingMsg ? compactingMsg.createdAt : new Date().toISOString(),
+			contextWindowSource,
+			...(hooks?.beat ? { onActivity: hooks.beat } : {}),
+		});
 		// Counts every scheduled retry across BOTH retry layers (summaryGenerate's
 		// internal backoff chain and the whole-chunk retry in narrator-context), so
 		// the UI's "retrying (N)" ordinal never resets or goes backwards mid-run.
@@ -1048,7 +1094,7 @@ async function doRunCustomCompact({
 			hooks?.beat,
 			(info) => {
 				retryCount += 1;
-				compactProgress.reportRetry(retryCount, info.error);
+				compactProgress?.reportRetry(retryCount, info.error);
 			},
 			options?.userId,
 		);
@@ -1062,38 +1108,41 @@ async function doRunCustomCompact({
 		const finalSummary = appendHint ? `${summary}\n\n${appendHint}` : summary;
 
 		const finalizeMode = currentHistoryCompactMode(narratorId, mode);
-		const compactedMsg = await narratorService.finalizeCompactingMessage(
-			compactingMsg.id,
-			narratorId,
-			finalSummary,
-			contextPercent,
-			{
-				mode: finalizeMode,
-				expectedAttempt,
-				expectedSeq,
-				...(options?.preparedRetryMessage
-					? {
-							expectedCompactBoundaryMessageId:
-								options.preparedRetryMessage.compactBoundaryMessageId,
-						}
-					: {}),
-			},
-		);
-		if (!compactedMsg) {
-			throw new AppError(
-				"Compact marker disappeared or its attempt changed before finalize",
-				409,
-				"COMPACT_FINALIZE_CONFLICT",
+		// Only publication is admitted, never the remote summary request. Share the
+		// claim mutex so durable clearing and the live persistence baseline move
+		// together even when a PostgreSQL conversation-id claim is still awaiting IO.
+		const compactedMsg = await withNarratorMutationAdmission(narratorId, async () => {
+			if (signal?.aborted) throw compactAbortError();
+			const committed = await narratorService.finalizeCompactingMessage(
+				compactingMsg.id,
+				narratorId,
+				finalSummary,
+				contextPercent,
+				{
+					mode: finalizeMode,
+					expectedAttempt,
+					expectedSeq,
+					epoch: compactEpochRecord(activeNarrators.get(narratorId)),
+					...(options?.preparedRetryMessage
+						? {
+								expectedCompactBoundaryMessageId:
+									options.preparedRetryMessage.compactBoundaryMessageId,
+							}
+						: {}),
+				},
 			);
-		}
-
-		resetActiveUpstreamSession(narratorId);
-		// Record that a history compact has completed but the active agent loop
-		// has not yet rebuilt its in-memory history from the new summary. This
-		// guards against a second background compact firing on the same (stale)
-		// context before the first one is consumed, which previously dropped a
-		// large chunk of context.
-		markActiveHistoryCompactPending(narratorId, compactedMsg?.seq ?? null);
+			if (!committed) {
+				throw new AppError(
+					"Compact marker disappeared or its attempt changed before finalize",
+					409,
+					"COMPACT_FINALIZE_CONFLICT",
+				);
+			}
+			resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
+			// Do not let another background compact consume the old in-memory history.
+			markActiveHistoryCompactPending(narratorId, committed.seq ?? null);
+			return committed;
+		});
 
 		let contextPercentAfter = contextPercent;
 		if (compactedMsg) {
@@ -1141,13 +1190,18 @@ async function doRunCustomCompact({
 		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
-		compactProgress.finish();
+		compactProgress?.finish();
 		// A watchdog abort arrives as an AbortError but is NOT a cancellation: nobody
 		// asked for it, the context was not compacted, and a blocking run must not
 		// continue its turn believing the context shrank. Report the timeout reason
 		// instead of "Aborted" and fall through to the failure path below.
 		const watchdogTimeout = isCompactAbortError(err) ? (hooks?.timeoutReason?.() ?? null) : null;
-		const errorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const rawErrorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const errorMsg = enrichCompactFailureMessage(rawErrorMsg, {
+			hasStreamedContent: compactProgress?.hasStreamedContent() ?? false,
+			timedOut: !!watchdogTimeout,
+			contextWindowSource,
+		});
 
 		// Cancelled by the user — silently roll back the in-progress compact:
 		// remove the placeholder marker, reset context state, and clear the
@@ -1236,7 +1290,7 @@ async function doRunCustomCompact({
 					...replacementFields,
 				});
 			}
-			compactProgress.close("failed");
+			compactProgress?.close("failed");
 			throw err;
 		}
 
@@ -1274,22 +1328,17 @@ async function doRunCustomCompact({
 			broadcastToNarrator(narratorId, compactFailedMessageEvent);
 		}
 
-		if (failureMode === "blocking") {
-			// Only override status for primary narrators — subagent status is
-			// managed by finalizeSubagent; overwriting it here would race.
-			if (!isSubagent) {
-				await narratorService.updateStatus(narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: `Compact failed: ${errorMsg}`,
-				});
-			}
-			// activeNarrators only tracks primary narrators; subagents are not
-			// registered there, so this abort is a no-op for them (which is fine —
-			// the subagent's own signal is managed by executeSubagent).
-			const active = activeNarrators.get(narratorId);
-			if (active?.alive) {
-				active.abortController.abort();
-			}
+		// A session with a live execution has exactly one terminal: its run's. The
+		// failure reaches that run through the thrown error and the run's own recovery
+		// decides the outcome; the run's finalizer then settles status and delivers once.
+		// Writing a status or aborting the turn here would race that terminal (and an
+		// abort turned the failure into a cancellation). Only an idle session has no
+		// other reporter, so it records the failure on its row.
+		if (failureMode === "blocking" && !getExecutionOwner(narratorId)) {
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: `Compact failed: ${errorMsg}`,
+			});
 		}
 		await setCompactingSubstatus(narratorId, failureMode, false).catch((err) => {
 			logger.warn("Failed to clear compacting substatus after failed custom compact", {
@@ -1303,10 +1352,11 @@ async function doRunCustomCompact({
 			messageId: compactingMsg.id,
 			mode: failureMode,
 			error: errorMsg,
+			contextWindowSource,
 			...replacementFields,
 		};
 		broadcastToNarrator(narratorId, compactFailedEvent);
-		compactProgress.close("failed");
+		compactProgress?.close("failed");
 		throw err;
 	} finally {
 		await setCompactingSubstatus(
@@ -1422,18 +1472,22 @@ async function doRunSegmentCompact({
 		hiddenMessageIds,
 	});
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode: "blocking" });
-	const compactProgress = createCompactProgressReporter({
-		narratorId,
-		messageId: markerMsg.id,
-		mode: "blocking",
-		model: settings.agent.summaryModel,
-		reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
-		startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
-		isSegment: true,
-		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
-	});
+	let contextWindowSource: ModelContextWindowSource | undefined;
+	let compactProgress: CompactProgressReporter | undefined;
 
 	try {
+		contextWindowSource = getSummaryModelContextWindowDetail(settings.agent.summaryModel).source;
+		compactProgress = createCompactProgressReporter({
+			narratorId,
+			messageId: markerMsg.id,
+			mode: "blocking",
+			model: settings.agent.summaryModel,
+			reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
+			startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
+			isSegment: true,
+			contextWindowSource,
+			...(hooks?.beat ? { onActivity: hooks.beat } : {}),
+		});
 		const messages = await narratorService.getMessagesForSegmentCompact(narratorId, messageIds);
 
 		if (messages.length === 0) {
@@ -1463,7 +1517,7 @@ async function doRunSegmentCompact({
 			hooks?.beat,
 			(info) => {
 				segmentRetryCount += 1;
-				compactProgress.reportRetry(segmentRetryCount, info.error);
+				compactProgress?.reportRetry(segmentRetryCount, info.error);
 			},
 			userId,
 		);
@@ -1509,11 +1563,16 @@ async function doRunSegmentCompact({
 		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
-		compactProgress.finish();
+		compactProgress?.finish();
 		// A watchdog abort is a bare "Aborted" AbortError, which tells the user
 		// nothing about why their segment summary failed. Record the timeout reason.
 		const watchdogTimeout = isCompactAbortError(err) ? (hooks?.timeoutReason?.() ?? null) : null;
-		const errorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const rawErrorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const errorMsg = enrichCompactFailureMessage(rawErrorMsg, {
+			hasStreamedContent: compactProgress?.hasStreamedContent() ?? false,
+			timedOut: !!watchdogTimeout,
+			contextWindowSource,
+		});
 		logger.error("Segment compact failed", {
 			narratorId,
 			messageId: markerMsg.id,
@@ -1551,8 +1610,9 @@ async function doRunSegmentCompact({
 			messageId: markerMsg.id,
 			mode: "blocking",
 			error: errorMsg,
+			contextWindowSource,
 		});
-		compactProgress.close("failed");
+		compactProgress?.close("failed");
 		throw err;
 	}
 }
@@ -1662,7 +1722,13 @@ async function runPlanCompactUnlocked(narratorId: string, planText: string): Pro
 
 	// persistPlanMessage atomically inserts the message, sets isCompact=1,
 	// and updates narrator's contextSummary + clears apiConversationId.
-	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
+	const compactMsg = await withNarratorMutationAdmission(narratorId, async () => {
+		const committed = await narratorService.persistPlanMessage(narratorId, planText);
+		// Every caller (normal loop, denied retry and persisted recovery) observes the
+		// durable clear and live CAS baseline together; no lock-free caller reset.
+		if (committed) resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
+		return committed;
+	});
 	if (compactMsg) {
 		broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactMsg });
 	}

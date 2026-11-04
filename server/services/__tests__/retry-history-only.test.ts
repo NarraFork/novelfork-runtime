@@ -20,7 +20,6 @@ const { narratorService } = await import("../narrator-service");
 const { retryLastMessage } = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
 const scopedRevert = await import("../narrator-scoped-revert");
-const snapshotRevert = await import("../snapshot-revert");
 const localRevert = await import("../revert-planner-local-access");
 
 const ID = "retry-history-only";
@@ -168,7 +167,6 @@ describe("retry after history-only rollback", () => {
 				message("notice", 3, "sys", [{ type: "text", text: "background notice" }]);
 			}
 			const scoped = spyOn(scopedRevert, "revertNarratorScopedForMessages");
-			const workspace = spyOn(snapshotRevert, "revertForMessagesTree");
 			const apply = spyOn(localRevert, "applyLocalRevertPlan");
 			const { start, reachedStart } = stopAtModelStart();
 			for (let retry = 0; retry < 2; retry++) {
@@ -178,7 +176,6 @@ describe("retry after history-only rollback", () => {
 			}
 			expect(start).toHaveBeenCalledTimes(2);
 			expect(scoped).not.toHaveBeenCalled();
-			expect(workspace).not.toHaveBeenCalled();
 			expect(apply).not.toHaveBeenCalled();
 			expect(
 				db
@@ -199,9 +196,9 @@ describe("retry after history-only rollback", () => {
 			expect(evidence()).toEqual(kept);
 		}
 		// Explicit file rollback still sees the evidence; it must not disappear globally.
-		await expect(narratorService.deleteMessagesAfter(ID, "user")).rejects.toThrow(
-			"execution_unavailable",
-		);
+		await expect(narratorService.deleteMessagesAfter(ID, "user")).rejects.toMatchObject({
+			code: "REVERT_AUTHENTICATION_REQUIRED",
+		});
 		expect(evidence()).toEqual(kept);
 		expect(readFileSync(path, "utf8")).toBe("kept file bytes\n");
 	});

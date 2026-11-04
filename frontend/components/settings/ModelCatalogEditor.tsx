@@ -10,13 +10,9 @@ import {
 	Text,
 	TextInput,
 } from "@mantine/core";
-import type {
-	FieldSource,
-	ModelBinding,
-	ModelCatalogSnapshot,
-	ModelQuery,
-	ResolvedModelMetadata,
-} from "@shared/model-catalog";
+import type { ModelCard } from "@shared/model-catalog/card";
+import type { ModelCardSnapshot } from "@shared/model-catalog/schema/api";
+import type { FieldSource, ModelQuery, RawBinding } from "@shared/model-catalog/schema/catalog";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -27,14 +23,21 @@ import {
 } from "../../hooks/useModelCatalog";
 import { ApiError } from "../../lib/api/client";
 import { Z } from "../../lib/z-index";
+import { ProviderWindowOverrides } from "../providers/ContextWindowField";
+import {
+	COMMAND_CODE_PROTOCOL_OPTIONS,
+	ModelProtocolSelect,
+	modelProtocolLabel,
+} from "../providers/ModelProtocolSelect";
+import type { CustomApiProtocol } from "../providers/types";
 import { ModelCardDetails } from "./ModelCardDetails";
 import {
 	buildCatalogPatch,
 	type CatalogEdits,
 	catalogFields,
+	fieldOptions,
 	fieldText,
 	metadataFromPatch,
-	metadataValue,
 } from "./model-catalog-form";
 
 export interface CatalogEditorTarget {
@@ -44,16 +47,35 @@ export interface CatalogEditorTarget {
 	modelId?: string;
 	variantId?: string;
 	query?: ModelQuery;
-	resolved?: ResolvedModelMetadata;
+	/** The resolved card the editor opened on; its revision authorizes the write. */
+	card?: ModelCard;
+}
+
+/**
+ * 模型级协议覆盖的读写入口。
+ *
+ * 协议分两层：provider 层（`settings.agent.modelProtocols`，设置页模型行写的）与本地覆盖层
+ * （`settings.agent.modelProtocolOverrides`，本对话框单独保存的，优先级更高）。两层都不在
+ * catalog 快照里、也不参与 revision 校验，因此由调用方负责读写；不传该项时编辑器不显示协议字段。
+ */
+export interface ModelProtocolDraft {
+	/** 作用对象：带前缀的完整模型 ID，例如 `CommandCode:deepseek/deepseek-v4.1-flash`。 */
+	modelValue: string;
+	/** 本层已保存的覆盖；`null` 表示本层没有覆盖，跟随继承。 */
+	value: CustomApiProtocol | null;
+	/** 继承来的值（provider 层写的协议）；本层覆盖被删除后由它生效。 */
+	inheritedValue: CustomApiProtocol | null;
+	/** `null` 表示删除本层覆盖（恢复继承），否则写入本层。 */
+	onSave: (protocol: CustomApiProtocol | null) => Promise<void>;
 }
 
 export function CatalogMetadataFields({
-	resolved,
+	card,
 	edits,
 	onChange,
 	readOnly,
 }: {
-	resolved?: ResolvedModelMetadata;
+	card?: ModelCard;
 	edits: CatalogEdits;
 	onChange: (edits: CatalogEdits) => void;
 	readOnly: boolean;
@@ -74,23 +96,17 @@ export function CatalogMetadataFields({
 							{catalogFields
 								.filter((field) => field.section === section)
 								.map((field) => {
-									const edit = edits[field.path];
-									const effective = metadataValue(resolved?.metadata ?? {}, field.path);
-									const source: FieldSource | undefined = resolved?.provenance[field.path];
-									const value = edit?.mode === "set" ? edit.value : fieldText(effective);
+									const edit = edits[field.key];
+									const effective = card?.metadata[field.key];
+									const source: FieldSource | undefined = card?.provenance[field.key];
+									const value =
+										edit?.mode === "set" ? edit.value : fieldText(effective, field.kind);
 									const setValue = (next: string) =>
-										onChange({ ...edits, [field.path]: { mode: "set", value: next } });
-									const options =
-										field.kind === "boolean"
-											? ["true", "false"]
-											: field.kind === "mode"
-												? ["levels", "fixed", "budget", "unknown"]
-												: field.kind === "longMode"
-													? ["full", "marginal"]
-													: null;
-									const label = t(`catalog.fields.${field.path.replaceAll(".", "_")}`);
+										onChange({ ...edits, [field.key]: { mode: "set", value: next } });
+									const options = fieldOptions[field.kind] ?? null;
+									const label = t(`catalog.fields.${field.key}`, { defaultValue: field.key });
 									return (
-										<Stack key={field.path} gap={4} data-catalog-field={field.path}>
+										<Stack key={field.key} gap={4} data-catalog-field={field.key}>
 											<Group justify="space-between">
 												<Text size="sm">{label}</Text>
 												{edit && <Badge size="xs">{t(`catalog.${edit.mode}`)}</Badge>}
@@ -105,9 +121,9 @@ export function CatalogMetadataFields({
 															? t(`catalog.values.${effective}`)
 															: Array.isArray(effective) && !effective.length
 																? t("catalog.emptyList")
-																: effective === "0" && field.kind === "price"
+																: Number(effective) === 0 && field.kind === "price"
 																	? t("catalog.free")
-																	: fieldText(effective)}{" "}
+																	: fieldText(effective, field.kind)}{" "}
 												·{" "}
 												{source
 													? `${t(`catalog.layers.${source.layer}`)}${source.id ? ` · ${source.id}` : ""}`
@@ -117,6 +133,7 @@ export function CatalogMetadataFields({
 											{options ? (
 												<Select
 													aria-label={label}
+													comboboxProps={EDITOR_COMBOBOX_PROPS}
 													data={options.map((v) => ({ value: v, label: t(`catalog.values.${v}`) }))}
 													value={value || null}
 													disabled={readOnly || (!!edit && edit.mode !== "set")}
@@ -129,9 +146,11 @@ export function CatalogMetadataFields({
 													aria-label={label}
 													value={value}
 													placeholder={
-														field.kind === "list" || field.kind === "modalities"
-															? t("catalog.listHint")
-															: t("catalog.valueHint")
+														field.kind === "toolModes"
+															? t("catalog.toolModesHint")
+															: field.kind === "list" || field.kind === "modalities"
+																? t("catalog.listHint")
+																: t("catalog.valueHint")
 													}
 													disabled={readOnly || (!!edit && edit.mode !== "set")}
 													onChange={(event) => setValue(event.currentTarget.value)}
@@ -142,16 +161,14 @@ export function CatalogMetadataFields({
 													<Button
 														size="compact-xs"
 														variant="subtle"
-														onClick={() =>
-															onChange({ ...edits, [field.path]: { mode: "unknown" } })
-														}
+														onClick={() => onChange({ ...edits, [field.key]: { mode: "unknown" } })}
 													>
 														{t("catalog.unknown")}
 													</Button>
 													<Button
 														size="compact-xs"
 														variant="subtle"
-														onClick={() => onChange({ ...edits, [field.path]: { mode: "reset" } })}
+														onClick={() => onChange({ ...edits, [field.key]: { mode: "reset" } })}
 													>
 														{t("catalog.reset")}
 													</Button>
@@ -161,7 +178,7 @@ export function CatalogMetadataFields({
 															variant="subtle"
 															onClick={() => {
 																const next = { ...edits };
-																delete next[field.path];
+																delete next[field.key];
 																onChange(next);
 															}}
 														>
@@ -182,16 +199,26 @@ export function CatalogMetadataFields({
 }
 
 /** Snapshot revision is captured on open, not silently rebased after a background refetch. */
+/**
+ * 本编辑器的 Modal 被显式抬到 `Z.modal + 1`（它可能嵌在价格弹窗之类更高的浮层里），
+ * 而 Mantine 的 Select 下拉默认停在 popover 层(300) —— 不抬高就会被自己的 Modal 盖住，
+ * 表现为「下拉点不开 / 选不了」。这里比 Modal 再高一层；Modal 用默认层级的场景不受影响。
+ */
+const EDITOR_COMBOBOX_PROPS = { withinPortal: true, zIndex: Z.modal + 2 } as const;
+
 export function ModelCatalogEditor({
 	target,
 	snapshot,
 	readOnly,
 	onClose,
+	protocol,
 }: {
 	target: CatalogEditorTarget;
-	snapshot: ModelCatalogSnapshot;
+	snapshot: ModelCardSnapshot;
 	readOnly: boolean;
 	onClose: () => void;
+	/** 协议字段（可选）：模型级覆盖，与 catalog 快照分开保存。 */
+	protocol?: ModelProtocolDraft;
 }) {
 	const { t } = useTranslation("settings");
 	const mutation = useCatalogMutation();
@@ -199,7 +226,7 @@ export function ModelCatalogEditor({
 	// Snapshot and actual-resolution queries may finish in either order. Never authorize
 	// a stale effective view with the newer revision from the other query.
 	const [baseRevision] = useState(
-		Math.min(snapshot.local.revision, target.resolved?.localRevision ?? snapshot.local.revision),
+		Math.min(snapshot.local.revision, target.card?.localRevision ?? snapshot.local.revision),
 	);
 	// A new entry has no stored identity to resolve a card for yet.
 	const card = useResolvedModelCard(
@@ -213,12 +240,18 @@ export function ModelCatalogEditor({
 	const [edits, setEdits] = useState<CatalogEdits>({});
 	const [id, setId] = useState(target.id);
 	const [name, setName] = useState("");
-	const [modelId, setModelId] = useState(target.modelId ?? target.resolved?.modelId ?? "");
-	const [variantId, setVariantId] = useState(target.variantId ?? target.resolved?.variantId ?? "");
+	const [modelId, setModelId] = useState(target.modelId ?? target.card?.modelId ?? "");
+	const [variantId, setVariantId] = useState(target.variantId ?? target.card?.variantId ?? "");
 	const [providerKey, setProviderKey] = useState(target.query?.providerKey ?? "");
 	const [providerId, setProviderId] = useState(target.query?.providerId ?? "");
 	const [channelId, setChannelId] = useState(target.query?.channelId ?? "");
 	const [upstream, setUpstream] = useState(target.query?.upstreamModelId ?? "");
+	const [protocolDraft, setProtocolDraft] = useState<CustomApiProtocol | null>(
+		protocol?.value ?? null,
+	);
+	const protocolChanged = !!protocol && protocolDraft !== (protocol.value ?? null);
+	/** 最终生效的协议：本层覆盖优先，其次继承 provider 层。 */
+	const effectiveProtocol = protocolDraft ?? protocol?.inheritedValue ?? null;
 	const [validationError, setValidationError] = useState("");
 	const conflict = mutation.error instanceof ApiError && mutation.error.status === 409;
 	const models = [
@@ -242,6 +275,8 @@ export function ModelCatalogEditor({
 	async function save() {
 		setValidationError("");
 		try {
+			// 协议不属于 catalog 快照，先单独落库；它没有 revision 冲突语义。
+			if (protocol && protocolChanged) await protocol.onSave(protocolDraft);
 			const patch = buildCatalogPatch(edits);
 			if (!target.isNew) {
 				if (!patch) {
@@ -293,7 +328,7 @@ export function ModelCatalogEditor({
 				} else {
 					if (!upstream.trim() || (!providerId.trim() && !channelId.trim()))
 						throw new Error(t("catalog.bindingRequired"));
-					const binding: ModelBinding = {
+					const binding: RawBinding = {
 						id: id.trim(),
 						upstreamModelId: upstream.trim(),
 						...(providerId.trim() ? { providerId: providerId.trim() } : {}),
@@ -348,6 +383,7 @@ export function ModelCatalogEditor({
 								label={t("catalog.model")}
 								searchable
 								clearable
+								comboboxProps={EDITOR_COMBOBOX_PROPS}
 								data={models.map((m) => ({ value: m.id, label: m.name ?? m.id }))}
 								value={modelId || null}
 								onChange={(value) => {
@@ -362,6 +398,7 @@ export function ModelCatalogEditor({
 								label={t("catalog.variant")}
 								searchable
 								clearable
+								comboboxProps={EDITOR_COMBOBOX_PROPS}
 								data={variants
 									.filter((v) => !modelId || v.modelId === modelId)
 									.map((v) => ({ value: v.id, label: v.name ?? v.id }))}
@@ -410,14 +447,74 @@ export function ModelCatalogEditor({
 						{t("catalog.patchHint")}
 					</Text>
 				)}
+				{protocol && (
+					<Stack gap={4} data-catalog-field="protocol">
+						<Group justify="space-between">
+							<Text size="sm">{t("catalog.protocol")}</Text>
+							{protocolDraft !== null && <Badge size="xs">{t("catalog.set")}</Badge>}
+						</Group>
+						<Text size="xs" c="dimmed">
+							{t("catalog.effective")}:{" "}
+							{effectiveProtocol
+								? modelProtocolLabel(t, effectiveProtocol)
+								: t("modelProtocolInherit")}{" "}
+							·{" "}
+							{protocolDraft !== null
+								? t("catalog.set")
+								: protocol.inheritedValue
+									? t("catalog.protocolProviderLayer")
+									: t("catalog.unreported")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("catalog.protocolHint", { model: protocol.modelValue })}
+						</Text>
+						{/* 下拉绑定本层草稿。null 显示「跟随默认」；上面的摘要行才展示继承后的有效协议。 */}
+						<ModelProtocolSelect
+							value={protocolDraft}
+							protocols={
+								protocol.modelValue.startsWith("CommandCode:")
+									? COMMAND_CODE_PROTOCOL_OPTIONS
+									: undefined
+							}
+							onChange={setProtocolDraft}
+							size="xs"
+							dropdownZIndex={Z.modal + 2}
+							disabled={readOnly}
+						/>
+						{!readOnly && (
+							<Group gap="xs">
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									disabled={protocolDraft === null}
+									onClick={() => setProtocolDraft(null)}
+								>
+									{t("catalog.reset")}
+								</Button>
+								{protocolDraft !== protocol.value && (
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										onClick={() => setProtocolDraft(protocol.value)}
+									>
+										{t("catalog.undo")}
+									</Button>
+								)}
+							</Group>
+						)}
+					</Stack>
+				)}
+				{target.kind === "model" && !target.isNew && (
+					<ProviderWindowOverrides modelId={target.id} />
+				)}
 				<CatalogMetadataFields
-					resolved={target.resolved}
+					card={target.card}
 					edits={edits}
 					onChange={setEdits}
 					readOnly={readOnly || mutation.isPending || conflict}
 				/>
-				{/* Read-only complete card next to the editable v1 fields: the editor writes
-				    only what v1 can express, so the full source view must not look editable. */}
+				{/* Read-only complete card next to the editable fields: attributes without a
+				    control stay visible but cannot be edited here. */}
 				{card.data && (
 					<Accordion>
 						<Accordion.Item value="card">

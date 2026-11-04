@@ -1,5 +1,6 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
@@ -21,6 +22,7 @@ const { db, sqlite } = getTestDb();
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
@@ -48,6 +50,7 @@ const {
 	getStreamingSnapshot,
 	isSameReasoningBlock,
 	processEvent,
+	retireSubagentOutputCharCount,
 } = await import("../narrator-event-handler");
 
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
@@ -191,6 +194,138 @@ describe("Write complete input source routing", () => {
 	});
 });
 
+describe("reasoning translation output boundary", () => {
+	for (const boundary of [
+		"stream_text",
+		"tool_use_chunk",
+		"tool_call",
+		"block_complete",
+	] as const) {
+		test(`${boundary} translates the latest reasoning once, never intermediate prefixes`, async () => {
+			const { settings } = await import("../../lib/settings");
+			const agent = await import("../../lib/agent");
+			const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "" });
+			const original = settings.agent.translateReasoning;
+			settings.agent.translateReasoning = true;
+			const id = `translation-boundary-${boundary}`;
+			const createdAt = new Date().toISOString();
+			await db
+				.insert(narrators)
+				.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+			let partialId: string | undefined;
+			const ctx: EventHandlerContext = {
+				...makeMainContext(),
+				narratorId: id,
+				broadcastTargetId: id,
+				locale: "zh-CN",
+				getPartialMessageId: () => partialId,
+				setPartialMessageId: (value) => {
+					partialId = value;
+				},
+			};
+			const checkpoint = (text: string, revision: number) =>
+				processEvent(
+					{
+						type: "block_complete",
+						block: { type: "reasoning", id: "reason", text, revision },
+					},
+					ctx,
+				);
+			try {
+				await checkpoint("A", 1);
+				await checkpoint("A+B", 2);
+				await checkpoint("A+B+C", 3);
+				expect(generate).not.toHaveBeenCalled();
+				expect(ctx.pendingReasoningTranslations?.size).toBe(1);
+				const event =
+					boundary === "stream_text"
+						? {
+								type: "stream_text" as const,
+								blockRevision: 1,
+								blockTextOffset: 0,
+								blockId: "text",
+								text: "Answer",
+							}
+						: boundary === "tool_use_chunk"
+							? {
+									type: "tool_use_chunk" as const,
+									toolUseId: "tool",
+									toolName: "Read",
+									inputCharsTotal: 1,
+								}
+							: boundary === "tool_call"
+								? { type: "tool_call" as const, toolUseId: "tool", toolName: "Read", input: {} }
+								: {
+										type: "block_complete" as const,
+										block: { type: "text" as const, text: "Answer" },
+									};
+				await processEvent(event, ctx);
+				await Bun.sleep(10);
+				expect(generate).toHaveBeenCalledTimes(1);
+				expect(generate.mock.calls[0]?.[0]).toBe("A+B+C");
+				await checkpoint("A+B+C", 4);
+				await processEvent(event, ctx);
+				await Bun.sleep(10);
+				expect(generate).toHaveBeenCalledTimes(1);
+				expect(ctx.pendingReasoningTranslations?.size).toBe(0);
+				// A later, distinct reasoning phase in the same response is independent.
+				await processEvent(
+					{
+						type: "block_complete",
+						block: { type: "reasoning", id: "next-reason", text: "Next thought", revision: 1 },
+					},
+					ctx,
+				);
+				expect(generate).toHaveBeenCalledTimes(1);
+				await processEvent(event, ctx);
+				await Bun.sleep(10);
+				expect(generate).toHaveBeenCalledTimes(2);
+				expect(generate.mock.calls[1]?.[0]).toBe("Next thought");
+			} finally {
+				generate.mockRestore();
+				settings.agent.translateReasoning = original;
+				clearStreamingSnapshot(id);
+				await cleanupFileContextNarrator(id);
+			}
+		});
+	}
+
+	for (const reset of ["stream_reset", "attempt_discarded", "api_request_start"] as const) {
+		test(`${reset} drops reasoning-only attempts without translation`, async () => {
+			const ctx = makeMainContext();
+			ctx.pendingReasoningTranslations = new Map([
+				[
+					"old",
+					{
+						messageId: "discarded",
+						block: { type: "reasoning", id: "old", text: "unused" },
+					},
+				],
+			]);
+			await processEvent(
+				reset === "stream_reset"
+					? { type: reset }
+					: reset === "attempt_discarded"
+						? { type: reset, requestId: "old" }
+						: { type: reset, requestId: "new", model: "test", provider: "test" },
+				ctx,
+			);
+			expect(ctx.pendingReasoningTranslations.size).toBe(0);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 1,
+					blockTextOffset: 0,
+					blockId: "text-6",
+					text: "new answer",
+				},
+				ctx,
+			);
+			expect(ctx.reasoningTranslations?.size ?? 0).toBe(0);
+		});
+	}
+});
+
 describe("request attribution", () => {
 	test("persists the actual request identity on the first content checkpoint", async () => {
 		const id = "request-checkpoint-identity";
@@ -332,9 +467,72 @@ function makeMainContext(sseEmitter?: EventEmitter): EventHandlerContext {
 	};
 }
 
+test("sealing a streamed assistant retains final duration, TTFT and metering without inserting another reply", async () => {
+	const id = "stream-final-metadata";
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+	const { createRuntimeEventContext } = await import("../agent-runtime/context");
+	const ctx = createRuntimeEventContext({
+		narratorId: id,
+		conversationId: "stream-session",
+		provider: "test",
+		model: "test-model",
+		locale: "en",
+		getTurnStartedAt: () => new Date(Date.now() - 2000).toISOString(),
+		getTtftMs: () => 125,
+	});
+	try {
+		await processEvent(
+			{
+				type: "block_complete",
+				block: { type: "text", id: "numbers", text: "[17,203]", revision: 1 },
+			},
+			ctx,
+		);
+		const partialId = ctx.getPartialMessageId();
+		expect(partialId).toBeDefined();
+		ctx.setContextUsagePct(25);
+		ctx.setMeterData(1.5, "credits");
+		await processEvent(
+			{
+				type: "assistant_message",
+				text: "[17,203]",
+				toolUses: [],
+				messageId: "upstream-id",
+				credentialId: "credential",
+			},
+			ctx,
+		);
+		const messages = await db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, id));
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).toMatchObject({
+			id: partialId,
+			ttftMs: 125,
+			contextPercent: 25,
+			meterUsage: 1.5,
+			meterUnit: "credits",
+			credentialId: "credential",
+			messageUuid: "upstream-id",
+		});
+		expect(messages[0]?.durationMs).toBeGreaterThanOrEqual(2000);
+		expect(ctx.getPartialMessageId()).toBeUndefined();
+		expect(getStreamingSnapshot(id)?.streamingBlocks ?? []).toHaveLength(0);
+	} finally {
+		clearStreamingSnapshot(id);
+		await cleanupFileContextNarrator(id);
+	}
+});
+
 afterEach(() => {
 	clearStreamingSnapshot(PARENT_NARRATOR_ID);
 	clearStreamingSnapshot(SUBAGENT_NARRATOR_ID);
+	// The counters are run-scoped, not snapshot-scoped: clearStreamingSnapshot no
+	// longer retires them, so tests retire them explicitly to stay isolated.
+	retireSubagentOutputCharCount(PARENT_NARRATOR_ID);
+	retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID);
 	broadcastMessages.length = 0;
 	broadcastTargets.length = 0;
 });
@@ -359,6 +557,53 @@ async function cleanupFileContextNarrator(id: string) {
 		sqlite.run("PRAGMA foreign_keys = ON");
 	}
 }
+
+describe("owned request-end round accounting", () => {
+	test("multiple requests, retries, duplicate ends and child broadcasts do not lose or duplicate charges", async () => {
+		const parent = makeMainContext();
+		const child = makeSubagentContext();
+		const parentUsage: Array<TokenUsageSnapshot | undefined> = [];
+		const childUsage: Array<TokenUsageSnapshot | undefined> = [];
+		parent.accountRequestTokenUsage = (usage) => parentUsage.push(usage);
+		child.accountRequestTokenUsage = (usage) => childUsage.push(usage);
+		async function start(ctx: EventHandlerContext, requestId: string) {
+			await processEvent(
+				{ type: "api_request_start", requestId, provider: "anthropic", model: "test" },
+				ctx,
+			);
+		}
+		await start(parent, "round-tool");
+		const end = {
+			type: "api_request_end" as const,
+			requestId: "round-tool",
+			usage: { inputTokens: 1000, completionTokens: 100 },
+		};
+		// Concurrent duplicate ends must consume the in-flight ownership only once.
+		await Promise.all([processEvent(end, parent), processEvent(end, parent)]);
+		await start(parent, "round-retry");
+		await processEvent({ ...end, requestId: "round-retry", errorMessage: "retryable" }, parent);
+		await start(parent, "round-final");
+		await processEvent(
+			{ ...end, requestId: "round-final", usage: { inputTokens: 1100, completionTokens: 100 } },
+			parent,
+		);
+		await start(child, "round-child");
+		await processEvent({ ...end, requestId: "round-child" }, parent);
+		await processEvent({ ...end, requestId: "round-child" }, child);
+		await start(parent, "round-empty");
+		await processEvent({ type: "api_request_end", requestId: "round-empty" }, parent);
+		await processEvent({ ...end, requestId: "round-final" }, parent);
+		expect(parentUsage).toEqual([
+			end.usage,
+			end.usage,
+			{ inputTokens: 1100, completionTokens: 100 },
+			undefined,
+		]);
+		expect(childUsage).toEqual([end.usage]);
+		expect(parent.apiRequestsMap?.size).toBe(0);
+		expect(child.apiRequestsMap?.size).toBe(0);
+	});
+});
 
 describe("request occupancy is independent from billing and historical usage", () => {
 	test("real usage explicitly clears sticky estimate state in memory, WS and SSE", async () => {
@@ -503,6 +748,115 @@ describe("request occupancy is independent from billing and historical usage", (
 	});
 });
 
+describe("durable API error association", () => {
+	test("completed request enriches the exact diagnostic object before error persistence and refresh", async () => {
+		const id = "error-association-narrator";
+		const now = "2026-10-08T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		const ctx = { ...makeMainContext(), narratorId: id, broadcastTargetId: id };
+		const diagnostics = {
+			schema: "narrafork.error-diagnostics.v1" as const,
+			recordingRequestId: "exact-attempt",
+			requestId: "upstream-id",
+			providerRequestId: "provider-id",
+			statusCode: 503,
+			message: "界😀".repeat(8192),
+		};
+		try {
+			// A different, later request must not become this error's association.
+			for (const requestId of ["exact-attempt", "other-attempt"]) {
+				await processEvent(
+					{ type: "api_request_start", requestId, provider: "anthropic", model: "test" },
+					ctx,
+				);
+			}
+			await processEvent(
+				{
+					type: "api_request_end",
+					requestId: "exact-attempt",
+					errorMessage: "upstream failed",
+					diagnostics,
+				},
+				ctx,
+			);
+			const request = db.select().from(apiRequests).where(eq(apiRequests.narratorId, id)).get();
+			expect(request).toBeDefined();
+			expect(diagnostics).toMatchObject({
+				apiRequestId: request?.id,
+				recordingRequestId: "exact-attempt",
+				requestId: "upstream-id",
+			});
+			expect(ctx.apiRequestsMap?.has("exact-attempt")).toBe(false);
+			const { narratorPersistence } = await import("../narrator-persistence");
+			await processEvent({ type: "error", message: "upstream failed", diagnostics }, ctx, {
+				onErrorCleanup: async (message, errorDiagnostics) => {
+					await narratorPersistence.updateStatus(id, "idle", {
+						substatus: ["error"],
+						errorMessage: message,
+						diagnostics: errorDiagnostics,
+					});
+				},
+			});
+			// Re-read backing storage (the path used after refresh), not a live broadcast.
+			const message = db
+				.select({ content: narratorMessages.contentJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.content).toEqual([
+				{ type: "error", message: "upstream failed", diagnostics },
+			]);
+			expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThanOrEqual(16 * 1024);
+			const ref = db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, id))
+				.get();
+			expect(ref).toBeDefined();
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("legacy errors and internal errors never acquire a nearby API association", async () => {
+		const id = "legacy-error-association-narrator";
+		const now = "2026-10-08T00:00:00Z";
+		await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+		try {
+			const { narratorPersistence } = await import("../narrator-persistence");
+			await narratorPersistence.updateStatus(id, "idle", {
+				substatus: ["error"],
+				errorMessage: "internal failure",
+			});
+			const message = db
+				.select({ content: narratorMessages.contentJson })
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, id))
+				.get();
+			expect(message?.content).toEqual([{ type: "error", message: "internal failure" }]);
+			const diagnostics = {
+				schema: "narrafork.error-diagnostics.v1" as const,
+				requestId: "untrusted-upstream-only",
+				recordingRequestId: "different-attempt",
+			};
+			const ctx = { ...makeMainContext(), narratorId: id, broadcastTargetId: id };
+			await processEvent(
+				{ type: "api_request_start", requestId: "current", provider: "anthropic", model: "test" },
+				ctx,
+			);
+			await processEvent(
+				{ type: "api_request_end", requestId: "current", errorMessage: "failed", diagnostics },
+				ctx,
+			);
+			expect(diagnostics).not.toHaveProperty("apiRequestId");
+		} finally {
+			await db.delete(apiRequests).where(eq(apiRequests.narratorId, id));
+			await cleanupFileContextNarrator(id);
+		}
+	});
+});
+
 describe("streaming snapshot author isolation", () => {
 	for (const event of [
 		{ type: "stream_reset" as const },
@@ -633,7 +987,17 @@ describe("assistant file-reference provenance", () => {
 			...makeSubagentContext(),
 			getFileReferenceContext: () => ({ deviceId: "ChildDevice", cwd: "/child" }),
 		};
-		await processEvent({ type: "stream_text", text: "src/a.ts", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "b0",
+				text: "src/a.ts",
+				outputIndex: 0,
+			},
+			ctx,
+		);
 		expect(getStreamingSnapshot(ctx.narratorId)?.streamingBlocks[0]).toMatchObject({
 			type: "text",
 			fileReferenceContext: { deviceId: "ChildDevice", cwd: "/child" },
@@ -667,9 +1031,29 @@ describe("assistant file-reference provenance", () => {
 			},
 		};
 		try {
-			await processEvent({ type: "stream_text", text: "[file]", outputIndex: 0 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 2,
+					blockTextOffset: 8,
+					blockId: "b0",
+					text: "[file]",
+					outputIndex: 0,
+				},
+				ctx,
+			);
 			source = { deviceId: "DeviceB", cwd: "/other" };
-			await processEvent({ type: "stream_text", text: "(src/a.ts#L2)", outputIndex: 0 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 3,
+					blockTextOffset: 14,
+					blockId: "b0",
+					text: "(src/a.ts#L2)",
+					outputIndex: 0,
+				},
+				ctx,
+			);
 			expect(reads).toBe(1);
 			expect(getStreamingSnapshot(id)?.streamingBlocks[0]).toMatchObject({
 				fileReferenceContext: { deviceId: "DeviceA", cwd: "/repo" },
@@ -683,14 +1067,25 @@ describe("assistant file-reference provenance", () => {
 			await processEvent(
 				{
 					type: "block_complete",
-					block: { type: "text", text: "[file](src/a.ts#L2)", outputIndex: 0 },
+					block: { type: "text", id: "b0", text: "[file](src/a.ts#L2)", outputIndex: 0 },
 				},
 				ctx,
 			);
 			const savedId = partialId;
-			await processEvent({ type: "stream_text", text: "next", outputIndex: 0 }, ctx);
+			// The provider reuses output index 0 for a new element: it reads its own device.
 			await processEvent(
-				{ type: "block_complete", block: { type: "text", text: "next", outputIndex: 0 } },
+				{
+					type: "stream_text",
+					blockRevision: 1,
+					blockTextOffset: 0,
+					blockId: "b1",
+					text: "next",
+					outputIndex: 0,
+				},
+				ctx,
+			);
+			await processEvent(
+				{ type: "block_complete", block: { type: "text", id: "b1", text: "next", outputIndex: 0 } },
 				ctx,
 			);
 			await processEvent(
@@ -714,7 +1109,7 @@ describe("assistant file-reference provenance", () => {
 		}
 	});
 
-	test("a combined provider text block never borrows its last device for earlier text", async () => {
+	test("a text block without an element id never borrows a streamed element's device", async () => {
 		const id = "file-context-mixed";
 		const createdAt = new Date().toISOString();
 		await db.insert(narrators).values({ id, createdAt, updatedAt: createdAt });
@@ -732,9 +1127,29 @@ describe("assistant file-reference provenance", () => {
 			getFileReferenceContext: () => ({ deviceId, cwd: "/repo" }),
 		};
 		try {
-			await processEvent({ type: "stream_text", text: "first ", outputIndex: 0 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 4,
+					blockTextOffset: 27,
+					blockId: "b0",
+					text: "first ",
+					outputIndex: 0,
+				},
+				ctx,
+			);
 			deviceId = "B";
-			await processEvent({ type: "stream_text", text: "second", outputIndex: 1 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 2,
+					blockTextOffset: 4,
+					blockId: "b1",
+					text: "second",
+					outputIndex: 1,
+				},
+				ctx,
+			);
 			await processEvent(
 				{ type: "block_complete", block: { type: "text", text: "first second", outputIndex: 1 } },
 				ctx,
@@ -1106,7 +1521,17 @@ describe("完成工具输入传递", () => {
 		sseEmitter.on("event", (event) => sseEvents.push(event));
 		const ctx = makeMainContext(sseEmitter);
 
-		await processEvent({ type: "stream_text", text: "保留的 partial 文本", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-7",
+				text: "保留的 partial 文本",
+				outputIndex: 0,
+			},
+			ctx,
+		);
 		await processEvent(
 			{
 				type: "tool_call",
@@ -1156,6 +1581,8 @@ describe("完成工具输入传递", () => {
 				text: "保留的 partial 文本",
 				outputIndex: 0,
 				id: expect.any(String),
+				revision: 1,
+				textOffset: 0,
 				fileReferenceContext: null,
 			},
 			{
@@ -1214,7 +1641,17 @@ describe("完成工具输入传递", () => {
 		const sseEvents: unknown[] = [];
 		sseEmitter.on("event", (event) => sseEvents.push(event));
 		const ctx = makeMainContext(sseEmitter);
-		await processEvent({ type: "stream_text", text: "still here", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-8",
+				text: "still here",
+				outputIndex: 0,
+			},
+			ctx,
+		);
 		await processEvent(
 			{
 				type: "image_generation",
@@ -1256,7 +1693,14 @@ describe("完成工具输入传递", () => {
 	test("子代理 retry 只清自身生图快照，父快照保持不变", async () => {
 		const parentCtx = makeMainContext();
 		await processEvent(
-			{ type: "stream_text", text: "parent live text", outputIndex: 0 },
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-9",
+				text: "parent live text",
+				outputIndex: 0,
+			},
 			parentCtx,
 		);
 
@@ -1285,6 +1729,8 @@ describe("完成工具输入传递", () => {
 				text: "parent live text",
 				outputIndex: 0,
 				id: expect.any(String),
+				revision: 1,
+				textOffset: 0,
 				fileReferenceContext: null,
 			},
 		]);
@@ -1623,6 +2069,86 @@ describe("narrator event handler persistence", () => {
 		}
 	});
 
+	test("EnterPlanMode 在自身 block_complete 落库时准备，assistant_message 不再重复准备", async () => {
+		const narratorId = `enter-plan-prepare-${Date.now()}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		let savedMessageId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId,
+			broadcastTargetId: narratorId,
+			parentToolUseId: undefined,
+			conversationId: `conversation-${narratorId}`,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (id) => {
+				partialId = id;
+			},
+			provider: "test",
+			model: "test-model",
+		};
+		const order: string[] = [];
+		const prepared: Array<[string, string]> = [];
+		const hooks = {
+			onPrepareEnterPlanMode: async (toolCallId: string, toolUseId: string) => {
+				order.push("prepare");
+				prepared.push([toolCallId, toolUseId]);
+			},
+			onAssistantMessageFinalized: async () => {
+				order.push("finalized");
+			},
+		};
+
+		try {
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "tool_use", toolUseId: "enter-plan", name: "EnterPlanMode", input: {} },
+					// The loop may start the call once it holds the binding: prepared state
+					// must already exist by then.
+					onToolPersisted: () => {
+						order.push("persisted");
+					},
+				},
+				ctx,
+				hooks,
+			);
+			savedMessageId = partialId;
+			expect(order).toEqual(["prepare", "persisted"]);
+			expect(prepared).toHaveLength(1);
+			expect(prepared[0]?.[1]).toBe("enter-plan");
+			expect(ctx.preparedPlanModeToolCalls?.get("enter-plan")).toBe(prepared[0]?.[0]);
+
+			await processEvent(
+				{
+					type: "assistant_message",
+					text: "",
+					toolUses: [{ toolUseId: "enter-plan", name: "EnterPlanMode", input: {} }],
+				},
+				ctx,
+				hooks,
+			);
+			expect(prepared).toHaveLength(1);
+			expect(order).toEqual(["prepare", "persisted", "finalized"]);
+			expect(partialId).toBeUndefined();
+		} finally {
+			sqlite.run("PRAGMA foreign_keys = OFF");
+			try {
+				if (savedMessageId) {
+					await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, savedMessageId));
+					await db
+						.delete(narratorMessageRefs)
+						.where(eq(narratorMessageRefs.messageId, savedMessageId));
+					await db.delete(narratorMessages).where(eq(narratorMessages.id, savedMessageId));
+				}
+				await db.delete(narrators).where(eq(narrators.id, narratorId));
+			} finally {
+				sqlite.run("PRAGMA foreign_keys = ON");
+			}
+		}
+	});
+
 	test("EnterPlanMode 仅在成功结果落库后按 row id 提交一次", async () => {
 		const ctx = makeSubagentContext();
 		ctx.preparedPlanModeToolCalls = new Map([["reused-call", "tool-row-new"]]);
@@ -1741,6 +2267,95 @@ describe("narrator event handler persistence", () => {
 	});
 });
 
+test.each([
+	false,
+	true,
+])("discarded restart reasoning preserves fork (created after COW=%s)", async (lateFork) => {
+	const owner = `restart-owner-${Date.now()}`;
+	const fork = `${owner}-fork`;
+	const now = new Date().toISOString();
+	await db.insert(narrators).values([
+		{ id: owner, createdAt: now, updatedAt: now },
+		{ id: fork, createdAt: now, updatedAt: now },
+	]);
+	let partialId: string | undefined;
+	const ctx: EventHandlerContext = {
+		...makeMainContext(),
+		narratorId: owner,
+		broadcastTargetId: owner,
+		conversationId: owner,
+		provider: "test",
+		model: "test",
+		getPartialMessageId: () => partialId,
+		setPartialMessageId: (id) => {
+			partialId = id;
+		},
+	};
+	try {
+		await processEvent(
+			{ type: "block_complete", block: { type: "text", text: "historical prefix" } },
+			ctx,
+		);
+		await processEvent(
+			{ type: "api_request_start", requestId: "restart-attempt", provider: "test", model: "test" },
+			ctx,
+		);
+		await processEvent(
+			{
+				type: "block_complete",
+				block: { type: "reasoning", text: "current thought", completed: true },
+			},
+			ctx,
+		);
+		if (!partialId) throw new Error("Missing persisted partial");
+		const sharedId = partialId;
+		const createFork = () =>
+			db.insert(narratorMessageRefs).values({
+				id: `${fork}-ref`,
+				narratorId: fork,
+				messageId: sharedId,
+				seq: 1,
+			});
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const originalCOW = narratorPersistence.copyOnWriteMessage.bind(narratorPersistence);
+		let forkCreated = false;
+		const cowSpy = lateFork
+			? spyOn(narratorPersistence, "copyOnWriteMessage").mockImplementation(async (...args) => {
+					const result = await originalCOW(...args);
+					if (!forkCreated) {
+						forkCreated = true;
+						await createFork();
+					}
+					return result;
+				})
+			: undefined;
+		try {
+			if (!lateFork) await createFork();
+			await processEvent({ type: "attempt_discarded", requestId: "restart-attempt" }, ctx);
+		} finally {
+			cowSpy?.mockRestore();
+		}
+		const current = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialId),
+		});
+		const snapshot = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, sharedId),
+		});
+		expect(current?.contentJson).toEqual([{ type: "text", text: "historical prefix" }]);
+		expect(JSON.stringify(snapshot?.contentJson)).toContain("current thought");
+		expect(partialId).not.toBe(sharedId);
+		expect(
+			broadcastMessages.some((message) => (message as { type: string }).type === "streaming_reset"),
+		).toBe(true);
+		expect(
+			broadcastMessages.some((message) => (message as { type: string }).type === "message_updated"),
+		).toBe(true);
+	} finally {
+		await cleanupFileContextNarrator(fork);
+		await cleanupFileContextNarrator(owner);
+	}
+});
+
 /**
  * Reasoning translation lands asynchronously, and an attempt can be discarded and
  * replayed while it is in flight (`attempt_discarded` truncates that attempt's
@@ -1770,5 +2385,268 @@ describe("isSameReasoningBlock — the translation write-back guard", () => {
 	test("an empty translated text is still matched exactly, not treated as absent", () => {
 		expect(isSameReasoningBlock({ type: "reasoning", text: "" }, "")).toBe(true);
 		expect(isSameReasoningBlock({ type: "reasoning" }, "")).toBe(false);
+	});
+});
+
+describe("subagent live output char count", () => {
+	/** The parent's own Agent call owns a snapshot chunk once `tool_call` ran. */
+	async function parentAgentChunk(toolUseId = PARENT_TOOL_USE_ID) {
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId,
+				toolName: "Agent",
+				input: { prompt: "go" },
+			},
+			makeMainContext(),
+		);
+	}
+
+	function toolOutputFrames() {
+		return (broadcastMessages as Array<Record<string, unknown>>).filter(
+			(message) => message.type === "tool_output",
+		);
+	}
+
+	/** Wait for the throttled trailing flush to land a given cumulative count. */
+	async function untilOutput(count: string) {
+		const deadline = Date.now() + 2_000;
+		while (Date.now() < deadline) {
+			if (toolOutputFrames().at(-1)?.output === count) return;
+			await Bun.sleep(10);
+		}
+		expect(toolOutputFrames().at(-1)?.output).toBe(count);
+	}
+
+	test("counts a subagent's streamed text and ticks the parent's Agent card", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		const frames = toolOutputFrames();
+		expect(frames.at(-1)).toMatchObject({
+			type: "tool_output",
+			narratorId: PARENT_NARRATOR_ID,
+			toolUseId: PARENT_TOOL_USE_ID,
+			output: "5",
+		});
+		// Not a child-tool frame: the parent page must fold this into its OWN card.
+		expect(frames.at(-1)).not.toHaveProperty("parentToolUseId");
+		// The snapshot carries the same count so a reconnecting client restores it.
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(PARENT_TOOL_USE_ID)?.streamingOutput,
+		).toBe("5");
+	});
+
+	test("throttled frames keep only the latest cumulative total", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 2,
+				blockTextOffset: 5,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		// Inside the throttle window this only arms the trailing flush.
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 3,
+				blockTextOffset: 10,
+				text: ", world",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		expect(toolOutputFrames()).toHaveLength(1);
+		// The trailing flush lands the FULL accumulated count ("Hello, world"), not
+		// the last delta.
+		await untilOutput("12");
+	});
+
+	test("an overlapping replay does not double-count", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 4,
+				blockTextOffset: 17,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		// A resend with an absolute offset overlapping the streamed prefix (resume).
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 5,
+				text: "Hello, world",
+				blockId: "blk-1",
+				blockTextOffset: 0,
+			},
+			sub,
+		);
+		// "Hello, world".length — never 5 + 12.
+		await untilOutput("12");
+	});
+
+	test("a primary narrator's own text never enters the subagent counter", async () => {
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 6,
+				blockTextOffset: 34,
+				text: "mine",
+				blockId: "blk-1",
+			},
+			makeMainContext(),
+		);
+		expect(toolOutputFrames()).toHaveLength(0);
+	});
+
+	test("skips the broadcast while no card tracks the tool, resuming with the full total", async () => {
+		const sub = makeSubagentContext();
+		// No Agent chunk yet: nothing to show the count on, so nothing is sent…
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 7,
+				blockTextOffset: 38,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		expect(toolOutputFrames()).toHaveLength(0);
+		// …but the counter keeps accumulating, so a card appearing later resumes
+		// from the true total rather than zero.
+		await parentAgentChunk();
+		await processEvent(
+			{ type: "stream_text", blockRevision: 8, blockTextOffset: 43, text: "!", blockId: "blk-1" },
+			sub,
+		);
+		await untilOutput("6");
+	});
+
+	test("iteration-level snapshot resets do NOT retire the counter (run-scoped total)", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 9,
+				blockTextOffset: 44,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		// A child with no subagents of its own hits `clearStreamingSnapshot` via
+		// `clearAuthorStreamingSnapshot` on EVERY `assistant_message` — the counter
+		// must survive it, or the badge would restart from zero between iterations.
+		clearStreamingSnapshot(SUBAGENT_NARRATOR_ID);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				text: ", world",
+				blockId: "blk-2",
+			},
+			sub,
+		);
+		await untilOutput("12");
+	});
+
+	test("a discarded attempt restarts the count with the replayed stream", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 10,
+				blockTextOffset: 49,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		await untilOutput("5");
+		// The dead-turn reset retracts the streamed text; the count starts over.
+		await processEvent({ type: "stream_reset" }, sub);
+		await processEvent(
+			{ type: "stream_text", blockRevision: 11, blockTextOffset: 54, text: "Hi", blockId: "blk-1" },
+			sub,
+		);
+		await untilOutput("2");
+	});
+
+	test("a replay fully inside the streamed span never shrinks the count", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 12,
+				text: "x".repeat(100),
+				blockId: "blk-1",
+				blockTextOffset: 0,
+			},
+			sub,
+		);
+		await untilOutput("100");
+		// A resend covering [20, 50) — entirely inside the existing span.
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 13,
+				text: "y".repeat(30),
+				blockId: "blk-1",
+				blockTextOffset: 20,
+			},
+			sub,
+		);
+		await processEvent(
+			{ type: "stream_text", blockRevision: 14, text: "z", blockId: "blk-1", blockTextOffset: 100 },
+			sub,
+		);
+		await untilOutput("101");
+	});
+
+	test("run end flushes the final count and retires the counter", async () => {
+		await parentAgentChunk();
+		const sub = makeSubagentContext();
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 15,
+				blockTextOffset: 59,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
+		// Inside the throttle window; the flush happens synchronously on retire.
+		await processEvent(
+			{ type: "stream_text", blockRevision: 16, blockTextOffset: 64, text: "!!", blockId: "blk-1" },
+			sub,
+		);
+		expect(toolOutputFrames()).toHaveLength(1);
+		retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID);
+		expect(toolOutputFrames().at(-1)?.output).toBe("7");
 	});
 });

@@ -1,5 +1,6 @@
-import { Code, useComputedColorScheme } from "@mantine/core";
-import { type CSSProperties, memo, useEffect, useRef, useState } from "react";
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
+import { Code } from "@mantine/core";
+import { type CSSProperties, memo, useEffect, useMemo, useRef, useState } from "react";
 import type { BundledLanguage } from "shiki";
 import { loadShiki } from "../../../lib/shiki-loader";
 import classes from "./HighlightedCode.module.css";
@@ -39,7 +40,7 @@ export const HighlightedCode = memo(function HighlightedCode({
 	maxHighlightChars = MAX_CACHEABLE_CODE_CHARS,
 }: HighlightedCodeProps) {
 	const highlightLimit = Math.min(maxHighlightChars, MAX_FILE_HIGHLIGHT_CODE_CHARS);
-	const computedScheme = useComputedColorScheme("dark");
+	const computedScheme = useSharedComputedColorScheme("dark");
 	const theme = computedScheme === "light" ? "github-light-default" : "github-dark-default";
 
 	// We can't synchronously check bundledLanguages before shiki loads,
@@ -142,8 +143,16 @@ export const HighlightedCode = memo(function HighlightedCode({
 		};
 	}, [lang, code, theme, highlightLimit]);
 
+	// React compares `dangerouslySetInnerHTML` by object identity and assigns
+	// `innerHTML` whenever that object is new, even if the HTML string is unchanged.
+	// A fresh literal on every render therefore replaces the text nodes and cancels
+	// an in-progress selection — the tool-call inspector re-renders on hover and on
+	// list updates, so copying out of a highlighted block was interrupted. Keep one
+	// payload until `html` itself changes (same fix as MermaidDiagram's svg host).
+	const highlightedHtml = useMemo(() => (html ? { __html: html } : null), [html]);
+
 	// Plain text, oversized, or pending — use Mantine Code
-	if (code.length > highlightLimit || !html) {
+	if (code.length > highlightLimit || !highlightedHtml) {
 		return (
 			<Code
 				block
@@ -164,7 +173,7 @@ export const HighlightedCode = memo(function HighlightedCode({
 			className={classes.root}
 			style={style}
 			// biome-ignore lint/security/noDangerouslySetInnerHtml: shiki output is trusted
-			dangerouslySetInnerHTML={{ __html: html }}
+			dangerouslySetInnerHTML={highlightedHtml}
 		/>
 	);
 });

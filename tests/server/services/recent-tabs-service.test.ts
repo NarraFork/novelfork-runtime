@@ -24,6 +24,7 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 }));
 
 const recentTabs = await import("../../../server/services/recent-tabs-service");
+const { reduceRecentTabsOperations } = await import("../../../frontend/hooks/useRecentTabs");
 
 const NOW = "2026-07-19T00:00:00.000Z";
 
@@ -84,6 +85,54 @@ afterAll(() => {
 	mock.restore();
 });
 
+describe("hidden narrators", () => {
+	it("leaves a ModelTrace cabin out of the sidebar", async () => {
+		seedUser();
+		db.insert(narrators)
+			.values([
+				{
+					id: "cabin",
+					title: "ModelTrace",
+					hiddenFromLists: true,
+					createdAt: NOW,
+					updatedAt: NOW,
+				},
+				{
+					id: "sub-cabin",
+					title: "ModelTrace sub",
+					hiddenFromLists: true,
+					createdAt: NOW,
+					updatedAt: NOW,
+				},
+				{
+					id: "visible",
+					title: "Visible",
+					hiddenFromLists: false,
+					createdAt: NOW,
+					updatedAt: NOW,
+				},
+			])
+			.run();
+
+		const saved = await recentTabs.upsertRecentTabsBatch("user-1", [
+			makeTab("cabin"),
+			makeTab("sub-cabin", { type: "subagent" }),
+			makeTab("visible"),
+		]);
+		expect(saved.changed).toBe(true);
+		expect(storedKeys()).toEqual(["narrator:visible"]);
+
+		const skipped = await recentTabs.upsertRecentTab("user-1", makeTab("cabin"));
+		expect(skipped).toEqual({
+			changed: false,
+			baseRevision: saved.revision,
+			revision: saved.revision,
+			operations: [],
+		});
+		expect(storedKeys()).toEqual(["narrator:visible"]);
+	});
+});
+
 describe("recent-tabs indexed side paths", () => {
 	it("promotes a draft tab without disturbing the pinned zone", async () => {
 		seedLegacyTabs([
@@ -124,11 +173,14 @@ describe("recent-tabs indexed side paths", () => {
 		]);
 		seedLegacyTabs(
 			[
+				// A legacy chapter tab pointing at the same narrator: chapters were removed, so it
+				// is dropped on migration and must not count as narrator membership.
 				makeTab("chapter-1", {
 					type: "chapter",
 					narratorId: "n-title",
 					title: "Old chapter title",
 				}),
+				makeTab("n-title", { title: "Old title" }),
 				makeTab("project-1", { type: "project" }),
 			],
 			"user-2",
@@ -137,6 +189,7 @@ describe("recent-tabs indexed side paths", () => {
 			"user-1",
 			"user-2",
 		]);
+		expect(storedKeys("user-2")).toEqual(["narrator:n-title", "project:project-1"]);
 		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 1)).toEqual(["user-1"]);
 		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 0)).toEqual([]);
 		await recentTabs.syncNarratorTitleToRecentTabs("n-title", "New title");
@@ -201,6 +254,91 @@ describe("recent-tabs revisions and deltas", () => {
 			makeTab("n-2", { title: "Revisited", lastVisitedAt: 99_999 }),
 		);
 		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2"]);
+	});
+
+	it("anchors metadata deltas within the tab's own section", async () => {
+		seedLegacyTabs([
+			makeTab("n-1"),
+			makeTab("p-1", { type: "project" }),
+			makeTab("n-2"),
+			makeTab("p-2", { type: "project" }),
+			makeTab("n-3"),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const result = await recentTabs.upsertRecentTab("user-1", makeTab("n-2", { title: "Renamed" }));
+
+		expect(result.operations).toEqual([
+			{
+				type: "upsert",
+				key: "narrator:n-2",
+				tab: makeTab("n-2", { title: "Renamed" }),
+				beforeKey: "narrator:n-3",
+				afterKey: "narrator:n-1",
+			},
+		]);
+	});
+
+	it("marks the first row of a section with a null predecessor", async () => {
+		seedLegacyTabs([makeTab("p-1", { type: "project" }), makeTab("n-1"), makeTab("n-2")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const result = await recentTabs.upsertRecentTab("user-1", makeTab("n-1", { title: "Renamed" }));
+
+		expect(result.operations).toHaveLength(1);
+		expect(result.operations[0]).toMatchObject({
+			key: "narrator:n-1",
+			beforeKey: "narrator:n-2",
+			afterKey: null,
+		});
+	});
+
+	it("includes displaced block members when constructing sequential moves", async () => {
+		seedLegacyTabs([makeTab("a"), makeTab("b"), makeTab("c"), makeTab("d")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const result = await recentTabs.restoreRecentTabs("user-1", {
+			tabs: [makeTab("c"), makeTab("d"), makeTab("a"), makeTab("b")],
+		});
+
+		expect(storedKeys()).toEqual(["narrator:c", "narrator:d", "narrator:a", "narrator:b"]);
+		expect(result.operations).toEqual([
+			{ type: "move", key: "narrator:c", beforeKey: "narrator:d", afterKey: null },
+			{ type: "move", key: "narrator:d", beforeKey: "narrator:a", afterKey: "narrator:c" },
+		]);
+	});
+
+	it("replays server deltas to the persisted order across mixed-section workspace permutations", async () => {
+		const blocks = [
+			[makeTab("p-1", { type: "project" })],
+			[makeTab("n-1")],
+			[makeTab("ws-1", { type: "workspace" }), makeTab("child-1", { workspaceId: "ws-1" })],
+			[makeTab("ws-2", { type: "workspace" }), makeTab("child-2", { workspaceId: "ws-2" })],
+		];
+		function permutations<T>(items: T[]): T[][] {
+			if (items.length === 0) return [[]];
+			return items.flatMap((item, index) =>
+				permutations(items.filter((_, otherIndex) => index !== otherIndex)).map((rest) => [
+					item,
+					...rest,
+				]),
+			);
+		}
+		seedLegacyTabs(blocks.flat());
+		await recentTabs.ensureMigrated("user-1");
+
+		for (const order of permutations(blocks)) {
+			const before = await recentTabs.listAllRecentTabs("user-1");
+			const result = await recentTabs.restoreRecentTabs("user-1", { tabs: order.flat() });
+			const persisted = await recentTabs.listAllRecentTabs("user-1");
+			for (const section of ["projects", "work"] as const) {
+				const belongs = (tab: PersistedRecentTab) =>
+					(tab.type === "project") === (section === "projects");
+				expect(
+					reduceRecentTabsOperations(before.filter(belongs), section, result.operations),
+				).toEqual(persisted.filter(belongs));
+			}
+		}
 	});
 
 	it("atomically batch-upserts a workspace header and children with one revision", async () => {
@@ -569,6 +707,68 @@ describe("recent-tabs capacity and undo", () => {
 		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2"]);
 	});
 
+	it("restores a single-tab remove from the bounded undo token", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2"), makeTab("n-3")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const removed = await recentTabs.removeRecentTab("user-1", "narrator", "n-2", {
+			storeUndo: true,
+		});
+		expect(removed).toMatchObject({ changed: true, revision: 1, removedCount: 1 });
+		expect(removed.undoToken).toBeString();
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-3"]);
+
+		const restored = await recentTabs.restoreRecentTabs("user-1", {
+			token: removed.undoToken,
+		});
+		expect(restored).toMatchObject({ changed: true, baseRevision: 1, revision: 2 });
+		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2", "narrator:n-3"]);
+	});
+
+	it("stores no undo token when removing a missing tab", async () => {
+		seedLegacyTabs([makeTab("n-1")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const removed = await recentTabs.removeRecentTab("user-1", "narrator", "ghost", {
+			storeUndo: true,
+		});
+		expect(removed).toMatchObject({ changed: false });
+		expect(removed.undoToken).toBeUndefined();
+	});
+
+	it("stores no undo token for cascade removes or workspace dissolve", async () => {
+		seedLegacyTabs([
+			makeTab("n-1"),
+			makeTab("n-2"),
+			makeTab("ws-1", { type: "workspace", title: "WS" }),
+			makeTab("n-child", { workspaceId: "ws-1" }),
+		]);
+		db.insert(workspaces)
+			.values({
+				id: "ws-1",
+				userId: "user-1",
+				title: "WS",
+				tree: "{}",
+				createdAt: new Date(NOW),
+				updatedAt: new Date(NOW),
+			})
+			.run();
+		await recentTabs.ensureMigrated("user-1");
+
+		// Cascade / internal path (no storeUndo): must not mint an undo token.
+		const cascaded = await recentTabs.removeRecentTab("user-1", "narrator", "n-1");
+		expect(cascaded).toMatchObject({ changed: true, removedCount: 1 });
+		expect(cascaded.undoToken).toBeUndefined();
+
+		// Workspace dissolve never stores undo — the entity and panels are torn down too.
+		const dissolved = await recentTabs.removeRecentTab("user-1", "workspace", "ws-1", {
+			storeUndo: true,
+		});
+		expect(dissolved).toMatchObject({ changed: true });
+		expect(dissolved.undoToken).toBeUndefined();
+		expect(storedKeys()).toEqual(["narrator:n-2", "narrator:n-child"]);
+	});
+
 	it("rejects an undo token after another mutation advances revision", async () => {
 		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
 		const cleared = await recentTabs.clearRecentTabs("user-1", "all");
@@ -734,6 +934,7 @@ describe("recent-tabs workspace member anchored moves", () => {
 				it(`moves ${source} ${position} ${anchor} without changing membership`, async () => {
 					await seedWorkspace();
 					const membership = storedMembership();
+					const before = await recentTabs.listAllRecentTabs("user-1");
 					const expectedMembers = memberIds.filter((id) => id !== source);
 					const target = expectedMembers.indexOf(anchor) + (position === "after" ? 1 : 0);
 					expectedMembers.splice(target, 0, source);
@@ -753,6 +954,15 @@ describe("recent-tabs workspace member anchored moves", () => {
 						"narrator:n-tail",
 					]);
 					expect(storedMembership()).toEqual(membership);
+					expect(
+						reduceRecentTabsOperations(
+							before.filter((tab) => tab.type !== "project"),
+							"work",
+							result.operations,
+						),
+					).toEqual(
+						(await recentTabs.listAllRecentTabs("user-1")).filter((tab) => tab.type !== "project"),
+					);
 					const changed = expectedMembers.some((id, index) => id !== memberIds[index]);
 					expect(result.changed).toBe(changed);
 				});

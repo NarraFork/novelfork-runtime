@@ -18,6 +18,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { FILE_CHANGE_EVIDENCE_VERSION } from "@shared/file-change-protocol";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	fileAttributions,
@@ -29,6 +30,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	projects,
 } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
@@ -156,6 +158,7 @@ async function exactEffect(over: {
 	filePath?: string;
 	linesAdded?: number;
 	linesRemoved?: number;
+	evidenceVersion?: number;
 }) {
 	const now = new Date().toISOString();
 	const filePath = over.filePath ?? "src/current.ts";
@@ -183,7 +186,8 @@ async function exactEffect(over: {
 	await db.insert(fileChangeOperations).values({
 		id: over.operationId,
 		executionSegmentId: over.segmentId,
-		evidenceVersion: 2,
+		// Default to what the live runtime writes, so a stale version filter cannot pass.
+		evidenceVersion: over.evidenceVersion ?? FILE_CHANGE_EVIDENCE_VERSION,
 		sourceInstanceId: `runtime-${over.segmentId}`,
 		sourceKind: "tool",
 		sourceId: `source-${over.operationId}`,
@@ -661,6 +665,35 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		expect(wrongActor.totalFiles).toBe(0);
 	});
 
+	test("current and v2 evidence both qualify as exact attempt evidence", async () => {
+		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
+		await exactEffect({
+			segmentId: "current-v2",
+			operationId: "v2-op",
+			filePath: "src/v2.ts",
+			linesAdded: 2,
+			evidenceVersion: 2,
+		});
+		sqlite.run("UPDATE file_change_execution_segments SET parent_segment_id = ? WHERE id = ?", [
+			"current",
+			"current-v2",
+		]);
+		await parentExecutionCall("current");
+		const exact = await getChildSubagentFileChanges({
+			parentNarratorId: PARENT,
+			childNarratorId: "sub-a",
+			scope: { sourceToolUseId: "parent-tool-use", startedAt: null, completedAt: null },
+			executionBoundary: {
+				sourceToolCallId: "parent-call",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				executionSegmentId: "current",
+			},
+		});
+		expect(exact.attributionScope).toBe("exact_attempt");
+		expect(exact.totalFiles).toBe(2);
+	});
+
 	test("child results deduplicate receipts, not entire files, and reject previous-round projections", async () => {
 		await exactEffect({ segmentId: "old", operationId: "old-op", linesAdded: 99 });
 		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
@@ -1042,12 +1075,41 @@ describe("getFileChangesBySubagent — the card projection", () => {
 
 	test("claims nothing about location when the parent has no workspace", async () => {
 		// Unknown must not be read as "outside": that would cry wolf on every ordinary
-		// change made by a chapter-bound narrator with no explicit cwd.
+		// change made by a narrator with no workspace of its own.
 		await attribute({ narratorId: "sub-a", filePath: "a.ts", linesAdded: 1 });
 
 		const byId = await getFileChangesBySubagent(["sub-a"]);
 
 		expect(byId.get("sub-a")?.files[0]?.outsideParentWorkspace).toBeNull();
+	});
+
+	test("resolves a project parent without a cwd from its project directory", async () => {
+		// A session in a project may have no cwd of its own; it works in the project root
+		// (the session's own precedence), so the card must classify against it rather than
+		// say unknown.
+		cleanDb(sqlite);
+		const now = new Date().toISOString();
+		await db.insert(projects).values({
+			id: "project-1",
+			name: "p",
+			gitPath: WORKSPACE,
+			createdAt: now,
+			updatedAt: now,
+		});
+		await makeNarrator(PARENT, null, undefined, { contextProjectId: "project-1" });
+		await makeNarrator("sub-a", PARENT);
+		await attribute({ narratorId: "sub-a", filePath: "in.ts", linesAdded: 1 });
+		await attribute({
+			narratorId: "sub-a",
+			filePath: "out.ts",
+			linesAdded: 1,
+			workspacePath: "/third",
+		});
+
+		const files = (await getFileChangesBySubagent(["sub-a"])).get("sub-a")?.files ?? [];
+
+		expect(files.find((f) => f.filePath === "in.ts")?.outsideParentWorkspace).toBe(false);
+		expect(files.find((f) => f.filePath === "out.ts")?.outsideParentWorkspace).toBe(true);
 	});
 });
 

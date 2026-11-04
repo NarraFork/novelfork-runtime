@@ -1,12 +1,42 @@
+import { homedir } from "node:os";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects, userPreferences } from "../db/schema";
+import { narrators, projects, userPreferences } from "../db/schema";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
-import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
-import { loadSkillSummariesForContext, resolveSkillContextForNarrator } from "./skill-service";
+import { policySourceIdOf, RUNTIME_SOURCE_COLUMNS } from "../lib/runtime-source";
+import {
+	loadSkillSummariesForContext,
+	resolveSkillContextForNarrator,
+	type SkillContext,
+} from "./skill-service";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
+
+export interface CommandParam {
+	name: string;
+	description?: string;
+	required?: boolean;
+	defaultValue?: string;
+}
+
+export interface CommandModelOverride {
+	/** Model identifier, e.g. "anthropic:claude-opus-4.6" */
+	model: string;
+	/** "temporary" = revert after this command; "permanent" = keep the new model */
+	mode: "temporary" | "permanent";
+}
+
+export interface Command {
+	name: string;
+	prompt: string;
+	description?: string;
+	runBashFirst?: boolean;
+	bashCommand?: string;
+	params?: CommandParam[];
+	modelOverride?: CommandModelOverride;
+}
 
 /** Safely extract commands array from a chapterSettings value. */
 function parseChapterSettingsCommands(raw: unknown): Command[] {
@@ -110,6 +140,12 @@ export interface BashCommandResult {
 	rawCommand: string;
 }
 
+export interface SaveDumpCommandResult {
+	resolved: true;
+	saveDump: true;
+	rawCommand: string;
+}
+
 export interface SpecGoalCommandResult {
 	resolved: true;
 	specGoal: true;
@@ -130,6 +166,7 @@ export type ResolveResult =
 	| UnblockSkillResult
 	| UnblockAllSkillsResult
 	| BashCommandResult
+	| SaveDumpCommandResult
 	| SpecGoalCommandResult;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
@@ -158,21 +195,16 @@ async function getUserCommands(userId: string): Promise<Command[]> {
 
 /** Load project-level commands from project.chapterSettings. */
 async function getProjectCommandsForNarrator(narratorId: string): Promise<Command[]> {
-	// narrator → chapter → project
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
+		columns: { id: true, contextProjectId: true },
 	});
-	if (!narrator?.chapterId) return [];
-
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true },
-	});
-	if (!chapter) return [];
+	if (!narrator) return [];
+	const projectId = await resolveNarratorProjectId(narrator);
+	if (!projectId) return [];
 
 	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, chapter.projectId),
+		where: eq(projects.id, projectId),
 		columns: { chapterSettings: true },
 	});
 	if (!project?.chapterSettings) return [];
@@ -297,6 +329,12 @@ export async function resolveCommand(
 ): Promise<ResolveResult> {
 	const parsed = parseCommandInput(prompt);
 	if (!parsed) return { resolved: false };
+
+	// This local control must never expand into a model prompt, even with invalid arguments.
+	if (parsed.name.toLowerCase() === "save_dump") {
+		if (parsed.input) throw new ValidationError("/save_dump does not accept arguments");
+		return { resolved: true, saveDump: true, rawCommand: prompt };
+	}
 
 	// Handle /load <toolName> — load an optional tool into the session
 	if (parsed.name.toLowerCase() === "load") {
@@ -441,6 +479,13 @@ export interface OptionalToolMenuItem {
 	descriptionZh: string;
 }
 
+export interface SlashMenuItems {
+	commands: ResolvedCommand[];
+	skills: SkillSummary[];
+	tools: OptionalToolMenuItem[];
+	allSkillsBlocked: boolean;
+}
+
 /**
  * Get commands + skills + optional tools for the slash menu.
  * Returns all lists so the frontend can render them with different styles.
@@ -448,18 +493,18 @@ export interface OptionalToolMenuItem {
 export async function getSlashMenuItems(
 	narratorId: string,
 	userId: string,
-): Promise<{
-	commands: ResolvedCommand[];
-	skills: SkillSummary[];
-	tools: OptionalToolMenuItem[];
-	allSkillsBlocked: boolean;
-}> {
+): Promise<SlashMenuItems> {
 	const [customCommands, skillContext, narrator] = await Promise.all([
 		getAvailableCommands(narratorId, userId),
 		resolveSkillContextForNarrator(narratorId),
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { traits: true, chapterId: true, contextProjectId: true },
+			columns: {
+				id: true,
+				traits: true,
+				contextProjectId: true,
+				...RUNTIME_SOURCE_COLUMNS,
+			},
 		}),
 	]);
 	// The slash menu must hide anything the layered traits block, otherwise a
@@ -469,9 +514,38 @@ export async function getSlashMenuItems(
 				narratorTraits: narrator.traits,
 				projectId: await resolveNarratorProjectId(narrator),
 				actingUserId: userId,
+				policySourceId: policySourceIdOf(narrator),
 			})
 		: null;
 	const blockedSkills = getBlockedSkills(layeredTraits?.traits ?? narrator?.traits);
+	return buildSlashMenu(customCommands, skillContext, blockedSkills);
+}
+
+/**
+ * Slash menu for a composer that has no session yet (the dashboard): user commands
+ * and the skills visible from `cwd`, filtered by the user's own trait layer — the
+ * layers a standalone session created from that composer would start with.
+ */
+export async function getDraftSlashMenuItems(
+	userId: string,
+	cwd: string | null,
+): Promise<SlashMenuItems> {
+	const [customCommands, layeredTraits] = await Promise.all([
+		getAvailableCommandsForSession(userId),
+		resolveEffectiveTraits({ narratorTraits: [], projectId: null, actingUserId: userId }),
+	]);
+	return buildSlashMenu(
+		customCommands,
+		{ projectGitPath: null, cwd: cwd || homedir() },
+		getBlockedSkills(layeredTraits.traits),
+	);
+}
+
+async function buildSlashMenu(
+	customCommands: ResolvedCommand[],
+	skillContext: SkillContext,
+	blockedSkills: ReturnType<typeof getBlockedSkills>,
+): Promise<SlashMenuItems> {
 	const commands: ResolvedCommand[] = [
 		{
 			name: "goal",

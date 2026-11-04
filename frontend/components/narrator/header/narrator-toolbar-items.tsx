@@ -34,6 +34,7 @@ import {
 	IconSearch,
 	IconTerminal,
 	IconTextSize,
+	IconTimeline,
 	IconWorldWww,
 } from "@tabler/icons-react";
 import type { ComponentType } from "react";
@@ -99,12 +100,10 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 	filetree: {
 		labelKey: "fileTree.title",
 		icon: IconFolder,
-		// Dock only, deliberately. `drawer` is not a capability flag but a claim that
-		// `MobileToolPanelHost` can render this kind, and its `MobileToolPanelKind` union
-		// has no `filetree` member — declaring it here would put a row in the mobile
-		// overflow menu that opens nothing, which is precisely the dead-control trap the
-		// notes on `hosts` describe. Add it back together with a mobile host.
-		hosts: ["dock"],
+		// Mobile hosts it in MobileToolPanelHost's full-screen Drawer; opening a
+		// file from the tree closes that drawer and uses the panel's internal
+		// file viewer instead of a dock `file` panel.
+		hosts: ["dock", "drawer"],
 	},
 	details: {
 		labelKey: "details.title",
@@ -160,6 +159,12 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		// Dock only: the panel's whole purpose is being visible BESIDE the transcript
 		// while a slider moves, which a modal drawer over the content cannot provide.
 		hosts: ["dock"],
+	},
+	timeline: {
+		labelKey: "timeline.title",
+		icon: IconTimeline,
+		// Dock panel on desktop; a full-screen drawer on mobile (MobileToolPanelHost).
+		hosts: ["dock", "drawer"],
 	},
 	lodlevel: {
 		labelKey: "lodDensity",

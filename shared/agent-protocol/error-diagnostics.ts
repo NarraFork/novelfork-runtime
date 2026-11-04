@@ -1,3 +1,4 @@
+import { parseTokenDanceRecoveryAction } from "../tokendance";
 import type { ApiRequestDiagnostics } from "./types";
 
 export const ERROR_DIAGNOSTICS_SCHEMA = "narrafork.error-diagnostics.v1" as const;
@@ -11,6 +12,15 @@ const DIAGNOSTIC_HEADER_ALLOWLIST = new Set([
 	"request-id",
 	"content-type",
 	"retry-after",
+	// Wait hints a quota/rate-limit recovery path reads back from the diagnostics
+	// (see `server/lib/opencode-quota-wait.ts`). Values are durations or instants,
+	// never credentials.
+	"retry-after-ms",
+	"x-ratelimit-reset",
+	"x-ratelimit-reset-requests",
+	"x-ratelimit-reset-tokens",
+	"ratelimit-reset",
+	"x-opencode-log-id",
 	"server",
 ]);
 
@@ -78,9 +88,6 @@ function limitDiagnosticJsonSize(result: ApiRequestDiagnostics): ApiRequestDiagn
 		"responseSnippet",
 		"cause",
 		"message",
-		"source",
-		"requestId",
-		"providerRequestId",
 		"endpoint",
 		"channelName",
 		"channelType",
@@ -91,6 +98,9 @@ function limitDiagnosticJsonSize(result: ApiRequestDiagnostics): ApiRequestDiagn
 		"reason",
 		"errorType",
 		"code",
+		"source",
+		"requestId",
+		"providerRequestId",
 	] as const;
 	for (const field of preferredFields) {
 		let value = result[field];
@@ -121,6 +131,10 @@ export function normalizeApiRequestDiagnostics(
 ): ApiRequestDiagnostics | undefined {
 	if (!input) return undefined;
 	const result: ApiRequestDiagnostics = { schema: ERROR_DIAGNOSTICS_SCHEMA };
+	if (input.provider === "tokendance") {
+		const action = parseTokenDanceRecoveryAction(input.tokendanceRecoveryAction);
+		if (action) result.tokendanceRecoveryAction = action;
+	}
 
 	const stringFields = [
 		"source",
@@ -142,6 +156,13 @@ export function normalizeApiRequestDiagnostics(
 	for (const field of stringFields) {
 		const value = stringValue(input[field]);
 		if (value !== undefined) result[field] = value;
+	}
+
+	// Association IDs must survive diagnostic text trimming, but must never be
+	// truncated into a different identity. Reject oversized/untrusted IDs instead.
+	for (const field of ["recordingRequestId", "apiRequestId"] as const) {
+		const value = typeof input[field] === "string" ? input[field]?.trim() : undefined;
+		if (value && Buffer.byteLength(value, "utf8") <= 256) result[field] = value;
 	}
 
 	if (typeof input.code === "string" || typeof input.code === "number") {

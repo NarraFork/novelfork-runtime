@@ -30,6 +30,7 @@
  * match nothing in the most common case.
  */
 
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -41,6 +42,7 @@ import {
 } from "../db/schema";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import { queueContextCharacterRefresh } from "../lib/context-characters";
+import { ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -50,9 +52,16 @@ import {
 	parseTraits,
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
+import { controllerOf, RUNTIME_SOURCE_COLUMNS, runDeliverToOf } from "../lib/runtime-source";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { getExecutionOwner } from "./agent-runtime/ownership";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
+import { bodyColumns, fillBody } from "./narrator-body-reads";
+import { adoptHumanReplyContext } from "./narrator-reply-context";
 import { narratorService } from "./narrator-service";
+import { isNarratorRuntimeBusy, withNarratorStartAdmission } from "./narrator-session-state";
+import { narratorStore } from "./narrator-store";
 import { parseTurnPauseTiming } from "./narrator-turn-timing";
 import { registerAndPersistSubagentAlias } from "./subagent-alias";
 
@@ -350,7 +359,7 @@ export function selectRecoveryCardCandidates(
  * phantom would also drive `narrator_tool_calls` through a permission decision this
  * path never requested.
  *
- * "running" is the honest state here: recovery re-drives the work itself (resumeSubagent /
+ * "running" is the honest state here: recovery re-drives the work itself (continueNarrator /
  * awaitAgentResultDetailed) without ever passing through executeTool's permission gate.
  *
  * Unlike `TOOL_CALL_RERUN_RESET_FIELDS` in narrator-session, no execution target is
@@ -440,23 +449,9 @@ async function loadSubagentsByOriginToolUse(
 	return map;
 }
 
-async function resolveOriginToolUseId(subagentId: string): Promise<string | null> {
-	const row = await db.query.narratorMessages.findFirst({
-		where: and(
-			eq(narratorMessages.narratorId, subagentId),
-			eq(narratorMessages.role, "user"),
-			sql`${narratorMessages.parentToolUseId} IS NOT NULL`,
-		),
-		columns: { parentToolUseId: true },
-		orderBy: [asc(narratorMessages.createdAt)],
-	});
-	return row?.parentToolUseId ?? null;
-}
-
 /**
- * Batched form of {@link resolveOriginToolUseId} for the card path, which resolves origins
- * for up to 50 subagents at once and would otherwise issue one SELECT per subagent.
- * Earliest message wins, matching the single-id ordering.
+ * The earliest linked parent tool use of each subagent, for the card path: up to 50
+ * subagents at once in one SELECT.
  */
 async function resolveOriginToolUseIds(subagentIds: string[]): Promise<Map<string, string>> {
 	const origins = new Map<string, string>();
@@ -501,8 +496,16 @@ export function resumeIncompleteAgentWorkForContinue(input: {
 	locale: Locale;
 	replyInUserLanguage: boolean;
 	userId?: string | null;
+	/** Only an explicit human recovery action may replace the recipient's reply policy. */
+	humanReplyContext?: ReplyContext;
 }): Promise<ResumeIncompleteAgentWorkResult> {
-	return recoveryLock.acquire(input.narratorId, () => prepareAndStartRecovery(input));
+	const acceptedInput = {
+		...input,
+		humanReplyContext: parseReplyContext(input.humanReplyContext) ?? undefined,
+	};
+	return recoveryLock.acquire(input.narratorId, () =>
+		withNarratorStartAdmission(input.narratorId, () => prepareAndStartRecovery(acceptedInput)),
+	);
 }
 
 async function prepareAndStartRecovery(input: {
@@ -510,8 +513,12 @@ async function prepareAndStartRecovery(input: {
 	locale: Locale;
 	replyInUserLanguage: boolean;
 	userId?: string | null;
+	humanReplyContext?: ReplyContext;
 }): Promise<ResumeIncompleteAgentWorkResult> {
 	const { narratorId } = input;
+	if (getExecutionOwner(narratorId) || isNarratorRuntimeBusy(narratorId)) {
+		throw new ValidationError("Cannot recover subagents while the narrator is already running");
+	}
 	const latest = await findLatestTopLevelMessage(narratorId);
 	if (!latest || latest.role !== "assistant") return { recovering: false, items: [] };
 
@@ -576,7 +583,7 @@ async function prepareAndStartRecovery(input: {
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const controller = new AbortController();
 	const registration = registerPlannedUpdateRecoveryController(narratorId, controller, undefined, {
-		// A foreground Agent candidate is re-driven in place through `resumeSubagent`,
+		// A foreground Agent candidate is re-driven in place through `continueNarrator`,
 		// whose run signal is independent of this narrator by design. Naming the
 		// subagents here is therefore the only way an interrupt can reach them — and
 		// naming them individually is what keeps the interrupt from touching any other
@@ -586,6 +593,14 @@ async function prepareAndStartRecovery(input: {
 			.map((candidate) => candidate.targetId),
 	});
 
+	try {
+		if (input.humanReplyContext) await adoptHumanReplyContext(narratorId, input.humanReplyContext);
+	} catch (error) {
+		registration.unregister();
+		throw error;
+	}
+	// Adopt once at accepted recovery admission, not after waiting: a newer queued
+	// human input must never be overwritten by this recovery's delayed continuation.
 	void runRecoveryStage(input, candidates, controller.signal)
 		.catch((err) => {
 			logger.error("Subagent recovery stage failed", {
@@ -783,26 +798,25 @@ async function driveRecoveryCandidate(
 
 	try {
 		if (candidate.kind === "agent") {
-			const { resumeSubagent } = await import("./subagent-resume");
-			const resumed = await resumeSubagent({
-				subagentId: candidate.targetId,
-				intent: "continue_tool_results",
-				actor: "user",
+			// The delegated session continues its registered run; the run's finalizer
+			// delivers the result into this Agent tool call (its registered destination).
+			const { continueNarrator } = await import("./narrator-session");
+			const resumed = await continueNarrator(
+				candidate.targetId,
 				locale,
-				createdBy: input.userId ?? null,
-				allowRunningRestart: true,
-				skipStaleAttach: true,
-				// No preserveBackground / skipConclusionDelivery: let
-				// deliverCompletedResume → updateToolCallConclusion publish the
-				// result straight back into this Agent tool call.
-			});
-			if (!resumed.started || !resumed.terminalCompletion) {
+				false,
+				input.userId ?? null,
+				{ recovered: true },
+			);
+			if (!resumed.ok || !resumed.terminal) {
 				throw new Error("Subagent continuation did not expose a terminal completion");
 			}
-			// Stop waiting as soon as the user interrupts. The subagent itself is stopped by
-			// interruptNarrator's foreground fan-out, and its own completion path still owns
-			// the tool-call row, so the parent only needs to abandon the wait here.
-			await raceAbort(resumed.terminalCompletion, signal);
+			// Stop waiting as soon as the user interrupts. The run is cancelled with this
+			// caller attempt by its registration; the parent only abandons the wait here.
+			const outcome = (await raceAbort(resumed.terminal, signal)) as { started?: boolean };
+			if (outcome?.started === false) {
+				throw new Error("Subagent continuation did not start");
+			}
 			// updateToolCallConclusion already wrote the row; do not overwrite it.
 			return;
 		}
@@ -1062,10 +1076,10 @@ async function clearBackgroundRunningClaim(
 	// Creation can throw after INSERT (e.g. while broadcasting). Check ownership
 	// before compensating: an id conflict with another task must leave it untouched.
 	try {
-		const { hasActiveSubagentResumeRun } = await import("./subagent-resume");
-		// A manual resume may have won the per-subagent lock while this batch
-		// prepared its row. Never withdraw the claim of that live continuation.
-		if (hasActiveSubagentResumeRun(subagentId)) return;
+		const { getExecutionOwner } = await import("./agent-runtime/ownership");
+		// A manual continuation may have won the session while this batch prepared
+		// its row. Never withdraw the claim of that live run.
+		if (getExecutionOwner(subagentId)) return;
 		const task = await db.query.backgroundTasks.findFirst({
 			where: and(
 				eq(backgroundTasks.id, subagentId),
@@ -1092,14 +1106,14 @@ async function clearBackgroundRunningClaim(
 				error: err instanceof Error ? err.message : String(err),
 			});
 		});
+	backgroundOccupancyStore.refreshNarrator(subagentId);
 }
 
 /**
  * Restart the selected subagents as BACKGROUND tasks.
  *
- * `preserveBackground` only means "do not clear the background flags"; a
- * foreground subagent must be marked background explicitly (mirrors
- * subagent-detach's restoreAttachedSubagentToBackground).
+ * A foreground subagent is marked background explicitly, the same way a detached
+ * run is (`controlRun` "detach" in agent-runtime/run.ts).
  */
 export async function resumeRecoverySubagents(input: {
 	narratorId: string;
@@ -1117,26 +1131,21 @@ export async function resumeRecoverySubagents(input: {
 				const subagent = await db.query.narrators.findFirst({
 					where: eq(narrators.id, subagentId),
 					columns: {
+						...RUNTIME_SOURCE_COLUMNS,
 						id: true,
-						variant: true,
 						status: true,
 						substatus: true,
 						createdAt: true,
 						backgroundStatus: true,
 						backgroundCompletedAt: true,
-						parentNarratorId: true,
 						isBackground: true,
-						subagentType: true,
 						title: true,
+						subagentType: true,
 						traits: true,
 					},
 				});
-				if (!subagent || subagent.parentNarratorId !== input.narratorId) {
-					skipped.push({ id: subagentId, reason: "not_a_child" });
-					continue;
-				}
-				if (!isSubagentVariant(subagent.variant)) {
-					skipped.push({ id: subagentId, reason: "not_a_subagent" });
+				if (!subagent || controllerOf(subagent)?.narratorId !== input.narratorId) {
+					skipped.push({ id: subagentId, reason: "not_controlled" });
 					continue;
 				}
 				if (subagent.status !== "idle") {
@@ -1160,17 +1169,16 @@ export async function resumeRecoverySubagents(input: {
 					skipped.push({ id: subagentId, reason: "failure_outside_latest_turn" });
 					continue;
 				}
-				const { resumeSubagent, hasActiveSubagentResumeRun } = await import("./subagent-resume");
-				if (hasActiveSubagentResumeRun(subagentId)) {
+				const { getExecutionOwner } = await import("./agent-runtime/ownership");
+				if (getExecutionOwner(subagentId)) {
 					skipped.push({ id: subagentId, reason: "already_resuming" });
 					continue;
 				}
-				const originToolUseId = await resolveOriginToolUseId(subagentId);
-				if (!originToolUseId) {
+				const deliverTo = runDeliverToOf(subagent);
+				if (!deliverTo || deliverTo.narratorId !== input.narratorId) {
 					skipped.push({ id: subagentId, reason: "origin_tool_call_missing" });
 					continue;
 				}
-
 				const title = subagent.title?.trim() || subagentId;
 				const subagentType = subagent.subagentType?.trim() || "general";
 
@@ -1185,61 +1193,36 @@ export async function resumeRecoverySubagents(input: {
 				// b) durable background task row (idempotent restart when it exists).
 				// The service can fail after INSERT, so compensate that path too.
 				taskClaimed = true;
-				await backgroundTaskService.createAgentTask({
+				const task = await backgroundTaskService.createAgentTask({
 					id: subagentId,
-					parentNarratorId: input.narratorId,
 					subagentNarratorId: subagentId,
 					subagentType,
-					toolUseId: originToolUseId,
 					alias,
 					title,
+					binding: {
+						deliverTo,
+						principal: { userId: input.userId ?? null },
+					},
 				});
-				// c) mark the narrator itself as background (detach's job, done by hand).
-				//    Under narratorTraitsLock with a fresh read, because `traits` is a whole-column
-				//    JSON array: writing the copy fetched at the top of this iteration would drop
-				//    any trait written since (including the watermark this very card just stamped).
-				//    `updatedAt` IS written here on purpose — unlike the watermark, this row is
-				//    being resumed, so its old failure time is no longer the relevant one.
-				await narratorTraitsLock.acquire(subagentId, async () => {
-					const current = await db.query.narrators.findFirst({
-						where: eq(narrators.id, subagentId),
-						columns: { traits: true },
-					});
-					await db
-						.update(narrators)
-						.set({
-							isBackground: true,
-							backgroundStatus: "running",
-							backgroundResult: null,
-							backgroundCompletedAt: null,
-							traits: [
-								...new Set([...parseTraits(current?.traits ?? subagent.traits), "background"]),
-							],
-							updatedAt: new Date().toISOString(),
-						})
-						.where(eq(narrators.id, subagentId));
-				});
+				// c) mark the narrator itself as background, the same way a detached run is.
+				await backgroundTaskService.markNarratorRunning(subagentId);
 
-				// d) restart, keeping background semantics and leaving the historical
-				//    Agent tool_result untouched.
-				const started = await resumeSubagent({
+				// d) continue the task's run. Its result lands on the task (the historical
+				//    Agent tool_result stays untouched), exactly like any detached run.
+				const { continueNarrator } = await import("./narrator-session");
+				const started = await continueNarrator(
 					subagentId,
-					intent: "continue_tool_results",
-					actor: "parent_agent",
-					locale: input.locale,
-					createdBy: input.userId ?? null,
-					abortController: new AbortController(),
-					allowRunningRestart: true,
-					skipStaleAttach: true,
-					preserveBackground: true,
-					skipConclusionDelivery: true,
-				});
-				if (!started.started) {
+					input.locale,
+					false,
+					input.userId ?? null,
+					{ resumeRunId: task.logicalRunId ?? undefined, recovered: true },
+				);
+				if (!started.ok) {
 					await clearBackgroundRunningClaim(subagentId, input.narratorId, "resume_not_started");
 					skipped.push({ id: subagentId, reason: "resume_not_started" });
 					continue;
 				}
-				void started.terminalCompletion?.catch((err) => {
+				void started.terminal?.catch((err: unknown) => {
 					logger.warn("Recovered background subagent failed", {
 						subagentId,
 						error: err instanceof Error ? err.message : String(err),
@@ -1267,42 +1250,39 @@ export async function markRecoveryCardResolved(input: {
 	/** Failed starts stay actionable; successful starts must not be restarted twice. */
 	retrySubagentIds?: string[];
 }): Promise<void> {
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, input.messageId),
-		columns: { id: true, contentJson: true },
-	});
-	if (!message) return;
-	const blocks = Array.isArray(message.contentJson) ? [...message.contentJson] : [];
-	const index = blocks.findIndex(
-		(block) => (block as { type?: string } | null)?.type === "subagent_recovery",
-	);
-	if (index < 0) return;
-	const previous = blocks[index] as Record<string, unknown>;
 	const retryIds = new Set(input.retrySubagentIds ?? []);
-	const remaining = (Array.isArray(previous.subagents) ? previous.subagents : []).filter(
-		(entry) => entry && typeof entry.id === "string" && retryIds.has(entry.id),
-	);
-	blocks[index] = {
-		...previous,
-		status: remaining.length > 0 ? "pending" : "resolved",
-		mode: input.mode,
-		resumedCount:
-			(typeof previous.resumedCount === "number" ? previous.resumedCount : 0) +
-			input.resumedAliases.length,
-		...(remaining.length > 0 ? { subagents: remaining } : {}),
-	};
-
-	await db
-		.update(narratorMessages)
-		.set({ contentJson: blocks })
-		.where(eq(narratorMessages.id, input.messageId));
+	// Card state: the card's model text is its content text (§5.4).
+	const written = narratorStore.patchState(input.messageId, (blocks) => {
+		const index = blocks.findIndex(
+			(block) => (block as { type?: string } | null)?.type === "subagent_recovery",
+		);
+		if (index < 0) return null;
+		const previous = blocks[index] as Record<string, unknown>;
+		const remaining = (Array.isArray(previous.subagents) ? previous.subagents : []).filter(
+			(entry) => entry && typeof entry.id === "string" && retryIds.has(entry.id),
+		);
+		blocks[index] = {
+			...previous,
+			status: remaining.length > 0 ? "pending" : "resolved",
+			mode: input.mode,
+			resumedCount:
+				(typeof previous.resumedCount === "number" ? previous.resumedCount : 0) +
+				input.resumedAliases.length,
+			...(remaining.length > 0 ? { subagents: remaining } : {}),
+		};
+		return blocks;
+	});
+	if (!written) return;
 	sqlite
 		.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
 		.run(input.narratorId);
 
-	const updated = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, input.messageId),
-	});
+	const updated = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, input.messageId),
+		}),
+	);
 	if (!updated) return;
 	broadcastToNarrator(input.narratorId, {
 		type: "message_updated",
@@ -1325,13 +1305,30 @@ export function buildRecoveryNotifyPrompt(entries: Array<{ alias: string }>): st
  * blocks, run them server-side, then continue ONCE so the model sees every
  * result in a single request.
  */
-export async function startRecoveryAwaitBatch(input: {
+export function startRecoveryAwaitBatch(
+	input: Parameters<typeof startRecoveryAwaitBatchUnlocked>[0],
+): Promise<{ messageId: string; toolUseIds: string[] }> {
+	const acceptedInput = {
+		...input,
+		humanReplyContext: parseReplyContext(input.humanReplyContext) ?? undefined,
+	};
+	return withNarratorStartAdmission(input.narratorId, () =>
+		startRecoveryAwaitBatchUnlocked(acceptedInput),
+	);
+}
+
+async function startRecoveryAwaitBatchUnlocked(input: {
 	narratorId: string;
 	aliases: string[];
 	locale: Locale;
 	replyInUserLanguage: boolean;
 	userId?: string | null;
+	humanReplyContext?: ReplyContext;
 }): Promise<{ messageId: string; toolUseIds: string[] }> {
+	if (getExecutionOwner(input.narratorId) || isNarratorRuntimeBusy(input.narratorId)) {
+		throw new ValidationError("Cannot recover subagents while the narrator is already running");
+	}
+	if (input.aliases.length === 0) throw new ValidationError("No subagents were resumed");
 	const { DEFAULT_AWAIT_TIMEOUT_MS } = await import("../lib/agent/tools/await");
 	const blocks = input.aliases.map((alias) => ({
 		type: "tool_use",
@@ -1358,10 +1355,13 @@ export async function startRecoveryAwaitBatch(input: {
 		},
 	});
 
-	const persisted = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, message.id),
-		with: { toolCalls: true },
-	});
+	const persisted = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, message.id),
+			...bodyColumns(),
+			with: { toolCalls: true },
+		}),
+	);
 	const toolCallIdByUseId = new Map<string, string>();
 	for (const call of persisted?.toolCalls ?? []) {
 		toolCallIdByUseId.set(call.toolUseId, call.id);
@@ -1400,6 +1400,14 @@ export async function startRecoveryAwaitBatch(input: {
 		undefined,
 		{ foregroundSubagentIds: [] },
 	);
+
+	try {
+		if (input.humanReplyContext)
+			await adoptHumanReplyContext(input.narratorId, input.humanReplyContext);
+	} catch (error) {
+		registration.unregister();
+		throw error;
+	}
 
 	void runRecoveryAwaitBatch(
 		{

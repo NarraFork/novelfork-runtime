@@ -1,4 +1,10 @@
 import { CITATION_LIMITS } from "@shared/citations";
+import { CONTEXT_CATEGORIES } from "@shared/context-composition";
+import {
+	MAX_INPUT_COMPOSITION_SEGMENTS,
+	readInputCompositionSegments,
+} from "@shared/context-usage";
+import { MEDIA_MIME_TO_EXT } from "@shared/media-attachments";
 import { z } from "zod";
 import { capabilityListSchema, invocationScopeSchema } from "./permissions";
 
@@ -9,18 +15,59 @@ export const manifestSchemaVersion = MANIFEST_SCHEMA_VERSION;
 export const NARRAFORK_RPC_PROTOCOL = "narrafork.rpc/1" as const;
 /** Provider business protocol negotiated on top of the RPC transport. */
 export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
-/** Full UTF-8 JSON-RPC request body budget, including base64 images; inbound limits stay small. */
+/** Full UTF-8 JSON-RPC request body budget, including native media; inbound limits stay small. */
 export const PROVIDER_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
+
+/** Optional v1 extension, usable only after explicit inputAudio/inputVideo negotiation. */
+export const providerNativeMediaSchema = z
+	.object({
+		type: z.enum(["audio", "video"]),
+		mediaType: z
+			.string()
+			.refine(
+				(value) => Object.hasOwn(MEDIA_MIME_TO_EXT, value),
+				"Unsupported native media MIME type",
+			),
+		dataBase64: z
+			.string()
+			.min(1)
+			.max(PROVIDER_REQUEST_MAX_BYTES)
+			.regex(/^[A-Za-z0-9+/]*={0,2}$/, "Native media must contain base64 bytes")
+			.refine((value) => value.length % 4 === 0, "Native media base64 is incomplete"),
+		filename: z.string().min(1).max(1024).optional(),
+	})
+	.strict()
+	.refine(
+		(value) => value.mediaType.startsWith(`${value.type}/`),
+		"Native media modality and MIME type disagree",
+	);
+export type ProviderNativeMedia = z.infer<typeof providerNativeMediaSchema>;
+
+/** Tool business payloads; schema limits and model-visible output previews are independent. */
+export const PLUGIN_TOOL_INPUT_MAX_BYTES = 8 * 1024 * 1024;
+export const PLUGIN_TOOL_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
+// Retain the former control-frame allowance for RPC IDs, invocation context and envelope.
+const TOOL_RPC_ENVELOPE_BYTES = 1024 * 1024;
+export const PLUGIN_TOOL_INPUT_FRAME_MAX_BYTES =
+	PLUGIN_TOOL_INPUT_MAX_BYTES + TOOL_RPC_ENVELOPE_BYTES;
+export const PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES =
+	PLUGIN_TOOL_OUTPUT_MAX_BYTES + TOOL_RPC_ENVELOPE_BYTES;
 /**
- * Ceiling on the dump budget the host advertises to a plugin in
- * `ProviderChatParams.requestDump.maxBytes`. The operator-configured
- * `agent.requestDumpMaxSize` is a retention ceiling and may be far larger; what crosses
- * the RPC boundary must stay well below the per-operation output budget (24 MiB) that
- * dump events share with the model's actual output.
+ * Dump budget the host advertises to a plugin in `ProviderChatParams.requestDump.maxBytes`.
+ * What crosses the RPC boundary stays bounded independently from model output. Exceeding
+ * this diagnostic budget truncates evidence, never terminates the business operation.
  */
 export const PLUGIN_REQUEST_DUMP_MAX_BYTES = 4 * 1024 * 1024;
 /** Maximum size of a single `dump.request`/`dump.response` body chunk. */
 export const PLUGIN_DUMP_CHUNK_MAX_CHARS = 64 * 1024;
+// Host-only provenance stays off the RPC wire and cannot be forged by a plugin.
+const hostTruncatedDumpEvents = new WeakSet<object>();
+export function markHostTruncatedDump(event: object): void {
+	hostTruncatedDumpEvents.add(event);
+}
+export function isHostTruncatedDump(event: object): boolean {
+	return hostTruncatedDumpEvents.has(event);
+}
 /** MessageChannel UI bridge protocol. */
 export const NARRAFORK_UI_PROTOCOL = "narrafork.ui/1" as const;
 
@@ -388,13 +435,15 @@ export const hostInitializeParamsSchema = z
 					.int()
 					.positive()
 					.max(64 * 1024 * 1024),
-				maxInFlight: z.number().int().positive().max(1_024),
-				maxQueuedBytes: z
+				maxOutboundFrameBytes: z
 					.number()
 					.int()
 					.positive()
-					.max(64 * 1024 * 1024)
+					.max(PROVIDER_REQUEST_MAX_BYTES)
 					.optional(),
+				maxInFlight: z.number().int().positive().max(1_024),
+				// A queue also reserves framing/control space; it can exceed one maximum frame.
+				maxQueuedBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 			})
 			.strict(),
 	})
@@ -512,7 +561,9 @@ const citationIndexSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_I
 
 export const providerUsageSchema = z
 	.object({
+		// Full prompt footprint, including cache reads and writes.
 		promptTokens: z.number().int().nonnegative().optional(),
+		// Already-normalized ordinary input; plugins must exclude cache reads/writes.
 		inputTokens: z.number().int().nonnegative().optional(),
 		completionTokens: z.number().int().nonnegative().optional(),
 		reasoningTokens: z.number().int().nonnegative().optional(),
@@ -544,6 +595,22 @@ const dumpHeadersSchema = z
 	})
 	.optional();
 
+// Reject oversized arrays before Zod traverses their entries. Only numeric classification
+// crosses this boundary: message bodies and write-time tool IDs are not wire metadata.
+const inputCompositionSegmentsSchema = z.preprocess(
+	(value) => (Array.isArray(value) && value.length > MAX_INPUT_COMPOSITION_SEGMENTS ? null : value),
+	z
+		.array(
+			z
+				.object({
+					category: z.enum(CONTEXT_CATEGORIES),
+					chars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+				})
+				.strict(),
+		)
+		.max(MAX_INPUT_COMPOSITION_SEGMENTS),
+);
+
 export const providerStreamEventSchema = z.discriminatedUnion("type", [
 	z
 		.object({
@@ -557,9 +624,28 @@ export const providerStreamEventSchema = z.discriminatedUnion("type", [
 					totalChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 					systemChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 					toolsChars: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+					compositionSegments: inputCompositionSegmentsSchema.nullable().optional(),
 				})
 				.strict()
 				.refine((counts) => counts.systemChars + counts.toolsChars <= counts.totalChars)
+				.refine((counts) => {
+					if (counts.compositionSegments == null) return true;
+					const segments = readInputCompositionSegments(
+						counts.compositionSegments,
+						counts.totalChars,
+					);
+					if (!segments) return false;
+					let systemChars = 0;
+					let toolsChars = 0;
+					for (const segment of segments) {
+						if (segment.category === "system" || segment.category === "summary") {
+							systemChars += segment.chars;
+						} else if (segment.category === "toolDefinition") {
+							toolsChars += segment.chars;
+						}
+					}
+					return systemChars === counts.systemChars && toolsChars === counts.toolsChars;
+				}, "Input composition must match total and fixed-prefix character counts")
 				.nullable()
 				.optional(),
 		})
@@ -1259,11 +1345,6 @@ export const uiRpcNotificationEnvelopeSchema = uiRpcNotificationSchema;
 
 export const PUBLIC_EVENT_TOPICS = [
 	"narrafork.project.changed",
-	"narrafork.chapter.created",
-	"narrafork.chapter.lifecycle",
-	"narrafork.chapter.edge.changed",
-	"narrafork.chapter.commits.changed",
-	"narrafork.review.lifecycle",
 	"narrafork.narrator.lifecycle",
 	"narrafork.narrator.attention",
 	"narrafork.narrator.message.changed",
@@ -1288,9 +1369,7 @@ export const publicEventTopicSchema = z.enum(PUBLIC_EVENT_TOPICS);
 const publicEventClassSchema = z.enum(["state", "lifecycle", "progress", "attention", "audit"]);
 const publicResourceTypeSchema = z.enum([
 	"project",
-	"chapter",
 	"narrator",
-	"review",
 	"terminal",
 	"container",
 	"background_task",
@@ -1302,7 +1381,6 @@ const publicEventResourceSchema = z
 		type: publicResourceTypeSchema,
 		id: nonEmptyIdSchema,
 		projectId: nonEmptyIdSchema.optional(),
-		chapterId: nonEmptyIdSchema.optional(),
 		narratorId: nonEmptyIdSchema.optional(),
 		resourceVersion: z.number().int().nonnegative().optional(),
 	})
@@ -1347,18 +1425,9 @@ export type PublicEventFilter = {
 	topic?: PublicEventTopic[];
 	eventClass?: Array<"state" | "lifecycle" | "progress" | "attention" | "audit">;
 	projectIds?: string[];
-	chapterIds?: string[];
 	narratorIds?: string[];
 	resourceTypes?: Array<
-		| "project"
-		| "chapter"
-		| "narrator"
-		| "review"
-		| "terminal"
-		| "container"
-		| "background_task"
-		| "provider"
-		| "plugin"
+		"project" | "narrator" | "terminal" | "container" | "background_task" | "provider" | "plugin"
 	>;
 	statuses?: string[];
 	actorKinds?: Array<"user" | "system" | "plugin">;
@@ -1373,7 +1442,6 @@ const publicEventFilterNodeSchema: z.ZodType<PublicEventFilter> = z.lazy(() =>
 			topic: z.array(publicEventTopicSchema).min(1).max(20).optional(),
 			eventClass: z.array(publicEventClassSchema).min(1).max(5).optional(),
 			projectIds: filterIdsSchema.optional(),
-			chapterIds: filterIdsSchema.optional(),
 			narratorIds: filterIdsSchema.optional(),
 			resourceTypes: z.array(publicResourceTypeSchema).min(1).max(20).optional(),
 			statuses: z.array(z.string().trim().min(1).max(100)).max(20).optional(),

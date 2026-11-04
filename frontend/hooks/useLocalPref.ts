@@ -17,6 +17,7 @@ type Key =
 	| "narrafork_advanced_anim"
 	| "narrafork_expand_reasoning"
 	| "narrafork_narrator_centered_column"
+	| "narrafork_narrator_bottom_spacing_resize"
 	// Alt+wheel / pinch stepping of the render LOD, plus the Alt-held indicator.
 	// Default ON; can be turned off because Alt+wheel collides with OS/browser
 	// gestures on some setups (window drag, horizontal scroll, IME) and an
@@ -24,9 +25,6 @@ type Key =
 	// whole transcript renders. With it off, Alt does nothing for LOD — the
 	// toolbar's detail-level menu (`lodlevel`) is the remaining click entry point.
 	| "narrafork_lod_alt_gesture"
-	// Ruler's deprecation notice has been acknowledged. Not per-project: the fact that
-	// the view is deprecated is global, so being told once is enough.
-	| "narrafork_ruler_deprecation_ack"
 	// Unified morph driver (visual-state + single rAF loop) instead of the keyframe
 	// planners. Now DEFAULT ON, after the browser comparison this gate existed for: the
 	// keyframe path loses a whole activity group's animation whenever the two levels'
@@ -39,6 +37,7 @@ type Key =
 	// keeps their stored value either way.
 	| "narrafork_unified_morph"
 	// TEMPORARY debug surface — see components/narrator/mock/README-REMOVAL.md.
+	| "narrafork_mock_stream"
 	| "narrafork_mock_stream";
 
 /**
@@ -113,16 +112,20 @@ export function localPrefDefault(key: Key): boolean {
 	return DEFAULT_TRUE.has(key);
 }
 
-function getSnapshot(key: Key): boolean {
-	const raw = localStorage.getItem(key);
-	if (raw === null) return localPrefDefault(key);
-	return raw === "true";
+export function readLocalPref(key: Key): boolean {
+	try {
+		const raw = localStorage.getItem(key);
+		if (raw === null) return localPrefDefault(key);
+		return raw === "true";
+	} catch {
+		return localPrefDefault(key);
+	}
 }
 
 export function useLocalPref(key: Key): [boolean, (v: boolean) => void] {
 	const value = useSyncExternalStore(
 		subscribe,
-		() => getSnapshot(key),
+		() => readLocalPref(key),
 		() => localPrefDefault(key),
 	);
 	const setValue = useCallback(

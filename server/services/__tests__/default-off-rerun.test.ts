@@ -21,6 +21,7 @@ const ROOT = "default-off-rerun-root";
 let session: typeof import("../narrator-session");
 let state: typeof import("../narrator-session-state");
 let executor: typeof import("../../lib/agent/tool-executor");
+let agent: typeof import("../../lib/agent");
 let narratorPersistence: (typeof import("../narrator-persistence"))["narratorPersistence"];
 let prepareToolCallAttempt: (typeof import("../narrator-persistence"))["narratorPersistence"]["prepareToolCallAttempt"];
 let realDbModule: Record<string, unknown>;
@@ -32,6 +33,7 @@ beforeAll(async () => {
 	session = await import("../narrator-session");
 	state = await import("../narrator-session-state");
 	executor = await import("../../lib/agent/tool-executor");
+	agent = await import("../../lib/agent");
 	({ narratorPersistence } = await import("../narrator-persistence"));
 	prepareToolCallAttempt = narratorPersistence.prepareToolCallAttempt.bind(narratorPersistence);
 });
@@ -100,6 +102,9 @@ function seedDeniedWrite(suffix: string) {
 
 beforeEach(() => {
 	cleanDb(sqlite);
+	// Re-execution prepares provider history before dispatching the tool (upstream 0.9).
+	// Keep the real re-run and executor path without requiring a configured provider.
+	spyOn(agent, "buildHistory").mockResolvedValue({ history: [] });
 	const now = new Date().toISOString();
 	db.insert(narrators)
 		.values({

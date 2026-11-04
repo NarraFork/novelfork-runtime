@@ -34,16 +34,26 @@ import {
 	useCallback,
 	useContext,
 	useMemo,
-	useRef,
 	useSyncExternalStore,
 } from "react";
-import { useNarrator } from "../../../hooks/useNarrator";
+import type { OutlineOpener, OutlineOpenOptions } from "../../../lib/outline-opener";
+import {
+	nextOutlinePanelId,
+	normalizeOutlinePanelState,
+	type OutlinePanelState,
+} from "../../../lib/outline-panel";
 import type { PluginContributionPick } from "../../plugins/PluginContributionPicker";
 import { buildPluginDockPanelOpenRequest } from "../../plugins/PluginContributionPicker";
 import type { PluginUiSessionContext } from "../../plugins/PluginUiSurfaceContext";
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
-import { filePanelIdentity, type NarratorToolPanelType } from "../dock/dock-panel-types";
+import {
+	filePanelIdentity,
+	type NarratorToolPanelType,
+	resolveFilePanel,
+} from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
+import { findOutlinePanel, navigateOutlinePanel } from "../dock/outline-dock";
+import type { MessageJumpOptions, ScrollToMessageFn } from "../message/message-list-handle";
 import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
@@ -91,7 +101,7 @@ const EMPTY_SHARD: NarratorDockShard = emptyShard();
 interface NarratorDockBridges {
 	appendChatInput: ((text: string) => void) | null;
 	writeTerminalStdin: ((text: string) => void) | null;
-	scrollToMessage: ((messageId: string) => void) | null;
+	scrollToMessage: ScrollToMessageFn | null;
 	/**
 	 * Submit text as a real user message through the narrator's own composer path
 	 * (used by the user-chat panel's "send to narrator"). See the note on the same
@@ -296,7 +306,7 @@ export class WorkspaceDockStore {
 		this.getBridges(narratorId).writeTerminalStdin?.(text);
 	}
 
-	registerScrollToMessage(narratorId: string, fn: (messageId: string) => void): () => void {
+	registerScrollToMessage(narratorId: string, fn: ScrollToMessageFn): () => void {
 		const b = this.getBridges(narratorId);
 		b.scrollToMessage = fn;
 		return () => {
@@ -316,8 +326,11 @@ export class WorkspaceDockStore {
 		this.getBridges(narratorId).submitToNarrator?.(text);
 	}
 
-	scrollToMessage(narratorId: string, messageId: string) {
-		this.getBridges(narratorId).scrollToMessage?.(messageId);
+	scrollToMessage(narratorId: string, messageId: string, options?: MessageJumpOptions) {
+		const scroll = this.getBridges(narratorId).scrollToMessage;
+		// Plain jumps keep the one-argument call the bridge has always received.
+		if (options) scroll?.(messageId, options);
+		else scroll?.(messageId);
 	}
 
 	/**
@@ -419,21 +432,52 @@ export class WorkspaceDockStore {
 		const api = this.apiRef.current;
 		if (!api) return;
 		const focusBeforeRestore = api.activePanel;
+		let restoredActivePreviewId: string | null = null;
 		for (const resource of resources) {
 			if (!this.narratorPanel(resource.origin.hostNarratorId)) continue;
+			let id = resource.id;
+			const params = resource.params as FilePanelParams | undefined;
+			if (params?.panelType === "file") {
+				const resolved = resolveFilePanel(
+					api.panels,
+					{ ...params, hostNarratorId: resource.origin.hostNarratorId },
+					workspaceFilePanelId(
+						resource.origin.hostNarratorId,
+						params.filePath,
+						params.deviceId ?? "local",
+						params.toolEdit,
+						params.fileNarratorId,
+					),
+					"workspace",
+					resource.id,
+				);
+				id = resolved.id;
+				if (resolved.existing) {
+					const existingParams = resolved.existing.params as FilePanelParams;
+					resolved.existing.api.updateParameters({
+						...existingParams,
+						referenceOrigin:
+							existingParams.referenceOrigin === true || params.referenceOrigin === true,
+						largeFileConfirmed:
+							existingParams.largeFileConfirmed === true || params.largeFileConfirmed === true,
+					});
+				}
+			}
 			this.openResource(
 				resource.origin.hostNarratorId,
 				{
-					id: resource.id,
+					id,
 					component: resource.component,
 					params: resource.params,
 					title: resource.title,
 				},
 				resource.origin.sourcePanelId,
 			);
+			if (resource.wasActive && restoredActivePreviewId === null && this.isTemporary(id)) {
+				restoredActivePreviewId = id;
+			}
 		}
-		this.activePreviewId =
-			resources.find((resource) => resource.wasActive && this.isTemporary(resource.id))?.id ?? null;
+		this.activePreviewId = restoredActivePreviewId;
 		this.syncTemporaryResourceChrome();
 		const focus = this.activePreviewId ? api.getPanel(this.activePreviewId) : focusBeforeRestore;
 		if (focus && (this.activePreviewId || !this.isTemporary(focus.id))) focus.api.setActive();
@@ -854,18 +898,13 @@ export class WorkspaceDockStore {
 		)
 			(origin.opener as HTMLElement).focus();
 	}
-	openToolPanel(
-		narratorId: string,
-		type: NarratorToolPanelType,
-		chapterId: string | null | undefined,
-		sourcePanelId?: string,
-	) {
+	openToolPanel(narratorId: string, type: NarratorToolPanelType, sourcePanelId?: string) {
 		this.openResource(
 			narratorId,
 			{
 				id: workspaceToolPanelId(narratorId, type),
 				component: PANEL_COMPONENT.narratorTool,
-				params: { panelType: "narrator-tool", toolType: type, narratorId, chapterId },
+				params: { panelType: "narrator-tool", toolType: type, narratorId },
 			},
 			sourcePanelId,
 		);
@@ -930,14 +969,22 @@ export class WorkspaceDockStore {
 		const deviceId = options.deviceId ?? "local";
 		const fileNarratorId =
 			options.fileNarratorId === hostNarratorId ? undefined : options.fileNarratorId;
-		const id = workspaceFilePanelId(
+		const canonicalId = workspaceFilePanelId(
 			hostNarratorId,
 			filePath,
 			deviceId,
 			options.toolEdit,
 			fileNarratorId,
 		);
-		const existing = api.getPanel(id);
+		const identity: FilePanelParams & { hostNarratorId: string } = {
+			panelType: "file",
+			hostNarratorId,
+			filePath,
+			deviceId,
+			fileNarratorId,
+			toolEdit: options.toolEdit,
+		};
+		const { id, existing } = resolveFilePanel(api.panels, identity, canonicalId, "workspace");
 		const params: WorkspacePanelParams = {
 			...(existing?.params as FilePanelParams | undefined),
 			panelType: "file",
@@ -987,6 +1034,39 @@ export class WorkspaceDockStore {
 		);
 	}
 
+	/**
+	 * Open an outline place for one narrator's cluster: the panel that already shows its page
+	 * (a member or another cluster's resource alike: one per space and page on the surface) is
+	 * navigated there and revealed; otherwise, or when a new panel is asked for, a new resource
+	 * of this narrator opens like a knowledge entry. False when the narrator has no cell here.
+	 */
+	openOutlinePanel(
+		hostNarratorId: string,
+		request: OutlinePanelState,
+		options: OutlineOpenOptions = {},
+		sourcePanelId?: string,
+	): boolean {
+		const api = this.apiRef.current;
+		if (!api || !this.narratorPanel(hostNarratorId)) return false;
+		const existing = options.newPanel ? undefined : findOutlinePanel(api.panels, request);
+		if (existing) {
+			navigateOutlinePanel(existing, request);
+			this.activateResource(existing);
+			return true;
+		}
+		this.openResource(
+			hostNarratorId,
+			{
+				id: nextOutlinePanelId(`woutline_${hostNarratorId}_`),
+				component: PANEL_COMPONENT.outline,
+				params: { panelType: "outline", hostNarratorId, ...normalizeOutlinePanelState(request) },
+				...(request.title ? { title: request.title } : {}),
+			},
+			sourcePanelId,
+		);
+		return true;
+	}
+
 	closeToolPanel(narratorId: string, type: NarratorToolPanelType) {
 		this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type))?.api.close();
 	}
@@ -995,15 +1075,10 @@ export class WorkspaceDockStore {
 	 * Same contract as `NarratorDockContext.toggleToolPanel`: open if closed,
 	 * focus an open-but-background tab, close only when it is already active.
 	 */
-	toggleToolPanel(
-		narratorId: string,
-		type: NarratorToolPanelType,
-		chapterId: string | null | undefined,
-		sourcePanelId?: string,
-	) {
+	toggleToolPanel(narratorId: string, type: NarratorToolPanelType, sourcePanelId?: string) {
 		const existing = this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type));
 		if (!existing) {
-			this.openToolPanel(narratorId, type, chapterId, sourcePanelId);
+			this.openToolPanel(narratorId, type, sourcePanelId);
 			return;
 		}
 		if (
@@ -1029,6 +1104,11 @@ export function workspaceResourceOwner(params: WorkspacePanelParams | undefined)
 		params.panelType === "knowledge"
 	)
 		return params.hostNarratorId;
+	// An outline page is a resource when a session opened it, a member when added on its own.
+	if (params.panelType === "outline")
+		return "hostNarratorId" in params && typeof params.hostNarratorId === "string"
+			? params.hostNarratorId
+			: null;
 	if (params.panelType === "plugin" && params.binding?.kind === "workspace-narrator")
 		return params.binding.ownerNarratorId;
 	return null;
@@ -1139,14 +1219,6 @@ export function useWorkspaceNarratorDockValue(
 		useCallback(() => (store ? store.getSnapshot(narratorId) : EMPTY_SHARD), [store, narratorId]),
 	);
 
-	// Legacy chapter association for the git tool. The adapter now resolves the
-	// narrator's actual workspace, so standalone and subagent narrators are supported.
-	const { data: narrator } = useNarrator(narratorId);
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
-	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
-	const chapterIdRef = useRef<string | null | undefined>(chapterId);
-	chapterIdRef.current = chapterId;
-
 	// Stable methods (keyed on store + narrator only, NOT on the reactive shard)
 	// so consumers that key effects on callback identity — e.g. NarratorPanel's
 	// details / browser publish effects — don't re-run on every shard
@@ -1168,9 +1240,10 @@ export function useWorkspaceNarratorDockValue(
 			registerWriteTerminalStdin: (fn: (text: string) => void) =>
 				store.registerWriteTerminalStdin(narratorId, fn),
 			writeTerminalStdin: (text: string) => store.writeTerminalStdin(narratorId, text),
-			registerScrollToMessage: (fn: (messageId: string) => void) =>
+			registerScrollToMessage: (fn: ScrollToMessageFn) =>
 				store.registerScrollToMessage(narratorId, fn),
-			scrollToMessage: (messageId: string) => store.scrollToMessage(narratorId, messageId),
+			scrollToMessage: (messageId: string, options?: MessageJumpOptions) =>
+				store.scrollToMessage(narratorId, messageId, options),
 			registerSubmitToNarrator: (fn: (text: string) => void) =>
 				store.registerSubmitToNarrator(narratorId, fn),
 			submitToNarrator: (text: string) => store.submitToNarrator(narratorId, text),
@@ -1179,7 +1252,7 @@ export function useWorkspaceNarratorDockValue(
 				if (api) store.refreshOpenToolTypes(api);
 			},
 			openToolPanel: (type: NarratorToolPanelType) =>
-				store.openToolPanel(narratorId, type, chapterIdRef.current, sourcePanelId),
+				store.openToolPanel(narratorId, type, sourcePanelId),
 			openSubagentPanel: (subagentNarratorId: string, messageId?: string) =>
 				store.openSubagentPanel(narratorId, subagentNarratorId, messageId, sourcePanelId),
 			openFilePanel: (filePath: string, fileName?: string, options?: FileOpenOptions) =>
@@ -1191,7 +1264,7 @@ export function useWorkspaceNarratorDockValue(
 				store.openKnowledgePanel(narratorId, entryId, scope, sourcePanelId),
 			closeToolPanel: (type: NarratorToolPanelType) => store.closeToolPanel(narratorId, type),
 			toggleToolPanel: (type: NarratorToolPanelType) =>
-				store.toggleToolPanel(narratorId, type, chapterIdRef.current, sourcePanelId),
+				store.toggleToolPanel(narratorId, type, sourcePanelId),
 		};
 	}, [store, narratorId, sourcePanelId]);
 
@@ -1199,9 +1272,7 @@ export function useWorkspaceNarratorDockValue(
 		if (!store || !methods) return null;
 		return {
 			narratorId,
-			chapterId,
 			// Workspace does not wire page-level navigation or deep-link highlight.
-			onForkFromMessage: null,
 			highlightMessageId: undefined,
 			onBack: null,
 			onMinimize: null,
@@ -1212,5 +1283,26 @@ export function useWorkspaceNarratorDockValue(
 			openToolTypes: shard.openToolTypes,
 			...methods,
 		};
-	}, [store, methods, narratorId, chapterId, shard]);
+	}, [store, methods, narratorId, shard]);
+}
+
+/**
+ * The outline opener of one narrator's cluster: places open as that narrator's resources (or in
+ * the panel already showing their page). Null outside a workspace surface.
+ */
+export function useWorkspaceOutlineOpener(
+	narratorId: string,
+	sourcePanelId?: string,
+): OutlineOpener | null {
+	const store = useWorkspaceDock();
+	return useMemo(
+		() =>
+			store && narratorId
+				? {
+						open: (state: OutlinePanelState, options?: OutlineOpenOptions) =>
+							store.openOutlinePanel(narratorId, state, options, sourcePanelId),
+					}
+				: null,
+		[store, narratorId, sourcePanelId],
+	);
 }

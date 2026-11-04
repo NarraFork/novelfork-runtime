@@ -2,16 +2,19 @@ import { listExecutorPlatformInfo } from "@shared/remote-executor";
 import { type Context, Hono } from "hono";
 import { DEVICE_PROTOCOL_VERSION } from "../lib/agent/execution/rpc-types";
 import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
-import { getExecutorManifest } from "../lib/executor-binaries";
-import { attachExecutorTicketScript, issueExecutorTicket } from "../lib/executor-bootstrap-ticket";
+import { freezeExecutorArtifact, getExecutorManifest } from "../lib/executor-binaries";
+import {
+	attachExecutorTicketScripts,
+	issueExecutorGroupTicket,
+} from "../lib/executor-bootstrap-ticket";
 import {
 	enrollmentRefusalMessage,
 	evaluateEnrollmentTransport,
 } from "../lib/executor-enrollment-policy";
 import { resolveExecutorInstallCa } from "../lib/executor-install-ca";
 import {
-	buildExecutorInstallOneLiner,
 	buildExecutorInstallScript,
+	buildUniversalExecutorInstall,
 } from "../lib/executor-install-script";
 import { resolvePublicOrigin } from "../lib/public-origin";
 import { settings } from "../lib/settings";
@@ -248,7 +251,7 @@ deviceRoutes.delete("/:id", async (c) => {
 	return c.json({ success: true });
 });
 
-// Generate a ready-to-run install command for one device and platform, along with
+// Generate a ready-to-run install command for one device and OS family, along with
 // the enrollment ticket its steps will spend.
 deviceRoutes.post("/:id/install-script", async (c) => {
 	// Available to the registrar: without it, registering a device is useless, and
@@ -257,20 +260,26 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 	const device = await requireManagedDevice(c);
 	const parsed = deviceInstallScriptSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { platform, mode, disableShell, serverBaseUrl, tokenDelivery } = parsed.data;
+	const { target, mode, disableShell, serverBaseUrl, tokenDelivery } = parsed.data;
 
-	const manifest = await getExecutorManifest();
+	const manifest = await getExecutorManifest({ signal: c.req.raw.signal });
 	if (!manifest) {
 		throw new ValidationError(
-			"No published executor release is available. Check the update server URL in settings.",
+			"No compatible executor release is available. Check the selected update source in settings.",
 		);
 	}
-	const artifact = manifest.platforms[platform];
-	if (!artifact) {
+	const platforms = listExecutorPlatformInfo()
+		.filter((info) => (info.os === "windows") === (target === "windows"))
+		.map((info) => info.platform)
+		.filter((platform) => manifest.platforms[platform]);
+	if (platforms.length === 0) {
 		throw new ValidationError(
-			`Executor v${manifest.version} does not publish a build for ${platform}`,
+			`Executor v${manifest.version} does not publish a build for ${target}`,
 		);
 	}
+	const artifacts = Object.fromEntries(
+		platforms.map((platform) => [platform, freezeExecutorArtifact(manifest, platform)] as const),
+	);
 
 	/*
 	 * Which URL the target machine should use, in order of trustworthiness:
@@ -330,45 +339,56 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 	 * public fetch endpoint can serve it without touching the database — a cycle.
 	 * Broken by minting the ticket first and attaching the rendered body after.
 	 */
-	const ticket = issueExecutorTicket(platform, {
+	const ticket = issueExecutorGroupTicket(target, artifacts, {
+		signal: c.req.raw.signal,
 		deviceId: device.id,
 		deviceSlug: device.slug,
-		// Structural, not cosmetic: a prompt-mode ticket must be unable to hand out a
-		// key even if something later points it at the enroll endpoint.
 		allowTokenDelivery: tokenDelivery === "enroll",
 	});
-	const generated = buildExecutorInstallScript({
-		platform,
-		mode,
-		serverBaseUrl: baseUrl,
-		deviceWsUrl,
-		deviceSlug: device.slug,
-		deviceName: device.name,
-		connectionMode: device.connectionMode,
-		disableShell,
-		artifactFilename: artifact.filename,
-		expectedSha256: artifact.sha256,
-		executorVersion: manifest.version,
-		ticket: ticket.ticket,
-		tokenDelivery,
-		caCertPem,
-	});
-	attachExecutorTicketScript(ticket.ticket, {
-		body: generated.script,
-		filename: generated.filename,
-		shell: generated.shell,
-	});
-
-	const scriptUrl = `${baseUrl}/api/executor/install/${platform}?ticket=${ticket.ticket}`;
+	const scripts = Object.fromEntries(
+		platforms.map((platform) => {
+			const artifact = artifacts[platform];
+			const generated = buildExecutorInstallScript({
+				platform,
+				mode,
+				serverBaseUrl: baseUrl,
+				deviceWsUrl,
+				deviceSlug: device.slug,
+				deviceName: device.name,
+				connectionMode: device.connectionMode,
+				disableShell,
+				artifactFilename: artifact.filename,
+				expectedSha256: artifact.sha256,
+				executorVersion: manifest.version,
+				executorProtocolVersion: manifest.protocolVersion,
+				ticket: ticket.ticket,
+				tokenDelivery,
+				caCertPem,
+			});
+			return [
+				platform,
+				{
+					body: generated.script,
+					filename: generated.filename,
+					shell: generated.shell,
+				},
+			] as const;
+		}),
+	);
+	attachExecutorTicketScripts(ticket.ticket, scripts);
+	const scriptUrls = Object.fromEntries(
+		platforms.map(
+			(platform) =>
+				[platform, `${baseUrl}/api/executor/install/${platform}?ticket=${ticket.ticket}`] as const,
+		),
+	);
+	const generated = buildUniversalExecutorInstall({ target, scriptUrls, caCertPem });
 	return c.json({
-		script: generated.script,
-		filename: generated.filename,
-		shell: generated.shell,
-		scriptUrl,
-		oneLiner: buildExecutorInstallOneLiner({ scriptUrl, shell: generated.shell, caCertPem }),
+		...generated,
 		tokenDelivery,
 		executorVersion: manifest.version,
-		platform,
+		target,
+		platforms,
 		expiresAt: new Date(ticket.expiresAt).toISOString(),
 	});
 });
@@ -385,7 +405,7 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 
 // Browse a remote path (file/dir metadata; recursive lists a directory tree).
 deviceRoutes.get("/:id/fs", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new NotFoundError("Device", c.req.param("id"));
 	const parsed = deviceStatQuerySchema.safeParse({
@@ -427,7 +447,7 @@ deviceRoutes.get("/:id/browse", async (c) => {
 
 // Background transfer tasks return immediately and can be paused/resumed.
 deviceRoutes.post("/:id/transfer-tasks", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	const parsed = deviceTransferSchema.safeParse(await c.req.json());
@@ -441,28 +461,28 @@ deviceRoutes.post("/:id/transfer-tasks", async (c) => {
 });
 
 deviceRoutes.get("/:id/transfer-tasks", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	return c.json(await listDeviceTransferTasks(device.id));
 });
 
 deviceRoutes.get("/:id/transfer-tasks/:taskId", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await getDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) throw new ValidationError("Transfer task not found");
 	return c.json(task);
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/pause", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await pauseDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) throw new ValidationError("Transfer task not found");
 	return c.json(task);
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/cancel", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await cancelDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) {
 		throw new ValidationError("Transfer task cannot be cancelled");
@@ -471,7 +491,7 @@ deviceRoutes.post("/:id/transfer-tasks/:taskId/cancel", async (c) => {
 });
 
 deviceRoutes.post("/:id/transfer-tasks/:taskId/resume", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const task = await resumeDeviceTransferTask(c.req.param("id"), c.req.param("taskId"));
 	if (!task) {
 		throw new ValidationError("Transfer task is not resumable");
@@ -481,7 +501,7 @@ deviceRoutes.post("/:id/transfer-tasks/:taskId/resume", async (c) => {
 
 // Synchronous compatibility endpoint. Progress is broadcast via transfer:* events.
 deviceRoutes.post("/:id/transfers", async (c) => {
-	assertAdmin(c);
+	await assertAdmin(c);
 	const device = await getDevice(c.req.param("id"));
 	if (!device) throw new ValidationError("Device not found");
 	const parsed = deviceTransferSchema.safeParse(await c.req.json());

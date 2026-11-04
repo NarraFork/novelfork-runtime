@@ -1,9 +1,11 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { asc, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 
-const { db, sqlite } = getTestDb();
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 // Focused suite: keep the narrator history columns the loop reads even when the
 // worktree carries unrelated deferred schema work.
@@ -27,9 +29,6 @@ for (const statement of [
 // Snapshot real modules before mocking so afterAll can re-point each specifier
 // back. Bun's mock.module is process-wide and mock.restore() does NOT undo it.
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
-const realDbModule = { ...(await import("../../db")) };
-
-mock.module("../../db", () => ({ db, sqlite }));
 
 /**
  * The provider chat generator is the steering wheel for these tests: it blocks
@@ -51,7 +50,7 @@ let releaseChat: (() => void) | null = null;
 const providerCalls: string[] = [];
 const testProvider = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params: { content: string; onRequestStart?: () => void; signal?: AbortSignal }) {
 		providerCalls.push(params.content);
@@ -77,13 +76,6 @@ const testProvider = {
 		}
 		yield { text: "turn ran" };
 	},
-	formatToolResult: (toolUseId: string, output: string, isError: boolean) => ({
-		toolUseId,
-		output,
-		isError,
-	}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -166,12 +158,11 @@ async function specContinuationCount(narratorId: string): Promise<number> {
 	).length;
 }
 
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
-	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
-	sqlite.close();
 });
 
 beforeEach(() => {
@@ -196,7 +187,15 @@ describe("interrupt task guard", () => {
 		releaseChat = () => {
 			gateOpened = true;
 		};
-		const sendPromise = sendMessage(narratorId, "work on the stale task", undefined, "en");
+		const sendPromise = sendMessage(
+			narratorId,
+			"work on the stale task",
+			undefined,
+			"en",
+			false,
+			null,
+			null,
+		);
 		await waitFor(() => providerCalls.length === 1);
 
 		expect(interruptNarrator(narratorId)).toBe(true);
@@ -267,7 +266,7 @@ describe("interrupt task guard", () => {
 
 		// The next user turn must NOT be followed by a spec auto-continuation for
 		// the stale task — the one-shot suppression consumes exactly that turn.
-		await sendMessage(narratorId, "changed my mind", undefined, "en");
+		await sendMessage(narratorId, "changed my mind", undefined, "en", false, null, null);
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle", 15_000);
 		expect(await specContinuationCount(narratorId)).toBe(0);
 
@@ -285,7 +284,7 @@ describe("interrupt task guard", () => {
 		);
 
 		releaseChat = () => {};
-		const firstSend = sendMessage(narratorId, "start work", undefined, "en");
+		const firstSend = sendMessage(narratorId, "start work", undefined, "en", false, null, null);
 		await waitFor(() => providerCalls.length === 1);
 
 		expect(await interruptAndWaitForIdle(narratorId, { timeoutMs: 5_000 })).toBe(true);
@@ -293,7 +292,15 @@ describe("interrupt task guard", () => {
 		releaseChat = null;
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
 
-		const replacement = sendMessage(narratorId, "replacement turn", undefined, "en");
+		const replacement = sendMessage(
+			narratorId,
+			"replacement turn",
+			undefined,
+			"en",
+			false,
+			null,
+			null,
+		);
 		await waitFor(() => providerCalls.length === 2);
 		await replacement;
 		await waitFor(async () => (await narratorStatus(narratorId)) === "idle");
@@ -334,7 +341,7 @@ describe("interrupt task guard", () => {
 		await insertIdleNarrator(narratorId);
 
 		releaseChat = () => {};
-		const sendPromise = sendMessage(narratorId, "hello", undefined, "en");
+		const sendPromise = sendMessage(narratorId, "hello", undefined, "en", false, null, null);
 		await waitFor(() => providerCalls.length === 1);
 
 		expect(interruptNarrator(narratorId)).toBe(true);
@@ -358,7 +365,15 @@ describe("interrupt task guard", () => {
 
 		for (let round = 0; round < 2; round++) {
 			releaseChat = () => {};
-			const sendPromise = sendMessage(narratorId, `round ${round}`, undefined, "en");
+			const sendPromise = sendMessage(
+				narratorId,
+				`round ${round}`,
+				undefined,
+				"en",
+				false,
+				null,
+				null,
+			);
 			await waitFor(() => providerCalls.length === round + 1);
 			interruptNarrator(narratorId);
 			releaseChat?.();

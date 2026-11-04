@@ -1,109 +1,95 @@
+import { STORAGE_CATEGORY_KEYS } from "@shared/storage-categories";
 import { Hono } from "hono";
 import { z } from "zod/v4";
-import {
-	beginWorkspaceMaintenanceSchema,
-	commitWorkspaceMaintenanceSchema,
-	recoverWorkspaceBarrierSchema,
-	workspaceMaintenanceTokenSchema,
-} from "../lib/validators/workspace-recovery";
 import { requireAdmin } from "../middleware/auth";
 import { databaseCleanupService } from "../services/database-cleanup-service";
+import {
+	blockBackfillStatus,
+	setBlockBackfillPaused,
+	startProjectionJob,
+	stopProjectionJobs,
+} from "../services/narrator-block-backfill";
 import {
 	cancelStorageScan,
 	getStorageScanJob,
 	startStorageScan,
 } from "../services/storage-scan-job";
 import { storageService } from "../services/storage-service";
-import {
-	beginWorkspaceMaintenance,
-	cancelWorkspaceMaintenance,
-	commitWorkspaceMaintenance,
-	listWorkspaceBarriers,
-	observeWorkspaceBarrier,
-	observeWorkspaceMaintenance,
-	recoverWorkspaceBarrier,
-	retryWorkspaceRecoveryPersistence,
-} from "../services/workspace-scope-recovery";
 
 export const storageRoutes = new Hono();
 
-storageRoutes.post("/workspace-barriers/:scopeId/retry-persistence", requireAdmin, async (c) => {
-	return c.json(await retryWorkspaceRecoveryPersistence(c.req.param("scopeId") ?? ""));
-});
-
-storageRoutes.post("/workspace-barriers/:scopeId/maintenance/begin", requireAdmin, async (c) => {
-	const parsed = beginWorkspaceMaintenanceSchema.safeParse(await c.req.json().catch(() => null));
-	if (!parsed.success) return c.json({ error: "Invalid maintenance request" }, 400);
-	return c.json(
-		await beginWorkspaceMaintenance({
-			...parsed.data,
-			scopeId: c.req.param("scopeId") ?? "",
-			adminUserId: c.get("user").sub,
-		}),
-	);
-});
-for (const [action, handler] of [
-	["observe", observeWorkspaceMaintenance],
-	["cancel", cancelWorkspaceMaintenance],
-] as const) {
-	storageRoutes.post(
-		`/workspace-barriers/:scopeId/maintenance/${action}`,
-		requireAdmin,
-		async (c) => {
-			const parsed = workspaceMaintenanceTokenSchema.safeParse(
-				await c.req.json().catch(() => null),
-			);
-			if (!parsed.success) return c.json({ error: "Invalid maintenance permission" }, 400);
-			return c.json(
-				await handler({
-					...parsed.data,
-					scopeId: c.req.param("scopeId") ?? "",
-					adminUserId: c.get("user").sub,
-					signal: c.req.raw.signal,
-				}),
-			);
-		},
-	);
-}
-storageRoutes.post("/workspace-barriers/:scopeId/maintenance/commit", requireAdmin, async (c) => {
-	const parsed = commitWorkspaceMaintenanceSchema.safeParse(await c.req.json().catch(() => null));
-	if (!parsed.success) return c.json({ error: "Invalid maintenance commit request" }, 400);
-	return c.json(
-		await commitWorkspaceMaintenance({
-			...parsed.data,
-			scopeId: c.req.param("scopeId") ?? "",
-			adminUserId: c.get("user").sub,
-			signal: c.req.raw.signal,
-		}),
-	);
+const scanSelectionSchema = z.object({
+	categories: z.array(z.enum(STORAGE_CATEGORY_KEYS)).min(1).optional(),
 });
 
 /**
- * POST /api/storage/scan/start — Kick off a storage scan as a server-side background job
- * (admin only). Scanning is decoupled from the HTTP connection: the client may navigate
- * away and the scan still runs to completion and populates the shared cache. Concurrent
- * calls dedupe onto the in-flight job (`started: false`).
+ * POST /api/storage/scan/start — Kick off category scans as server-side background work
+ * (admin only). Omit `categories` to start every category. They run together; a category
+ * that is already running is left alone (`started` is false only when nothing new began).
+ * Scanning is decoupled from the HTTP connection.
  */
-storageRoutes.post("/scan/start", requireAdmin, (c) => {
-	const { started, state } = startStorageScan();
+storageRoutes.post("/scan/start", requireAdmin, async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = scanSelectionSchema.safeParse(body ?? {});
+	if (!parsed.success) return c.json({ error: "Invalid scan request" }, 400);
+	const { started, state } = startStorageScan(parsed.data);
 	return c.json({ started, state });
 });
 
 /**
- * GET /api/storage/scan/status — Poll the background scan job (admin only).
+ * GET /api/storage/scan/status — Poll every category job (admin only).
  */
 storageRoutes.get("/scan/status", requireAdmin, (c) => {
 	return c.json({ state: getStorageScanJob() });
 });
 
 /**
- * POST /api/storage/scan/cancel — Abort the running scan job, if any (admin only).
+ * POST /api/storage/scan/cancel — Abort running category scans (admin only).
+ * Omit `categories` to abort every running category.
  */
 storageRoutes.post("/scan/cancel", requireAdmin, async (c) => {
-	// Awaited: `abort()` alone leaves the state at `running`, so the response would
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = scanSelectionSchema.safeParse(body ?? {});
+	if (!parsed.success) return c.json({ error: "Invalid scan request" }, 400);
+	// Awaited: `abort()` alone leaves the category at `running`, so the response would
 	// report the very status the caller just cancelled. The service waits (briefly,
-	// bounded) for the scan to reach its terminal state before answering.
-	return c.json({ state: await cancelStorageScan() });
+	// bounded) for those categories to reach a terminal state before answering.
+	return c.json({ state: await cancelStorageScan(parsed.data) });
+});
+
+/**
+ * GET /api/storage/blocks/backfill — Progress of the background block jobs that convert
+ * older messages to block storage and check converted ones (admin only).
+ */
+storageRoutes.get("/blocks/backfill", requireAdmin, (c) => {
+	return c.json({ status: blockBackfillStatus() });
+});
+
+const backfillPauseSchema = z.object({ paused: z.boolean() });
+
+/**
+ * POST /api/storage/blocks/backfill/pause — Pause (`{ paused: true }`) or resume the block
+ * jobs (admin only). Resuming restarts them from their saved position.
+ */
+storageRoutes.post("/blocks/backfill/pause", requireAdmin, async (c) => {
+	const parsed = backfillPauseSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) return c.json({ error: "Invalid pause request" }, 400);
+	return c.json({ status: setBlockBackfillPaused(parsed.data.paused) });
+});
+
+const projectionSchema = z.object({ action: z.enum(["clear", "restore", "stop"]) });
+
+/**
+ * POST /api/storage/blocks/projection — Start the job that drops verified messages'
+ * duplicate `content_json` (`clear`, needs `narratorBlocks.compactJson`), the one that
+ * writes it back (`restore`, needs the switch off), or stop either (admin only). 409 when
+ * what the job needs is missing; the status names it.
+ */
+storageRoutes.post("/blocks/projection", requireAdmin, async (c) => {
+	const parsed = projectionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) return c.json({ error: "Invalid projection request" }, 400);
+	const { action } = parsed.data;
+	return c.json({ status: action === "stop" ? stopProjectionJobs() : startProjectionJob(action) });
 });
 
 /**
@@ -124,7 +110,6 @@ const cleanupTargetSchema = z.object({
 const databaseCleanupTargetSchema = z.enum([
 	"archivedSessions",
 	"staleSessions",
-	"apiRequestDumps",
 	"toolCallPayloads",
 ]);
 
@@ -165,7 +150,7 @@ storageRoutes.post("/cleanup", requireAdmin, async (c) => {
 			return c.json({ ok: true, ...result });
 		}
 		case "worktrees": {
-			const result = await storageService.cleanupOrphanedWorktrees();
+			const result = await storageService.repackTreeSnapshots();
 			return c.json({ ok: true, ...result });
 		}
 		case "containers": {
@@ -208,6 +193,16 @@ storageRoutes.post("/database/cleanup", requireAdmin, async (c) => {
 });
 
 /**
+ * POST /api/storage/database/legacy-request-dumps/clear — Clear request dumps an upgrade kept
+ * when it deferred migration 0207's column rewrites (admin only).
+ */
+storageRoutes.post("/database/legacy-request-dumps/clear", requireAdmin, async (c) => {
+	const result = await databaseCleanupService.clearLegacyRequestDumps();
+	storageService.invalidateStorageCache();
+	return c.json(result);
+});
+
+/**
  * POST /api/storage/database/vacuum — Run SQLite VACUUM to release reusable free pages.
  *
  * This is a deliberate service-wide maintenance window, not ordinary CRUD: the
@@ -223,55 +218,4 @@ storageRoutes.post("/database/vacuum", requireAdmin, async (c) => {
 	const result = await databaseCleanupService.vacuumDatabase();
 	storageService.invalidateStorageCache();
 	return c.json(result);
-});
-
-/**
- * GET /api/storage/workspace-barriers — List durable workspace write barriers
- * awaiting external recovery: quarantined scopes (uncertain writes) and dead
- * leases from crashed runs (admin only).
- */
-storageRoutes.get("/workspace-barriers", requireAdmin, async (c) => {
-	return c.json(await listWorkspaceBarriers(c.req.query("cursor")));
-});
-
-/**
- * POST /api/storage/workspace-barriers/:scopeId/observe — Re-observe every
- * unsettled effect's physical file and return per-effect verdicts. It may record
- * fresh strict owner-termination evidence for native IO; it never modifies
- * workspace files. The confirmation UI uses this as its preview (admin only).
- */
-storageRoutes.post("/workspace-barriers/:scopeId/observe", requireAdmin, async (c) => {
-	const scopeId = c.req.param("scopeId");
-	if (!scopeId) return c.json({ error: "Missing scopeId" }, 400);
-	const leaseId = c.req.query("leaseId");
-	if (leaseId !== undefined && (!leaseId || leaseId.length > 256))
-		return c.json({ error: "Invalid leaseId" }, 400);
-	return c.json(await observeWorkspaceBarrier(scopeId, c.req.raw.signal, leaseId));
-});
-
-/**
- * POST /api/storage/workspace-barriers/:scopeId/recover — Human-confirmed
- * recovery: re-observes outside the transaction, checks the preview token, then
- * atomically settles the target lease's evidence and releases its barrier.
- * The scope URL remains compatible with legacy barriers (admin only).
- */
-storageRoutes.post("/workspace-barriers/:scopeId/recover", requireAdmin, async (c) => {
-	const scopeId = c.req.param("scopeId");
-	if (!scopeId) return c.json({ error: "Missing scopeId" }, 400);
-	const body = await c.req.json().catch(() => ({}));
-	const parsed = recoverWorkspaceBarrierSchema.safeParse(body);
-	if (!parsed.success) {
-		return c.json({ error: "Invalid workspace barrier recovery request" }, 400);
-	}
-	return c.json(
-		await recoverWorkspaceBarrier({
-			scopeId,
-			leaseId: parsed.data.leaseId,
-			confirmationToken: parsed.data.confirmationToken,
-			recoveredByUserId: c.get("user").sub,
-			acknowledgements: parsed.data.acknowledgements,
-			acknowledgeInspected: parsed.data.acknowledgeInspected,
-			signal: c.req.raw.signal,
-		}),
-	);
 });

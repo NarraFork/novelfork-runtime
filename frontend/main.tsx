@@ -11,6 +11,10 @@ import "@mantine/core/styles.css";
 import "@mantine/dates/styles.css";
 import "@mantine/notifications/styles.css";
 import "@mantine/tiptap/styles.css";
+// Patches a Mantine Slider layout detail: mark labels must not widen the
+// scroll container they sit in. Global because every `marks` slider needs it —
+// see the stylesheet header.
+import "@frontend/styles/mantine-slider-marks.css";
 import { installPinchZoomGuard } from "@frontend/lib/pinch-zoom-guard";
 /*
  * The plain store, NOT `hooks/usePluginThemes`.
@@ -60,7 +64,7 @@ import ReactDOM from "react-dom/client";
  * bootstrap concerns.
  */
 import { App } from "./App";
-import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
+import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-storage-cleanup";
 import { isPublicNarratorSharePath } from "./lib/app-path-classify";
 import { getRouterBasepath } from "./lib/base-path";
 import { installHostBridge } from "./lib/host-bridge";
@@ -110,6 +114,7 @@ async function bootstrap() {
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
 	if (!isPublicShare) cleanupStaleNarratorDockLayouts();
 
+	// Wait only for global common/errors copy; localized route gates load the rest.
 	await initI18n(getInitialNamespaces(window.location.pathname));
 	if (!isPublicShare) void syncPluginUiContributions().catch(() => {});
 

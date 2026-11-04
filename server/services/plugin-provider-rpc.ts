@@ -2,11 +2,14 @@ import { generateId } from "@server/lib/id";
 import {
 	type JsonRpcNotification,
 	type JsonValue,
+	markHostTruncatedDump,
 	PROVIDER_PROTOCOL_VERSION,
 	PROVIDER_REQUEST_MAX_BYTES,
 	PROVIDER_SEARCH_METHOD,
+	type ProviderNativeMedia,
 	type ProviderStreamEvent,
 	providerEventSchema,
+	providerNativeMediaSchema,
 } from "@server/lib/plugins/protocol";
 import type { PluginRuntime } from "./plugin-runtime";
 
@@ -176,6 +179,9 @@ export interface ProviderDescriptor {
 		generate: boolean;
 		reasoningContinuation?: boolean;
 		inputImages?: boolean;
+		/** Native media wire support; omission is not consent to send media. */
+		inputAudio?: boolean;
+		inputVideo?: boolean;
 		mayLeakXmlToolCalls?: boolean;
 	};
 	/**
@@ -217,6 +223,9 @@ export interface ProviderModelDescriptor {
 		tools: boolean;
 		parallelToolCalls?: boolean;
 		inputImages?: boolean;
+		/** Native media wire support; omission is not consent to send media. */
+		inputAudio?: boolean;
+		inputVideo?: boolean;
 		reasoning?: boolean;
 		reasoningEfforts?: Array<"none" | "low" | "medium" | "high" | "xhigh" | "max">;
 		sessionMode: "stateless" | "stateful";
@@ -374,6 +383,8 @@ export interface ProviderChatParams extends ProviderBaseParams {
 		current: {
 			text: string;
 			images?: Array<{ mediaType: string; dataBase64: string }>;
+			/** Complete original media bytes; never a local path or transcript. */
+			media?: ProviderNativeMedia[];
 			toolResults: ProviderContentBlock[];
 		};
 		tools: ProviderToolDefinition[];
@@ -393,6 +404,48 @@ export interface ProviderChatParams extends ProviderBaseParams {
 	 * field's presence is the entire compatibility negotiation.
 	 */
 	requestDump?: { maxBytes: number };
+}
+
+function assertNativeMediaRequest(
+	params: ProviderChatParams,
+	descriptor?: ProviderDescriptor,
+): void {
+	const check = (value: unknown) => {
+		const parsed = providerNativeMediaSchema.safeParse(value);
+		if (!parsed.success)
+			throw new ProviderRpcError(
+				"INVALID_REQUEST",
+				`Invalid native media: ${parsed.error.message}`,
+			);
+		const capability = parsed.data.type === "audio" ? "inputAudio" : "inputVideo";
+		if (descriptor?.capabilities[capability] !== true) {
+			throw new ProviderRpcError(
+				"UNSUPPORTED_MEDIA",
+				`Plugin provider ${params.providerTypeId} did not explicitly negotiate ${capability}; native ${parsed.data.type} cannot be sent.`,
+			);
+		}
+	};
+	const visit = (content: ProviderContentBlock[]) => {
+		for (const block of content) {
+			if (["input_audio", "input_video", "audio_url", "video_url"].includes(block.type)) {
+				throw new ProviderRpcError(
+					"INVALID_REQUEST",
+					`Unsupported native media representation: ${block.type}`,
+				);
+			}
+			if (block.type === "audio" || block.type === "video") check(block);
+			if (block.type === "tool_result" && Array.isArray(block.content)) {
+				visit(block.content as ProviderContentBlock[]);
+			}
+		}
+	};
+	if (params.request.current.media !== undefined) {
+		if (!Array.isArray(params.request.current.media))
+			throw new ProviderRpcError("INVALID_REQUEST", "Native media must be an array");
+		for (const media of params.request.current.media) check(media);
+	}
+	for (const message of params.request.history) visit(message.content);
+	visit(params.request.current.toolResults);
 }
 
 export interface ProviderGenerateParams extends ProviderBaseParams {
@@ -446,6 +499,8 @@ export interface ProviderOperation extends AsyncIterable<ProviderStreamEvent> {
 }
 
 export type ProviderRpcErrorCode =
+	| "UNSUPPORTED_MEDIA"
+	| "INVALID_REQUEST"
 	| "NOT_DESCRIBED"
 	| "INCOMPATIBLE_PROTOCOL"
 	| "INVALID_RESPONSE"
@@ -1044,6 +1099,7 @@ export class PluginProviderRpcClient {
 		}
 		this.assertConfigLimit(params.providerTypeId, params.config);
 		const descriptor = this.descriptors.get(params.providerTypeId);
+		if (kind === "chat") assertNativeMediaRequest(params as ProviderChatParams, descriptor);
 		if (kind === "generate" && descriptor && !descriptor.capabilities.generate) {
 			throw new ProviderRpcError("INVALID_RESPONSE", "Provider does not support generate");
 		}
@@ -1229,13 +1285,14 @@ export class PluginProviderRpcClient {
 		}
 		if (!this.consumeCredit(record, terminal ? "terminal" : "normal", bodyBytes)) return;
 		if (!this.validateEventSemantics(record, event)) return;
-		record.eventCount += 1;
+		const diagnostic = event.type === "dump.request" || event.type === "dump.response";
+		if (!diagnostic) record.eventCount += 1;
 		if (record.eventCount > this.limits.maxEventsPerOperation) {
 			this.releaseCredit(record, terminal ? "terminal" : "normal", bodyBytes);
 			this.outputLimit(record, "Provider operation exceeded its event limit");
 			return;
 		}
-		if (!terminal) {
+		if (!terminal && !diagnostic) {
 			record.operationOutputBytes += bodyBytes;
 			if (record.operationOutputBytes > this.limits.maxOperationOutputBytes) {
 				this.releaseCredit(record, "normal", bodyBytes);
@@ -1394,10 +1451,17 @@ export class PluginProviderRpcClient {
 				return false;
 			}
 			const bytes = event.bodyChunk ? utf8Bytes(event.bodyChunk) : 0;
-			record.dumpBytes += bytes;
-			if (record.dumpBytes > record.dumpMaxBytes) {
-				this.outputLimit(record, "Provider dump output exceeded the advertised budget");
-				return false;
+			const remaining = Math.max(0, record.dumpMaxBytes - record.dumpBytes);
+			record.dumpBytes = Math.min(record.dumpMaxBytes, record.dumpBytes + bytes);
+			if (bytes > remaining) {
+				// Diagnostic retention is not business output admission. Keep a UTF-8 prefix
+				// and an explicit marker while still processing done/text/tool events normally.
+				event.bodyChunk = new TextDecoder().decode(
+					textEncoder.encode(event.bodyChunk ?? "").subarray(0, remaining),
+					{ stream: true },
+				);
+				event.truncated = true;
+				markHostTruncatedDump(event);
 			}
 		}
 		return true;
@@ -1903,6 +1967,11 @@ function normalizeDescribeResult(
 		) {
 			throw new ProviderRpcError("INVALID_RESPONSE", "Provider capabilities are incomplete");
 		}
+		for (const key of ["inputAudio", "inputVideo"] as const) {
+			if (capabilities[key] !== undefined && typeof capabilities[key] !== "boolean") {
+				throw new ProviderRpcError("INVALID_RESPONSE", `Invalid provider capability: ${key}`);
+			}
+		}
 		const configSchema = requireRecord(provider.configSchema, "provider.configSchema") as Record<
 			string,
 			JsonValue
@@ -1932,6 +2001,12 @@ function normalizeDescribeResult(
 					: {}),
 				...(typeof capabilities.inputImages === "boolean"
 					? { inputImages: capabilities.inputImages }
+					: {}),
+				...(typeof capabilities.inputAudio === "boolean"
+					? { inputAudio: capabilities.inputAudio }
+					: {}),
+				...(typeof capabilities.inputVideo === "boolean"
+					? { inputVideo: capabilities.inputVideo }
 					: {}),
 				...(typeof capabilities.mayLeakXmlToolCalls === "boolean"
 					? { mayLeakXmlToolCalls: capabilities.mayLeakXmlToolCalls }
@@ -2062,6 +2137,11 @@ function normalizeModelCatalog(value: unknown, maximum: number): ModelCatalog {
 				throw new ProviderRpcError("INVALID_RESPONSE", `Missing model capability: ${key}`);
 			}
 		}
+		for (const key of ["inputAudio", "inputVideo"] as const) {
+			if (capabilities[key] !== undefined && typeof capabilities[key] !== "boolean") {
+				throw new ProviderRpcError("INVALID_RESPONSE", `Invalid model capability: ${key}`);
+			}
+		}
 		const chat = capabilities.chat as boolean;
 		const generate = capabilities.generate as boolean;
 		const streaming = capabilities.streaming as boolean;
@@ -2109,6 +2189,12 @@ function normalizeModelCatalog(value: unknown, maximum: number): ModelCatalog {
 					: {}),
 				...(typeof capabilities.inputImages === "boolean"
 					? { inputImages: capabilities.inputImages }
+					: {}),
+				...(typeof capabilities.inputAudio === "boolean"
+					? { inputAudio: capabilities.inputAudio }
+					: {}),
+				...(typeof capabilities.inputVideo === "boolean"
+					? { inputVideo: capabilities.inputVideo }
 					: {}),
 				...(typeof capabilities.reasoning === "boolean"
 					? { reasoning: capabilities.reasoning }

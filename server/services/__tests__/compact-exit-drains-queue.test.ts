@@ -16,7 +16,8 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { chapters, narratorMessages, narrators, projects } from "../../db/schema";
+import { narratorMessages, narrators, projects } from "../../db/schema";
+import { settings } from "../../lib/settings";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
@@ -45,6 +46,13 @@ mock.module("../compact-queue-drain", () => ({
 
 const { narratorContext } = await import("../narrator-context");
 const { cancelCompact, compactLocks, runCustomCompact } = await import("../narrator-compact");
+const { claimConversationIdentity, createConversationIdentityStore } = await import(
+	"../narrator-conversation-identity"
+);
+const { sqliteContextQuery } = await import("../context-composition-history");
+const { activeNarrators, withNarratorMutationAdmission } = await import(
+	"../narrator-session-state"
+);
 
 const realGenerateCompactSummary = narratorContext.generateCompactSummary.bind(narratorContext);
 const NARRATOR_ID = "n-compact-exit";
@@ -54,21 +62,11 @@ function seed(): void {
 	db.insert(projects)
 		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "ch1",
-			projectId: "p1",
-			title: "Chapter",
-			branch: "chapter/ch1",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
 	db.insert(narrators)
 		.values({
 			id: NARRATOR_ID,
-			chapterId: "ch1",
+			contextProjectId: "p1",
+			cwd: "/tmp/repo",
 			type: "primary",
 			inheritMode: "fresh",
 			createdAt: now,
@@ -128,6 +126,74 @@ describe("runCustomCompact drains the queue on exit", () => {
 
 		expect(drainCalls).toEqual([NARRATOR_ID]);
 		expect(compactLocks.has(NARRATOR_ID)).toBe(false);
+	});
+
+	test("compact generates outside admission but publishes its clear and live reset together", async () => {
+		seed();
+		let summaryStarted!: () => void;
+		const summaryReady = new Promise<void>((resolve) => {
+			summaryStarted = resolve;
+		});
+		let release!: () => void;
+		const releaseClaim = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let claimed!: () => void;
+		const claimReady = new Promise<void>((resolve) => {
+			claimed = resolve;
+		});
+		const previousProviders = settings.anthropicProviders;
+		settings.anthropicProviders = [
+			...(previousProviders ?? []),
+			{
+				id: "compact-identity-test",
+				name: "Compact identity test",
+				prefix: "compact-identity-test",
+				apiKey: "isolated-no-network",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "claude-sonnet-5-5",
+				officialApi: false,
+			},
+		];
+		const active = {
+			alive: true,
+			model: "claude-sonnet-5-5",
+			provider: "compact-identity-test",
+			_enabledOptionalTools: new Set<string>(),
+			conversationId: "stable-before-compact",
+			_persistedConversationId: null,
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set(NARRATOR_ID, active);
+		const store = createConversationIdentityStore(sqliteContextQuery(sqlite));
+		narratorContext.generateCompactSummary = async () => {
+			summaryStarted();
+			return { summary: "new compact", contextPercent: 10 };
+		};
+		const claim = withNarratorMutationAdmission(NARRATOR_ID, async () => {
+			// The remote summary must start while this short admission is held.
+			await summaryReady;
+			await claimConversationIdentity(store, NARRATOR_ID, active);
+			claimed();
+			await releaseClaim;
+		});
+		const compact = runCustomCompact(NARRATOR_ID, "en", "m-target", { mode: "background" });
+		try {
+			await claimReady;
+			expect((await store.read(NARRATOR_ID)).conversationId).toBe("stable-before-compact");
+			expect(active._persistedConversationId).toBe("stable-before-compact");
+			release();
+			await claim;
+			await compact;
+			expect((await store.read(NARRATOR_ID)).conversationId).toBeNull();
+			expect(active._persistedConversationId).toBeNull();
+			expect(active.conversationId).toBe("stable-before-compact");
+			expect(active._resetUpstreamSessionOnNextRequest).toBe(true);
+		} finally {
+			release();
+			await Promise.allSettled([claim, compact]);
+			activeNarrators.delete(NARRATOR_ID);
+			settings.anthropicProviders = previousProviders;
+		}
 	});
 
 	test("a cancelled compact reaches the drain too, so nothing is stranded", async () => {

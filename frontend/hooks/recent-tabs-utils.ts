@@ -1,5 +1,6 @@
 import type { PersistedRecentTab, RecentTabRuntimePatch } from "@shared/recent-tabs";
 import { RECENT_TABS_LIVE_LIMIT } from "@shared/recent-tabs";
+import { getEffectiveNarratorDisplay } from "../lib/status-registry";
 
 export interface RecentTabViewer {
 	userId: string;
@@ -14,9 +15,10 @@ export interface RecentTab extends PersistedRecentTab {
 	// Runtime-enriched fields (not persisted to DB)
 	activeTerminalCount?: number;
 	activeBackgroundTaskCount?: number;
+	activeBackgroundWorkCount?: number;
+	activeBackgroundServiceCount?: number;
 	viewers?: RecentTabViewer[];
 	viewerCount?: number;
-	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	/** Runtime-enriched marker: this narrator has unsent draft text. */
 	hasDraft?: boolean;
 	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
@@ -27,13 +29,32 @@ export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const RECENT_TAB_VIEWERS_MAX = 20;
 
 /**
- * Whether a narrator tab whose foreground renders hollow (idle, nothing unread)
- * still has background tasks running — the signal for the diagonally half-filled
- * bubble. Kept here (not inside the component) so the decision is unit-testable
- * and every surface agrees on it.
+ * Structural subset of `RecentTab` that background-activity detection reads.
+ * Widened from `RecentTab` so the narrator list page (whose items are not tabs)
+ * can run the same decision through `NarratorStatusIcon`.
  */
-export function isRecentTabBackgroundActive(tab: RecentTab, filledStatus: boolean): boolean {
-	return !filledStatus && (tab.activeBackgroundTaskCount ?? 0) > 0;
+export interface RecentTabBackgroundSource {
+	status?: string | null;
+	substatus?: string[] | null;
+	activeBackgroundWorkCount?: number | null;
+	activeBackgroundTaskCount?: number | null;
+}
+
+/** Idle foreground + background work: half blue, with a hollow or unread-green base. */
+export function isRecentTabBackgroundActive(
+	tab: RecentTabBackgroundSource,
+	filledStatus: boolean,
+): boolean {
+	if ((tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0) <= 0) return false;
+	if (!filledStatus) return true;
+	// Unread fills the foreground half, but must not hide ongoing background work.
+	// Keep stronger states (errors, planning, approvals) in their existing solid form.
+	const substatus = tab.substatus?.filter((tag) => tag !== "reasoning");
+	return (
+		(tab.status ?? "idle") === "idle" &&
+		getEffectiveNarratorDisplay("idle", substatus) ===
+			getEffectiveNarratorDisplay("idle", ["unread"])
+	);
 }
 
 export function clampRecentTabText(value: string | null | undefined): string | undefined {
@@ -94,9 +115,10 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"substatus",
 	"activeTerminalCount",
 	"activeBackgroundTaskCount",
+	"activeBackgroundWorkCount",
+	"activeBackgroundServiceCount",
 	"viewers",
 	"viewerCount",
-	"containerStatus",
 	"hasDraft",
 ] as const satisfies ReadonlyArray<keyof RecentTab>;
 
@@ -178,7 +200,6 @@ export function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: Recent
 
 function recentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId ?? null;
 	return null;
 }
 
@@ -271,9 +292,6 @@ export function reconcileRecentTabsRuntimePatches(
 
 function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "project") return pathname === `/projects/${tab.id}`;
-	if (tab.type === "chapter") {
-		return !!tab.narratorId && pathname === `/narrators/${tab.narratorId}`;
-	}
 	if (tab.type === "workspace") return pathname === `/narrators/workspace/${tab.id}`;
 	return pathname === `/narrators/${tab.id}`;
 }

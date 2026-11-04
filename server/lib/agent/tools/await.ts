@@ -11,7 +11,7 @@ import {
 import { SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR } from "@server/services/subagent-communication-policy";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
-import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import type { ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
 async function consumeTerminalResult(result: {
@@ -52,6 +52,10 @@ const AWAIT_TIMEOUT_DESCRIPTION =
 
 export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 
+const GUIDANCE_ENDED_WAIT_NOTE =
+	"This wait ended early because the user sent new guidance. Read it first; Await again " +
+	"only if the target still blocks what the user now wants.";
+
 // --- Live timeout management ---
 // Tracks running Await waits so the UI can extend their timeout mid-wait, mirroring
 // the Bash tool's runningBashProcesses map. Pinned to globalThis via hotSafe so hot
@@ -66,6 +70,12 @@ interface RunningAwaitEntry {
 	awaitType: AwaitTargetType;
 	targetId: string;
 	narratorId: string;
+	/**
+	 * Set once an agent wait resolves its target. Drives the live output-count
+	 * forwarding to the waiting card (see narrator-event-handler's
+	 * `noteSubagentOutputText`).
+	 */
+	resolvedSubagentNarratorId?: string;
 	/** Reschedule the timeout to fire `newMs` after the wait started. */
 	reschedule: (newMs: number) => void;
 }
@@ -92,6 +102,25 @@ export function listRunningAwaits(): RunningAwaitSnapshot[] {
 	}));
 }
 
+/**
+ * In-flight `type: "agent"` waits whose resolved target is `subagentNarratorId`.
+ *
+ * The event handler forwards the subagent's live output char count to these
+ * cards too, so a parent waiting on a child sees the same growing counter on
+ * the Await card as on the (long-completed) spawn card.
+ */
+export function listRunningAgentAwaitsForSubagent(
+	subagentNarratorId: string,
+): Array<{ narratorId: string; toolUseId: string }> {
+	const out: Array<{ narratorId: string; toolUseId: string }> = [];
+	for (const [toolUseId, entry] of runningAwaits) {
+		if (entry.awaitType === "agent" && entry.resolvedSubagentNarratorId === subagentNarratorId) {
+			out.push({ narratorId: entry.narratorId, toolUseId });
+		}
+	}
+	return out;
+}
+
 const runningAwaits = hotSafe(
 	"narrafork:runningAwaits",
 	() => new Map<string, RunningAwaitEntry>(),
@@ -115,13 +144,14 @@ export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): num
  *
  * Imported lazily and never awaited by the caller: this is a UI affordance, so it
  * must not add latency to the wait or fail it. `type: "agent"` is rejected for
- * subagents (see `buildRawJsonSchema`), so the owning narrator is always the
+ * subagents by the execution policy, so the owning narrator is always the
  * top-level one and no `parentToolUseId` routing is needed.
  */
 export async function broadcastAwaitAgentResolved(
 	narratorId: string,
 	toolUseId: string,
 	subagentNarratorId: string,
+	subagentTitle?: string | null,
 ): Promise<void> {
 	try {
 		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
@@ -130,29 +160,22 @@ export async function broadcastAwaitAgentResolved(
 			narratorId,
 			toolUseId,
 			subagentNarratorId,
+			...(subagentTitle ? { subagentTitle } : {}),
 		});
 	} catch {
 		// Best-effort only; a reload picks the same fact up from the message loader.
 	}
 }
 
-function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
-	const policy = runtimePolicyForContext(config);
-	const targets = runtimeAwaitTargets(policy);
-	const questionHint =
-		policy.capabilities.askUserQuestion === "disabled"
-			? "question waits only on an existing own question; AskUserQuestion is unavailable."
-			: "question waits on an async AskUserQuestion belonging to this session.";
+function buildRawJsonSchema(): Record<string, unknown> {
 	return {
 		type: "object",
 		properties: {
 			type: {
-				description: `What to await: ${targets.join(", ")}. ${questionHint}${
-					policy.capabilities.awaitAgent ? "" : " Subagents cannot await other agents."
-				}`,
+				description:
+					'What to await: "agent" (primary narrator only), "bash", "transfer", or "question" (an existing own async question). Current runtime capabilities are enforced at execution.',
 				type: "string",
-				// Legacy own-question waits remain available independently of question creation.
-				enum: targets,
+				enum: ["agent", "bash", "transfer", "question"],
 			},
 			id: {
 				description: "The task/subagent ID, alias, accessible subagent name, or async question id.",
@@ -207,12 +230,7 @@ export const awaitTool: ToolDefinition = {
 			.optional()
 			.describe('For type="bash" only: return early when this text appears in output.'),
 	}),
-	get rawJsonSchema() {
-		return buildRawJsonSchema();
-	},
-	getRawJsonSchema(config?: AgentConfig) {
-		return buildRawJsonSchema(config);
-	},
+	rawJsonSchema: buildRawJsonSchema(),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { type, id, wait_for_text } = args as {
 			type: AwaitTargetType;
@@ -259,13 +277,27 @@ export const awaitTool: ToolDefinition = {
 		};
 		if (toolUseId) runningAwaits.set(toolUseId, runningEntry);
 
+		// Await is the one tool queued guidance may cut short: it only waits, so ending
+		// the wait loses nothing and lets the model read the guidance right away.
+		const waitSignal = ctx.guidanceSignal
+			? AbortSignal.any([ctx.signal, ctx.guidanceSignal])
+			: ctx.signal;
 		// Distinguish a timeout abort from a real parent interrupt so we can label the
 		// result correctly: parent abort → "aborted", our timeout → "timeout".
-		const combinedSignal = AbortSignal.any([ctx.signal, timeoutController.signal]);
+		const combinedSignal = AbortSignal.any([waitSignal, timeoutController.signal]);
 		const relabel = (status: string): string =>
-			status === "aborted" && !ctx.signal.aborted && timeoutController.signal.aborted
+			status === "aborted" && !waitSignal.aborted && timeoutController.signal.aborted
 				? "timeout"
 				: status;
+		const endedForGuidance = () => !ctx.signal.aborted && ctx.guidanceSignal?.aborted === true;
+		const withGuidanceNote = (result: ToolResult): ToolResult =>
+			endedForGuidance()
+				? {
+						...result,
+						output: `${result.output}\n\n${GUIDANCE_ENDED_WAIT_NOTE}`,
+						metadata: { ...result.metadata, endedForGuidance: true },
+					}
+				: result;
 
 		try {
 			if (type === "agent") {
@@ -273,22 +305,32 @@ export const awaitTool: ToolDefinition = {
 				const result = await awaitAgentResultDetailed({
 					callerNarratorId: ctx.narratorId,
 					id,
+					userId: ctx.userId,
 					// The reschedulable timeoutController drives the deadline; give the inner
 					// waits a large cap so their own timers never win first.
 					timeoutMs: MAX_AWAIT_TIMEOUT_MS,
-					signal: ctx.signal,
+					signal: waitSignal,
 					timeoutSignal: timeoutController.signal,
 					// The wait can last for the whole timeout, and the returned metadata
 					// (which is what normally carries `subagentId`) only lands when it
 					// ends. Publishing the id here is what lets the card offer "open
 					// session" while the child is still working.
-					onTargetResolved: (subagentNarratorId) => {
+					onTargetResolved: (subagentNarratorId, subagentTitle) => {
 						if (!toolUseId) return;
-						void broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, subagentNarratorId);
+						// Publish the resolved target onto the registry entry too: the event
+						// handler reads it to forward the child's live output char count.
+						const entry = runningAwaits.get(toolUseId);
+						if (entry) entry.resolvedSubagentNarratorId = subagentNarratorId;
+						void broadcastAwaitAgentResolved(
+							ctx.narratorId,
+							toolUseId,
+							subagentNarratorId,
+							subagentTitle,
+						);
 					},
 				});
 				if (!combinedSignal.aborted) await consumeTerminalResult(result);
-				return {
+				return withGuidanceNote({
 					output: result.formatted,
 					metadata: {
 						kind: "await",
@@ -297,11 +339,13 @@ export const awaitTool: ToolDefinition = {
 						// Readable name for the header/badges; `subagentId` stays the real
 						// narrator id so the card can still open its session.
 						targetLabel: result.label,
+						// The session's display name; the card headlines this over the slug.
+						...(result.title ? { targetTitle: result.title } : {}),
 						resolvedId: result.id,
 						subagentId: result.id,
 						status: result.status,
 					},
-				};
+				});
 			}
 
 			if (type === "question") {
@@ -312,7 +356,7 @@ export const awaitTool: ToolDefinition = {
 					// The reschedulable timeoutController owns the deadline (so the UI can
 					// extend the wait mid-flight); the primitive's own timer is left unarmed.
 					timeoutMs: 0,
-					signal: ctx.signal,
+					signal: waitSignal,
 					timeoutSignal: timeoutController.signal,
 				});
 				if (result.status === "not_found") {
@@ -343,7 +387,7 @@ export const awaitTool: ToolDefinition = {
 						output = `<question_answer_fallback event="${result.record.answerMessageId}">\n${receipt}\n</question_answer_fallback>`;
 					}
 				}
-				return {
+				return withGuidanceNote({
 					output,
 					metadata: {
 						kind: "await",
@@ -353,7 +397,7 @@ export const awaitTool: ToolDefinition = {
 						resolvedId: result.record.id,
 						status: result.status,
 					},
-				};
+				});
 			}
 
 			const { backgroundTaskService } = await import("@server/services/background-task-service");
@@ -434,7 +478,7 @@ export const awaitTool: ToolDefinition = {
 			// than inventing a prefix — unlike a subagent id, a task id is looked up by
 			// exact match (`getById`/`getByAlias`), so a prefix would not resolve.
 			const taskLabel = task.alias ?? taskId;
-			return {
+			return withGuidanceNote({
 				output: formatResult(taskLabel, status, result.output),
 				metadata: {
 					kind: "await",
@@ -445,7 +489,7 @@ export const awaitTool: ToolDefinition = {
 					status,
 					waitForText: wait_for_text,
 				},
-			};
+			});
 		} catch (err) {
 			return {
 				output: `Await error: ${err instanceof Error ? err.message : String(err)}`,

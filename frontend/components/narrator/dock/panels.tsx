@@ -7,7 +7,7 @@
  *   - terminal → NarratorTerminal (with a header bar)
  *   - details  → NarratorDetailsPanel (inline) — props from dock context
  *   - spec     → SpecPanel
- *   - git      → GitPanel (resolves narrator workspace; chapter adapter retained)
+ *   - git      → GitPanel (resolves the narrator workspace)
  *   - browser  → BrowserPanel — session info from dock context
  *
  * Tool panels take their cross-panel state from NarratorDockContext (published
@@ -29,6 +29,7 @@ import {
 	IconSearch,
 	IconTerminal2,
 	IconTextSize,
+	IconTimeline,
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
@@ -40,14 +41,15 @@ import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
+import { lazyWithRetry } from "../../../lib/lazy-with-retry";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
-import { getFilePreviewType } from "../file-panel/FilePreviewModal";
 import {
 	FilePanelNavigationProvider,
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
+import { DockviewNarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
@@ -58,15 +60,17 @@ import {
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelGeometryReady, usePanelHeaderDrag } from "../panels/shared";
+import { fitWidePanelHeight } from "../panels/tool-placement";
 import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { FocusChatSlot } from "./FocusChatHost";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
+import { OutlineDockPanel } from "./OutlineDockPanel";
 
 const NarratorTerminal = lazy(() =>
 	import("../../terminal/NarratorTerminal").then((m) => ({ default: m.NarratorTerminal })),
 );
-const NarratorPanel = lazy(() =>
+const NarratorPanel = lazyWithRetry(() =>
 	import("../NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
 );
 const NarratorDetailsPanel = lazy(() =>
@@ -88,21 +92,19 @@ const NarratorSearchPanel = lazy(() =>
 const NarratorUserChatPanel = lazy(() =>
 	import("../../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),
 );
-const GitPanel = lazy(() =>
-	import("../../chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
-);
+const GitPanel = lazy(() => import("../../git/GitPanel").then((m) => ({ default: m.GitPanel })));
 const FileTreePanel = lazy(() =>
 	import("../file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
 );
-// Lazy so sessions without an open text file do not load the editor module graph.
-const FileEditorContent = lazy(() =>
-	import("../file-editor/FileEditorContent").then((m) => ({ default: m.FileEditorContent })),
+const NarratorTimelinePanel = lazy(() =>
+	import("../timeline/NarratorTimelinePanel").then((m) => ({ default: m.NarratorTimelinePanel })),
+);
+// Both dock and drawer defer the same editor / binary-preview entry.
+const FilePanelContent = lazy(() =>
+	import("../file-panel/FilePanelContent").then((m) => ({ default: m.FilePanelContent })),
 );
 const ToolEditFileViewer = lazy(() =>
 	import("../tool-call/ToolEditFileViewer").then((m) => ({ default: m.ToolEditFileViewer })),
-);
-const FileViewerContent = lazy(() =>
-	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),
 );
 const KnowledgeEntryPanelContent = lazy(() =>
 	import("../knowledge/KnowledgeEntryPanelContent").then((m) => ({
@@ -242,7 +244,15 @@ export function ToolPanelShell({
 		props,
 		subjectId,
 		"tool",
-		detachKind ? { toolKind: detachKind, ...(resourceId ? { resourceId } : {}) } : undefined,
+		detachKind
+			? {
+					toolKind: detachKind,
+					...(resourceId ? { resourceId } : {}),
+					...(detachKind === "file" && props.params.largeFileConfirmed === true
+						? { largeFileConfirmed: true }
+						: {}),
+				}
+			: undefined,
 	);
 	const close = useCallback(() => props.api.close(), [props.api]);
 	const guardedPointerDown = useCallback(
@@ -292,7 +302,6 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 							key={narratorId}
 							narratorId={narratorId}
 							compact={compact}
-							onForkFromMessage={dock?.onForkFromMessage ?? undefined}
 							onHeaderPointerDown={onHeaderPointerDown}
 							onViewSubagentSession={dock?.openSubagentPanel}
 							highlightMessageId={dock?.highlightMessageId}
@@ -621,7 +630,6 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
-	const chapterId = dock?.chapterId ?? props.params.chapterId;
 	const icon = <IconGitBranch size={16} color="var(--mantine-color-dimmed)" />;
 
 	// Sync Dockview tab title with localization
@@ -632,7 +640,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 		}
 	}, [t, props.api]);
 
-	if (!narratorId && !chapterId) {
+	if (!narratorId) {
 		return (
 			<ToolPanelShell
 				title={t("panel.title")}
@@ -658,7 +666,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 			detachKind="git"
 		>
 			<LazyPanelBoundary>
-				<GitPanel narratorId={narratorId} chapterId={chapterId} />
+				<GitPanel narratorId={narratorId} />
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
@@ -820,6 +828,78 @@ export function AppearanceDockPanel(props: IDockviewPanelProps<NarratorBoundPane
 	);
 }
 
+// ── Timeline (per-turn lanes of this agent and its subagents) ──
+export function TimelineDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+
+	useLayoutEffect(() => {
+		const title = t("timeline.title");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	// The group is sized to its content (one lane needs far less than five) until the
+	// reader drags the divider; from then on their height is kept.
+	const fitRef = useRef<{ applied: number | null; userSized: boolean }>({
+		applied: null,
+		userSized: false,
+	});
+	useEffect(() => {
+		// Compare group to group height: the event reports the panel body, which excludes
+		// the tab strip that the fitted size includes. A whole-dock resize also moves the
+		// group, so only a change while the dock itself kept its height counts as a drag.
+		let dockHeight = props.containerApi.height;
+		const disposable = props.api.onDidDimensionsChange(() => {
+			const fit = fitRef.current;
+			const dockNow = props.containerApi.height;
+			const dockResized = Math.abs(dockNow - dockHeight) > 1;
+			dockHeight = dockNow;
+			if (dockResized || fit.applied === null) return;
+			if (Math.abs(props.api.group.height - fit.applied) > 4) fit.userSized = true;
+		});
+		return () => disposable.dispose();
+	}, [props.api, props.containerApi]);
+	const bodyRef = useRef<HTMLDivElement>(null);
+	const fitToContent = useCallback(
+		(contentHeight: number) => {
+			const fit = fitRef.current;
+			// Only a group stacked in the dock's vertical split can be resized this way.
+			if (fit.userSized || props.api.location.type !== "grid") return;
+			const body = bodyRef.current;
+			if (!body) return;
+			const groupHeight = props.api.group.height;
+			// Everything in the group that is not the scrollable body: tab strip + panel header.
+			const chrome = Math.max(0, groupHeight - body.getBoundingClientRect().height);
+			const target = fitWidePanelHeight(contentHeight, chrome, props.containerApi.height);
+			if (Math.abs(target - groupHeight) <= 4) {
+				fit.applied = target;
+				return;
+			}
+			fit.applied = target;
+			props.api.group.api.setSize({ height: target });
+		},
+		[props.api, props.containerApi],
+	);
+
+	return (
+		<ToolPanelShell
+			title={t("timeline.title")}
+			icon={<IconTimeline size={16} color="var(--mantine-color-cyan-5)" />}
+			props={props}
+			subjectId="__timeline__"
+			detachKind="timeline"
+		>
+			<Box ref={bodyRef} style={{ height: "100%" }}>
+				<LazyPanelBoundary>
+					<NarratorTimelinePanel narratorId={narratorId} onContentHeight={fitToContent} />
+				</LazyPanelBoundary>
+			</Box>
+		</ToolPanelShell>
+	);
+}
+
 // ── Mock stream harness (TEMPORARY, see ../mock/README-REMOVAL.md) ──
 export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
@@ -975,8 +1055,6 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 		[props.api, props.containerApi, canExit],
 	);
 	const displayTitle = toolEdit ? `${title} · Edit` : editorDirty ? `${title} *` : title;
-	// Text always uses CodeMirror; the editor itself enforces write capability.
-	const isText = getFilePreviewType(filePath ?? "") === "text";
 
 	useLayoutEffect(() => {
 		if (!hostNarratorId || props.params.hostNarratorId === hostNarratorId) return;
@@ -1040,27 +1118,21 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							filePath={filePath}
 							navigationRequestId={highlightRequestId}
 						/>
-					) : isText ? (
-						<FileEditorContent
-							key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
-							filePath={filePath}
-							narratorId={fileNarratorId}
-							deviceId={deviceId}
-							referenceOrigin={referenceOrigin}
-							selection={selection}
-							navigationRequestId={highlightRequestId}
-							onDirtyChange={onDirtyChange}
-						/>
 					) : (
-						<FileViewerContent
-							key={`${fileNarratorId}:${deviceId}:${filePath}`}
-							filePath={filePath}
-							narratorId={fileNarratorId}
-							deviceId={deviceId}
-							referenceOrigin={referenceOrigin}
-							selection={selection}
-							highlightRequestId={highlightRequestId}
-						/>
+						<DockviewNarratorPanelVisibilityProvider api={props.api}>
+							<FilePanelContent
+								filePath={filePath}
+								narratorId={fileNarratorId}
+								deviceId={deviceId}
+								referenceOrigin={referenceOrigin}
+								selection={selection}
+								navigationRequestId={highlightRequestId}
+								onDirtyChange={onDirtyChange}
+								onOpenFileTarget={openFilePanel ? openFileTarget : undefined}
+								confirmed={props.params.largeFileConfirmed}
+								onConfirm={() => props.api.updateParameters({ largeFileConfirmed: true })}
+							/>
+						</DockviewNarratorPanelVisibilityProvider>
 					)}
 				</LazyPanelBoundary>
 			</FileReferenceScopeProvider>
@@ -1172,10 +1244,12 @@ export const narratorDockComponents: Record<
 	search: SearchDockPanel,
 	userchat: UserChatDockPanel,
 	appearance: AppearanceDockPanel,
+	timeline: TimelineDockPanel,
 	subagent: SubagentDockPanel,
 	filetree: FileTreeDockPanel,
 	file: FileDockPanel,
 	knowledge: KnowledgeDockPanel,
+	outline: OutlineDockPanel,
 	plugin: PluginDockPanel,
 	// TEMPORARY (see ../mock/README-REMOVAL.md).
 	mock: MockDockPanel,

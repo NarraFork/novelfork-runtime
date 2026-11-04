@@ -2,15 +2,16 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { EventEmitter } from "node:events";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const executor = await import("../narrator-executor");
 const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
 const { narratorService } = await import("../narrator-service");
@@ -29,16 +30,12 @@ const adapter: ProviderAdapter = {
 		providerBuilds.push(model);
 		return {
 			history: [{ protocol: "inheritfixture", source: "rebuilt" }],
-			trailingToolResults: [],
 		};
 	},
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("This runtime test must not contact a provider");
 	},
-	formatToolResult: () => ({}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => {
 		throw new Error("This runtime test must not generate titles");
 	},
@@ -53,12 +50,14 @@ const otherAdapter: ProviderAdapter = {
 	...adapter,
 	buildHistory: async (_messages, model) => {
 		providerBuilds.push(`otherfixture:${model}`);
-		return { history: [{ protocol: "otherfixture", source: "rebuilt" }], trailingToolResults: [] };
+		return { history: [{ protocol: "otherfixture", source: "rebuilt" }] };
 	},
 };
-const unregister = registerExternalProviderResolver((name) =>
-	name === "inheritfixture" ? adapter : name === "otherfixture" ? otherAdapter : null,
-);
+const unregister = registerExternalProviderResolver({
+	resolve: (name) =>
+		name === "inheritfixture" ? adapter : name === "otherfixture" ? otherAdapter : null,
+	listReadiness: () => [],
+});
 const PARENT = "inherit-parent";
 const CHILD = "inherit-child";
 const A = "inheritfixture:a";
@@ -71,7 +70,8 @@ const finished: ExecuteLoopResult = {
 	completedNaturally: true,
 };
 let broadcasts: Array<Record<string, unknown>> = [];
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	settings.agent.autoContinuationMode = "off";
 	settings.agent.defaultModel = A;
@@ -90,6 +90,10 @@ beforeEach(() => {
 				type: id === CHILD ? "subagent" : "primary",
 				variant: id === CHILD ? "subagent:general" : "primary",
 				parentNarratorId: id === CHILD ? PARENT : null,
+				...(id === CHILD && {
+					policySourceNarratorId: PARENT,
+					runtimeRegistrationJson: delegationRegistration(PARENT, "general"),
+				}),
 				subagentType: id === CHILD ? "general" : null,
 				model: id === CHILD ? FOLLOW_PARENT_MODEL : A,
 				cwd: process.env.HOME,
@@ -102,16 +106,15 @@ beforeEach(() => {
 });
 afterEach(async () => {
 	const active = activeNarrators.get(CHILD);
-	if (active) {
-		await active._modelRefreshPending;
-		getExecutionOwner(CHILD)?.release();
-		activeNarrators.delete(CHILD);
-	}
+	if (active) await active._modelRefreshPending;
+	// The run service (not the loop) releases a run's owner; these tests drive the loop.
+	getExecutionOwner(CHILD)?.release();
+	activeNarrators.delete(CHILD);
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregister();
-	mock.module("../../db", () => realDb);
 });
 
 function writeModel(id: string, model: string) {
@@ -121,8 +124,6 @@ function writeModel(id: string, model: string) {
 
 function fixture(
 	script: (options: ExecuteLoopOptions, active: ActiveNarrator) => Promise<ExecuteLoopResult>,
-	primary = false,
-	initialModel = B,
 ) {
 	const active: ActiveNarrator = {
 		narratorId: CHILD,
@@ -140,30 +141,13 @@ function fixture(
 		_blockedSkills: { all: false, names: new Set() },
 		_substatus: new Set(),
 	};
-	const owner = tryClaimExecution(CHILD, primary ? "primary" : "subagent");
+	const owner = tryClaimExecution(CHILD, "run");
 	if (!owner) throw new Error("Missing test execution owner");
 	activeNarrators.set(CHILD, active);
 	spyOn(executor, "executeAgentLoop").mockImplementation((options) => script(options, active));
 	return {
 		active,
-		run: () =>
-			runAgentLoopUnlocked(
-				active,
-				owner,
-				"fixture input",
-				undefined,
-				primary
-					? { kind: "primary" }
-					: {
-							kind: "subagent",
-							parentNarratorId: PARENT,
-							parentToolUseId: "inherit-origin",
-							subagentType: "general",
-							systemPrompt: "fixture prompt",
-							initialModel,
-							initialHistory: [{ protocol: "obsolete-provider", source: "snapshot" }],
-						},
-			),
+		run: () => runAgentLoopUnlocked(active, owner, "fixture input"),
 	};
 }
 
@@ -200,19 +184,17 @@ describe("shared orchestrator inherited runtime model", () => {
 		).toBe(true);
 	});
 
-	test("a DB pin overrides an older executor model and its prebuilt history", async () => {
+	test("a DB pin overrides an older executor model and history is rebuilt for it", async () => {
 		db.update(narrators).set({ model: B }).where(eq(narrators.id, CHILD)).run();
 		let checked = false;
-		const f = fixture(
-			async ({ history }, active) => {
-				expect(active.model).toBe(B);
-				expect(history).toEqual([{ protocol: "inheritfixture", source: "rebuilt" }]);
-				checked = true;
-				return finished;
-			},
-			false,
-			A,
-		);
+		const f = fixture(async ({ history }, active) => {
+			expect(active.model).toBe(B);
+			expect(history.built).toEqual([{ protocol: "inheritfixture", source: "rebuilt" }]);
+			checked = true;
+			return finished;
+		});
+		// The session still carries an older executor model.
+		f.active.model = A;
 		await f.run();
 		expect(checked).toBe(true);
 	});
@@ -222,17 +204,13 @@ describe("shared orchestrator inherited runtime model", () => {
 		db.update(narrators).set({ model: otherModel }).where(eq(narrators.id, PARENT)).run();
 		settings.agent.subagentAllowedModels.general = [otherModel];
 		let checked = false;
-		const f = fixture(
-			async ({ history, config }, active) => {
-				expect(active.model).toBe(otherModel);
-				expect(config.provider).toBe("otherfixture");
-				expect(history).toEqual([{ protocol: "otherfixture", source: "rebuilt" }]);
-				checked = true;
-				return finished;
-			},
-			false,
-			otherModel,
-		);
+		const f = fixture(async ({ history, config }, active) => {
+			expect(active.model).toBe(otherModel);
+			expect(config.provider).toBe("otherfixture");
+			expect(history.built).toEqual([{ protocol: "otherfixture", source: "rebuilt" }]);
+			checked = true;
+			return finished;
+		});
 		await f.run();
 		expect(checked).toBe(true);
 	});
@@ -399,7 +377,7 @@ describe("shared orchestrator inherited runtime model", () => {
 			.set({ model: B, pendingModelRestore: FOLLOW_PARENT_MODEL })
 			.where(eq(narrators.id, CHILD))
 			.run();
-		const f = fixture(async () => finished, true);
+		const f = fixture(async () => finished);
 		await f.run();
 		await settleNarratorRuntimeModel(f.active);
 		const row = db.select().from(narrators).where(eq(narrators.id, CHILD)).get();

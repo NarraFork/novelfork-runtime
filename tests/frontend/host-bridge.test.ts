@@ -13,12 +13,13 @@ import {
 	type HostBridgeHandle,
 	installHostBridge,
 	isEmbeddedByHost,
+	isPinnableOrigin,
 	looksLikeSessionToken,
 } from "@frontend/lib/host-bridge";
 
-/** A syntactically plausible session JWT (never verified by the client). */
-const TOKEN_A = "aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc";
-const TOKEN_B = "dddddddddddd.eeeeeeeeeeee.ffffffffffff";
+/** Syntactically plausible session tokens (never verified by the client). */
+const TOKEN_A = `nfs_${"a".repeat(43)}`;
+const TOKEN_B = `nfs_${"b".repeat(43)}`;
 const HOST_ORIGIN = "vscode-webview://7803497a-8232-4556-988a-7a1636d48b30";
 
 interface SentMessage {
@@ -98,8 +99,14 @@ afterEach(() => {
 });
 
 describe("looksLikeSessionToken", () => {
-	it("accepts a three-segment base64url token", () => {
+	it("accepts a session token", () => {
 		expect(looksLikeSessionToken(TOKEN_A)).toBe(true);
+	});
+
+	it("rejects a malformed session token and the retired JWT format", () => {
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}`)).toBe(false);
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}.`)).toBe(false);
+		expect(looksLikeSessionToken("aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc")).toBe(false);
 	});
 
 	it("rejects values that could not be a token", () => {
@@ -137,6 +144,27 @@ describe("isEmbeddedByHost", () => {
 
 	it("is true only when framed AND marked", () => {
 		expect(isEmbeddedByHost(makeWindow("https://nf.test/?nfEmbed=abc") as never)).toBe(true);
+	});
+});
+
+describe("isPinnableOrigin", () => {
+	const SELF = "https://nf.test";
+	it("accepts the vscode-webview scheme", () => {
+		expect(isPinnableOrigin(HOST_ORIGIN, SELF, [])).toBe(true);
+	});
+	it("accepts the app's own origin", () => {
+		expect(isPinnableOrigin(SELF, SELF, [])).toBe(true);
+	});
+	it("accepts a configured embed origin, and only when configured", () => {
+		expect(isPinnableOrigin("https://editor.example.com", SELF, [])).toBe(false);
+		expect(
+			isPinnableOrigin("https://editor.example.com", SELF, ["https://editor.example.com"]),
+		).toBe(true);
+	});
+	it("refuses an arbitrary web origin and an opaque origin", () => {
+		expect(isPinnableOrigin("https://evil.example.com", SELF, [])).toBe(false);
+		expect(isPinnableOrigin("null", SELF, [])).toBe(false);
+		expect(isPinnableOrigin("", SELF, [])).toBe(false);
 	});
 });
 
@@ -189,6 +217,34 @@ describe("installHostBridge", () => {
 			data: { type: "narrafork.bootstrap", token: TOKEN_B },
 		});
 		expect(getToken()).toBe(TOKEN_A);
+	});
+
+	it("refuses to pin an arbitrary web origin, even as the first sender", () => {
+		// The token-theft vector: a page frames the app and tries to win the bridge by
+		// speaking first. An ordinary web origin is not an approved embedder, so no pin.
+		const win = makeWindow("https://nf.test/?nfEmbed=n1");
+		bridge = installHostBridge(win as never);
+		win.deliver({
+			origin: "https://evil.example.com",
+			data: { type: "narrafork.bootstrap", token: TOKEN_A },
+		});
+		expect(getToken()).toBeNull();
+		expect(bridge?.pinnedOrigin).toBeNull();
+	});
+
+	it("pins a configured embed origin", () => {
+		// A non-webview editor host (e.g. code-server) is trusted only when the operator
+		// lists its origin — the same origins the backend trusts for CORS / frame-ancestors.
+		const win = makeWindow("https://nf.test/?nfEmbed=n1");
+		bridge = installHostBridge(win as never, {
+			allowedEmbedOrigins: ["https://editor.example.com"],
+		});
+		win.deliver({
+			origin: "https://editor.example.com",
+			data: { type: "narrafork.bootstrap", token: TOKEN_A },
+		});
+		expect(getToken()).toBe(TOKEN_A);
+		expect(bridge?.pinnedOrigin).toBe("https://editor.example.com");
 	});
 
 	it("ignores unknown message types and malformed payloads", () => {
@@ -299,7 +355,7 @@ describe("installHostBridge", () => {
 		});
 
 		it("says nothing when the value did not actually change", () => {
-			// Hydration and `absorbRenewedToken` both re-assert the current value; announcing
+			// Hydration re-asserts the current value; announcing
 			// those would send a message per request.
 			const win = bootstrapped();
 			setToken(TOKEN_A);

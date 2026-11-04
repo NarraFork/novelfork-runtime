@@ -4,19 +4,20 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/narrafork/remote-executor/internal/testgit"
 )
 
 func gitTestRun(t *testing.T, cwd string, args ...string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := testgit.CommandContext(ctx, args...)
 	cmd.Dir = cwd
 	cmd.Env = gitWorkspaceEnv(map[string]any{"GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.test"})
 	out, err := cmd.CombinedOutput()
@@ -32,7 +33,7 @@ func gitTestIdentity() map[string]any {
 
 func newGitFixture(t *testing.T) (string, *Handlers) {
 	t.Helper()
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	gitTestRun(t, root, "init", "-b", "main")
 	return root, NewWithOptions(NewPathGuard([]string{root}), gitWorkspaceMaxBytes, true)
 }
@@ -52,6 +53,12 @@ func gitCall(t *testing.T, h *Handlers, root, operation string, extra map[string
 
 func TestGitWorkspaceLifecycle(t *testing.T) {
 	root, h := newGitFixture(t)
+	name := "hello\tthere.txt"
+	if runtime.GOOS == "windows" {
+		// Win32 rejects tab characters in filenames; retain real whitespace
+		// and Unicode path coverage without skipping any lifecycle operations.
+		name = "hello 空格 there.txt"
+	}
 	write := func(path, content string) {
 		t.Helper()
 		if err := os.WriteFile(filepath.Join(root, path), []byte(content), 0600); err != nil {
@@ -63,13 +70,13 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 		t.Fatalf("probe: %v", probe)
 	}
 	gitCall(t, h, root, "status", nil)
-	write("hello\tthere.txt", "initial\n")
+	write(name, "initial\n")
 	gitCall(t, h, root, "stage", map[string]any{"all": true})
 	gitCall(t, h, root, "unstage", map[string]any{"all": true})
 	if gitTestRun(t, root, "ls-files") != "" {
 		t.Fatal("unborn unstage left index entries")
 	}
-	gitCall(t, h, root, "stage", map[string]any{"files": []any{"hello\tthere.txt"}})
+	gitCall(t, h, root, "stage", map[string]any{"files": []any{name}})
 	commit := gitCall(t, h, root, "commit", map[string]any{"message": "initial", "identity": gitTestIdentity()})
 	first := strings.TrimSpace(commit["stdout"].(string))
 	if len(first) != 40 {
@@ -78,15 +85,15 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	if got := gitTestRun(t, root, "show", "-s", "--format=%an <%ae> %cn <%ce>"); got != "Acting User <acting@example.test> Acting User <acting@example.test>" {
 		t.Fatalf("identity: %s", got)
 	}
-	write("hello\tthere.txt", "initial\nsecond\n")
-	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{"hello\tthere.txt"}})["stdout"].(string); !strings.Contains(diff, "+second") {
+	write(name, "initial\nsecond\n")
+	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{name}})["stdout"].(string); !strings.Contains(diff, "+second") {
 		t.Fatalf("diff %q", diff)
 	}
 	gitCall(t, h, root, "stage", map[string]any{"all": true})
-	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{"hello\tthere.txt"}, "staged": true})["stdout"].(string); !strings.Contains(diff, "+second") {
+	if diff := gitCall(t, h, root, "diff", map[string]any{"files": []any{name}, "staged": true})["stdout"].(string); !strings.Contains(diff, "+second") {
 		t.Fatalf("staged diff %q", diff)
 	}
-	gitCall(t, h, root, "unstage", map[string]any{"files": []any{"hello\tthere.txt"}})
+	gitCall(t, h, root, "unstage", map[string]any{"files": []any{name}})
 	gitCall(t, h, root, "stashPush", map[string]any{"message": "shelved", "identity": gitTestIdentity()})
 	if !strings.Contains(gitCall(t, h, root, "stashList", nil)["stdout"].(string), "shelved") {
 		t.Fatal("stash missing")
@@ -94,7 +101,7 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	gitCall(t, h, root, "stashPop", nil)
 	gitCall(t, h, root, "stashPush", map[string]any{"identity": gitTestIdentity()})
 	gitCall(t, h, root, "stashDrop", map[string]any{"index": 0})
-	write("hello\tthere.txt", "changed\n")
+	write(name, "changed\n")
 	write("new.txt", "new\n")
 	if full := gitCall(t, h, root, "fullDiff", nil)["stdout"].(string); !strings.Contains(full, "+new") {
 		t.Fatalf("full diff omitted untracked: %q", full)
@@ -107,7 +114,7 @@ func TestGitWorkspaceLifecycle(t *testing.T) {
 	if got := gitTestRun(t, root, "status", "--porcelain"); got != "" {
 		t.Fatalf("discard: %s", got)
 	}
-	write("hello\tthere.txt", "third\n")
+	write(name, "third\n")
 	gitCall(t, h, root, "stage", map[string]any{"all": true})
 	gitCall(t, h, root, "commit", map[string]any{"message": "second", "identity": gitTestIdentity()})
 	log := gitCall(t, h, root, "log", map[string]any{"limit": 1, "skip": 1})["stdout"].(string)
@@ -373,7 +380,13 @@ func TestGitWorkspaceDisableShellReadFilters(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(root, ".gitattributes"), []byte("tracked filter=payload\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(tracked, []byte("modified content\n"), 0600); err != nil {
+			// A size change lets lightweight porcelain mark the path dirty without
+			// hashing it. Keep the same size to exercise a real clean filter in status.
+			if err := os.WriteFile(tracked, []byte("changed\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			changedTime := time.Now().Add(2 * time.Second)
+			if err := os.Chtimes(tracked, changedTime, changedTime); err != nil {
 				t.Fatal(err)
 			}
 			params := map[string]any{"cwd": root, "expectedRoot": root, "operation": operation}
@@ -411,7 +424,7 @@ func TestGitWorkspaceDisableShellReadFilters(t *testing.T) {
 }
 
 func TestGitWorkspaceDisableShellLinkedWorktreeHooks(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(parent, "repo")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
@@ -504,7 +517,7 @@ func TestGitWorkspaceUnavailableStatesAndNestedRepository(t *testing.T) {
 }
 
 func TestGitWorkspaceSubmodule(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	source := filepath.Join(parent, "source")
 	root := filepath.Join(parent, "root")
 	for _, path := range []string{source, root} {
@@ -549,7 +562,7 @@ func TestGitWorkspaceSubmodule(t *testing.T) {
 }
 
 func TestGitWorkspaceWorktreeAndDetached(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(parent, "repo")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
@@ -584,5 +597,241 @@ func TestGitWorkspaceWorktreeAndDetached(t *testing.T) {
 	_, err := h.ConnectionScoped().GitWorkspace(context.Background(), map[string]any{"cwd": wt, "expectedRoot": wt, "operation": "reset", "mode": "soft", "target": "HEAD"})
 	if err == nil || !strings.Contains(err.Error(), "repository is busy") {
 		t.Fatalf("shared repository lock ignored: %v", err)
+	}
+}
+
+// A fixture with --disable-shell off. push/fetch are refused there by design, so
+// the network operations need a handler set that is allowed to run git normally.
+func newOpenGitFixture(t *testing.T) (string, *Handlers) {
+	t.Helper()
+	root := canonicalFixturePath(t, t.TempDir())
+	gitTestRun(t, root, "init", "-b", "main")
+	return root, NewWithOptions(NewPathGuard([]string{root}), gitWorkspaceMaxBytes, false)
+}
+
+func branchRecordNames(t *testing.T, result map[string]any, key string) []string {
+	t.Helper()
+	outputs, ok := result["outputs"].(map[string]string)
+	if !ok {
+		t.Fatalf("%s: missing outputs: %v", key, result)
+	}
+	var names []string
+	for _, line := range strings.Split(outputs[key], "\n") {
+		if line == "" {
+			continue
+		}
+		names = append(names, strings.Split(line, "\x00")[0])
+	}
+	return names
+}
+
+func gitTestWrite(t *testing.T, root, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGitWorkspaceBranches(t *testing.T) {
+	root, h := newOpenGitFixture(t)
+	// An unborn repository still names its branch, but has no commit behind it.
+	unborn := gitCall(t, h, root, "branches", nil)
+	outputs := unborn["outputs"].(map[string]string)
+	if outputs["headSha"] != "" || outputs["branch"] != "main" {
+		t.Fatalf("unborn branch identity: %v", outputs)
+	}
+	if unborn["truncated"] != false {
+		t.Fatalf("unborn truncation: %v", unborn)
+	}
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+
+	result := gitCall(t, h, root, "branches", nil)
+	outputs = result["outputs"].(map[string]string)
+	if len(outputs["headSha"]) != 40 || outputs["branch"] != "main" {
+		t.Fatalf("branch identity: %v", outputs)
+	}
+	// Eight NUL-separated fields per record, in the order the server parses.
+	record := strings.Split(strings.SplitN(outputs["heads"], "\n", 2)[0], "\x00")
+	if len(record) != 8 {
+		t.Fatalf("branch record shape: got %d fields %q", len(record), record)
+	}
+	if record[0] != "main" || record[6] != "*" {
+		t.Fatalf("current branch record: %q", record)
+	}
+	if names := branchRecordNames(t, result, "remoteRefs"); len(names) != 0 {
+		t.Fatalf("remote branches without a remote: %v", names)
+	}
+	if outputs["remoteNames"] != "" {
+		t.Fatalf("remote names without a remote: %q", outputs["remoteNames"])
+	}
+	if _, present := gitCall(t, h, root, "branches", nil)["outputs"].(map[string]string)["worktrees"]; !present {
+		t.Fatal("worktree listing missing")
+	}
+	// Whole-worktree reads must not accept per-file actions.
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "branches", "files": []any{"seed.txt"},
+	}); err == nil || !strings.Contains(err.Error(), "does not accept files") {
+		t.Fatalf("branches accepted files: %v", err)
+	}
+	// A detached HEAD is reported as a commit with no branch, not as unborn.
+	gitTestRun(t, root, "checkout", "--detach")
+	detached := gitCall(t, h, root, "branches", nil)["outputs"].(map[string]string)
+	if detached["branch"] != "" || len(detached["headSha"]) != 40 {
+		t.Fatalf("detached branch identity: %v", detached)
+	}
+}
+
+func TestGitWorkspaceBranchCheckout(t *testing.T) {
+	root, h := newOpenGitFixture(t)
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+	gitTestRun(t, root, "branch", "side")
+
+	gitCall(t, h, root, "checkout", map[string]any{"branch": "side"})
+	if got := gitTestRun(t, root, "symbolic-ref", "--short", "HEAD"); got != "side" {
+		t.Fatalf("switch to existing branch: %s", got)
+	}
+	gitCall(t, h, root, "checkout", map[string]any{"branch": "feature/one", "create": true})
+	if got := gitTestRun(t, root, "symbolic-ref", "--short", "HEAD"); got != "feature/one" {
+		t.Fatalf("create branch: %s", got)
+	}
+	gitCall(t, h, root, "checkout", map[string]any{"branch": "feature/from-main", "create": true, "startPoint": "main"})
+	if got := gitTestRun(t, root, "symbolic-ref", "--short", "HEAD"); got != "feature/from-main" {
+		t.Fatalf("create branch from start point: %s", got)
+	}
+	if gitTestRun(t, root, "rev-parse", "HEAD") != gitTestRun(t, root, "rev-parse", "main") {
+		t.Fatal("start point was ignored")
+	}
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "checkout", "branch": "missing",
+	}); err == nil || !strings.Contains(err.Error(), "branch not found") {
+		t.Fatalf("missing branch: %v", err)
+	}
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "checkout", "branch": "bad..name",
+	}); err == nil || !strings.Contains(err.Error(), "invalid Git branch name") {
+		t.Fatalf("invalid branch name: %v", err)
+	}
+}
+
+func TestGitWorkspacePushAndFetch(t *testing.T) {
+	root, h := newOpenGitFixture(t)
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+	remote := filepath.Join(canonicalFixturePath(t, t.TempDir()), "origin.git")
+	gitTestRun(t, root, "init", "--bare", "-b", "main", remote)
+	gitTestRun(t, root, "remote", "add", "origin", remote)
+
+	// No upstream yet: push establishes it.
+	gitCall(t, h, root, "push", map[string]any{"setUpstream": true})
+	if got := gitTestRun(t, remote, "rev-parse", "--verify", "main"); len(got) != 40 {
+		t.Fatalf("pushed ref: %q", got)
+	}
+	outputs := gitCall(t, h, root, "branches", nil)["outputs"].(map[string]string)
+	if !strings.Contains(outputs["heads"], "origin/main") {
+		t.Fatalf("upstream not recorded: %q", outputs["heads"])
+	}
+
+	// A second clone moves the remote; fetch brings the new branch in and prune removes it.
+	second := filepath.Join(canonicalFixturePath(t, t.TempDir()), "second")
+	gitTestRun(t, root, "clone", remote, second)
+	gitTestWrite(t, second, "other.txt", "other\n")
+	gitTestRun(t, second, "add", "-A")
+	gitTestRun(t, second, "commit", "-m", "other")
+	gitTestRun(t, second, "push", "origin", "HEAD:refs/heads/ephemeral")
+	gitCall(t, h, root, "fetch", nil)
+	if names := branchRecordNames(t, gitCall(t, h, root, "branches", nil), "remoteRefs"); !containsString(names, "origin/ephemeral") {
+		t.Fatalf("fetch did not add the remote branch: %v", names)
+	}
+	gitTestRun(t, second, "push", "origin", "--delete", "ephemeral")
+	gitCall(t, h, root, "fetch", map[string]any{"prune": true})
+	if names := branchRecordNames(t, gitCall(t, h, root, "branches", nil), "remoteRefs"); containsString(names, "origin/ephemeral") {
+		t.Fatalf("prune did not remove the deleted remote branch: %v", names)
+	}
+
+	// An unknown remote never reaches git.
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "push", "remote": "elsewhere",
+	}); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("unknown remote: %v", err)
+	}
+	// Nor does a flag-shaped one.
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "fetch", "remote": "--upload-pack=evil",
+	}); err == nil {
+		t.Fatal("flag-shaped remote accepted")
+	}
+	// A detached HEAD cannot be pushed.
+	gitTestRun(t, root, "checkout", "--detach")
+	if _, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "push",
+	}); err == nil || !strings.Contains(err.Error(), "detached HEAD") {
+		t.Fatalf("detached push: %v", err)
+	}
+}
+
+func TestGitWorkspacePushFollowsConfiguredUpstream(t *testing.T) {
+	root, h := newOpenGitFixture(t)
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+	remote := filepath.Join(canonicalFixturePath(t, t.TempDir()), "origin.git")
+	gitTestRun(t, root, "init", "--bare", "-b", "main", remote)
+	gitTestRun(t, root, "remote", "add", "origin", remote)
+	gitCall(t, h, root, "push", map[string]any{"setUpstream": true})
+	gitTestRun(t, root, "branch", "-m", "main", "develop")
+	gitTestWrite(t, root, "more.txt", "more\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "more", "identity": gitTestIdentity()})
+	gitCall(t, h, root, "push", nil)
+	if gitTestRun(t, remote, "rev-parse", "refs/heads/main") != gitTestRun(t, root, "rev-parse", "HEAD") {
+		t.Fatal("push did not update the tracked upstream branch")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := testgit.CommandContext(ctx, "rev-parse", "--verify", "refs/heads/develop")
+	cmd.Dir = remote
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("push created the local branch name on the remote: %s", out)
+	}
+}
+
+func TestGitWorkspacePushRefusesAmbiguousRemote(t *testing.T) {
+	root, h := newOpenGitFixture(t)
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+	remote := filepath.Join(canonicalFixturePath(t, t.TempDir()), "origin.git")
+	gitTestRun(t, root, "init", "--bare", "-b", "main", remote)
+	gitTestRun(t, root, "remote", "add", "origin", remote)
+	gitTestRun(t, root, "remote", "rename", "origin", "upstream")
+	fork := filepath.Join(canonicalFixturePath(t, t.TempDir()), "fork.git")
+	gitTestRun(t, root, "init", "--bare", "-b", "main", fork)
+	gitTestRun(t, root, "remote", "add", "fork", fork)
+	gitTestRun(t, root, "checkout", "-b", "feature")
+	_, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "push",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot choose a Git remote") {
+		t.Fatalf("ambiguous remote: %v", err)
+	}
+}
+
+func TestGitWorkspaceDisableShellRefusesNetworkWrites(t *testing.T) {
+	root, h := newGitFixture(t) // --disable-shell
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+	for _, operation := range []string{"push", "fetch"} {
+		_, err := h.GitWorkspace(context.Background(), map[string]any{
+			"cwd": root, "expectedRoot": root, "operation": operation,
+		})
+		if err == nil || !strings.Contains(err.Error(), "shell execution is disabled") {
+			t.Fatalf("%s under --disable-shell: %v", operation, err)
+		}
 	}
 }

@@ -1,10 +1,8 @@
 import type { ProxyOverride } from "../../lib/proxy";
 
 export type CustomApiProtocol =
-	| "anthropic-official"
-	| "anthropic-compatible"
-	| "codex-native"
-	| "responses-compatible"
+	| "anthropic-messages"
+	| "openai-responses"
 	| "completions-compatible"
 	| "gemini-compatible";
 
@@ -16,16 +14,15 @@ export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";
  * chosen a User-Agent mode.
  *
  * Relay defaults follow the protocol the traffic actually speaks:
- * - Codex 中转 → Codex
- * - Claude Code 中转（official / compatible）→ Claude Code
+ * - OpenAI Responses（Codex 客户端契约）→ Codex
+ * - Anthropic Messages（Claude Code 方言）→ Claude Code
  * - Everything else presents as NarraFork
  */
 export function defaultUserAgentModeForProtocol(protocol: CustomApiProtocol): UserAgentMode {
 	switch (protocol) {
-		case "codex-native":
+		case "openai-responses":
 			return "codex";
-		case "anthropic-official":
-		case "anthropic-compatible":
+		case "anthropic-messages":
 			return "claude-code";
 		default:
 			return "narrafork";
@@ -96,9 +93,16 @@ export interface AnthropicProviderState {
 	disabled?: boolean;
 }
 
-/** Ensure a model value has a "provider:" prefix. */
+/**
+ * Ensure a model value has a "provider:" prefix.
+ *
+ * Values starting with `__` are settings sentinels (`__default__`, `__summary__`,
+ * `__agg__:…`), not model IDs. Prefixing one turns "follow the default model"
+ * into a provider-qualified string that no model list contains, so every Select
+ * that only offers the bare sentinel renders it as an empty field.
+ */
 export function ensurePrefix(val: string): string {
-	if (!val || val.includes(":")) return val;
+	if (!val || val.includes(":") || val.startsWith("__")) return val;
 	// Bare claude model names resolve to the Anthropic provider.
 	if (["claude-haiku-4.5", "claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"].includes(val))
 		return `anthropic:${val}`;

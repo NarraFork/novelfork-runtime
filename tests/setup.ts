@@ -17,7 +17,12 @@ import { join, resolve } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { ensureColumns } from "../server/db/ensure-columns";
 import * as relations from "../server/db/relations";
+import {
+	initializeAbsentReceiptProtectionSource,
+	installResourceProtectionTriggers,
+} from "../server/db/resource-protection-index";
 import * as schema from "../server/db/schema";
+import { getNarraforkPath } from "../server/lib/narrafork-home";
 
 // Runtime migrations are host-provided immutable assets in production and in the
 // workspace test runner. Keep the local drizzle fallback for standalone upstream tests.
@@ -60,15 +65,23 @@ function isKnownAlreadyAppliedMigrationError(statement: MigrationStatement, err:
 	].some((prefix) => statement.sql.startsWith(prefix));
 }
 
+/**
+ * Replay like the production runner (`applyPendingMigrationsByHash`): foreign keys off and
+ * every statement in one transaction, where a migration's own `PRAGMA foreign_keys` is a no-op.
+ * Outside a transaction a mid-file `PRAGMA foreign_keys=ON` would take effect, and a later
+ * table rebuild's `DROP TABLE` would run FK actions/checks against already dropped tables.
+ */
 function applyMigrations(sqlite: Database): void {
-	for (const statement of MIGRATION_STATEMENTS) {
-		try {
-			sqlite.run(statement.sql);
-		} catch (err) {
-			if (isKnownAlreadyAppliedMigrationError(statement, err)) continue;
-			throw err;
+	sqlite.transaction(() => {
+		for (const statement of MIGRATION_STATEMENTS) {
+			try {
+				sqlite.run(statement.sql);
+			} catch (err) {
+				if (isKnownAlreadyAppliedMigrationError(statement, err)) continue;
+				throw err;
+			}
 		}
-	}
+	})();
 }
 
 export function getTestDb() {
@@ -76,7 +89,28 @@ export function getTestDb() {
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	applyMigrations(sqlite);
 	ensureColumns(sqlite);
+	// PR6's identity tables have no generated migration yet. Only add in-memory
+	// fixtures here; production databases and migration files are never changed.
+	sqlite.run(`
+		CREATE TABLE IF NOT EXISTS user_git_identities (
+			id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name TEXT NOT NULL, email TEXT NOT NULL, is_default INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_user_git_identities_user ON user_git_identities(user_id, created_at);
+		CREATE TABLE IF NOT EXISTS narrator_git_identity_bindings (
+			id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL REFERENCES narrators(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			identity_id TEXT NOT NULL REFERENCES user_git_identities(id) ON DELETE CASCADE,
+			updated_at TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_narrator_git_identity_unique ON narrator_git_identity_bindings(narrator_id, user_id);
+		CREATE INDEX IF NOT EXISTS idx_narrator_git_identity_user ON narrator_git_identity_bindings(user_id);
+	`);
 	sqlite.run("PRAGMA foreign_keys = ON");
+	// Match runtime tracking even when a filesystem/service test replaces ../server/db.
+	installResourceProtectionTriggers(sqlite);
+	initializeAbsentReceiptProtectionSource(sqlite, getNarraforkPath("worktree-requests"));
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 	return { db, sqlite };
 }
@@ -112,4 +146,6 @@ export function cleanDb(sqlite: Database) {
 		sqlite.run(`DELETE FROM "${name}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");
+	installResourceProtectionTriggers(sqlite);
+	initializeAbsentReceiptProtectionSource(sqlite, getNarraforkPath("worktree-requests"));
 }

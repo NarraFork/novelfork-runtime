@@ -1,5 +1,6 @@
 import type { DataDirectorySecurityStatus } from "@shared/data-directory-security";
 import type { Locale } from "@shared/i18n-locales";
+import type { ProviderReadiness } from "@shared/provider-readiness";
 import type {
 	PersistedRecentTab,
 	RecentTabsMutationResult,
@@ -7,7 +8,14 @@ import type {
 	RecentTabsRuntimeResult,
 	RecentTabsSection,
 } from "@shared/recent-tabs";
-import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
+import {
+	ApiError,
+	apiBase,
+	authorizedFetch,
+	pickRequestOptions,
+	readFetchError,
+	request,
+} from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
 
@@ -151,13 +159,21 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ confirmed: true }),
 		}),
-	getSettings: () => request<ApiEntity>("/settings"),
+	getSettings: (options?: object) =>
+		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>(
+			"/settings",
+			pickRequestOptions(options),
+		),
 	getContextThresholds: (model: string, provider: string) =>
 		request<{ compactStart: number }>(
 			`/settings/context-thresholds?model=${encodeURIComponent(model)}&provider=${encodeURIComponent(provider)}`,
 		),
-	updateSettings: (data: Record<string, unknown>) =>
-		request<ApiEntity>("/settings", { method: "PATCH", body: JSON.stringify(data) }),
+	updateSettings: (data: Record<string, unknown>, options?: object) =>
+		request<ApiEntity & { providerReadiness: ProviderReadiness[] }>("/settings", {
+			method: "PATCH",
+			body: JSON.stringify(data),
+			...pickRequestOptions(options),
+		}),
 	generateTlsCert: () =>
 		request<{
 			certPath: string;
@@ -346,6 +362,11 @@ export const settingsApi = {
 			narratorToolbarLayout: {
 				items: Array<{ id: string }>;
 			};
+			/** 大纲标签排布（JSON: { [narratorId]: { order, pinned } }）。 */
+			specTabLayout: Record<string, unknown>;
+			/** 提交身份入口的显示位置：会话右键菜单 / 新建会话弹窗（跟账号走）。 */
+			gitIdentityContextMenu: boolean;
+			gitIdentityCreateModal: boolean;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -414,6 +435,8 @@ export const settingsApi = {
 		narratorToolbarLayout?: {
 			items: Array<{ id: string }>;
 		};
+		gitIdentityContextMenu?: boolean;
+		gitIdentityCreateModal?: boolean;
 	}) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",
@@ -453,10 +476,20 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ tabs }),
 		}),
-	removeRecentTab: (type: PersistedRecentTab["type"], id: string) =>
-		request<RecentTabsMutationResponse>(`/user-preferences/recent-tabs/${type}/${id}`, {
-			method: "DELETE",
-		}),
+	/**
+	 * Remove one recent tab. `cascade` is for entity-teardown cleanups (a narrator
+	 * archived) — it skips minting an undo token so it cannot clobber a pending
+	 * user undo with a snapshot that points at already-deleted entities.
+	 */
+	removeRecentTab: (
+		type: PersistedRecentTab["type"],
+		id: string,
+		options?: { cascade?: boolean },
+	) =>
+		request<RecentTabsMutationResponse>(
+			`/user-preferences/recent-tabs/${type}/${id}${options?.cascade ? "?cascade=1" : ""}`,
+			{ method: "DELETE" },
+		),
 	moveRecentTab: (key: string, target: RecentTabMoveTarget, signal?: AbortSignal) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/move", {
 			method: "PATCH",
@@ -489,21 +522,13 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify(input),
 		}),
-	saveGraphViewport: (
-		projectId: string,
-		viewport: {
-			x: number;
-			y: number;
-			zoom: number;
-			rulerOrientation?: "horizontal" | "vertical";
-			rulerEdge?: "start" | "end";
-			rulerMainPan?: number;
-			rulerCrossPan?: number;
-			rulerThickness?: number;
-		},
-	) =>
-		request<{ ok: boolean }>("/user-preferences/graph-viewports", {
+	/**
+	 * 保存某个叙述者的大纲标签排布。服务端按 narratorId 合并写入，
+	 * 不会覆盖其他叙述者的记录。
+	 */
+	saveSpecTabLayout: (narratorId: string, layout: { order: string[]; pinned: string[] }) =>
+		request<{ ok: boolean }>("/user-preferences/spec-tab-layout", {
 			method: "PATCH",
-			body: JSON.stringify({ projectId, viewport }),
+			body: JSON.stringify({ narratorId, ...layout }),
 		}),
 };

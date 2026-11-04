@@ -1,6 +1,5 @@
 import { Box } from "@mantine/core";
 import type { ReactNode } from "react";
-import { useNarrator } from "../../hooks/useNarrator";
 import { getInitialNamespaces } from "../../lib/i18n";
 import { RuntimeFrontendHostProviders } from "../host/RuntimeFrontendHostProviders";
 import { NarratorDock } from "./dock/NarratorDock";
@@ -19,7 +18,6 @@ const runtimeNamespaces = [
 	"common",
 	"narrator",
 	"narrators",
-	"chapters",
 	"settings",
 	"terminal",
 	"git",
@@ -28,6 +26,10 @@ const runtimeNamespaces = [
 export interface EmbeddedNarratorDockHostProps {
 	readonly narratorId: string;
 	readonly highlightMessageId?: string;
+	/**
+	 * Kept for host API compatibility. Upstream removed chapters, and forking from a message
+	 * was a chapter-session action, so the dock no longer offers it.
+	 */
 	readonly onForkFromMessage?: (messageUuid: string) => void;
 	readonly compact?: boolean;
 	readonly toolResultRenderer?: RuntimeToolResultRenderer;
@@ -40,17 +42,7 @@ export interface EmbeddedNarratorDockHostProps {
 function EmbeddedNarratorDockSurface({
 	narratorId,
 	highlightMessageId,
-	onForkFromMessage,
-}: Pick<
-	EmbeddedNarratorDockHostProps,
-	"narratorId" | "highlightMessageId" | "onForkFromMessage"
->): ReactNode {
-	const { data: narrator } = useNarrator(narratorId);
-	const chapterId =
-		typeof (narrator as { chapterId?: unknown } | undefined)?.chapterId ===
-		"string"
-			? (narrator as { chapterId: string }).chapterId
-			: null;
+}: Pick<EmbeddedNarratorDockHostProps, "narratorId" | "highlightMessageId">): ReactNode {
 
 	return (
 		<Box
@@ -66,8 +58,6 @@ function EmbeddedNarratorDockSurface({
 			<NarratorDockProvider
 				key={narratorId}
 				narratorId={narratorId}
-				chapterId={chapterId}
-				onForkFromMessage={chapterId ? (onForkFromMessage ?? null) : null}
 				highlightMessageId={highlightMessageId}
 			>
 				<NarratorDock device="desktop" />
@@ -83,7 +73,6 @@ function EmbeddedNarratorDockSurface({
 export function EmbeddedNarratorDockHost({
 	narratorId,
 	highlightMessageId,
-	onForkFromMessage,
 	toolResultRenderer,
 	onOpenFile,
 	colorScheme,
@@ -111,7 +100,6 @@ export function EmbeddedNarratorDockHost({
 					<EmbeddedNarratorDockSurface
 						narratorId={narratorId}
 						highlightMessageId={highlightMessageId}
-						onForkFromMessage={onForkFromMessage}
 					/>
 				</RuntimeFileOpenInterceptorProvider>
 			</RuntimeToolResultRendererProvider>

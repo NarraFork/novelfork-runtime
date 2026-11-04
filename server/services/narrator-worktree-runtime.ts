@@ -5,7 +5,10 @@ import { isAdminUser } from "../lib/agent/tools/admin-common";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
 import { narraforkDir } from "../lib/settings";
-import { authorizeGitTargetForPrincipal } from "./git-workspace-access";
+import {
+	authorizeGitDestinationForPrincipal,
+	authorizeGitTargetForPrincipal,
+} from "./git-workspace-access";
 import type { NarratorPrincipal } from "./narrator-acl";
 import { loadNarratorForAccess, resolveAclRootId } from "./narrator-acl";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
@@ -16,6 +19,8 @@ import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspac
 
 /** Real production adapters; fixture tests deliberately import only the pure service. */
 export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrincipal>({
+	authorizeList: (principal, narratorId, _need, signal) =>
+		authorizeGitTargetForPrincipal(principal, { narratorId }, "read", signal, false, true),
 	authorize: async (principal, narratorId, need, signal) => {
 		if (activeDatabaseBackend !== "sqlite")
 			throw new AppError(
@@ -41,6 +46,25 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 				: unknownWorktreeScope,
 		};
 	},
+	authorizeDestination: async (principal, narratorId, source, destination, need, signal) => {
+		const target = await authorizeGitDestinationForPrincipal(
+			principal,
+			narratorId,
+			destination,
+			need,
+			signal,
+		);
+		if (
+			target.workspace.repositoryKey !== source.workspace.repositoryKey ||
+			target.workspace.deviceId !== source.workspace.deviceId ||
+			target.backend?.runtimeGeneration !== source.backend?.runtimeGeneration
+		)
+			throw new AppError(
+				"Destination authorization identity changed",
+				409,
+				"GIT_WORKSPACE_CHANGED",
+			);
+	},
 	withRevision: (narratorId, revision, action) =>
 		workspaceContextService.withRevision(narratorId, revision, undefined, async (context) => {
 			if (context.deviceId !== "local" || !context.capabilities.switchDirectory)
@@ -53,7 +77,11 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 		}),
 	principalKey: (principal) => principal.userId,
 	withRepositoryLock: withWorkspaceRepositoryLock,
-	journal: new FileWorktreeJournal(join(narraforkDir, "worktree-requests")),
+	// Keep the legacy namespace immutable for its one-time protection import.
+	journal: new FileWorktreeJournal(
+		join(narraforkDir, "worktree-requests-v2"),
+		join(narraforkDir, "worktree-requests"),
+	),
 	resources: narratorWorktreeResourceRegistry,
 	generateBranchName: async (principal, narratorId, requirement, signal) => {
 		const [{ summaryGenerate }, { db }, { narrators }] = await Promise.all([

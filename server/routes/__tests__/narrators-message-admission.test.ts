@@ -1,11 +1,21 @@
 import { describe, expect, mock, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import { type FileReference, fileReferenceMessageForDisplay } from "@shared/file-reference";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 } from "@shared/text-file-types";
 import { Hono } from "hono";
-import { AppError, ValidationError } from "../../lib/errors";
+import {
+	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
+	parseOptionalComposerDocument,
+	restoreMultipartComposerText,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../../lib/composer-document";
+import { AppError, catalogError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
 import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
 
@@ -24,15 +34,7 @@ const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
 		section('narratorRoutes.post("/:id/messages"', "// Retry last user message"),
 	]
 		.join("\n")
-		.replaceAll("export async function", "async function")
-		.replace(
-			/import\(\s*"\.\.\/services\/narrator-subagent"\s*\)/g,
-			"Promise.resolve(subagentQueue)",
-		)
-		.replace(
-			/import\(\s*"\.\.\/services\/subagent-executor"\s*\)/g,
-			"Promise.resolve(subagentQueue)",
-		),
+		.replaceAll("export async function", "async function"),
 );
 
 function fixture(
@@ -44,8 +46,12 @@ function fixture(
 		subagent?: boolean;
 		compact?: boolean;
 		modelOverride?: boolean;
-		control?: "bash" | "load" | "unload" | "block" | "unblock";
+		expandedCommand?: boolean;
+		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
+		canonicalPrefix?: string;
+		/** The session's task backend (outline P2). */
+		taskBackend?: "spec" | "outline";
 	} = {},
 ) {
 	let status = options.status ?? "idle";
@@ -77,31 +83,39 @@ function fixture(
 	const legacyPush = mock(() => {
 		throw new Error("Primary admission bypassed");
 	});
-	const pushSub = mock(async (_id: string, _prompt: string, _options: Record<string, unknown>) => ({
-		ok: true,
-		id: "sub-queued",
-		bufferedAt: "now",
-	}));
-	const resume = mock(async (_options: Record<string, unknown>) => ({ userMessage: userMsg }));
 	const updateModel = mock(async () => {});
 	const modelBroadcast = mock(() => {});
 	const restoreModel = mock(async () => {});
-	const awaitCompact = mock(async () => {});
 	const broadcast = mock(() => {});
+	const saveRecording = mock(async (_id: string) => ({
+		id: "saved-recording",
+		narratorId: "session",
+		partial: true,
+	}));
 	const routes = new Hono();
 	const bindings = {
+		saveRequestRecording: saveRecording,
 		narratorRoutes: routes,
 		ValidationError,
 		parseFileReferenceInput,
+		parseOptionalComposerDocument,
+		bindComposerDocumentReferences,
+		bindComposerMediaProjection,
+		restoreMultipartComposerText,
+		validateComposerProjection,
+		validateComposerAssets,
 		sendMessageSchema,
 		bufferQueueModeSchema,
+		MAX_MEDIA_ATTACHMENTS,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 		fileReferenceMessageForDisplay,
 		captureFileReferences: async (_id: string, _userId: string, refs: FileReference[]) =>
 			refs.map((reference) => ({
 				type: "file_reference",
-				reference,
+				reference: options.canonicalPrefix
+					? { ...reference, path: `${options.canonicalPrefix}${reference.path}` }
+					: reference,
 				snapshotText: "private snapshot bytes",
 				snapshotHash: "a".repeat(64),
 				capturedAt: "2026-09-21T00:00:00.000Z",
@@ -119,13 +133,11 @@ function fixture(
 			}),
 			updateModel,
 		},
-		isSubagentVariant: (variant: string) => variant === "subagent",
 		isLoopRunning: () => !!options.busy,
 		isNarratorRuntimeBusy: () => options.runtimeBusy ?? !!options.busy,
 		isExecutionSuspended: () => false,
 		getQueueDuringCompaction: () => true,
 		isCompactInProgress: () => !!options.compact,
-		awaitCompactCompletion: awaitCompact,
 		reconcileRunningStatus: async () => {
 			status = options.busy ? "working" : "idle";
 		},
@@ -140,6 +152,7 @@ function fixture(
 							unload: { unloadTool: "Read" },
 							block: { blockAllSkills: true },
 							unblock: { unblockAllSkills: true },
+							save: { saveDump: true },
 						}[options.control],
 					}
 				: message.startsWith("/goal")
@@ -152,18 +165,18 @@ function fixture(
 								bashCommand: "pwd",
 								command: { modelOverride: { model: "replacement", mode: "temporary" } },
 							}
-						: { resolved: false },
+						: options.expandedCommand
+							? {
+									resolved: true,
+									expandedPrompt: "expanded skill instructions",
+									rawCommand: message,
+								}
+							: { resolved: false },
 		getUserLanguage: async () => "zh-CN",
 		getUserReplyInLanguage: async () => true,
 		acceptUserMessage: accept,
 		sendMessage: legacySend,
 		pushBufferedMessage: legacyPush,
-		resumeSubagent: resume,
-		subagentQueue: {
-			bufferSubagentUserMessage: pushSub,
-			isTakenOver: () => true,
-			getSubagentBufferedMessagesAsync: async () => [],
-		},
 		toBufferSummary: (items: unknown[]) => items,
 		broadcastToNarrator: broadcast,
 		setTemporaryModelRestore: restoreModel,
@@ -183,6 +196,8 @@ function fixture(
 		users: { id: "id" },
 		eq: () => undefined,
 		logger: { warn: () => {} },
+		resolveTaskBackend: async () => options.taskBackend ?? "spec",
+		catalogError,
 	};
 	new Function(...Object.keys(bindings), compiled)(...Object.values(bindings));
 	const app = new Hono();
@@ -198,16 +213,14 @@ function fixture(
 	);
 	app.route("/narrators", routes);
 	return {
+		saveRecording,
 		accept,
 		legacySend,
 		legacyPush,
-		pushSub,
-		resume,
 		deletedImages,
 		updateModel,
 		modelBroadcast,
 		restoreModel,
-		awaitCompact,
 		broadcast,
 		post: (body: FormData | Record<string, unknown>) =>
 			app.request("http://localhost/narrators/session/messages", {
@@ -219,6 +232,25 @@ function fixture(
 	};
 }
 
+test.each([
+	false,
+	true,
+])("subagent expanded commands discard obsolete text-only layout (busy=%s)", async (busy) => {
+	const f = fixture({ subagent: true, busy, buffered: busy, expandedCommand: true });
+	const document = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "/skill explain" }] }],
+		assets: [],
+	};
+	const response = await f.post({ message: "/skill explain", composerDocument: document });
+	expect(response.status).toBe(busy ? 202 : 201);
+	// Every session takes the one admission; the expanded text replaces the layout.
+	const [, prompt, input] = f.accept.mock.calls[0] ?? [];
+	expect(input?.composerDocument).toBeUndefined();
+	expect(prompt).toBe("expanded skill instructions");
+	expect(input?.commandText).toBe("/skill explain");
+});
+
 function multipart(interrupt?: string) {
 	const body = new FormData();
 	body.set("message", "hello");
@@ -228,7 +260,148 @@ function multipart(interrupt?: string) {
 	return body;
 }
 
+describe("save_dump immediate HTTP control", () => {
+	test.each([
+		false,
+		true,
+	])("save does not admit or interrupt a model turn (subagent=%s)", async (subagent) => {
+		const f = fixture({ control: "save", busy: true, status: "working", subagent, compact: true });
+		const response = await f.post({
+			message: "/save_dump",
+			interrupt: true,
+			queueMode: "interrupt",
+		});
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			id: "saved-recording",
+			narratorId: "session",
+			partial: true,
+		});
+		expect(f.saveRecording).toHaveBeenCalledWith("session");
+		expect(f.accept).not.toHaveBeenCalled();
+		expect(f.legacySend).not.toHaveBeenCalled();
+		expect(f.legacyPush).not.toHaveBeenCalled();
+		expect(f.broadcast).not.toHaveBeenCalled();
+	});
+	test("save cleans up unused multipart uploads", async () => {
+		const f = fixture({ control: "save", busy: true, status: "working" });
+		const body = multipart("true");
+		body.set("message", "/save_dump");
+		expect((await f.post(body)).status).toBe(200);
+		expect(f.deletedImages).toEqual(["saved-image"]);
+	});
+	test("file references cannot silently disappear into a save control", async () => {
+		const f = fixture({ control: "save" });
+		const response = await f.post({
+			message: "/save_dump",
+			fileReferences: [{ id: "ref", deviceId: "local", path: "/test/file", label: "file" }],
+		});
+		expect(response.status).toBe(400);
+		expect(f.saveRecording).not.toHaveBeenCalled();
+		expect(f.accept).not.toHaveBeenCalled();
+	});
+});
+
 describe("primary HTTP message admission", () => {
+	test("semantic document is validated and passed intact to durable admission", async () => {
+		const f = fixture({ buffered: true });
+		const document = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "text", text: "rich" }] }],
+			assets: [],
+		};
+		expect((await f.post({ message: "rich", composerDocument: document })).status).toBe(202);
+		expect(f.accept.mock.calls[0]?.[2].composerDocument).toEqual(document);
+		expect((await f.post({ message: "different", composerDocument: document })).status).toBe(400);
+		expect(
+			(await f.post({ message: "rich", composerDocument: { ...document, version: 9 } })).status,
+		).toBe(400);
+	});
+	test("multipart CRLF normalization keeps a pasted-image document in sync", async () => {
+		const f = fixture({ buffered: true });
+		const document = {
+			version: 1,
+			paragraphs: [
+				{ children: [{ type: "text", text: "line one" }] },
+				{
+					children: [
+						{ type: "text", text: "line two" },
+						{ type: "attachment", id: "node", assetId: "asset" },
+					],
+				},
+			],
+			assets: [{ id: "asset", kind: "image", name: "image.png", size: 5, mimeType: "image/png" }],
+		};
+		const body = new FormData();
+		body.set("message", "line one\nline two");
+		body.append("images", new File(["image"], "image.png", { type: "image/png" }));
+		body.set("composerDocument", JSON.stringify(document));
+		expect((await f.post(body)).status).toBe(202);
+		expect(f.accept.mock.calls[0]?.[1]).toBe("line one\nline two");
+		expect(f.accept.mock.calls[0]?.[2].composerDocument).toEqual(document);
+	});
+	test("ZIP MIME alias survives HTTP parsing and downstream attachment validation", async () => {
+		const f = fixture({ buffered: true });
+		const zip = new File(["PK archive bytes"], "archive.zip", {
+			type: "application/x-zip-compressed",
+		});
+		const document: ComposerDocument = {
+			version: 1,
+			paragraphs: [{ children: [{ type: "attachment", id: "node", assetId: "asset" }] }],
+			assets: [
+				{ id: "asset", kind: "textFile", name: zip.name, size: zip.size, mimeType: zip.type },
+			],
+		};
+		const body = new FormData();
+		body.set("message", "");
+		body.set("composerDocument", JSON.stringify(document));
+		body.append("textFiles", zip);
+		expect((await f.post(body)).status).toBe(202);
+		const admission = f.accept.mock.calls[0]?.[2] as {
+			composerDocument: ComposerDocument;
+			textFiles: File[];
+		};
+		expect(admission.composerDocument).toEqual(document);
+		expect(admission.textFiles[0].type).toBe("application/zip");
+		validateComposerAssets(admission.composerDocument, [], admission.textFiles);
+	});
+	test("document adopts canonical file reference metadata from capture", async () => {
+		const f = fixture({ buffered: true, canonicalPrefix: "/private" });
+		const reference = { id: "ref", deviceId: "local", path: "/tmp/a.ts", label: "a.ts" };
+		const document = {
+			version: 1,
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "see " },
+						{ type: "fileReference", id: "node", reference },
+					],
+				},
+			],
+			assets: [],
+		};
+		const message = "see #file:a.ts";
+		const response = await f.post({
+			message,
+			fileReferences: [{ ...reference, inputRange: [4, message.length] }],
+			composerDocument: document,
+		});
+		expect(response.status).toBe(202);
+		const admission = f.accept.mock.calls[0]?.[2] as {
+			composerDocument: ComposerDocument;
+			fileReferences: { reference: FileReference }[];
+		};
+		const node = admission.composerDocument.paragraphs[0]?.children[1];
+		expect(node?.type === "fileReference" && node.reference.path).toBe("/private/tmp/a.ts");
+		// Durable admission re-validates against the captured snapshots.
+		expect(() =>
+			validateComposerProjection(
+				admission.composerDocument,
+				message,
+				admission.fileReferences.map((snapshot) => snapshot.reference),
+			),
+		).not.toThrow();
+	});
 	test.each([
 		"turn",
 		"tool",
@@ -384,7 +557,6 @@ describe("primary HTTP message admission", () => {
 			const f = fixture({ compact: true, buffered: true });
 			expect((await f.post({ message: "hello", interrupt })).status).toBe(202);
 			expect(f.accept.mock.calls[0]?.[2].queueOnly).toBe(!interrupt);
-			expect(f.awaitCompact).not.toHaveBeenCalled();
 		}
 	});
 
@@ -400,6 +572,23 @@ describe("primary HTTP message admission", () => {
 			objective: "do work",
 		});
 		expect(f.accept.mock.calls[0]?.[2].commandText).toBe("/goal do work");
+	});
+
+	test.each([
+		false,
+		true,
+	])("/goal in an outline session is refused before anything is persisted (busy=%s)", async (busy) => {
+		const f = fixture({
+			status: busy ? "working" : "idle",
+			busy,
+			buffered: busy,
+			taskBackend: "outline",
+		});
+		const response = await f.post({ message: "/goal do work" });
+		expect(response.status).toBe(409);
+		expect(((await response.json()) as { error: string }).error).toContain("/goal");
+		expect(f.accept).not.toHaveBeenCalled();
+		expect(f.broadcast).not.toHaveBeenCalled();
 	});
 
 	test.each([false, true])("model override travels with admission (busy=%s)", async (busy) => {
@@ -456,31 +645,55 @@ describe("primary HTTP message admission", () => {
 	});
 });
 
+// A delegated session is sent to through the same admission as any session: the same
+// queue, the same intent scheduling, the same status codes. 201 = the input was claimed
+// and delivered now (response is the persisted user message); 202 = it was accepted
+// into the session's mailbox and will be consumed by the running/next run.
 describe("subagent HTTP compatibility", () => {
-	test("busy subagent uses its existing queue, ignoring primary interrupt intent", async () => {
-		const f = fixture({ subagent: true, status: "working", busy: true });
+	test.each([
+		false,
+		true,
+	])("busy session queues and schedules interrupt intent identically (subagent=%s)", async (subagent) => {
+		const f = fixture({ subagent, status: "working", busy: true, buffered: true });
 		const response = await f.post(multipart("true"));
 		expect(response.status).toBe(202);
-		expect(await response.json()).toEqual({ buffered: true, id: "sub-queued", bufferedAt: "now" });
-		expect(f.accept).not.toHaveBeenCalled();
-		expect(f.pushSub.mock.calls[0]?.[2]).toMatchObject({ requestSoftStop: false });
-		expect(f.pushSub.mock.calls[0]?.[2].interrupt).toBeUndefined();
-		expect(!!f.pushSub.mock.calls[0]?.[2].priority).toBe(false);
+		expect(await response.json()).toEqual({
+			buffered: true,
+			id: "queued-message",
+			bufferedAt: "now",
+		});
+		expect(f.accept).toHaveBeenCalledTimes(1);
+		// Interrupt intent reaches admission for every session; admission cancels the
+		// current activity and handles this input next, inside the same run.
+		expect(f.accept.mock.calls[0]?.[2]).toMatchObject({ interrupt: true, priority: true });
+		expect(f.accept.mock.calls[0]?.[2].queueOnly).toBe(false);
+		expect(f.legacySend).not.toHaveBeenCalled();
+		expect(f.legacyPush).not.toHaveBeenCalled();
+		// The mailbox owns the uploads now.
 		expect(f.deletedImages).toEqual([]);
 	});
 
 	test("explicit subagent priority is still passed through", async () => {
-		const f = fixture({ subagent: true, status: "working", busy: true });
+		const f = fixture({ subagent: true, status: "working", busy: true, buffered: true });
 		expect((await f.post({ message: "hello", priority: true })).status).toBe(202);
-		expect(f.pushSub.mock.calls[0]?.[2].priority).toBe(true);
+		expect(f.accept.mock.calls[0]?.[2]).toMatchObject({ priority: true, interrupt: undefined });
 	});
 
-	test("idle compacting subagent waits then resumes, ignoring interrupt", async () => {
-		const f = fixture({ subagent: true, compact: true });
-		expect((await f.post({ message: "hello", interrupt: true })).status).toBe(201);
-		expect(f.awaitCompact).toHaveBeenCalledTimes(1);
-		expect(f.resume).toHaveBeenCalledTimes(1);
-		expect(f.resume.mock.calls[0]?.[0].interrupt).toBeUndefined();
-		expect(f.accept).not.toHaveBeenCalled();
+	test("idle subagent send is delivered immediately (201)", async () => {
+		const f = fixture({ subagent: true });
+		const response = await f.post({ message: "hello" });
+		expect(response.status).toBe(201);
+		expect((await response.json()).id).toBe("user-message");
+		expect(f.accept).toHaveBeenCalledTimes(1);
+	});
+
+	test("idle compacting subagent queues behind the compaction; interrupt opts out", async () => {
+		for (const interrupt of [false, true]) {
+			const f = fixture({ subagent: true, compact: true, buffered: true });
+			expect((await f.post({ message: "hello", interrupt })).status).toBe(202);
+			// queueOnly: accepted durably, consumed by the post-compact drain, not now.
+			expect(f.accept.mock.calls[0]?.[2]).toMatchObject({ queueOnly: !interrupt });
+			expect(f.accept.mock.calls[0]?.[2].interrupt).toBe(interrupt);
+		}
 	});
 });

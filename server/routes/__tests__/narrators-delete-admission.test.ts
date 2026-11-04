@@ -20,7 +20,7 @@
  *  - the interrupt reaches a loop parked on a pending permission;
  *  - a loop that refuses to stop is still reported instead of being written over.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -76,8 +76,13 @@ function app() {
 	return instance;
 }
 
-function del(path: string) {
-	return app().request(`http://localhost/narrators${path}`, { method: "DELETE" });
+function del(path: string, body?: unknown) {
+	return app().request(`http://localhost/narrators${path}`, {
+		method: "DELETE",
+		...(body === undefined
+			? {}
+			: { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+	});
 }
 
 /**
@@ -203,25 +208,20 @@ test("history-only deletion ignores missing file evidence and preserves workspac
 });
 
 describe("another narrator running in the same worktree", () => {
-	test("does not block a deletion that rolls files back", async () => {
+	test("does not block a history-only deletion or stop the other loop", async () => {
 		const other = registerBusyLoop(generateId(), WORKTREE);
-		expect(await admissionError(await del(`/${narratorId}/messages/${generateId()}`))).toBeNull();
-		// Somebody else's loop is not ours to stop.
-		expect(other._loopRunning).toBe(true);
-	});
-
-	test("does not block a history-only deletion", async () => {
-		registerBusyLoop(generateId(), WORKTREE);
 		expect(
 			await admissionError(await del(`/${narratorId}/messages/${generateId()}?skipRevert=1`)),
 		).toBeNull();
+		// Somebody else's loop is not ours to stop.
+		expect(other._loopRunning).toBe(true);
 	});
 
 	test("does not block a history-only block deletion", async () => {
 		registerBusyLoop(generateId(), WORKTREE);
 		expect(
 			await admissionError(
-				await del(`/${narratorId}/messages/${generateId()}/blocks/0?skipRevert=1`),
+				await del(`/${narratorId}/blocks`, { blockIds: [generateId()], skipRevert: true }),
 			),
 		).toBeNull();
 	});
@@ -230,17 +230,25 @@ describe("another narrator running in the same worktree", () => {
 describe("the narrator itself running", () => {
 	test("is interrupted and the deletion proceeds", async () => {
 		const session = registerBusyLoop(narratorId, WORKTREE);
-		expect(await admissionError(await del(`/${narratorId}/messages/${generateId()}`))).toBeNull();
-		expect(session.abortController.signal.aborted).toBe(true);
-		expect(session._loopRunning).toBe(false);
-	});
-
-	test("is interrupted for a history-only deletion too", async () => {
-		const session = registerBusyLoop(narratorId, WORKTREE);
 		expect(
 			await admissionError(await del(`/${narratorId}/messages/${generateId()}?skipRevert=1`)),
 		).toBeNull();
 		expect(session.abortController.signal.aborted).toBe(true);
+		expect(session._loopRunning).toBe(false);
+	});
+
+	test.each([
+		["/messages/m", undefined],
+		["/blocks", { blockIds: ["m:0"] }],
+	] as const)("an unplanned file-restoring deletion (%s) is refused before interrupting", async (path, body) => {
+		const session = registerBusyLoop(narratorId, WORKTREE);
+		const response = await del(`/${narratorId}${path}`, body);
+		expect(response.status).toBe(409);
+		expect(((await response.json()) as { code?: string }).code).toBe(
+			"REVERT_CONFIRMATION_REQUIRED",
+		);
+		expect(session.abortController.signal.aborted).toBe(false);
+		expect(session._loopRunning).toBe(true);
 	});
 
 	test("a loop parked on a pending permission is released, not waited on forever", async () => {
@@ -270,32 +278,43 @@ describe("the narrator itself running", () => {
 			},
 		} as unknown as NonNullable<ReturnType<typeof pendingPermissions.get>>);
 
-		expect(await admissionError(await del(`/${narratorId}/messages/${generateId()}`))).toBeNull();
+		expect(
+			await admissionError(await del(`/${narratorId}/messages/${generateId()}?skipRevert=1`)),
+		).toBeNull();
 		expect(pendingPermissions.has(requestId)).toBe(false);
 	});
 
 	test("a loop that ignores the abort is reported, not written over", async () => {
-		registerBusyLoop(narratorId, WORKTREE, { stopsOnAbort: false });
-		const error = await admissionError(await del(`/${narratorId}/messages/${generateId()}`));
-		expect(error).toContain("did not stop after being interrupted");
+		// The real wait/report path, with a short idle budget instead of the 15 s production
+		// one: only "the budget expires while the loop is still busy" matters here, and the
+		// full budget made this single case ~15 s of polling.
+		const session = await import("../../services/narrator-session");
+		const realWait = session.interruptAndWaitForIdle;
+		const shortWait = spyOn(session, "interruptAndWaitForIdle").mockImplementation((id, opts) =>
+			realWait(id, { ...opts, timeoutMs: 500 }),
+		);
+		try {
+			registerBusyLoop(narratorId, WORKTREE, { stopsOnAbort: false });
+			const error = await admissionError(
+				await del(`/${narratorId}/messages/${generateId()}?skipRevert=1`),
+			);
+			expect(error).toContain("did not stop after being interrupted");
+			// The route really went through the (shortened) real wait, not around it.
+			expect(shortWait).toHaveBeenCalledTimes(1);
+		} finally {
+			shortWait.mockRestore();
+		}
 	}, 30_000);
 });
 
-describe("a suspended subagent runner", () => {
-	test("admits history deletion without aborting the retained runner", async () => {
+describe("a run parked by its hold", () => {
+	test("admits history deletion without aborting the retained run", async () => {
 		const { tryClaimExecution, setExecutionSuspended, isExecutionSuspended } = await import(
 			"../../services/agent-runtime/ownership"
 		);
-		const { waitForManualOverride } = await import("../../services/subagent-manual-override");
-		const owner = tryClaimExecution(narratorId, "subagent");
+		const owner = tryClaimExecution(narratorId, "run");
 		if (!owner) throw new Error("Failed to claim test execution");
-		const parentController = new AbortController();
-		const completion = waitForManualOverride(
-			narratorId,
-			parentController.signal,
-			"parent",
-			"origin-tool",
-		);
+		// A held run parks at its turn boundary: the owner is retained, no turn runs.
 		const session = registerBusyLoop(narratorId, WORKTREE, { stopsOnAbort: false });
 		setExecutionSuspended(owner, true);
 		try {
@@ -307,8 +326,7 @@ describe("a suspended subagent runner", () => {
 			expect(session._loopRunning).toBe(true);
 			expect(isExecutionSuspended(narratorId)).toBe(true);
 		} finally {
-			parentController.abort();
-			await completion;
+			setExecutionSuspended(owner, false);
 			owner.release();
 		}
 	}, 30_000);
@@ -316,6 +334,8 @@ describe("a suspended subagent runner", () => {
 
 describe("an idle narrator", () => {
 	test("is admitted without an interrupt", async () => {
-		expect(await admissionError(await del(`/${narratorId}/messages/${generateId()}`))).toBeNull();
+		expect(
+			await admissionError(await del(`/${narratorId}/messages/${generateId()}?skipRevert=1`)),
+		).toBeNull();
 	});
 });

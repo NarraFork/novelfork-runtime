@@ -3,9 +3,11 @@ import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
+import { z } from "zod/v4";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import type { ExecutionBackend } from "../../lib/agent/execution/backend";
@@ -74,7 +76,12 @@ for (const statement of [
 		if (!String(error).includes("duplicate column name")) throw error;
 	}
 }
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+}));
 const wsModule = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...wsModule, broadcastToNarrator: () => {} }));
 const narratorModule = { ...(await import("../narrator-service")) };
@@ -83,7 +90,94 @@ mock.module("../narrator-service", () => ({
 	narratorService: { ...narratorModule.narratorService, updateStatus: async () => {} },
 }));
 const service = await import("../permission-rule-request-service");
+const { materializeLegacyDelegations } = await import("../legacy-delegation-materializer");
 const permission = await import("../narrator-permission");
+test("explicit worktree tools enforce destination write ACLs without expanding receipt paths", () => {
+	for (const toolName of ["ListWorktrees", "GetWorktreeOperation"]) {
+		const input = toolName === "ListWorktrees" ? {} : { operationId: "receipt" };
+		expect(permission.extractToolPaths(toolName, input)).toEqual([]);
+		for (const permMode of ["default", "readOnly"] as const) {
+			expect(
+				permission.resolvePermissionDecision({ toolName, input, permMode, cwd: "/local/work" }),
+			).toBe("allow");
+		}
+		expect(
+			permission.resolvePermissionDecision({
+				toolName,
+				input,
+				permMode: "bypassPermissions",
+				planMode: true,
+				cwd: "/local/work",
+			}),
+		).toBe("allow");
+	}
+	for (const toolName of ["CreateWorktree", "AttachWorktree"]) {
+		const opts = {
+			toolName,
+			input: { branchName: "feature", destinationPath: "/outside/worktree" },
+			cwd: "/local/work",
+		};
+		expect(permission.extractToolPaths(toolName, opts.input)).toEqual(["/outside/worktree"]);
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "bypassPermissions",
+				blacklistDirs: [{ path: "/outside", denyLevel: "denyWrite", enabled: true }],
+			}),
+		).toBe("deny");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "default",
+				whitelistDirs: [{ path: "/outside", accessLevel: "readOnly", enabled: true }],
+			}),
+		).toBe("ask");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "default",
+				whitelistDirs: [{ path: "/outside", accessLevel: "readWrite", enabled: true }],
+			}),
+		).toBe("allow");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				input: { ...opts.input, destinationPath: "/local/work/.git/new" },
+				permMode: "bypassPermissions",
+			}),
+		).toBe("deny");
+		for (const permMode of [
+			"default",
+			"acceptEdits",
+			"readOnly",
+			"dontAsk",
+			"bypassPermissions",
+		] as const) {
+			expect(permission.resolvePermissionDecision({ ...opts, permMode })).toBe(
+				permission.resolvePermissionDecision({
+					...opts,
+					toolName: "Worktree",
+					input: { action: "create" },
+					permMode,
+				}),
+			);
+		}
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "bypassPermissions",
+				reviewReadOnlyBash: true,
+			}),
+		).toBe("deny");
+		expect(
+			permission.resolvePermissionDecision({
+				...opts,
+				permMode: "bypassPermissions",
+				planMode: true,
+			}),
+		).toBe("deny");
+	}
+});
 const { requestPermissionRuleTool } = await import("../../lib/agent/tools/request-permission-rule");
 const { toolRegistry, resolveToolJsonSchema, zodToJsonSchema } = await import(
 	"../../lib/agent/tool-registry"
@@ -103,7 +197,7 @@ let reflectionScenario: "confirm" | "text" | "throw" | "cancel" | "confirmError"
 const providerModule = { ...(await import("../../lib/agent/provider")) };
 const fakeProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -122,9 +216,6 @@ const fakeProvider: ProviderAdapter = {
 			],
 		};
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -155,6 +246,109 @@ const { executeTool } = await import("../../lib/agent/tool-executor");
 const { buildFinalToolStartAuthorization } = await import("../tool-final-start-authorization");
 const { narratorPersistence } = await import("../narrator-persistence");
 const finalTestDirectories: string[] = [];
+for (const withHook of [true, false]) {
+	test(`real executor validation ${withHook ? "uses tool feedback hook" : "retains default feedback"} without dispatch`, async () => {
+		const name = withHook
+			? "__ValidationFeedbackFixtureHook"
+			: "__ValidationFeedbackFixtureDefault";
+		const execute = mock(async () => ({ output: "must not run" }));
+		const formatValidationError = mock(() => "Concrete branchName correction required");
+		toolRegistry.register({
+			name,
+			description: "Validation feedback regression fixture",
+			parameters: z.strictObject({ branchName: z.string() }),
+			...(withHook ? { formatValidationError } : {}),
+			execute,
+		});
+		try {
+			const fixture = await finalExecutionFixture(name, false, undefined, {});
+			fixture.config.permissionHandler = async () => ({ behavior: "allow" });
+			const result = await executeTool(fixture.tu, fixture.config, {
+				toolCallBinding: fixture.binding,
+			});
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain(
+				withHook ? "Concrete branchName correction required" : "Invalid parameters:",
+			);
+			expect(execute).toHaveBeenCalledTimes(0);
+			expect(formatValidationError).toHaveBeenCalledTimes(withHook ? 1 : 0);
+		} finally {
+			toolRegistry.unregister(name);
+		}
+	});
+}
+test("provider public tool set exposes four explicit worktree tools and retains hidden legacy execution", () => {
+	const names = toolRegistry
+		.all()
+		.filter((tool) => !tool.isAvailable || tool.isAvailable())
+		.map((tool) => tool.name);
+	for (const name of ["ListWorktrees", "CreateWorktree", "AttachWorktree", "GetWorktreeOperation"])
+		expect(names).toContain(name);
+	expect(names).not.toContain("Worktree");
+	expect(toolRegistry.get("Worktree")).toBeDefined();
+});
+test("real provider formatters preserve flat worktree parameters and required fields", async () => {
+	const { OpenAIProvider } = await import("../../lib/agent/openai-provider");
+	const { AnthropicProvider } = await import("../../lib/agent/anthropic-provider");
+	const { GeminiProvider } = await import("../../lib/agent/gemini-provider");
+	const config = {
+		id: "worktree-schema",
+		name: "worktree-schema",
+		prefix: "fixture",
+		apiKey: "unused",
+		baseUrl: "https://example.invalid",
+		defaultModel: "fixture",
+	};
+	const definitions = [
+		// Query fields stay optional; only the compatibility placeholder is required.
+		{
+			name: "ListWorktrees",
+			required: ["confirm"],
+			properties: ["limit", "cursor", "sort", "order", "search", "confirm"],
+		},
+		{
+			name: "CreateWorktree",
+			required: ["branchName", "destinationPath"],
+			properties: ["branchName", "destinationPath", "baseRef"],
+		},
+		{
+			name: "AttachWorktree",
+			required: ["branchName", "destinationPath"],
+			properties: ["branchName", "destinationPath"],
+		},
+		{ name: "GetWorktreeOperation", required: ["operationId"], properties: ["operationId"] },
+	];
+	const tools = definitions.map(({ name }) => {
+		const tool = toolRegistry.get(name);
+		if (!tool || typeof tool.description !== "string") throw new Error(`Missing tool ${name}`);
+		return { ...tool, description: tool.description };
+	});
+	for (const provider of [
+		new OpenAIProvider({ ...config, apiMode: "responses" }),
+		new OpenAIProvider({ ...config, apiMode: "completions" }),
+		new AnthropicProvider(config),
+		new GeminiProvider(config),
+	]) {
+		const formatted = provider.formatTools(tools) as Record<string, unknown>[];
+		const declarations = (formatted[0]?.functionDeclarations ?? formatted) as Record<
+			string,
+			unknown
+		>[];
+		for (const [index, expected] of definitions.entries()) {
+			const entry = declarations[index];
+			const declaration = (entry?.function ?? entry) as Record<string, unknown>;
+			expect(declaration.name).toBe(expected.name);
+			const schema = (declaration.parameters ?? declaration.input_schema ?? {}) as Record<
+				string,
+				unknown
+			>;
+			expect(schema.required ?? []).toEqual(expected.required);
+			expect(Object.keys((schema.properties ?? {}) as object)).toEqual(expected.properties);
+			expect(schema.oneOf).toBeUndefined();
+			expect(schema.anyOf).toBeUndefined();
+		}
+	}
+});
 const now = () => new Date().toISOString();
 let seq = 0;
 async function seed(
@@ -171,6 +365,8 @@ async function seed(
 		createdAt: now(),
 		updatedAt: now(),
 	});
+	// A delegated row stores its source, controller and ceiling.
+	if (parent) await materializeLegacyDelegations([narratorId]);
 	return call(narratorId);
 }
 async function call(narratorId: string) {
@@ -207,7 +403,16 @@ async function call(narratorId: string) {
 	return { narratorId, toolUseId, binding, context };
 }
 async function finalExecutionFixture(
-	kind: "Write" | "Bash" | "Edit" | "StructSed" | "Read" | "RequestPermissionRule" | "Worktree",
+	kind:
+		| "Write"
+		| "Bash"
+		| "Edit"
+		| "StructSed"
+		| "Read"
+		| "RequestPermissionRule"
+		| "Worktree"
+		| "__ValidationFeedbackFixtureHook"
+		| "__ValidationFeedbackFixtureDefault",
 	child: boolean,
 	before?: () => Promise<void>,
 	overrideInput?: Record<string, unknown>,
@@ -451,26 +656,17 @@ async function installRealOAuthFinalAuthority(
 		assertActive: () => assertOAuthNarratorRuntimeActive(fixture.actor.narratorId, userId),
 	};
 }
-async function seedChapterDenyProject() {
+async function seedDenyProject() {
 	await db.insert(schema.projects).values({
-		id: "chapter-policy-project",
-		name: "Chapter policy",
-		gitPath: "/tmp/chapter-policy-repository",
+		id: "deny-policy-project",
+		name: "Deny policy",
+		gitPath: "/tmp/deny-policy-repository",
 		chapterSettings: {
 			commandWhitelist: [{ pattern: "pwd", enabled: true }],
 			commandBlacklist: [{ pattern: "pwd", enabled: true }],
 			whitelistDirs: [{ path: "/tmp", accessLevel: "full", enabled: true }],
-			blacklistDirs: [{ path: "/tmp/chapter-policy-private", denyLevel: "denyAll", enabled: true }],
+			blacklistDirs: [{ path: "/tmp/deny-policy-private", denyLevel: "denyAll", enabled: true }],
 		},
-		createdAt: now(),
-		updatedAt: now(),
-	});
-	await db.insert(schema.chapters).values({
-		id: "policy-chapter",
-		projectId: "chapter-policy-project",
-		title: "Policy",
-		branch: "policy",
-		baseBranch: "main",
 		createdAt: now(),
 		updatedAt: now(),
 	});
@@ -565,12 +761,22 @@ async function start(identity: Awaited<ReturnType<typeof seed>>, input: Record<s
 	);
 }
 describe("permission request tool schema compatibility", () => {
-	test("exports an object root without dropping discriminated union constraints", () => {
+	test("exports a flat provider schema while retaining discriminated runtime validation", () => {
 		const original = zodToJsonSchema(service.requestPermissionRuleSchema);
 		const exported = resolveToolJsonSchema(requestPermissionRuleTool);
 		expect(exported.type).toBe("object");
-		expect(exported).toEqual({ ...original, type: "object" });
-		expect(exported.anyOf).toHaveLength(4);
+		expect(exported.anyOf).toBeUndefined();
+		expect(exported.oneOf).toBeUndefined();
+		expect(exported.allOf).toBeUndefined();
+		expect(exported.required).toEqual(["ruleType", "reason"]);
+		const properties = exported.properties as Record<string, unknown>;
+		expect(properties.ruleType).toMatchObject({
+			type: "string",
+			enum: ["directoryWhitelist", "directoryBlacklist", "commandWhitelist", "commandBlacklist"],
+		});
+		expect(properties.scope).toMatchObject({ enum: ["narrator"] });
+		expect(original.anyOf).toHaveLength(4);
+		expect(requestPermissionRuleTool.parameters).toBe(service.requestPermissionRuleSchema);
 	});
 
 	test("runtime validation still accepts all four rule types and rejects unsafe inputs", () => {
@@ -605,6 +811,10 @@ describe("attempt-bound permission requests", () => {
 				const path = symlink ? join(fixture.directory, "alias.json") : configuration;
 				if (symlink) symlinkSync(configuration, path);
 				if (kind === "Edit") {
+					// Edit would normally need a prior Read of the file. The secret-path
+					// guard now refuses even that Read of the host settings file, so the
+					// bypass is cut off a step earlier; the Edit below is still blocked by
+					// the host-settings write boundary.
 					const read = await call(fixture.actor.narratorId);
 					const input = { file_path: path, offset: 1, limit: 2 };
 					await db
@@ -619,7 +829,7 @@ describe("attempt-bound permission requests", () => {
 								{ toolCallBinding: read.binding },
 							)
 						).isError,
-					).not.toBe(true);
+					).toBe(true);
 				}
 				fixture.tu.input =
 					kind === "Write"
@@ -649,13 +859,17 @@ describe("attempt-bound permission requests", () => {
 				expect(readFileSync(configuration, "utf8")).toBe(original);
 			});
 
-	test("host settings Read and trusted saveSettings remain available; repository settings Write is unrelated", async () => {
+	test("agent Read of host settings is now refused; trusted saveSettings and repository settings Write are unrelated", async () => {
 		settings.agent.permissionRuleAutoApprove = true;
+		// Trusted, non-agent saveSettings still writes the host settings file.
 		saveSettings(structuredClone(settings));
 		expect(
 			JSON.parse(readFileSync(join(narraforkDir, "settings.json"), "utf8")).agent
 				.permissionRuleAutoApprove,
 		).toBe(true);
+		// An agent file tool, however, may no longer read the host settings file:
+		// it holds auth.jwtSecret and provider keys, so a hijacked agent could
+		// otherwise exfiltrate them. The secret-path guard refuses it in every mode.
 		const reader = await finalExecutionFixture("Read", false, undefined, {
 			file_path: join(narraforkDir, "settings.json"),
 			offset: 1,
@@ -663,7 +877,7 @@ describe("attempt-bound permission requests", () => {
 		});
 		expect(
 			(await executeTool(reader.tu, reader.config, { toolCallBinding: reader.binding })).isError,
-		).not.toBe(true);
+		).toBe(true);
 		const writer = await finalExecutionFixture("Write", false);
 		writer.tu.input.file_path = join(writer.directory, "settings.json");
 		await db
@@ -685,6 +899,16 @@ describe("attempt-bound permission requests", () => {
 			await next();
 		});
 		app.route("/settings", settingsRoutes);
+		// assertAdmin now authorizes against the live DB role, so the acting
+		// administrator must exist as an admin row (the token claim alone no
+		// longer grants admin).
+		await db.insert(schema.users).values({
+			id: "trusted-human",
+			username: "trusted-human",
+			passwordHash: "not-a-real-password",
+			role: "admin",
+			createdAt: now(),
+		});
 		settings.agent.permissionRuleAutoApprove = false;
 		const response = await app.request("/settings", {
 			method: "PATCH",
@@ -1547,7 +1771,7 @@ describe("attempt-bound permission requests", () => {
 		});
 		const policy = await executionPolicyEngine.compile(identity.narratorId, identity.context);
 		const { analyzeShellCommand } = await import("../../lib/agent/bash-analyze");
-		const analysis = await analyzeShellCommand("rm -rf /", "/tmp", "bash", false);
+		const analysis = await analyzeShellCommand("rm -rf /", "/tmp", "bash");
 		expect(
 			permission.resolvePermissionDecision({
 				toolName: "Bash",
@@ -2000,56 +2224,54 @@ describe("attempt-bound permission requests", () => {
 			),
 		).rejects.toThrow("Device differs");
 	});
-	test("chapter-bound narrator with null contextProjectId enforces project directory and command denies in bypass", async () => {
-		await seedChapterDenyProject();
+	test("a narrator indexed into a project by its cwd enforces project directory and command denies in bypass", async () => {
+		await seedDenyProject();
 		const identity = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ chapterId: "policy-chapter", contextProjectId: null })
+			.set({ cwd: "/tmp/deny-policy-repository", contextProjectId: null })
 			.where(eq(schema.narrators.id, identity.narratorId));
+		// The primary link the project index derives from that directory.
+		await db.insert(schema.narratorProjectLinks).values({
+			narratorId: identity.narratorId,
+			projectId: "deny-policy-project",
+			role: "primary",
+			source: "cwd",
+			directory: "/tmp/deny-policy-repository",
+			updatedAt: now(),
+		});
 		const loaded = db.transaction((tx) =>
 			executionPolicyRepository.loadNow(identity.narratorId, tx),
 		);
-		expect(loaded.projectId).toBe("chapter-policy-project");
-		expect(loaded.projectGitPath).toBe("/tmp/chapter-policy-repository");
+		expect(loaded.projectId).toBe("deny-policy-project");
+		expect(loaded.projectGitPath).toBe("/tmp/deny-policy-repository");
 		expect(loaded.commandBlacklist).toHaveLength(1);
 		expect(loaded.directoryBlacklist).toHaveLength(1);
 		await expectProjectPolicyDeny(identity.narratorId, "Bash", { command: "pwd" });
 		await expectProjectPolicyDeny(identity.narratorId, "Read", {
-			file_path: "/tmp/chapter-policy-private/secret",
+			file_path: "/tmp/deny-policy-private/secret",
 		});
 	});
-	test("chapter project takes precedence over a permissive explicit context project", async () => {
-		await seedChapterDenyProject();
-		await db.insert(schema.projects).values({
-			id: "permissive-explicit-project",
-			name: "Other",
-			chapterSettings: { commandWhitelist: [{ pattern: "pwd", enabled: true }] },
-			createdAt: now(),
-			updatedAt: now(),
-		});
-		const identity = await seed("bypassPermissions");
-		await db
-			.update(schema.narrators)
-			.set({ chapterId: "policy-chapter", contextProjectId: "permissive-explicit-project" })
-			.where(eq(schema.narrators.id, identity.narratorId));
-		expect(executionPolicyRepository.loadNow(identity.narratorId).projectId).toBe(
-			"chapter-policy-project",
-		);
-		await expectProjectPolicyDeny(identity.narratorId, "Bash", { command: "pwd" });
-	});
-	test("child and nested subagent inherit chapter ancestor project denies without explicit project context", async () => {
-		await seedChapterDenyProject();
+	test("child and nested subagent inherit the source's project denies without explicit project context", async () => {
+		await seedDenyProject();
 		const parent = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ chapterId: "policy-chapter", contextProjectId: null })
+			.set({ contextProjectId: "deny-policy-project" })
 			.where(eq(schema.narrators.id, parent.narratorId));
 		const child = await seed("bypassPermissions", parent.narratorId),
 			nested = await seed("bypassPermissions", child.narratorId);
 		for (const actor of [child, nested]) {
+			expect(
+				(
+					await db.query.narrators.findFirst({
+						where: eq(schema.narrators.id, actor.narratorId),
+						columns: { contextProjectId: true },
+					})
+				)?.contextProjectId,
+			).toBeNull();
 			expect(executionPolicyRepository.loadNow(actor.narratorId).projectId).toBe(
-				"chapter-policy-project",
+				"deny-policy-project",
 			);
 			await permissionRuleService.createNarratorRule(actor.narratorId, {
 				ruleType: "commandWhitelist",
@@ -2057,40 +2279,33 @@ describe("attempt-bound permission requests", () => {
 			});
 			await expectProjectPolicyDeny(actor.narratorId, "Bash", { command: "pwd" });
 			await expectProjectPolicyDeny(actor.narratorId, "Read", {
-				file_path: "/tmp/chapter-policy-private/secret",
+				file_path: "/tmp/deny-policy-private/secret",
 			});
 		}
 	});
 	test("standalone explicit project retains deny policy in actual bypass permission handling", async () => {
-		await seedChapterDenyProject();
+		await seedDenyProject();
 		const identity = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ chapterId: null, contextProjectId: "chapter-policy-project" })
+			.set({ contextProjectId: "deny-policy-project" })
 			.where(eq(schema.narrators.id, identity.narratorId));
 		expect(executionPolicyRepository.loadNow(identity.narratorId).projectId).toBe(
-			"chapter-policy-project",
+			"deny-policy-project",
 		);
 		await expectProjectPolicyDeny(identity.narratorId, "Bash", { command: "pwd" });
 		await expectProjectPolicyDeny(identity.narratorId, "Read", {
-			file_path: "/tmp/chapter-policy-private/secret",
+			file_path: "/tmp/deny-policy-private/secret",
 		});
 	});
-	test("standalone cwd alone never selects a project and dangling chapter fails closed", async () => {
-		await seedChapterDenyProject();
+	test("a directory inside a project selects nothing without an index link", async () => {
+		await seedDenyProject();
 		const identity = await seed("bypassPermissions");
 		await db
 			.update(schema.narrators)
-			.set({ cwd: "/tmp/chapter-policy-repository", chapterId: null, contextProjectId: null })
+			.set({ cwd: "/tmp/deny-policy-repository", contextProjectId: null })
 			.where(eq(schema.narrators.id, identity.narratorId));
 		expect(executionPolicyRepository.loadNow(identity.narratorId).projectId).toBeNull();
-		await db
-			.update(schema.narrators)
-			.set({ chapterId: "missing-policy-chapter", contextProjectId: "chapter-policy-project" })
-			.where(eq(schema.narrators.id, identity.narratorId));
-		expect(() => executionPolicyRepository.loadNow(identity.narratorId)).toThrow(
-			"chapter context no longer exists",
-		);
 	});
 	test("standalone contextProjectId supplies project deny layers", async () => {
 		const identity = await seed();
@@ -2119,6 +2334,7 @@ describe("attempt-bound permission requests", () => {
 				.update(schema.narrators)
 				.set(update)
 				.where(eq(schema.narrators.id, identity.narratorId));
+			await materializeLegacyDelegations([identity.narratorId]);
 			await expect(
 				service.preparePermissionRuleRequest(identity, proposal, identity.context),
 			).rejects.toThrow("ceilings");

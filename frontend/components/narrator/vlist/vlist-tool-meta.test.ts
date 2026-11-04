@@ -1,7 +1,9 @@
 /** vlist-tool-meta.test.ts — unit tests for the per-row tool metadata derivation. */
 
 import { describe, expect, it } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
+import { resolveTraceRowIdentity, sameToolMeta } from "./vlist-exact-row-state";
 import { buildToolMetaIndex, deriveToolMeta, readSubagentIdTag } from "./vlist-tool-meta";
 
 function toolBlock(props: Record<string, unknown>): ContentBlock {
@@ -9,8 +11,90 @@ function toolBlock(props: Record<string, unknown>): ContentBlock {
 }
 
 function msg(contentJson: ContentBlock[], id = "m1", seq = 1): NarratorMsg {
-	return { id, seq, role: "assistant", contentJson } as unknown as NarratorMsg;
+	return rowWithElements({ id, seq, role: "assistant" }, contentJson) as unknown as NarratorMsg;
 }
+
+describe("captured file identity projection", () => {
+	it("does not borrow execution context from another persisted attempt", () => {
+		const message = {
+			...msg([
+				toolBlock({
+					name: "Read",
+					input: { file_path: "a.txt" },
+					tcId: "original",
+					executionAttempt: 1,
+				}),
+			]),
+			narratorId: "child",
+			toolCalls: [
+				{
+					id: "retry",
+					executionAttempt: 2,
+					toolUseId: "tu-1",
+					executionDeviceId: "Remote",
+					executionCwd: "/wrong",
+				},
+			],
+		} as unknown as NarratorMsg;
+		expect(buildToolMetaIndex([message]).get("tu-1")?.fileTarget).toBeUndefined();
+	});
+	it("a retry cannot overwrite the original relative path under its frozen cwd", () => {
+		const message = {
+			...msg([
+				toolBlock({
+					name: "Read",
+					input: { file_path: "original.txt" },
+					tcId: "original",
+					executionAttempt: 1,
+					executionDeviceId: "Remote",
+					executionCwd: "/original",
+				}),
+			]),
+			narratorId: "child",
+			toolCalls: [
+				{
+					id: "retry",
+					executionAttempt: 2,
+					toolUseId: "tu-1",
+					toolName: "Read",
+					inputJson: { file_path: "wrong.txt" },
+				},
+			],
+		} as unknown as NarratorMsg;
+		expect(buildToolMetaIndex([message]).get("tu-1")?.fileTarget).toEqual({
+			deviceId: "Remote",
+			path: "/original/original.txt",
+		});
+	});
+	it("folded rows retain the same target/source and memoization observes identity changes", () => {
+		const fileTarget = { deviceId: "Remote", path: "/original/a.txt" };
+		const meta = {
+			toolName: "Read",
+			filePath: "a.txt",
+			fileTarget,
+			fileNarratorId: "child",
+			isFileTool: true,
+		};
+		const identity = resolveTraceRowIdentity(
+			{ identity: { messageId: "m", toolUseId: "tu-1", blockIndex: 0 } } as Parameters<
+				typeof resolveTraceRowIdentity
+			>[0],
+			{
+				byBlockId: new Map([["tc-tu-1", { blockId: "tc-tu-1", messageId: "m", blockIndex: 0 }]]),
+			} as Parameters<typeof resolveTraceRowIdentity>[1],
+			new Map([["tu-1", meta]]),
+		);
+		expect(identity?.tool).toMatchObject({ fileTarget, fileNarratorId: "child" });
+		expect(sameToolMeta(meta, { ...meta, fileTarget: { ...fileTarget } })).toBe(true);
+		expect(sameToolMeta(meta, { ...meta, fileTarget: { ...fileTarget, deviceId: "Other" } })).toBe(
+			false,
+		);
+		expect(sameToolMeta(meta, { ...meta, fileTarget: { ...fileTarget, path: "/new.txt" } })).toBe(
+			false,
+		);
+		expect(sameToolMeta(meta, { ...meta, fileNarratorId: "host" })).toBe(false);
+	});
+});
 
 describe("foreground Bash detachment", () => {
 	it("uses the exact tool id and only executing/running foreground commands", () => {
@@ -63,17 +147,48 @@ describe("foreground Bash detachment", () => {
 
 describe("active question waits", () => {
 	it("exposes only running question waits, not completed or other waits", () => {
-		for (const status of ["running", "success", "fail", "cancelled", "pending", undefined]) {
+		for (const status of [
+			"running",
+			"executing",
+			"success",
+			"fail",
+			"cancelled",
+			"pending",
+			undefined,
+		]) {
 			const meta = deriveToolMeta(
 				toolBlock({ name: "Await", status, input: { type: "question", id: "q1" } }),
 			);
-			expect(meta?.awaitQuestionId).toBe(status === "running" ? "q1" : undefined);
+			expect(meta?.awaitQuestionId).toBe(
+				status === "running" || status === "executing" ? "q1" : undefined,
+			);
 		}
 		expect(
 			deriveToolMeta(
 				toolBlock({ name: "Await", status: "running", input: { type: "bash", id: "q1" } }),
 			)?.awaitQuestionId,
 		).toBeUndefined();
+	});
+
+	it("matches live tool-call input and stops hosting when the record completes", () => {
+		const message = msg([toolBlock({ name: "Await", input: {} })], "live", 17);
+		for (const status of ["running", "executing", "success"]) {
+			const live = {
+				...message,
+				toolCalls: [
+					{
+						toolUseId: "tu-1",
+						toolName: "Await",
+						status,
+						inputJson: { type: "question", id: "q-live" },
+					},
+				],
+			} as unknown as NarratorMsg;
+			const meta = buildToolMetaIndex([live]).get("tu-1");
+			if (status === "success") expect(meta?.awaitQuestionId).toBeUndefined();
+			else expect(meta).toMatchObject({ awaitQuestionId: "q-live", awaitQuestionSeq: 17 });
+		}
+		expect(messageBody(message)).toEqual([toolBlock({ name: "Await", input: {} })]);
 	});
 
 	it("carries the owning message seq so concurrent waits can pick the newest", () => {

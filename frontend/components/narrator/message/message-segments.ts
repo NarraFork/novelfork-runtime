@@ -7,10 +7,13 @@
 import { mergeSendDeliveryTargetCount, mergeSendDeliveryTargets } from "@shared/communication-tool";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import { appendStreamingTextPreview } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "../narrator-panel-types";
 import type { ToolCallData } from "../tool-call/tool-call-data";
+import { toolExecutionFallback } from "../tool-call/tool-file-target";
+import { isNestedRow, nestedRowsByParent } from "./nested-rows";
 
 // ---------------------------------------------------------------------------
 // Legacy tool name mapping
@@ -37,7 +40,8 @@ export type ToolRunItem = {
 	msg: NarratorMsg;
 	blockIndex: number;
 	tc: ToolCallData;
-	children: NarratorMsg[];
+	/** Rows nested under this tool call (`nested-rows.ts`). */
+	nestedRows: NarratorMsg[];
 	isSubagent: boolean;
 };
 
@@ -60,7 +64,7 @@ export type RenderSegment =
 
 function isVisibleContentBlock(b: ContentBlock): boolean {
 	if (b.type === "text") return !!b.text?.trim();
-	if (b.type === "image") return true;
+	if (b.type === "image" || b.type === "audio" || b.type === "video") return true;
 	if (b.type === "text_file" || b.type === "file_reference") return true;
 	if (b.type === "web_search") return true;
 	if (b.type === "image_generation") return true;
@@ -70,14 +74,14 @@ function isVisibleContentBlock(b: ContentBlock): boolean {
 
 export function hasToolUse(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	return blocks.some((b: ContentBlock) => b.type === "tool_use");
 }
 
 /** True when every visible block is either tool_use or blank text. */
 export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	return (
 		blocks.length > 0 &&
 		blocks.every(
@@ -92,7 +96,7 @@ export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Tool call resolution (from contentJson blocks → ToolCallData)
+// Tool call resolution (from tool_use elements → ToolCallData)
 // ---------------------------------------------------------------------------
 
 function parseToolTimestamp(value: unknown): number | undefined {
@@ -111,7 +115,7 @@ function parseToolTimestamp(value: unknown): number | undefined {
  * synthetic-tool-call path had no remaining consumer and is gone.
  */
 export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	const results: ToolCallData[] = [];
 	for (const block of blocks) {
 		if (block.type !== "tool_use") continue;
@@ -128,6 +132,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 				block.executionAttempt === matchingTc.executionAttempt)
 				? matchingTc
 				: undefined;
+		const executionTc = toolExecutionFallback(block, matchingTc);
 		const status = block.status ?? tc?.status ?? "running";
 		const createdAt = block.tcCreatedAt ?? matchingTc?.createdAt;
 		const persistedStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
@@ -148,7 +153,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			id: block.tcId ?? tc?.id,
 			toolName: normalizeToolName(block.name ?? ""),
 			toolUseId: block.id,
-			inputJson: block.inputJson ?? tc?.inputJson ?? block.input,
+			inputJson: block.inputJson ?? (executionTc ? tc?.inputJson : undefined) ?? block.input,
 			outputJson: block.outputJson ?? tc?.outputJson,
 			status,
 			durationMs: block.durationMs ?? tc?.durationMs,
@@ -158,6 +163,11 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			executionStartedAt: block.executionStartedAt ?? matchingTc?.executionStartedAt,
 			completedAt: block.completedAt ?? matchingTc?.completedAt,
 			createdAt,
+			fileNarratorId: msg.narratorId,
+			executionDeviceId: block.executionDeviceId ?? executionTc?.executionDeviceId,
+			executionCwd: block.executionCwd ?? executionTc?.executionCwd,
+			resolvedFilePath: block.resolvedFilePath ?? executionTc?.resolvedFilePath,
+			executionTarget: block.executionTarget ?? executionTc?.executionTarget,
 			errorMessage: block.errorMessage ?? tc?.errorMessage,
 			permissionDenyMessage: block.permissionDenyMessage ?? tc?.permissionDenyMessage,
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
@@ -196,6 +206,10 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			_awaitAgentNarratorId:
 				// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 				block._awaitAgentNarratorId ?? (tc as any)?._awaitAgentNarratorId,
+			// Companion of the id above: the session's display title, so the running
+			// card can headline it before the tool's metadata exists.
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
+			_awaitAgentTitle: block._awaitAgentTitle ?? (tc as any)?._awaitAgentTitle,
 			// Same contract: an explicit field list, so a missing entry here silently
 			// drops the takeover badge and the card goes back to looking merely busy.
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
@@ -205,12 +219,19 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 	return results;
 }
 
-export function filterChildrenByToolUse(
-	children: NarratorMsg[],
+/** The rows among a row's nested rows that answer the tool call `toolUseId`. */
+export function nestedRowsOfTool(
+	nestedRows: readonly NarratorMsg[],
 	toolUseId: string | undefined,
 ): NarratorMsg[] {
 	if (!toolUseId) return [];
-	return children.filter((c) => c.parentToolUseId === toolUseId);
+	return nestedRows.filter((row) => row.parentToolUseId === toolUseId);
+}
+
+const NO_ROWS: readonly NarratorMsg[] = [];
+
+function sameRows(left: readonly NarratorMsg[], right: readonly NarratorMsg[]): boolean {
+	return left.length === right.length && left.every((row, index) => row === right[index]);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +240,119 @@ export function filterChildrenByToolUse(
 
 export interface SegmentOptions {
 	streamingMsg?: NarratorMsg | null;
+	cache?: MessageSegmentationCache;
+}
+
+type MessageAtom =
+	| { lane: "content"; msg: NarratorMsg; blockIndex: number }
+	| { lane: "content-whole"; msg: NarratorMsg }
+	| { lane: "tool"; msg: NarratorMsg; blockIndex: number; item?: ToolRunItem };
+
+type MessageMaterials = {
+	atoms: MessageAtom[];
+	toolCalls: ToolCallData[];
+};
+
+type CachedMessageMaterials = {
+	msg: NarratorMsg;
+	role: NarratorMsg["role"];
+	body: readonly unknown[];
+	toolCalls: NarratorMsg["toolCalls"];
+	nestedRows: readonly NarratorMsg[];
+	materials: MessageMaterials;
+};
+
+/**
+ * Owned by one message-list coordinator, never shared globally. Direct message/
+ * role/body/toolCalls/nested-row replacement invalidates automatically.
+ * Nested in-place edits require invalidate(id), or invalidate()/clear() for all.
+ * Only per-message materials are retained: runs are assembled afresh each time.
+ */
+export class MessageSegmentationCache {
+	private readonly entries = new Map<string, CachedMessageMaterials>();
+	private readonly maxMessages: number;
+	private readonly maxAtoms: number;
+	private retainedAtoms = 0;
+
+	constructor(options: { maxMessages?: number; maxAtoms?: number } = {}) {
+		this.maxMessages = options.maxMessages ?? 1024;
+		this.maxAtoms = options.maxAtoms ?? 8192;
+		if (
+			!Number.isSafeInteger(this.maxMessages) ||
+			this.maxMessages < 0 ||
+			!Number.isSafeInteger(this.maxAtoms) ||
+			this.maxAtoms < 0
+		) {
+			throw new RangeError("Message segmentation cache limits must be non-negative safe integers");
+		}
+	}
+
+	get size(): number {
+		return this.entries.size;
+	}
+
+	get atomCount(): number {
+		return this.retainedAtoms;
+	}
+
+	clear(): void {
+		this.entries.clear();
+		this.retainedAtoms = 0;
+	}
+
+	invalidate(messageId?: string): void {
+		if (messageId === undefined) {
+			this.clear();
+			return;
+		}
+		const entry = this.entries.get(messageId);
+		if (!entry) return;
+		this.retainedAtoms -= entry.materials.atoms.length;
+		this.entries.delete(messageId);
+	}
+
+	/** Internal to segmentMessages; exposed for coordinator-independent ownership. */
+	getMaterials(msg: NarratorMsg, nestedRows: readonly NarratorMsg[] = NO_ROWS): MessageMaterials {
+		const entry = this.entries.get(msg.id);
+		if (
+			entry &&
+			entry.msg === msg &&
+			entry.role === msg.role &&
+			entry.body === messageBody(msg) &&
+			entry.toolCalls === msg.toolCalls &&
+			sameRows(entry.nestedRows, nestedRows)
+		) {
+			return entry.materials;
+		}
+
+		// A same-id replacement must release the previous version even if the new
+		// materials exceed the budget and therefore cannot be retained.
+		this.invalidate(msg.id);
+		const materials = buildMessageMaterials(msg, nestedRows);
+		if (
+			msg.id !== "__streaming__" &&
+			this.entries.size < this.maxMessages &&
+			this.retainedAtoms + materials.atoms.length <= this.maxAtoms
+		) {
+			this.entries.set(msg.id, {
+				msg,
+				role: msg.role,
+				body: messageBody(msg),
+				toolCalls: msg.toolCalls,
+				nestedRows,
+				materials,
+			});
+			this.retainedAtoms += materials.atoms.length;
+		}
+		return materials;
+	}
+
+	prune(messages: NarratorMsg[]): void {
+		const activeIds = new Set(messages.map((msg) => msg.id));
+		for (const id of this.entries.keys()) {
+			if (!activeIds.has(id)) this.invalidate(id);
+		}
+	}
 }
 
 type VisualLane = "content" | "tool";
@@ -229,39 +363,84 @@ function classifyBlock(b: ContentBlock): VisualLane | null {
 	return null;
 }
 
+function isEpochMarker(msg: NarratorMsg): boolean {
+	const head = messageBody(msg)[0];
+	return !!head && typeof head === "object" && (head as { type?: unknown }).type === "epoch";
+}
+
+function buildMessageMaterials(
+	msg: NarratorMsg,
+	nestedRows: readonly NarratorMsg[] = NO_ROWS,
+): MessageMaterials {
+	const atoms: MessageAtom[] = [];
+	const materials: MessageMaterials = { atoms, toolCalls: [] };
+	if (msg.role !== "assistant") {
+		// An epoch marker records what the model's request is rebuilt from; it is not part
+		// of the conversation and has nothing to show.
+		if (msg.role === "system" && isEpochMarker(msg)) return materials;
+		atoms.push({ lane: "content-whole", msg });
+		return materials;
+	}
+
+	const blocks = messageBody(msg);
+	let hasTools = false;
+	for (let bi = 0; bi < blocks.length; bi++) {
+		const lane = classifyBlock(blocks[bi]);
+		if (lane === "content") atoms.push({ lane: "content", msg, blockIndex: bi });
+		else if (lane === "tool") {
+			atoms.push({ lane: "tool", msg, blockIndex: bi });
+			hasTools = true;
+		}
+	}
+	if (atoms.length === 0 && blocks.length > 0) {
+		atoms.push({ lane: "content-whole", msg });
+	}
+
+	if (hasTools) {
+		materials.toolCalls = resolveAllToolCallsFromMsg(msg);
+		for (const atom of atoms) {
+			if (atom.lane !== "tool") continue;
+			const block = blocks[atom.blockIndex];
+			// Preserve first-match behavior for repeated toolUseIds (retry blocks).
+			const tc = materials.toolCalls.find((tool) => tool.toolUseId === block.id);
+			if (!tc) continue;
+			const toolRows = nestedRowsOfTool(nestedRows, tc.toolUseId);
+			atom.item = {
+				kind: "tool",
+				msg,
+				blockIndex: atom.blockIndex,
+				tc,
+				nestedRows: toolRows,
+				isSubagent:
+					tc.toolName === "Agent" ||
+					tc.toolName === "Task" ||
+					tc.toolName === "Send" ||
+					!!tc._subagentActivity ||
+					toolRows.length > 0,
+			};
+		}
+	}
+	return materials;
+}
+
 export function segmentMessages(
 	messages: NarratorMsg[],
 	opts: SegmentOptions = {},
 ): RenderSegment[] {
-	const { streamingMsg } = opts;
+	const { streamingMsg, cache } = opts;
 
 	const effectiveMessages = streamingMsg != null ? [...messages, streamingMsg] : messages;
-
-	type Atom =
-		| { lane: "content"; msg: NarratorMsg; blockIndex: number }
-		| { lane: "content-whole"; msg: NarratorMsg }
-		| { lane: "tool"; msg: NarratorMsg; blockIndex: number };
-
-	const atoms: Atom[] = [];
-
+	const nestedByParent = nestedRowsByParent(messages);
+	const atoms: MessageAtom[] = [];
 	for (const msg of effectiveMessages) {
-		const atomStartIdx = atoms.length;
-
-		if (msg.role !== "assistant") {
-			atoms.push({ lane: "content-whole", msg });
-		} else {
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-
-			for (let bi = 0; bi < blocks.length; bi++) {
-				const lane = classifyBlock(blocks[bi]);
-				if (lane === "content") atoms.push({ lane: "content", msg, blockIndex: bi });
-				else if (lane === "tool") atoms.push({ lane: "tool", msg, blockIndex: bi });
-			}
-
-			if (atoms.length === atomStartIdx && blocks.length > 0) {
-				atoms.push({ lane: "content-whole", msg });
-			}
-		}
+		// A nested row is read through its parent's tool call, never on its own.
+		if (isNestedRow(msg)) continue;
+		const nestedRows = nestedByParent.get(msg.id) ?? NO_ROWS;
+		const materials = cache
+			? cache.getMaterials(msg, nestedRows)
+			: buildMessageMaterials(msg, nestedRows);
+		// Do not spread arbitrarily large block lists into a function call.
+		for (const atom of materials.atoms) atoms.push(atom);
 	}
 
 	const segments: RenderSegment[] = [];
@@ -297,41 +476,12 @@ export function segmentMessages(
 		// tool → start a tool-run
 		const items: ToolRunItem[] = [];
 		const sourceMessagesSet = new Set<NarratorMsg>();
-		const allTcsCache = new Map<NarratorMsg, ToolCallData[]>();
-
-		const getTcs = (msg: NarratorMsg) => {
-			let tcs = allTcsCache.get(msg);
-			if (!tcs) {
-				tcs = resolveAllToolCallsFromMsg(msg);
-				allTcsCache.set(msg, tcs);
-			}
-			return tcs;
-		};
 
 		while (ai < atoms.length) {
 			const cur = atoms[ai];
 			if (cur.lane === "tool") {
-				const tcs = getTcs(cur.msg);
-				const block = (Array.isArray(cur.msg.contentJson) ? cur.msg.contentJson : [])[
-					cur.blockIndex
-				];
-				const tc = block ? tcs.find((t) => t.toolUseId === block.id) : undefined;
-				if (tc) {
-					const children = filterChildrenByToolUse(cur.msg.children ?? [], tc.toolUseId);
-					const isSubagent =
-						tc.toolName === "Agent" ||
-						tc.toolName === "Task" ||
-						tc.toolName === "Send" ||
-						!!tc._subagentActivity ||
-						children.length > 0;
-					items.push({
-						kind: "tool",
-						msg: cur.msg,
-						blockIndex: cur.blockIndex,
-						tc,
-						children,
-						isSubagent,
-					});
+				if (cur.item) {
+					items.push(cur.item);
 					sourceMessagesSet.add(cur.msg);
 				}
 				ai++;
@@ -349,26 +499,8 @@ export function segmentMessages(
 		}
 	}
 
+	cache?.prune(effectiveMessages);
 	return segments;
-}
-
-// ---------------------------------------------------------------------------
-// Target ID collection (for virtualization / scroll-to)
-// ---------------------------------------------------------------------------
-
-export function collectSegmentTargetIds(seg: RenderSegment): string[] {
-	if (seg.kind === "message") return seg.msg.id ? [seg.msg.id] : [];
-	const ids = new Set<string>();
-	for (const item of seg.items) {
-		if (item.msg.id) ids.add(item.msg.id);
-		if (item.tc.toolUseId) ids.add(item.tc.toolUseId);
-	}
-	for (const srcMsg of seg.sourceMessages) {
-		for (const child of srcMsg.children ?? []) {
-			if (child.id) ids.add(child.id);
-		}
-	}
-	return [...ids];
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +524,11 @@ function trimToolBlockCache() {
 		if (oldestKey === undefined) return;
 		toolBlockCache.delete(oldestKey);
 	}
+}
+
+/** Reset the tool-use block reference cache (between tests). */
+export function clearToolBlockCache(): void {
+	toolBlockCache.clear();
 }
 
 function stabilizeToolUseBlock(block: ContentBlock): ContentBlock {
@@ -419,18 +556,14 @@ function shallowBlockEqual(a: ContentBlock, b: ContentBlock): boolean {
 	return a.type === b.type && a.id === b.id && a.name === b.name && a.input === b.input;
 }
 
-/** Clear the tool-use block reference cache (call when streaming ends). */
-export function clearToolBlockCache(): void {
-	toolBlockCache.clear();
-}
-
 /** A streaming block tracked in temporal order (by event arrival / provider output order). */
 export type StreamingBlock =
 	| {
 			type: "reasoning";
-			id?: string;
-			revision?: number;
-			textOffset?: number;
+			/** The element this lane streams, its revision, and the raw characters before `text`. */
+			id: string;
+			revision: number;
+			textOffset: number;
 			outputIndex?: number;
 			text: string;
 	  }
@@ -458,9 +591,9 @@ export type StreamingBlock =
 	| {
 			type: "text";
 			text: string;
-			id?: string;
-			revision?: number;
-			textOffset?: number;
+			id: string;
+			revision: number;
+			textOffset: number;
 			outputIndex?: number;
 			fileReferenceContext?: FileReferenceContext | null;
 	  };
@@ -585,32 +718,18 @@ function findMatchingStreamingBlockIndex(
 	blocks: StreamingBlock[],
 	incoming: StreamingBlock,
 ): number {
-	if (incoming.type === "web_search" || incoming.type === "image_generation") {
-		return blocks.findIndex((b) => b.type === incoming.type && b.id === incoming.id);
-	}
-	if (incoming.type === "reasoning") {
-		const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
-		return blocks.findIndex((b) => {
-			if (b.type !== "reasoning") return false;
-			if (incoming.id) return b.id === incoming.id;
-			if (incomingOutputIndex != null)
-				return getStreamingBlockOutputIndex(b) === incomingOutputIndex;
-			return !b.id && getStreamingBlockOutputIndex(b) == null;
-		});
-	}
-	if (incoming.type === "text" && incoming.id) {
-		return blocks.findIndex((b) => b.type === "text" && b.id === incoming.id);
-	}
-	// text — prefer the provider output index, but legacy/providers without one
-	// still keep a single live text block that must merge with a reconnect snapshot
-	// instead of being inserted again and rendered twice.
-	const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
-	return blocks.findIndex((b) => {
-		if (b.type !== "text") return false;
-		const existingOutputIndex = getStreamingBlockOutputIndex(b);
-		if (incomingOutputIndex != null) return existingOutputIndex === incomingOutputIndex;
-		return existingOutputIndex == null;
-	});
+	return blocks.findIndex((b) => b.type === incoming.type && b.id === incoming.id);
+}
+
+/** A snapshot's text/reasoning lane names its element, revision and raw offset. */
+function isExactLane(block: StreamingBlock): boolean {
+	if (block.type !== "text" && block.type !== "reasoning") return true;
+	return (
+		typeof block.id === "string" &&
+		block.id.length > 0 &&
+		Number.isSafeInteger(block.revision) &&
+		Number.isSafeInteger(block.textOffset)
+	);
 }
 
 /**
@@ -628,14 +747,14 @@ export function mergeStreamingSnapshotBlocks(
 ): boolean {
 	let changed = false;
 	for (const incoming of snapshotBlocks) {
+		if (!isExactLane(incoming)) continue;
 		const idx = findMatchingStreamingBlockIndex(blocks, incoming);
 		if (idx === -1) {
 			const next = { ...incoming };
 			if (next.type === "text" || next.type === "reasoning") {
 				const rawLength = next.text.length;
 				next.text = appendStreamingTextPreview("", next.text);
-				if (next.textOffset != null || rawLength !== next.text.length)
-					next.textOffset = (next.textOffset ?? 0) + rawLength - next.text.length;
+				next.textOffset += rawLength - next.text.length;
 			}
 			blocks.splice(
 				findStreamingInsertIndex(blocks, getStreamingBlockOutputIndex(incoming)),
@@ -663,46 +782,28 @@ export function mergeStreamingSnapshotBlocks(
 				);
 				changed = true;
 			}
-			// Modern snapshots are exact versions, including shorter corrected bodies.
-			if (incoming.id && incoming.revision != null && existing.revision != null) {
-				if (incoming.revision <= existing.revision) {
-					// A delta may precede its reconnect snapshot. Revision guards the
-					// suffix; raw offsets let an older snapshot restore its missing prefix.
-					const start = incoming.textOffset;
-					const currentStart = existing.textOffset;
-					if (
-						start != null &&
-						currentStart != null &&
-						start < currentStart &&
-						start + incoming.text.length >= currentStart
-					) {
-						const end = currentStart + existing.text.length;
-						const prefix = incoming.text.slice(0, currentStart - start);
-						const text = appendStreamingTextPreview(prefix, existing.text);
-						if (text !== existing.text) {
-							existing.text = text;
-							existing.textOffset = end - text.length;
-							changed = true;
-						}
+			// Snapshots are exact versions, including shorter corrected bodies.
+			if (incoming.revision <= existing.revision) {
+				// A delta may precede its reconnect snapshot. Revision guards the
+				// suffix; raw offsets let an older snapshot restore its missing prefix.
+				const start = incoming.textOffset;
+				const currentStart = existing.textOffset;
+				if (start < currentStart && start + incoming.text.length >= currentStart) {
+					const end = currentStart + existing.text.length;
+					const prefix = incoming.text.slice(0, currentStart - start);
+					const text = appendStreamingTextPreview(prefix, existing.text);
+					if (text !== existing.text) {
+						existing.text = text;
+						existing.textOffset = end - text.length;
+						changed = true;
 					}
-					continue;
 				}
-				existing.text = appendStreamingTextPreview("", incoming.text);
-				existing.textOffset =
-					(incoming.textOffset ?? 0) + incoming.text.length - existing.text.length;
-				existing.revision = incoming.revision;
-				changed = true;
 				continue;
 			}
-			if (incoming.revision != null) existing.revision = incoming.revision;
-			// Legacy snapshots have no version; retain their conservative longer preview.
-			if (incoming.text.length > existing.text.length) {
-				existing.text = incoming.text;
-				if (incoming.type === "reasoning" && existing.type === "reasoning" && incoming.id) {
-					existing.id = incoming.id;
-				}
-				changed = true;
-			}
+			existing.text = appendStreamingTextPreview("", incoming.text);
+			existing.textOffset = incoming.textOffset + incoming.text.length - existing.text.length;
+			existing.revision = incoming.revision;
+			changed = true;
 		} else {
 			// web_search / image_generation: adopt the fresher snapshot status/fields.
 			blocks[idx] = { ...existing, ...incoming };
@@ -740,19 +841,15 @@ export function buildStreamingMsg(opts: {
 	const blocks: ContentBlock[] = [];
 
 	if (hasStreamingBlocks) {
-		for (const [index, sb] of streamingBlocks.entries()) {
+		for (const sb of streamingBlocks) {
 			if (sb.type === "reasoning") {
 				blocks.push({
 					type: "reasoning",
-					id:
-						sb.id ??
-						(sb.outputIndex != null
-							? `streaming:reasoning:${sb.outputIndex}`
-							: `streaming:reasoning:${index}`),
+					id: sb.id,
 					text: sb.text,
 					outputIndex: sb.outputIndex,
-					...(sb.revision != null ? { revision: sb.revision } : {}),
-					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
+					revision: sb.revision,
+					textOffset: sb.textOffset,
 				} as ContentBlock);
 			} else if (sb.type === "web_search") {
 				blocks.push({
@@ -778,10 +875,10 @@ export function buildStreamingMsg(opts: {
 			} else if (sb.type === "text") {
 				blocks.push({
 					type: "text",
-					id: sb.id ?? `streaming:text:${index}`,
+					id: sb.id,
 					text: sb.text,
-					...(sb.revision != null ? { revision: sb.revision } : {}),
-					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
+					revision: sb.revision,
+					textOffset: sb.textOffset,
 					outputIndex: sb.outputIndex,
 					...(sb.fileReferenceContext !== undefined
 						? { fileReferenceContext: normalizeFileReferenceContext(sb.fileReferenceContext) }
@@ -792,67 +889,25 @@ export function buildStreamingMsg(opts: {
 	}
 
 	if (toolChunksMsg) {
-		const chunkBlocks = Array.isArray(toolChunksMsg.contentJson) ? toolChunksMsg.contentJson : [];
+		const chunkBlocks = messageBody(toolChunksMsg);
 		for (const raw of chunkBlocks) {
 			blocks.push(stabilizeToolUseBlock(raw));
 		}
 	}
 
-	return {
+	const row = {
 		id: "__streaming__",
 		narratorId,
 		...(opts.model !== undefined ? { model: opts.model } : {}),
 		...(opts.provider !== undefined ? { provider: opts.provider } : {}),
 		parentToolUseId: null,
 		role: "assistant",
-		contentJson: blocks,
 		contentText: null,
 		toolCalls: toolChunksMsg?.toolCalls ?? [],
 		createdAt: toolChunksMsg?.createdAt ?? new Date().toISOString(),
-		children: [],
 		// Text/reasoning blocks are emitted first and in the same order as
 		// `streamingBlocks`, so the accumulator's index carries over unchanged.
 		...(liveBlockIndex != null ? { liveBlockIndex } : {}),
-	} as NarratorMsg;
-}
-
-/**
- * Generate stable React keys for a list of content blocks.
- *
- * Blocks that already carry an `id` (tool_use, web_search from the API,
- * streaming blocks with synthetic ids) use that id directly.
- * For blocks without an id, the block *type* is used as the key since each
- * type typically appears at most once per message.  When multiple blocks
- * share the same type and both lack an id, a dedup counter is appended so
- * every key remains unique.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function generateBlockKeys(blocks: any[]): string[] {
-	const typeCount: Record<string, number> = {};
-	return blocks.map((block) => {
-		if (block.id) return block.id as string;
-		const t = block.type as string;
-		// Known content types typically appear at most once per message,
-		// so the first occurrence uses the bare type name as the key
-		// (e.g. "text") for maximum stability during streaming.
-		// Subsequent occurrences append a dedup counter (e.g. "text-1").
-		if (
-			t === "text" ||
-			t === "reasoning" ||
-			t === "thinking" ||
-			t === "web_search" ||
-			t === "image_generation" ||
-			t === "image" ||
-			t === "text_file"
-		) {
-			const count = typeCount[t] ?? 0;
-			typeCount[t] = count + 1;
-			return count === 0 ? t : `${t}-${count}`;
-		}
-		// Unknown types always include a counter (e.g. "custom-0") since
-		// we cannot assume they appear at most once per message.
-		const count = typeCount[t] ?? 0;
-		typeCount[t] = count + 1;
-		return `${t}-${count}`;
-	});
+	} as Omit<NarratorMsg, "blocks">;
+	return rowWithElements(row, blocks);
 }

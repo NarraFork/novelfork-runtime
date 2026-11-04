@@ -4,6 +4,7 @@ import { parseHTML } from "linkedom";
 import type { editor, IPosition, IRange } from "monaco-editor/editor/editor.api";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { EDITOR_HIDE_DELAY_MS } from "../narrator-panel-visibility";
 import {
 	type MonacoDocumentStatus,
 	MonacoEditor,
@@ -81,7 +82,22 @@ class View {
 	setModel = (model: Model) => {
 		this.model = model;
 	};
+	getModel = () => this.model;
 	getSelection = () => this.selection;
+	saveViewState = () => ({ selection: { ...this.selection } });
+	restoreViewState = (state: { selection: IRange }) => {
+		this.selection = { ...state.selection };
+	};
+	widgets = new Set<editor.IGlyphMarginWidget>();
+	addGlyphMarginWidget = mock((widget: editor.IGlyphMarginWidget) => {
+		this.widgets.add(widget);
+		host.appendChild(widget.getDomNode());
+	});
+	layoutGlyphMarginWidget = mock((_widget: editor.IGlyphMarginWidget) => {});
+	removeGlyphMarginWidget = mock((widget: editor.IGlyphMarginWidget) => {
+		this.widgets.delete(widget);
+		widget.getDomNode().remove();
+	});
 	setPosition = mock((p: IPosition) => {
 		this.selection = {
 			startLineNumber: p.lineNumber,
@@ -176,6 +192,7 @@ beforeEach(() => {
 		navigator: window.navigator,
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
+		Event: window.Event,
 		Node: window.Node,
 		MutationObserver: window.MutationObserver,
 		ResizeObserver: class {
@@ -219,6 +236,7 @@ beforeEach(() => {
 			setModelLanguage() {},
 			CursorChangeReason: { ContentFlush: 1, RecoverFromMarkers: 2 },
 			MouseTargetType: { CONTENT_TEXT: 6, CONTENT_EMPTY: 7, GUTTER_LINE_NUMBERS: 2 },
+			GlyphMarginLane: { Center: 2 },
 			create: (_host: HTMLElement, options: editor.IStandaloneEditorConstructionOptions) => {
 				expect(options.largeFileOptimizations).toBe(false);
 				expect(options.model).toBeNull();
@@ -270,6 +288,149 @@ async function render(
 		);
 	});
 }
+
+test("external model is shared by independent views and never reset or disposed by view cleanup", async () => {
+	const shared = new Model("shared document");
+	const renderViews = async (left: boolean) =>
+		act(async () =>
+			root.render(
+				<MantineProvider forceColorScheme="dark">
+					{left && (
+						<MonacoEditor
+							key="left"
+							documentKey="shared"
+							filePath="a.ts"
+							initialValue="ignored"
+							model={shared as unknown as editor.ITextModel}
+						/>
+					)}
+					<MonacoEditor
+						key="right"
+						documentKey="shared"
+						filePath="a.ts"
+						initialValue="also ignored"
+						model={shared as unknown as editor.ITextModel}
+					/>
+				</MantineProvider>,
+			),
+		);
+	await renderViews(true);
+	expect(models).toHaveLength(0);
+	expect(views).toHaveLength(2);
+	expect(views[0].model).toBe(shared);
+	expect(views[1].model).toBe(shared);
+	views[0].setPosition({ lineNumber: 1, column: 2 });
+	views[1].setPosition({ lineNumber: 1, column: 4 });
+	expect(views[0].getSelection().startColumn).toBe(2);
+	expect(views[1].getSelection().startColumn).toBe(4);
+	await renderViews(false);
+	expect(views[0].disposed).toBe(true);
+	expect(views[1].disposed).toBe(false);
+	expect(shared.disposed).toBe(false);
+	expect(shared.setValue).not.toHaveBeenCalled();
+	await act(async () => root.render(null));
+	expect(shared.disposed).toBe(false);
+	expect(views[1].disposed).toBe(true);
+	shared.dispose();
+});
+
+function hideClock() {
+	const timers = new Map<ReturnType<typeof setTimeout>, () => void>();
+	const original = globalThis.setTimeout;
+	const cancel = globalThis.clearTimeout;
+	const schedule = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: () => void,
+		ms?: number,
+	) => {
+		if (ms !== EDITOR_HIDE_DELAY_MS) return original(callback, ms);
+		const id = original(() => {}, 60_000);
+		timers.set(id, callback);
+		return id;
+	}) as typeof setTimeout);
+	const remove = spyOn(globalThis, "clearTimeout").mockImplementation(((
+		id: ReturnType<typeof setTimeout>,
+	) => {
+		timers.delete(id);
+		cancel(id);
+	}) as typeof clearTimeout);
+	return {
+		flush: async () =>
+			act(async () => {
+				for (const [id, callback] of [...timers]) {
+					timers.delete(id);
+					cancel(id);
+					callback();
+				}
+			}),
+		restore: () => {
+			for (const id of timers.keys()) cancel(id);
+			schedule.mockRestore();
+			remove.mockRestore();
+		},
+		pending: () => timers.size,
+	};
+}
+
+test("never-visible source creates no view/model/observer or delayed timer", async () => {
+	const clock = hideClock();
+	try {
+		await render({ visible: false });
+		expect(views).toHaveLength(0);
+		expect(models).toHaveLength(0);
+		expect(loadSpy).not.toHaveBeenCalled();
+		expect(clock.pending()).toBe(0);
+		await render({ visible: true });
+		expect(views).toHaveLength(1);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("hidden grace releases view/listeners/RAF but preserves external model and independent view state", async () => {
+	const clock = hideClock();
+	const model = new Model("one\ntwo");
+	const props = { model: model as unknown as editor.ITextModel };
+	try {
+		await render(props);
+		views[0].setPosition({ lineNumber: 2, column: 2 });
+		await render({ ...props, visible: false });
+		expect(views[0].disposed).toBe(false);
+		expect(clock.pending()).toBe(1);
+		await clock.flush();
+		expect(views[0].disposed).toBe(true);
+		expect(model.disposed).toBe(false);
+		expect(model.changes.listeners.size).toBe(0);
+		expect(views[0].cursor.listeners.size).toBe(0);
+		expect(views[0].mouse.listeners.size).toBe(0);
+		expect(windowMouseUp).toBeNull();
+		expect(frames.size).toBe(0);
+		expect(handle).toBeNull();
+		await render({ ...props, visible: true });
+		expect(views).toHaveLength(2);
+		expect(views[1].model).toBe(model);
+		expect(views[1].selection.startLineNumber).toBe(2);
+		expect(views[1].selection.startColumn).toBe(2);
+		expect(model.setValue).not.toHaveBeenCalled();
+	} finally {
+		clock.restore();
+	}
+});
+
+test("rapid hide/show cancels deferred disposal instead of recreating its view", async () => {
+	const clock = hideClock();
+	try {
+		await render();
+		await render({ visible: false });
+		expect(clock.pending()).toBe(1);
+		await render({ visible: true });
+		expect(clock.pending()).toBe(0);
+		await clock.flush();
+		expect(views).toHaveLength(1);
+		expect(views[0].disposed).toBe(false);
+	} finally {
+		clock.restore();
+	}
+});
 
 test.each([
 	{
@@ -586,6 +747,83 @@ test("mouse drag-select coalesces cursor events until pointer end", async () => 
 	windowMouseUp?.();
 	expect(selectionChange).toHaveBeenCalledTimes(1);
 	expect(selectionChange).toHaveBeenLastCalledWith(final, true);
+});
+
+test("selection quote follows live selection and latest callbacks without commands or model rebuild", async () => {
+	const quote = mock((_selection: unknown) => {});
+	const replacement = mock((_selection: unknown) => {});
+	await render({ onQuoteSelection: quote, readOnly: true });
+	const view = views[0];
+	const selected = { startLineNumber: 1, startColumn: 2, endLineNumber: 2, endColumn: 3 };
+	const select = (selection: IRange) => {
+		view.selection = selection;
+		view.cursor.emit({ selection, reason: 3 } as editor.ICursorSelectionChangedEvent);
+	};
+	const button = () => host.querySelector<HTMLButtonElement>("[data-monaco-quote-selection]");
+	expect(button()).toBeNull();
+	select(selected);
+	expect(button()).toBeTruthy();
+	expect([...view.widgets][0].getPosition()).toMatchObject({ lane: 2, range: selected });
+	const down = new Event("mousedown", { cancelable: true, bubbles: true });
+	button()?.dispatchEvent(down);
+	expect(down.defaultPrevented).toBe(true);
+	button()?.click();
+	expect(quote).toHaveBeenLastCalledWith(selected);
+	expect(view.selection).toBe(selected);
+	await render({ onQuoteSelection: replacement, quoteSelectionDisabledReason: "Save first" });
+	expect(button()?.disabled).toBe(true);
+	expect(button()?.title).toBe("Save first");
+	button()?.dispatchEvent(new Event("click"));
+	expect(replacement).not.toHaveBeenCalled();
+	await render({ onQuoteSelection: replacement });
+	button()?.click();
+	expect(replacement).toHaveBeenLastCalledWith(selected);
+	// This must reread Monaco rather than quote the widget's previous range.
+	const current = { ...selected, endColumn: 2 };
+	view.selection = current;
+	button()?.click();
+	expect(replacement).toHaveBeenLastCalledWith(current);
+	models[0].version++;
+	button()?.click();
+	expect(replacement).toHaveBeenCalledTimes(2);
+	expect([...view.commands.keys()].sort()).toEqual([2048 | 36, 2048 | 49]);
+	expect(
+		view.updateOptions.mock.calls.every(
+			([options]) => !(options as { glyphMargin?: boolean }).glyphMargin,
+		),
+	).toBe(true);
+	expect(models).toHaveLength(1);
+	expect(models[0].setValue).not.toHaveBeenCalled();
+	select({ startLineNumber: 1, endLineNumber: 1, startColumn: 1, endColumn: 1 });
+	expect(button()).toBeNull();
+});
+
+test("selection quote clears for absent callback, owner change, reload and unmount", async () => {
+	const quote = mock((_selection: unknown) => {});
+	await render({ onQuoteSelection: quote });
+	const view = views[0];
+	const selected = { startLineNumber: 1, startColumn: 1, endLineNumber: 2, endColumn: 2 };
+	const select = () => {
+		view.selection = selected;
+		view.cursor.emit({ selection: selected, reason: 3 } as editor.ICursorSelectionChangedEvent);
+	};
+	select();
+	await render();
+	expect(view.widgets.size).toBe(0);
+	await render({ onQuoteSelection: quote });
+	expect(view.widgets.size).toBe(1);
+	await render({ onQuoteSelection: quote, filePath: "other.ts" });
+	expect(view.widgets.size).toBe(0);
+	select();
+	expect(view.widgets.size).toBe(1);
+	await act(async () => models[0].setValue("fresh bytes"));
+	expect(view.widgets.size).toBe(0);
+	select();
+	const detached = [...view.widgets][0].getDomNode().querySelector("button");
+	await render({ documentKey: "other" });
+	expect(view.widgets.size).toBe(0);
+	detached?.dispatchEvent(new Event("click"));
+	expect(quote).not.toHaveBeenCalled();
 });
 
 test("shortcuts use latest callbacks and readonly blocks toolbar history commands", async () => {

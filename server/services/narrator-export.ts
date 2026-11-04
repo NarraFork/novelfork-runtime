@@ -33,12 +33,29 @@
  */
 
 import { parseCompactMessageBlock } from "@shared/compact-message";
+import {
+	GEN_UI_PUBLIC_SUMMARY,
+	GEN_UI_PUBLIC_SUMMARY_CODE,
+	GEN_UI_TOOL_NAME,
+	isGenUiToolName,
+	publicGenUiSummary,
+} from "@shared/gen-ui-public";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { logger } from "../lib/logger";
+import { blockBodies, bodySql, readBodies } from "../lib/narrator-bodies";
+import { assembledBodyLengthSql } from "../lib/narrator-body-length";
 import { isSubagentVariant } from "../lib/narrator-utils";
+import {
+	type OwnTurnPlacement,
+	ownTurnPlacementOf,
+	ownTurnSql,
+	RUNTIME_SOURCE_COLUMNS,
+} from "../lib/runtime-source";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import { resolveLazyLineage } from "./narrator-refs-backfill";
+import { projectPublicNarratorPayload } from "./public-narrator-share-gen-ui";
 
 // ── Tunables ───────────────────────────────────────────────────────────────
 
@@ -201,6 +218,8 @@ interface ExportMessageRow {
 	costStatus?: "complete" | "partial" | "unknown" | null;
 	costMissingFields?: string[] | null;
 	parentToolUseId: string | null;
+	/** Indexed server-owned identity, also available when a child's JSON is clamped. */
+	hasPrivateUi?: number;
 	/**
 	 * Only set on child (subagent) rows: their content is clamped in SQL, so a
 	 * reader has to be told when what they see is an excerpt. Top-level rows are
@@ -363,10 +382,11 @@ async function hasHistoryBelow(
 	// biome-ignore lint/suspicious/noExplicitAny: drizzle SQL predicate union
 	scopeClause: any,
 	boundarySeq: number,
-	isSubagent: boolean,
+	ownPlacement: OwnTurnPlacement,
 ): Promise<boolean> {
 	const conditions = [scopeClause, sql`${narratorMessageRefs.seq} < ${boundarySeq}`];
-	if (!isSubagent) conditions.push(isNull(narratorMessages.parentToolUseId));
+	const own = ownTurnSql(ownPlacement);
+	if (own) conditions.push(own);
 	const rows = await db
 		.select({ seq: narratorMessageRefs.seq })
 		.from(narratorMessageRefs)
@@ -398,7 +418,7 @@ async function loadRefPage(
 	scopeClause: any,
 	cursor: { seq: number; refId: string } | null,
 	latestCompactSeq: number | null,
-	isSubagent: boolean,
+	ownPlacement: OwnTurnPlacement,
 ): Promise<ExportRefRow[]> {
 	const conditions = [scopeClause];
 	if (cursor) {
@@ -406,9 +426,8 @@ async function loadRefPage(
 			sql`(${narratorMessageRefs.seq}, ${narratorMessageRefs.id}) > (${cursor.seq}, ${cursor.refId})`,
 		);
 	}
-	// Subagent transcripts ARE the child messages, so their top level is not
-	// filtered by parentToolUseId; a primary narrator's is.
-	if (!isSubagent) conditions.push(isNull(narratorMessages.parentToolUseId));
+	const own = ownTurnSql(ownPlacement);
+	if (own) conditions.push(own);
 	if (latestCompactSeq != null) {
 		conditions.push(gt(narratorMessageRefs.seq, latestCompactSeq));
 	}
@@ -436,7 +455,126 @@ async function loadRefPage(
 	}));
 }
 
+/**
+ * A narrator's paging scope, resolved once before the first page is read.
+ *
+ * Kept as a value rather than recomputed per page because two readers share it:
+ * the Markdown/JSON stream needs `earlierHistoryOmitted` before it writes its
+ * header, and the Claude Code / Codex exporter walks the same refs to build an
+ * interchange session.
+ */
+export interface TranscriptScope {
+	// biome-ignore lint/suspicious/noExplicitAny: drizzle SQL predicate union
+	clause: any;
+	latestCompactSeq: number | null;
+	ownTurnPlacement: OwnTurnPlacement;
+	/** True only when `visible` genuinely hides messages older than the last compact. */
+	earlierHistoryOmitted: boolean;
+}
+
+export async function resolveTranscriptScope(
+	narratorId: string,
+	scope: NarratorExportScope,
+): Promise<TranscriptScope> {
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: RUNTIME_SOURCE_COLUMNS,
+	});
+	const ownTurnPlacement = row ? ownTurnPlacementOf(row) : null;
+	const clause = await buildRefScope(narratorId, scope);
+	const latestCompactSeq = scope === "visible" ? await loadLatestCompactSeq(narratorId) : null;
+	const earlierHistoryOmitted =
+		latestCompactSeq != null
+			? await hasHistoryBelow(clause, latestCompactSeq, ownTurnPlacement)
+			: false;
+	return { clause, latestCompactSeq, ownTurnPlacement, earlierHistoryOmitted };
+}
+
+export interface TranscriptRefPage {
+	/**
+	 * Refs seen for the first time, in `(seq, refId)` order. Can be empty when a
+	 * page held only second copies of messages reachable through two lineages.
+	 */
+	refs: ExportRefRow[];
+	/** Seq of the last raw row read, for error reports. */
+	lastSeq: number;
+}
+
+/**
+ * Walk a narrator's top-level refs one bounded page at a time, read-only.
+ *
+ * Owns the three things every reader of a transcript must get right: the total
+ * `(seq, refId)` cursor, deduplication by message id across pages (see
+ * `loadRefPage`), and handing the event loop back between pages. Consumers load
+ * whatever they need for each page's message ids.
+ *
+ * An aborted signal ends the walk before the next query; the consumer decides
+ * what an abort means for its own output.
+ */
+export async function* iterateNarratorTranscript(
+	narratorId: string,
+	scope: TranscriptScope,
+	signal?: AbortSignal,
+): AsyncGenerator<TranscriptRefPage> {
+	const seenMessageIds = new Set<string>();
+	let cursor: { seq: number; refId: string } | null = null;
+
+	for (;;) {
+		if (signal?.aborted) return;
+		const pageStart = Date.now();
+
+		const refs = await loadRefPage(
+			scope.clause,
+			cursor,
+			scope.latestCompactSeq,
+			scope.ownTurnPlacement,
+		);
+		if (refs.length === 0) return;
+		const lastRef = refs[refs.length - 1];
+		cursor = { seq: lastRef.seq, refId: lastRef.refId };
+
+		// The same message can be reachable through both the narrator's own ref
+		// and an ancestor's, and an inherited ref keeps the ancestor's original
+		// seq — so the two copies can land in the SAME page with equal seq. The
+		// seen-set therefore has to be updated as we walk, not after filtering:
+		// a batch filter would let both copies through on their first page.
+		const fresh: ExportRefRow[] = [];
+		for (const ref of refs) {
+			if (seenMessageIds.has(ref.messageId)) continue;
+			seenMessageIds.add(ref.messageId);
+			fresh.push(ref);
+		}
+
+		yield { refs: fresh, lastSeq: lastRef.seq };
+
+		// Measured across the yield on purpose: the consumer's per-page reads are
+		// part of what makes a page slow.
+		const elapsed = Date.now() - pageStart;
+		if (elapsed > SLOW_PAGE_MS) {
+			logger.warn("Slow narrator export page", {
+				narratorId,
+				untilSeq: lastRef.seq,
+				refs: refs.length,
+				elapsedMs: elapsed,
+			});
+		}
+
+		if (refs.length < EXPORT_PAGE_REFS) return;
+		// Hand the event loop back so a long export cannot stall other requests.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+}
+
+// No body reads/JSON parsing: the message index establishes the trusted tool identity.
+const messageHasPrivateUi = sql<number>`EXISTS (
+	SELECT 1 FROM narrator_tool_calls AS private_ui_call
+	WHERE private_ui_call.message_id = narrator_messages.id
+	AND private_ui_call.tool_name = ${GEN_UI_TOOL_NAME}
+	LIMIT 1
+)`;
+
 const MESSAGE_COLUMNS = {
+	hasPrivateUi: messageHasPrivateUi,
 	id: narratorMessages.id,
 	role: narratorMessages.role,
 	contentJson: narratorMessages.contentJson,
@@ -455,13 +593,37 @@ const MESSAGE_COLUMNS = {
 	parentToolUseId: narratorMessages.parentToolUseId,
 } as const;
 
+/**
+ * Whether block-format bodies are read from their rows: SQLite only, the one backend
+ * that writes them. Exported for the session interchange, which reads the same bodies.
+ */
+export function exportBodiesFromBlocks(): boolean {
+	return blockReadsEnabled();
+}
+
 async function loadMessages(messageIds: string[]): Promise<Map<string, ExportMessageRow>> {
 	if (messageIds.length === 0) return new Map();
+	if (!exportBodiesFromBlocks()) {
+		const rows = await db
+			.select(MESSAGE_COLUMNS)
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.id, messageIds));
+		return new Map(rows.map((row) => [row.id, row as ExportMessageRow]));
+	}
 	const rows = await db
-		.select(MESSAGE_COLUMNS)
+		.select({
+			...MESSAGE_COLUMNS,
+			contentJson: sql<string | null>`${sql.raw(bodySql("narrator_messages", true))}`,
+		})
 		.from(narratorMessages)
 		.where(inArray(narratorMessages.id, messageIds));
-	return new Map(rows.map((row) => [row.id, row as ExportMessageRow]));
+	const bodies = readBodies(
+		sqlite,
+		rows.map((row) => ({ id: row.id, body: row.contentJson })),
+	);
+	return new Map(
+		rows.map((row) => [row.id, { ...row, contentJson: bodies.get(row.id) } as ExportMessageRow]),
+	);
 }
 
 /**
@@ -498,22 +660,24 @@ async function loadToolCallMeta(messageIds: string[]) {
 			status: narratorToolCalls.status,
 			durationMs: narratorToolCalls.durationMs,
 			createdAt: narratorToolCalls.createdAt,
-			errorMessage: sql<
-				string | null
-			>`substr(${narratorToolCalls.errorMessage}, 1, ${EXPORT_TOOL_ERROR_LIMIT})`.as(
-				"error_excerpt",
+			// A private UI contributes no source, error excerpt or source-length side channel.
+			errorMessage: sql<string | null>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN NULL
+				ELSE substr(${narratorToolCalls.errorMessage}, 1, ${EXPORT_TOOL_ERROR_LIMIT})
+				END`.as("error_excerpt"),
+			errorBytes: sql<number>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
+				ELSE length(COALESCE(${narratorToolCalls.errorMessage}, '')) END`.as("error_bytes"),
+			inputBytes: sql<number>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
+				ELSE length(COALESCE(CAST(${narratorToolCalls.inputJson} AS TEXT), '')) END`.as(
+				"input_bytes",
 			),
-			errorBytes: sql<number>`length(COALESCE(${narratorToolCalls.errorMessage}, ''))`.as(
-				"error_bytes",
+			outputBytes: sql<number>`CASE
+				WHEN ${narratorToolCalls.toolName} = ${GEN_UI_TOOL_NAME} THEN 0
+				ELSE length(COALESCE(CAST(${narratorToolCalls.outputJson} AS TEXT), '')) END`.as(
+				"output_bytes",
 			),
-			inputBytes:
-				sql<number>`length(COALESCE(CAST(${narratorToolCalls.inputJson} AS TEXT), ''))`.as(
-					"input_bytes",
-				),
-			outputBytes:
-				sql<number>`length(COALESCE(CAST(${narratorToolCalls.outputJson} AS TEXT), ''))`.as(
-					"output_bytes",
-				),
 			rank: sql<number>`row_number() OVER (
 					PARTITION BY ${narratorToolCalls.messageId}
 					ORDER BY ${narratorToolCalls.createdAt}, ${narratorToolCalls.id}
@@ -555,6 +719,8 @@ function selectToolBodyIds(rows: Awaited<ReturnType<typeof loadToolCallMeta>>): 
 	const allowed = new Set<string>();
 	let spent = 0;
 	for (const row of rows) {
+		// Excluded BEFORE the body query, even when includeToolIO was requested.
+		if (isGenUiToolName(row.toolName)) continue;
 		const projected =
 			Math.min(row.inputBytes, EXPORT_TOOL_FIELD_LIMIT) +
 			Math.min(row.outputBytes, EXPORT_TOOL_FIELD_LIMIT);
@@ -639,6 +805,7 @@ async function loadToolCalls(
 }
 
 const CHILD_MESSAGE_COLUMNS = {
+	hasPrivateUi: messageHasPrivateUi,
 	id: narratorMessages.id,
 	role: narratorMessages.role,
 	model: narratorMessages.model,
@@ -655,6 +822,9 @@ const CHILD_MESSAGE_COLUMNS = {
 	parentToolUseId: narratorMessages.parentToolUseId,
 } as const;
 
+/** Characters of a block-format child's assembled `content_json`, measured like the column. */
+const BLOCK_CONTENT_CHARS = sql<number>`${sql.raw(assembledBodyLengthSql("narrator_messages.id", "chars"))}`;
+
 /**
  * Subagent messages for a page, with their content clamped inside SQLite.
  *
@@ -668,34 +838,57 @@ const CHILD_MESSAGE_COLUMNS = {
  * mapping the row. Parsing is done here instead, and a row whose JSON was clamped
  * falls back to its `content_text` excerpt — a labelled excerpt is worth more than
  * a hard failure, and far more than silently dropping the message.
+ *
+ * A block-format child is measured in SQL as well (`BLOCK_CONTENT_CHARS`), and only
+ * one that fits is assembled from its rows, so the same bound holds.
  */
 async function loadChildMessages(toolUseIds: string[]): Promise<ExportMessageRow[]> {
 	if (toolUseIds.length === 0) return [];
+	const fromBlocks = exportBodiesFromBlocks();
+	const body = sql.raw(bodySql("narrator_messages", fromBlocks));
 	const rows = await db
 		.select({
 			...CHILD_MESSAGE_COLUMNS,
 			contentJsonText: sql<
 				string | null
-			>`substr(CAST(${narratorMessages.contentJson} AS TEXT), 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
+			>`substr(CAST(${body} AS TEXT), 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
 			contentTextExcerpt: sql<
 				string | null
 			>`substr(${narratorMessages.contentText}, 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
-			contentJsonBytes: sql<number>`length(COALESCE(CAST(${narratorMessages.contentJson} AS TEXT), ''))`,
+			contentJsonBytes: fromBlocks
+				? sql<number>`CASE WHEN ${body} IS NULL THEN ${BLOCK_CONTENT_CHARS}
+					ELSE length(COALESCE(CAST(${body} AS TEXT), '')) END`
+				: sql<number>`length(COALESCE(CAST(${body} AS TEXT), ''))`,
 			contentTextBytes: sql<number>`length(COALESCE(${narratorMessages.contentText}, ''))`,
+			bodyInBlocks: sql<number>`${body} IS NULL`,
 		})
 		.from(narratorMessages)
 		.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
 		.orderBy(narratorMessages.createdAt)
 		// One over the cap: enough to know more exist without reading them all.
 		.limit(EXPORT_CHILD_MESSAGES_PER_PAGE + 1);
+	const assembled = blockBodies(
+		sqlite,
+		rows
+			.filter((row) => row.bodyInBlocks && row.contentJsonBytes <= EXPORT_CHILD_CONTENT_LIMIT)
+			.map((row) => row.id),
+	);
 
 	return rows.map((row) => {
-		const { contentJsonText, contentTextExcerpt, contentJsonBytes, contentTextBytes, ...rest } =
-			row;
+		const {
+			contentJsonText,
+			contentTextExcerpt,
+			contentJsonBytes,
+			contentTextBytes,
+			bodyInBlocks,
+			...rest
+		} = row;
 		const jsonClamped = contentJsonBytes > EXPORT_CHILD_CONTENT_LIMIT;
 		const textClamped = contentTextBytes > EXPORT_CHILD_CONTENT_LIMIT;
 		let contentJson: unknown = null;
-		if (!jsonClamped && contentJsonText) {
+		if (bodyInBlocks) {
+			contentJson = assembled.get(row.id) ?? null;
+		} else if (!jsonClamped && contentJsonText) {
 			try {
 				contentJson = JSON.parse(contentJsonText);
 			} catch {
@@ -819,6 +1012,74 @@ export function assemblePage(
 
 	if (pageOmittedIO) stats.pagesWithIoOmitted += 1;
 	return page;
+}
+
+/**
+ * GenUI cards have the same static boundary as an anonymous share;
+ * clamped child JSON must not resurrect preview references via contentText.
+ * Ordinary file-tool history, including UI source, is not classified as private.
+ * Metadata is batched by indexed message IDs and bounded independently of IO.
+ */
+async function projectExportMessages(
+	narratorId: string,
+	rows: ExportMessageRow[],
+): Promise<ExportMessageRow[]> {
+	const privateByMessage = new Map<string, Set<string>>();
+	const ids = rows.filter((row) => row.hasPrivateUi).map((row) => row.id);
+	const maxIdentities = 4096;
+	let count = 0;
+	for (let start = 0; start < ids.length; start += 128) {
+		const identities = await db
+			.select({ messageId: narratorToolCalls.messageId, toolUseId: narratorToolCalls.toolUseId })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
+					eq(narratorToolCalls.toolName, GEN_UI_TOOL_NAME),
+				),
+			)
+			.limit(maxIdentities - count + 1);
+		count += identities.length;
+		if (count > maxIdentities) throw new Error("Export private-tool identity limit exceeded");
+		for (const identity of identities) {
+			const set = privateByMessage.get(identity.messageId) ?? new Set<string>();
+			set.add(identity.toolUseId);
+			privateByMessage.set(identity.messageId, set);
+		}
+	}
+	const prepared = rows.map((row) => {
+		if (!row.hasPrivateUi) return row;
+		if (!Array.isArray(row.contentJson)) {
+			return {
+				...row,
+				contentJson: [
+					{
+						type: "text",
+						text: GEN_UI_PUBLIC_SUMMARY,
+						publicSummary: GEN_UI_PUBLIC_SUMMARY_CODE,
+					},
+				],
+				contentText: null,
+				contentTruncated: false,
+				contentBytes: 0,
+			};
+		}
+		const privateIds = privateByMessage.get(row.id);
+		return {
+			...row,
+			contentText: null,
+			contentJson: row.contentJson.map((block: Record<string, unknown>) => {
+				const id =
+					block?.type === "tool_use"
+						? block.id
+						: block?.type === "tool_result"
+							? block.tool_use_id
+							: undefined;
+				return typeof id === "string" && privateIds?.has(id) ? publicGenUiSummary(block) : block;
+			}),
+		};
+	});
+	return projectPublicNarratorPayload(narratorId, { messages: prepared }).messages;
 }
 
 // ── Labels ─────────────────────────────────────────────────────────────────
@@ -1029,10 +1290,18 @@ function contentBlocks(contentJson: any): any[] {
 	return Array.isArray(contentJson) ? contentJson : [];
 }
 
+function privateUiSummaryLabel(lang: NarratorExportLang): string {
+	return lang === "zh-CN" ? "此会话导出不提供交互式预览。" : GEN_UI_PUBLIC_SUMMARY;
+}
+
 function renderMessageBody(row: ExportMessageRow, lang: NarratorExportLang): string {
 	const parts: string[] = [];
 	for (const block of contentBlocks(row.contentJson)) {
 		if (!block || typeof block !== "object") continue;
+		if (block.publicSummary === GEN_UI_PUBLIC_SUMMARY_CODE) {
+			parts.push(`_${privateUiSummaryLabel(lang)}_`);
+			continue;
+		}
 		const compact = parseCompactMessageBlock(block);
 		if (compact) {
 			const summary = compact.summary?.trim();
@@ -1072,6 +1341,7 @@ function renderMessageBody(row: ExportMessageRow, lang: NarratorExportLang): str
 }
 
 function renderToolCall(tool: ExportToolCall, lang: NarratorExportLang): string {
+	if (isGenUiToolName(tool.toolName)) return details(GEN_UI_TOOL_NAME, privateUiSummaryLabel(lang));
 	const heading = [
 		tool.toolName,
 		tool.status,
@@ -1162,38 +1432,42 @@ function jsonMessage(message: ExportMessage, includeToolIO: boolean) {
 		isCompactMarker: message.isCompactMarker,
 		folded: message.folded,
 		content: contentBlocks(message.row.contentJson),
-		toolCalls: message.toolCalls.map((tool) => ({
-			toolUseId: tool.toolUseId,
-			toolName: tool.toolName,
-			status: tool.status,
-			durationMs: tool.durationMs,
-			errorMessage: tool.errorMessage,
-			errorTruncated: tool.errorTruncated,
-			errorBytes: tool.errorBytes,
-			...(includeToolIO
-				? {
-						input: tool.input,
-						output: tool.output,
-						inputTruncated: tool.inputTruncated,
-						outputTruncated: tool.outputTruncated,
-						inputBytes: tool.inputBytes,
-						outputBytes: tool.outputBytes,
-						ioOmitted: tool.ioOmitted,
-					}
-				: {}),
-			subagentMessages: tool.children.map((child) => ({
-				id: child.id,
-				role: child.role,
-				createdAt: child.createdAt,
-				model: child.model,
-				// A clamped `content_json` did not survive as blocks, so the excerpt
-				// travels as text and the flags say which one a reader is holding.
-				content: contentBlocks(child.contentJson),
-				contentText: child.contentText,
-				contentTruncated: child.contentTruncated === true,
-				contentBytes: child.contentBytes ?? 0,
-			})),
-		})),
+		toolCalls: message.toolCalls.map((tool) =>
+			isGenUiToolName(tool.toolName)
+				? { ...publicGenUiSummary({ ...tool }), subagentMessages: [] }
+				: {
+						toolUseId: tool.toolUseId,
+						toolName: tool.toolName,
+						status: tool.status,
+						durationMs: tool.durationMs,
+						errorMessage: tool.errorMessage,
+						errorTruncated: tool.errorTruncated,
+						errorBytes: tool.errorBytes,
+						...(includeToolIO
+							? {
+									input: tool.input,
+									output: tool.output,
+									inputTruncated: tool.inputTruncated,
+									outputTruncated: tool.outputTruncated,
+									inputBytes: tool.inputBytes,
+									outputBytes: tool.outputBytes,
+									ioOmitted: tool.ioOmitted,
+								}
+							: {}),
+						subagentMessages: tool.children.map((child) => ({
+							id: child.id,
+							role: child.role,
+							createdAt: child.createdAt,
+							model: child.model,
+							// A clamped `content_json` did not survive as blocks, so the excerpt
+							// travels as text and the flags say which one a reader is holding.
+							content: contentBlocks(child.contentJson),
+							contentText: child.contentText,
+							contentTruncated: child.contentTruncated === true,
+							contentBytes: child.contentBytes ?? 0,
+						})),
+					},
+		),
 		toolCallsOmitted: message.toolCallsOmitted,
 	};
 }
@@ -1259,7 +1533,6 @@ export interface NarratorExportHeader {
 	variant: string | null;
 	model: string | null;
 	cwd: string | null;
-	chapterId: string | null;
 	parentNarratorId: string | null;
 	createdAt: string | null;
 }
@@ -1276,7 +1549,6 @@ async function loadHeader(
 			variant: true,
 			model: true,
 			cwd: true,
-			chapterId: true,
 			parentNarratorId: true,
 			createdAt: true,
 		},
@@ -1289,7 +1561,6 @@ async function loadHeader(
 		variant: row.variant ?? null,
 		model: row.model ?? null,
 		cwd: row.cwd ?? null,
-		chapterId: row.chapterId ?? null,
 		parentNarratorId: row.parentNarratorId ?? null,
 		createdAt: row.createdAt ?? null,
 		isSubagent: isSubagentVariant(row.variant),
@@ -1394,19 +1665,10 @@ export async function* streamNarratorExport(
 	// error escape here would abandon the response before a single byte, so the
 	// client would get a truncated file with no explanation instead of the
 	// parseable "incomplete" document the failure contract promises.
-	// biome-ignore lint/suspicious/noExplicitAny: drizzle SQL predicate union
-	let scopeClause: any = null;
-	let latestCompactSeq: number | null = null;
+	let scope: TranscriptScope | null = null;
 	try {
-		scopeClause = await buildRefScope(narratorId, options.scope);
-		latestCompactSeq = options.scope === "visible" ? await loadLatestCompactSeq(narratorId) : null;
-		if (latestCompactSeq != null) {
-			stats.earlierHistoryOmitted = await hasHistoryBelow(
-				scopeClause,
-				latestCompactSeq,
-				header.isSubagent,
-			);
-		}
+		scope = await resolveTranscriptScope(narratorId, options.scope);
+		stats.earlierHistoryOmitted = scope.earlierHistoryOmitted;
 	} catch (error) {
 		failure = error instanceof Error ? error.message : String(error);
 		logger.error("Narrator export failed while resolving scope", {
@@ -1438,83 +1700,53 @@ export async function* streamNarratorExport(
 	try {
 		// A scope that failed to resolve has no usable predicate; skip paging and let
 		// the tail report the failure rather than querying with a null clause.
-		if (failure != null) throw new Error(failure);
+		if (failure != null || !scope) throw new Error(failure ?? "Export scope unavailable");
 
-		const seenMessageIds = new Set<string>();
-		let cursor: { seq: number; refId: string } | null = null;
 		let first = true;
+		for await (const page of iterateNarratorTranscript(narratorId, scope, signal)) {
+			lastSeq = page.lastSeq;
+			const fresh = page.refs;
+			if (fresh.length === 0) continue;
 
-		for (;;) {
-			if (signal?.aborted) return;
-			const pageStart = Date.now();
-
-			const refs = await loadRefPage(scopeClause, cursor, latestCompactSeq, header.isSubagent);
-			if (refs.length === 0) break;
-			const lastRef = refs[refs.length - 1];
-			cursor = { seq: lastRef.seq, refId: lastRef.refId };
-			lastSeq = lastRef.seq;
-
-			// The same message can be reachable through both the narrator's own ref
-			// and an ancestor's, and an inherited ref keeps the ancestor's original
-			// seq — so the two copies can land in the SAME page with equal seq. The
-			// seen-set therefore has to be updated as we walk, not after filtering:
-			// a batch filter would let both copies through on their first page.
-			const fresh: ExportRefRow[] = [];
-			for (const ref of refs) {
-				if (seenMessageIds.has(ref.messageId)) continue;
-				seenMessageIds.add(ref.messageId);
-				fresh.push(ref);
+			const messageIds = fresh.map((ref) => ref.messageId);
+			const [messages, toolRows] = await Promise.all([
+				loadMessages(messageIds),
+				loadToolCalls(messageIds, options.includeToolIO),
+			]);
+			const toolUseIds = toolRows.map((row) => row.toolUseId).filter(Boolean);
+			// A subagent transcript is already the child level; descending again
+			// would recurse without bound.
+			const childRows = header.isSubagent ? [] : await loadChildMessages(toolUseIds);
+			if (childRows.length > EXPORT_CHILD_MESSAGES_PER_PAGE) {
+				stats.childMessagesOmitted += childRows.length - EXPORT_CHILD_MESSAGES_PER_PAGE;
+				childRows.length = EXPORT_CHILD_MESSAGES_PER_PAGE;
 			}
 
-			if (fresh.length > 0) {
-				const messageIds = fresh.map((ref) => ref.messageId);
-				const [messages, toolRows] = await Promise.all([
-					loadMessages(messageIds),
-					loadToolCalls(messageIds, options.includeToolIO),
-				]);
-				const toolUseIds = toolRows.map((row) => row.toolUseId).filter(Boolean);
-				// A subagent transcript is already the child level; descending again
-				// would recurse without bound.
-				const childRows = header.isSubagent ? [] : await loadChildMessages(toolUseIds);
-				if (childRows.length > EXPORT_CHILD_MESSAGES_PER_PAGE) {
-					stats.childMessagesOmitted += childRows.length - EXPORT_CHILD_MESSAGES_PER_PAGE;
-					childRows.length = EXPORT_CHILD_MESSAGES_PER_PAGE;
+			const topRows = [...messages.values()];
+			const safeRows = await projectExportMessages(narratorId, [...topRows, ...childRows]);
+			const safeMessages = new Map(safeRows.slice(0, topRows.length).map((row) => [row.id, row]));
+			const assembled = assemblePage(
+				fresh,
+				safeMessages,
+				toolRows,
+				safeRows.slice(topRows.length),
+				options.includeToolIO,
+				stats,
+			);
+
+			for (const message of assembled) {
+				if (isJson) {
+					yield `${first ? "\n" : ",\n"}${JSON.stringify(jsonMessage(message, options.includeToolIO))}`;
+					first = false;
+				} else {
+					yield renderMessage(message, options.lang);
 				}
-
-				const page = assemblePage(
-					fresh,
-					messages,
-					toolRows,
-					childRows,
-					options.includeToolIO,
-					stats,
-				);
-
-				for (const message of page) {
-					if (isJson) {
-						yield `${first ? "\n" : ",\n"}${JSON.stringify(jsonMessage(message, options.includeToolIO))}`;
-						first = false;
-					} else {
-						yield renderMessage(message, options.lang);
-					}
-					messageCount += 1;
-				}
+				messageCount += 1;
 			}
-
-			const elapsed = Date.now() - pageStart;
-			if (elapsed > SLOW_PAGE_MS) {
-				logger.warn("Slow narrator export page", {
-					narratorId,
-					untilSeq: lastSeq,
-					refs: refs.length,
-					elapsedMs: elapsed,
-				});
-			}
-
-			if (refs.length < EXPORT_PAGE_REFS) break;
-			// Hand the event loop back so a long export cannot stall other requests.
-			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
+		// A disconnect ends the walk early. Nothing further can reach a closed
+		// connection, and the missing tail is what marks the file as partial.
+		if (signal?.aborted) return;
 	} catch (error) {
 		failure = error instanceof Error ? error.message : String(error);
 		logger.error("Narrator export failed mid-stream", {

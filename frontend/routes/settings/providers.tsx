@@ -1,13 +1,33 @@
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
-import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
+import {
+	Affix,
+	Alert,
+	Box,
+	Button,
+	Group,
+	Skeleton,
+	Stack,
+	Title,
+	Transition,
+} from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, useSearch } from "@tanstack/react-router";
+import {
+	createFileRoute,
+	Outlet,
+	useNavigate,
+	useRouter,
+	useRouterState,
+	useSearch,
+} from "@tanstack/react-router";
+import { nanoid } from "nanoid";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { CodexSection } from "../../components/providers/CodexSection";
+import { CommandCodeSection } from "../../components/providers/CommandCodeSection";
 import {
 	CUSTOM_API_PROTOCOL_LABEL_KEYS,
 	CustomApiProviderSection,
@@ -15,25 +35,41 @@ import {
 	isGeminiProtocol,
 } from "../../components/providers/CustomApiProviderSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
-import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
+import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
-	type AddProviderType,
-	ProviderOverviewView,
-} from "../../components/providers/ProviderOverviewView";
+	ProviderAddContext,
+	ProviderImportContext,
+	TokenDanceAddContext,
+} from "../../components/providers/provider-add-context";
+import type { AddProviderDraft } from "../../components/providers/provider-add-draft";
+import { createProviderAndRefresh } from "../../components/providers/provider-create-flow";
+import { rebaseProviderState } from "../../components/providers/provider-settings-rebase";
 import {
 	createSnapshot,
 	initialProvidersState,
+	isPlatformProviderPrefix,
 	type ProvidersState,
 	providersReducer,
 	providersStateFromSettings,
-	type SavedSnapshot,
 	useIsDirty,
 	useProvidersDispatch,
 } from "../../components/providers/providers-reducer";
+import { TokenDanceSection } from "../../components/providers/TokenDanceSection";
+import {
+	claimTokenDanceDraft,
+	clearTokenDanceFlow,
+	restoreTokenDanceDraft,
+	setTokenDanceDraftOwner,
+	startTokenDanceLogin,
+	TOKENDANCE_FLOW_MARKER,
+	TokenDanceFreshSettingsError,
+	tokenDanceDraftSnapshot,
+} from "../../components/providers/tokendance-flow";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { modelCatalogKeys } from "../../hooks/useModelCatalog";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	useProviderModelRefreshCapability,
@@ -69,26 +105,7 @@ function getDirtyProviderIds<T extends { id: string }>(
 	return dirtyIds;
 }
 
-function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: SavedSnapshot) {
-	const migratedWindows = { ...state.modelContextWindows };
-	for (const providers of [
-		{ cur: state.customApiProviders, saved: savedSnapshot.customApiProviders },
-		{ cur: state.nugProviders, saved: savedSnapshot.nugProviders },
-	]) {
-		for (const provider of providers.cur) {
-			const original = providers.saved.find((p) => p.id === provider.id);
-			if (original && original.prefix !== provider.prefix) {
-				for (const key of Object.keys(migratedWindows)) {
-					if (key.startsWith(`${original.prefix}:`)) {
-						const model = key.slice(original.prefix.length + 1);
-						migratedWindows[`${provider.prefix}:${model}`] = migratedWindows[key];
-						delete migratedWindows[key];
-					}
-				}
-			}
-		}
-	}
-
+function prepareProviderSettingsSave(state: ProvidersState) {
 	const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
 		...provider,
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
@@ -101,7 +118,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 		...state,
 		customApiProviders: normalizedCustomApiProviders,
 		nugProviders: normalizedNugProviders,
-		modelContextWindows: migratedWindows,
 	};
 	const snapshot = createSnapshot(normalizedState);
 
@@ -111,10 +127,11 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 		payload: {
 			customApiProviders: normalizedCustomApiProviders,
 			nugProviders: normalizedNugProviders,
+			commandCode: state.commandCode,
 			agent: {
 				hiddenModels: [...state.hiddenModels],
 				customModels: state.customModels,
-				modelContextWindows: migratedWindows,
+				modelProtocols: state.modelProtocols,
 				providerOrder: state.providerOrder,
 				disabledProviders: [...state.disabledProviders],
 			},
@@ -131,6 +148,9 @@ export function SettingsProvidersPage() {
 	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const nugRefreshCapability = useProviderModelRefreshCapability("nug");
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
+	const isAddingProvider = useRouterState({
+		select: (router) => router.matches.some((match) => match.routeId === "/settings/providers/add"),
+	});
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
 		oauth_error?: string;
@@ -148,6 +168,21 @@ export function SettingsProvidersPage() {
 	// ── Single reducer ──
 	const [state, dispatch] = useReducer(providersReducer, initialProvidersState);
 	const dispatchers = useProvidersDispatch(dispatch);
+	const stateRef = useRef(state);
+	stateRef.current = state;
+	const providerPageMountedRef = useRef(true);
+	const isAddingRef = useRef(isAddingProvider);
+	isAddingRef.current = isAddingProvider;
+	const creationIdRef = useRef<string | null>(null);
+	useEffect(() => {
+		providerPageMountedRef.current = true;
+		return () => {
+			providerPageMountedRef.current = false;
+		};
+	}, []);
+	useEffect(() => {
+		if (!isAddingProvider) creationIdRef.current = null;
+	}, [isAddingProvider]);
 
 	const savedSnapshot = useRef(createSnapshot(initialProvidersState));
 
@@ -165,8 +200,113 @@ export function SettingsProvidersPage() {
 		}
 	}, [state.initialized, state]);
 
+	const navigate = useNavigate();
+	const isTokenDanceCallback = useRouterState({
+		select: (router) =>
+			router.matches.some((match) => match.routeId === "/settings/providers/tokendance/callback"),
+	});
+	const [restoredAddPage, setRestoredAddPage] = useState<Record<string, unknown>>();
+	const consumeRestoredAddPage = useCallback(() => setRestoredAddPage(undefined), []);
+	const [restoreError, setRestoreError] = useState(false);
+	const [restoreFetchError, setRestoreFetchError] = useState(false);
+	const [returnEpoch, setReturnEpoch] = useState(0);
+	const draftActorRef = useRef(user?.id);
+	draftActorRef.current = user?.id;
+	useEffect(() => {
+		setTokenDanceDraftOwner(user?.id);
+	}, [user?.id]);
+	useEffect(() => {
+		const onReturn = () => setReturnEpoch((value) => value + 1);
+		window.addEventListener("pageshow", onReturn);
+		return () => window.removeEventListener("pageshow", onReturn);
+	}, []);
+	useEffect(() => {
+		// A pageshow epoch reruns restoration after a bfcache browser return.
+		void returnEpoch;
+		void user?.id;
+		if (!state.initialized || isTokenDanceCallback || user?.role !== "admin" || !user?.id) return;
+		let flowId: string | null = null;
+		try {
+			flowId =
+				typeof sessionStorage === "undefined"
+					? null
+					: sessionStorage.getItem(TOKENDANCE_FLOW_MARKER);
+		} catch {
+			setRestoreError(true);
+			return;
+		}
+		if (!flowId) return;
+		let active = true;
+		void claimTokenDanceDraft(flowId, user.id)
+			.then(({ restore, fresh }) => {
+				if (!active || draftActorRef.current !== user.id) return;
+				setRestoreFetchError(false);
+				if (restore.status !== "completed")
+					notifications.show({ message: t("tokendance.loginFailed"), color: "yellow" });
+				const freshState = providersStateFromSettings(fresh);
+				if (restore.draftSnapshot) {
+					const recovered = restoreTokenDanceDraft(restore.draftSnapshot, fresh);
+					// Edits made after this parent mounted take precedence over late restoration.
+					const latest = rebaseProviderState(stateRef.current, savedSnapshot.current, {
+						...fresh,
+						customApiProviders: recovered.customApiProviders,
+						nugProviders: recovered.nugProviders,
+						agent: { ...(fresh.agent as Record<string, unknown>), ...createSnapshot(recovered) },
+					});
+					savedSnapshot.current = createSnapshot(freshState);
+					dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: createSnapshot(latest) });
+					if (restore.draftSnapshot.addPage) {
+						setRestoredAddPage(restore.draftSnapshot.addPage);
+						if (restore.status !== "completed")
+							void navigate({ to: "/settings/providers/add", replace: true });
+					}
+				} else setRestoreError(true);
+				qc.setQueryData(["settings"], fresh);
+				qc.setQueryData(["admin", "settings"], fresh);
+				clearTokenDanceFlow(flowId);
+			})
+			.catch((cause) => {
+				if (!active || draftActorRef.current !== user.id) return;
+				if (cause instanceof TokenDanceFreshSettingsError) {
+					setRestoreFetchError(true);
+					return;
+				}
+				setRestoreError(true);
+				clearTokenDanceFlow(flowId);
+			});
+		return () => {
+			active = false;
+		};
+	}, [state.initialized, isTokenDanceCallback, user?.role, user?.id, navigate, qc, returnEpoch, t]);
+	const tokenDanceLogin = useCallback(
+		(addPage?: Record<string, unknown>) =>
+			startTokenDanceLogin(
+				tokenDanceDraftSnapshot(stateRef.current, savedSnapshot.current, addPage),
+			),
+		[],
+	);
+	const tokenDance = settings?.tokendance as TokenDancePublicConnection | undefined;
+	const refreshTokenDanceSettings = useCallback(async () => {
+		const fresh = await api.getSettings();
+		qc.setQueryData(["settings"], fresh);
+		qc.setQueryData(["admin", "settings"], fresh);
+	}, [qc]);
+
 	const savedProviderSnapshot = savedSnapshot.current;
 	const isDirty = useIsDirty(state, savedProviderSnapshot);
+	/** 平台 provider 的开关都在 state 里（见 PLATFORM_PROVIDER_PREFIXES），草稿即真值。 */
+	const tokenDanceDisabled = state.tokenDanceDisabled;
+	const providerSettingsDirty = isDirty;
+
+	// TokenDance 的连接状态可能被登录/刷新改变：没有草稿时跟服务端保持一致，
+	// 有草稿（与快照不同）时留给用户自己保存。
+	useEffect(() => {
+		if (!state.initialized || !tokenDance) return;
+		const serverDisabled = !!tokenDance.disabled;
+		if (serverDisabled === state.tokenDanceDisabled) return;
+		if (state.tokenDanceDisabled !== savedProviderSnapshot.tokenDanceDisabled) return;
+		dispatchers.setPlatformDisabled("tokendance", serverDisabled);
+	}, [state.initialized, state.tokenDanceDisabled, tokenDance, savedProviderSnapshot, dispatchers]);
 
 	// OAuth callback handling lives lower in the component so it can call the
 	// shared NUG model auto-refresh helper (declared after the reducer wiring).
@@ -191,7 +331,7 @@ export function SettingsProvidersPage() {
 	);
 
 	// ── Prefix conflict detection ──
-	const RESERVED_PREFIXES = useMemo(() => new Set(["codex"]), []);
+	const RESERVED_PREFIXES = useMemo(() => new Set(["codex", "CommandCode"]), []);
 	const allPrefixToId = useMemo(() => {
 		const map = new Map<string, string>();
 		for (const p of [...state.customApiProviders, ...state.nugProviders]) {
@@ -260,13 +400,30 @@ export function SettingsProvidersPage() {
 				});
 				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
 			}
-			const { payload } = prepareProviderSettingsSave(stateToSave, savedSnapshot.current);
+			// 平台集成里 TokenDance 的开关存在它自己的连接记录里，所以先提交它、再存 settings：
+			// 这样 settings 响应里的 tokendance.disabled 已是新值，SYNC 之后草稿不会回退。
+			if (stateToSave.tokenDanceDisabled !== savedSnapshot.current.tokenDanceDisabled) {
+				try {
+					await api.tokenDanceUpdateConnection(stateToSave.tokenDanceDisabled);
+				} catch {
+					notifications.show({ message: t("tokendance.operationFailed"), color: "red" });
+					throw new Error(t("tokendance.operationFailed"));
+				}
+			}
+			const { payload } = prepareProviderSettingsSave(stateToSave);
 			const response = await updateMutation.mutateAsync(payload);
-			const syncedState = providersStateFromSettings(response as Record<string, unknown>);
-			savedSnapshot.current = createSnapshot(syncedState);
+			// 快照先行、SYNC 随后：快照一变，概览排序（只看快照）在 SYNC 触发的这次
+			// 渲染里就重排 —— 不需要额外的信号 state，也不存在时序窗口。
+			savedSnapshot.current = createSnapshot(
+				providersStateFromSettings(response as Record<string, unknown>),
+			);
 			dispatch({ type: "SYNC_FROM_SETTINGS", settings: response as Record<string, unknown> });
+			// 凭据可能刚被替换，额度要按新的 key 重新拉取。
+			void qc.invalidateQueries({ queryKey: ["commandcode", "usage"] });
+			// Prefix renames and removed providers move or drop provider-model overrides.
+			void qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 		},
-		[settingsFeatureCapability.patchSupported, t, updateMutation, state],
+		[settingsFeatureCapability.patchSupported, t, updateMutation, state, qc],
 	);
 
 	const handleSave = useCallback(() => {
@@ -282,84 +439,191 @@ export function SettingsProvidersPage() {
 	// Holds the latest auto-fetch implementation so handleSave keeps a stable identity.
 	const autoFetchAndFillRef = useRef<(() => Promise<void>) | null>(null);
 
+	/**
+	 * 刷新 Command Code 模型。未保存的新 API key 只随这次请求带上，不把整份设置草稿一起提交。
+	 * 已保存的 key 则等服务端缓存更新后重新读取设置。
+	 */
+	const refreshCommandCodeModels = useCallback(async () => {
+		const draftKey = state.commandCode.apiKey.trim();
+		const savedKey = savedSnapshot.current.commandCode.apiKey.trim();
+		const unsavedKey =
+			draftKey && draftKey !== savedKey && !draftKey.startsWith("*") ? draftKey : undefined;
+		const models = await api.commandCodeRefreshModels(
+			unsavedKey ? { apiKey: unsavedKey } : undefined,
+		);
+		if (unsavedKey) {
+			const patch = (current: unknown) =>
+				current && typeof current === "object"
+					? { ...current, commandcodeModels: models, commandcodeModelsPending: false }
+					: current;
+			qc.setQueryData(["settings"], patch);
+			qc.setQueryData(["admin", "settings"], patch);
+			return;
+		}
+		await qc.invalidateQueries({ queryKey: ["settings"] });
+		await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+	}, [state.commandCode.apiKey, qc]);
+
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
 	const [testingModel, setTestingModel] = useState<string | null>(null);
-	// selectedProvider: provider ID for multi-instance providers, prefix for platform providers (codex)
-	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+	// The open provider lives in the URL (`?provider=`), not in component state, so deep
+	// links (model picker, Codex quota, TokenDance recovery), reloads and back/forward all
+	// land on the same page. Opening from the overview pushes an entry and closing steps
+	// back over it; closing a deep-linked detail replaces its entry with the overview.
+	const router = useRouter();
+	const setSelectedProvider = useCallback(
+		(key: string | null) => {
+			if (key) {
+				void navigate({
+					to: "/settings/providers",
+					search: { provider: key },
+					state: (prev) => ({ ...prev, providerDetailFromOverview: true }),
+				});
+				return;
+			}
+			if (router.state.location.state.providerDetailFromOverview) {
+				router.history.back();
+				return;
+			}
+			void navigate({ to: "/settings/providers", search: {}, replace: true });
+		},
+		[navigate, router],
+	);
 
 	useEffect(() => {
-		if (search.provider === "codex") setSelectedProvider("codex");
-	}, [search.provider]);
-
-	useEffect(() => {
-		if (isDirty) {
+		if (providerSettingsDirty) {
 			setHighlight(true);
 			const timer = setTimeout(() => setHighlight(false), 1500);
 			return () => clearTimeout(timer);
 		}
-	}, [isDirty]);
+	}, [providerSettingsDirty]);
 
 	// ── Add provider ──
-	const handleAddProvider = useCallback(
-		(type: AddProviderType) => {
-			const id = Math.random().toString(36).slice(2, 10);
-			switch (type) {
-				case "nug":
-					dispatchers.setNugProviders((prev) => [
-						...prev,
-						{ id, name: "NUG", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
-					]);
-					break;
-				default: {
-					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nug">, string> = {
-						"anthropic-compatible": t("addProviderAnthropicCompatible"),
-						"anthropic-official": t("addProviderClaudeCode"),
-						"codex-native": t("addProviderCodex"),
-						"responses-compatible": t("addProviderResponses"),
-						"completions-compatible": t("addProviderCompletions"),
-						"gemini-compatible": t("addProviderGemini"),
-					};
-					// Gemini defaults to Google's endpoint; others start blank.
-					const isGemini = type === "gemini-compatible";
-					dispatchers.setCustomApiProviders((prev) => [
-						...prev,
-						{
-							id,
-							name: defaultNameByProtocol[type],
-							prefix: "",
-							apiKey: "",
-							baseUrl: isGemini ? "https://generativelanguage.googleapis.com/v1beta" : "",
-							defaultModel: isGemini ? "gemini-3-flash-preview" : "",
-							protocol: type,
-							...(isGemini ? { geminiTransport: "generate-content" as const } : {}),
-							codexAccountId: "",
-							codexWebSocket: false,
-							tlsRejectUnauthorized: true,
-						},
-					]);
-					break;
+	/** Save one provider under `id`, then refresh its models (shared by add and import). */
+	const createProvider = useCallback(
+		async (id: string, draft: AddProviderDraft) => {
+			if (!settingsFeatureCapability.patchSupported)
+				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
+			const bounded = async <T,>(
+				execute: (options: { signal: AbortSignal; maxResponseBytes: number }) => Promise<T>,
+			): Promise<T> => {
+				const controller = new AbortController();
+				const timer = setTimeout(
+					() => controller.abort(new Error(t("addProviderRequestTimeout"))),
+					30_000,
+				);
+				try {
+					return await execute({ signal: controller.signal, maxResponseBytes: 8 * 1024 * 1024 });
+				} finally {
+					clearTimeout(timer);
 				}
-			}
-			// Route to new provider by its immutable ID
-			setSelectedProvider(id);
+			};
+			const applyServerSettings = (response: Record<string, unknown>) => {
+				if (providerPageMountedRef.current) {
+					const next = rebaseProviderState(stateRef.current, savedSnapshot.current, response);
+					savedSnapshot.current = createSnapshot(providersStateFromSettings(response));
+					stateRef.current = next;
+					dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: createSnapshot(next) });
+				}
+				qc.setQueryData(["admin", "settings"], response);
+				qc.setQueryData(["settings"], response);
+			};
+			return createProviderAndRefresh(id, draft, stateRef.current, {
+				getSettings: () => bounded((options) => api.getSettings(options)),
+				updateSettings: (payload) => bounded((options) => api.updateSettings(payload, options)),
+				refreshModels: (providerId, protocol) =>
+					bounded<unknown>((options) => {
+						switch (protocol) {
+							case "nug":
+								return api.nugRefreshProviderModels(providerId, options);
+							case "gemini-compatible":
+								return api.geminiRefreshProviderModels(providerId, options);
+							case "anthropic-messages":
+								return api.anthropicRefreshProviderModels(providerId, options);
+							default:
+								return api.openaiRefreshProviderModels(providerId, options);
+						}
+					}),
+				onSaved: applyServerSettings,
+				onRefreshed: applyServerSettings,
+				messages: {
+					invalidDraft: t("addProviderInvalidDraft"),
+					prefixConflict: (prefix) =>
+						t(prefix === "codex" ? "prefixReserved" : "prefixDuplicate", { prefix }),
+					unconfirmedSave: t("addProviderSaveUnconfirmed"),
+				},
+			});
 		},
-		[dispatchers, t],
+		[settingsFeatureCapability.patchSupported, qc, t],
 	);
 
-	// ── Server-side context window merge (e.g. after a provider model add) ──
-	const handleServerContextWindowsMerge = useCallback(
-		(windows: Record<string, number>) => {
-			dispatchers.mergeContextWindows(windows);
-			// Also update the saved snapshot so dirty detection doesn't falsely trigger
-			const snap = savedSnapshot.current;
-			for (const [key, value] of Object.entries(windows)) {
-				if (!(key in snap.modelContextWindows)) {
-					snap.modelContextWindows[key] = value;
-				}
+	const handleAddProvider = useCallback(
+		async (draft: AddProviderDraft) => {
+			const id = creationIdRef.current ?? nanoid();
+			creationIdRef.current = id;
+			const result = await createProvider(id, draft);
+			const openCreated =
+				providerPageMountedRef.current && isAddingRef.current && creationIdRef.current === id;
+			if ("refreshError" in result) {
+				notifications.show({
+					title: t("addProviderSavedRefreshFailed"),
+					message:
+						result.refreshError instanceof Error
+							? result.refreshError.message
+							: tc("unexpectedError"),
+					color: "yellow",
+				});
+			} else {
+				notifications.show({
+					title: t("addProviderSaved"),
+					message: t("addProviderModelsRefreshed"),
+					color: "green",
+				});
 			}
+			// The add route navigates back with this id, which opens the new provider.
+			return openCreated ? result.providerId : undefined;
 		},
-		[dispatchers],
+		[createProvider, t, tc],
+	);
+
+	// Each imported provider is a separate creation with its own id; the import
+	// panel reports the batch outcome itself, so no per-provider notification.
+	const handleImportProvider = useCallback(
+		async (draft: AddProviderDraft) => {
+			const result = await createProvider(nanoid(), draft);
+			return { refreshFailed: "refreshError" in result };
+		},
+		[createProvider],
+	);
+
+	// Existence-only probe of other tools' config directories (reads no file),
+	// so the add page offers "import from this machine" only when there is something.
+	const canImport = user?.role === "admin";
+	const localDetect = useQuery({
+		queryKey: ["provider-import", "local-detect"],
+		queryFn: api.detectLocalProviders,
+		enabled: canImport && isAddingProvider,
+		staleTime: 0,
+		gcTime: 60_000,
+		retry: false,
+	});
+	const importContext = useMemo(
+		() =>
+			canImport
+				? {
+						importProvider: handleImportProvider,
+						detectedSources: localDetect.data?.sources,
+						detecting: localDetect.isPending && localDetect.fetchStatus !== "idle",
+					}
+				: null,
+		[
+			canImport,
+			handleImportProvider,
+			localDetect.data,
+			localDetect.isPending,
+			localDetect.fetchStatus,
+		],
 	);
 
 	const confirmSaveBeforeRefresh = useCallback(async () => {
@@ -395,17 +659,15 @@ export function SettingsProvidersPage() {
 		async (providerId: string) => {
 			if (!nugRefreshCapability.supported) return;
 			try {
-				const result = await api.nugRefreshProviderModels(providerId);
-				if (result.modelContextWindows) {
-					handleServerContextWindowsMerge(result.modelContextWindows);
-				}
+				await api.nugRefreshProviderModels(providerId);
 				await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				await qc.invalidateQueries({ queryKey: ["settings"] });
+				await qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
 			} catch {
 				// Non-critical — model list can still be refreshed manually.
 			}
 		},
-		[nugRefreshCapability.supported, qc, handleServerContextWindowsMerge],
+		[nugRefreshCapability.supported, qc],
 	);
 
 	// ── Handle OAuth callback redirect (oauth_success / oauth_error in URL) ──
@@ -464,6 +726,7 @@ export function SettingsProvidersPage() {
 	const {
 		providerLabels,
 		codexModels,
+		commandcodeModels,
 		openaiByProvider,
 		anthropicByProvider,
 		geminiByProvider,
@@ -587,9 +850,12 @@ export function SettingsProvidersPage() {
 	}, [settings?.geminiProviders, settings?.geminiModelsGrouped]);
 
 	// ── Build provider groups for overview ──
+	// 排序键（inactive）只由 savedProviderSnapshot 决定，且 Array.sort 是稳定排序：
+	// 草稿变化时重算但顺序不变；保存成功后快照更新，同一次渲染里顺序自然重排。
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
-		const platformPrefixes = new Set(["codex"]);
+		const platformPrefixes = new Set(["codex", "CommandCode"]);
+		if (tokenDance?.connected) platformPrefixes.add("tokendance");
 		// Executable-plugin providers, keyed by prefix. They are presented like platform
 		// providers (single instance, not user-addable) but need their own lookup because
 		// the detail area has to reach the owning plugin rather than a builtin section.
@@ -629,7 +895,15 @@ export function SettingsProvidersPage() {
 			if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
 		};
 
+		if (tokenDance?.connected)
+			for (const m of tokenDance.models)
+				addModel("tokendance", {
+					value: `tokendance:${m.id}`,
+					label: m.name || m.id,
+					provider: "tokendance",
+				});
 		for (const m of codexModels) addModel("codex", m);
+		for (const m of commandcodeModels) addModel("CommandCode", m);
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of geminiByProvider) for (const m of g.models) addModel(g.prefix, m);
@@ -654,54 +928,117 @@ export function SettingsProvidersPage() {
 		for (const p of state.customApiProviders) ensureEmpty(p.prefix);
 		for (const p of state.nugProviders) ensureEmpty(p.prefix);
 
-		return [...byPrefix].map(([prefix, models]) => {
-			const plugin = pluginByPrefix.get(prefix);
-			// Plugin providers sit in the platform column: like the builtins they are single
-			// instance and cannot be added or removed from this page.
-			const isPlatform = platformPrefixes.has(prefix) || plugin !== undefined;
+		return (
+			[...byPrefix]
+				.map(([prefix, models]) => {
+					const plugin = pluginByPrefix.get(prefix);
+					// Plugin providers sit in the platform column: like the builtins they are single
+					// instance and cannot be added or removed from this page.
+					const isPlatform = platformPrefixes.has(prefix) || plugin !== undefined;
 
-			// Find provider config for multi-instance providers so local detail toggles
-			// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
-			const match = !isPlatform
-				? (state.customApiProviders.find((p) => p.prefix === prefix) ??
-					state.nugProviders.find((p) => p.prefix === prefix))
-				: undefined;
-			const providerId = match?.id;
-			// `disabledProviders` is a plain prefix set, so the overview toggle already
-			// governs plugin providers without any extra wiring. Turning one off hides its
-			// models; it deliberately does NOT stop the plugin, which may also contribute
-			// tools and views.
-			const disabled = state.disabledProviders.has(prefix) || !!match?.disabled;
+					// Find provider config for multi-instance providers so local detail toggles
+					// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
+					const match = !isPlatform
+						? (state.customApiProviders.find((p) => p.prefix === prefix) ??
+							state.nugProviders.find((p) => p.prefix === prefix))
+						: undefined;
+					const providerId = match?.id;
+					// `disabledProviders` is a plain prefix set, so the overview toggle already
+					// governs plugin providers without any extra wiring. Turning one off hides its
+					// models; it deliberately does NOT stop the plugin, which may also contribute
+					// tools and views.
+					// CommandCode carries its own persisted flag (settings.commandCode.disabled,
+					// which is what stops the provider server-side), so the overview reads the
+					// draft directly and reflects a toggle before it is saved.
+					const disabled =
+						prefix === "tokendance"
+							? tokenDanceDisabled
+							: prefix === "CommandCode"
+								? state.commandCode.disabled
+								: state.disabledProviders.has(prefix) || !!match?.disabled;
 
-			return {
-				prefix,
-				providerId,
-				label: providerLabels[prefix] ?? prefix,
-				badgeLabel: plugin
-					? t("providerBadgePlugin")
-					: isPlatform
-						? undefined
-						: getBadgeLabel(prefix),
-				models,
-				disabled,
-				isPlatform,
-				...(plugin?.pluginId ? { pluginId: plugin.pluginId } : {}),
-				...(plugin?.contributionId ? { contributionId: plugin.contributionId } : {}),
-			};
-		});
+					// 排序只看**已保存**的开关状态：用户开着的 provider（哪怕还没配凭据）按
+					// 意图排在前面，关掉的排到最后。未配置的引导交给卡片徽章（unverified），
+					// 不再作为排序键 —— 否则无凭据的 codex 恒垫底，开关切了卡片也不动。
+					const savedMatch = !isPlatform
+						? (savedProviderSnapshot.customApiProviders.find((p) => p.prefix === prefix) ??
+							savedProviderSnapshot.nugProviders.find((p) => p.prefix === prefix))
+						: undefined;
+					const inactive =
+						prefix === "tokendance"
+							? savedProviderSnapshot.tokenDanceDisabled
+							: prefix === "CommandCode"
+								? savedProviderSnapshot.commandCode.disabled
+								: savedProviderSnapshot.disabledProviders.includes(prefix) ||
+									!!savedMatch?.disabled;
+
+					return {
+						prefix,
+						providerId,
+						label:
+							prefix === "tokendance" && tokenDance?.connected
+								? tokenDance.name || "TokenDance"
+								: (providerLabels[prefix] ?? prefix),
+						badgeLabel: plugin
+							? t("providerBadgePlugin")
+							: isPlatform
+								? undefined
+								: getBadgeLabel(prefix),
+						models,
+						disabled,
+						inactive,
+						isPlatform,
+						...(plugin?.pluginId ? { pluginId: plugin.pluginId } : {}),
+						...(plugin?.contributionId ? { contributionId: plugin.contributionId } : {}),
+					};
+				})
+				// 未启用的排到最后；同组内保持原有顺序（平台 provider 固定在前）。
+				.sort((a, b) => Number(a.inactive) - Number(b.inactive))
+		);
 	}, [
 		codexModels,
+		commandcodeModels,
 		openaiByProvider,
 		anthropicByProvider,
 		geminiByProvider,
 		nugByProvider,
 		pluginProviderGroups,
+		tokenDance,
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,
 		state.customApiProviders,
 		state.nugProviders,
+		state.commandCode,
+		savedProviderSnapshot,
+		tokenDanceDisabled,
 		t,
+	]);
+
+	// Resolve `?provider=` (a provider id or a model prefix) to a key the config view can
+	// render: the provider id for multi-instance providers, the prefix for platform and
+	// plugin providers. Anything else (an unknown or not-yet-loaded target, or a prefix
+	// that only carries custom models) shows the overview rather than an empty detail.
+	const selectedProvider = useMemo(() => {
+		const target = search.provider;
+		if (!target) return null;
+		if (target === "tokendance") return tokenDance?.connected ? "tokendance" : null;
+		if (target === "codex" || target === "CommandCode") return target;
+		const configured = [...state.customApiProviders, ...state.nugProviders];
+		const byId = configured.find((p) => p.id === target);
+		if (byId) return byId.id;
+		const lower = target.toLowerCase();
+		const byPrefix =
+			configured.find((p) => p.prefix === target) ??
+			configured.find((p) => p.prefix?.toLowerCase() === lower);
+		if (byPrefix) return byPrefix.id;
+		return pluginProviderGroups?.some((group) => group.prefix === target) ? target : null;
+	}, [
+		search.provider,
+		tokenDance?.connected,
+		state.customApiProviders,
+		state.nugProviders,
+		pluginProviderGroups,
 	]);
 
 	// ── Provider label for detail panel ──
@@ -735,7 +1072,7 @@ export function SettingsProvidersPage() {
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
 		// Platform providers: selectedProvider is the prefix
-		if (["codex"].includes(selectedProvider)) {
+		if (["codex", "CommandCode", "tokendance"].includes(selectedProvider)) {
 			return providerLabels[selectedProvider] ?? selectedProvider;
 		}
 		// Plugin providers are also addressed by prefix; without this they would fall
@@ -757,15 +1094,15 @@ export function SettingsProvidersPage() {
 		providerLabels,
 	]);
 
-	// ── Auto-fetch models + fill default context windows after a manual save ──
+	// ── Auto-fetch models after a manual save ──
 	// Triggered by handleSave (only when a provider is being edited). Refreshes the
-	// model list for the selected provider, then computes default token counts for
-	// recognized model families and silently saves them.
+	// model list for the selected provider. Windows are not filled in here: the model
+	// catalog supplies them, and a stored value would pin this provider entry for good.
 	const autoFetchAndFill = useCallback(async () => {
 		const providerId = selectedProvider;
 		if (!providerId) return;
-		// Platform providers (codex) manage their own model lists.
-		if (["codex"].includes(providerId)) return;
+		// Platform providers (codex / commandcode) manage their own model lists.
+		if (["codex", "CommandCode"].includes(providerId)) return;
 
 		const customApi = state.customApiProviders.find((p) => p.id === providerId);
 		const nug = state.nugProviders.find((p) => p.id === providerId);
@@ -792,67 +1129,66 @@ export function SettingsProvidersPage() {
 			return;
 		}
 
-		// Fetch fresh settings so we can read the newly-refreshed grouped models.
-		let freshSettings: Record<string, unknown>;
-		try {
-			freshSettings = (await qc.fetchQuery({
-				queryKey: ["admin", "settings"],
-				queryFn: api.getSettings,
-			})) as Record<string, unknown>;
-			qc.setQueryData(["settings"], freshSettings);
-		} catch {
-			return;
-		}
-
-		// Resolve this provider's prefix and the list of model ids from grouped data.
-		const prefix = customApi?.prefix ?? nug?.prefix ?? "";
-		if (!prefix) return;
-
-		const groupedKey = customApi
-			? isGemini
-				? "geminiModelsGrouped"
-				: isAnthropicProtocol(customApi.protocol)
-					? "anthropicModelsGrouped"
-					: "openaiModelsGrouped"
-			: "nugModelsGrouped";
-		const grouped = (freshSettings[groupedKey] ?? []) as Array<{
-			providerId: string;
-			models: Array<Record<string, unknown>>;
-		}>;
-		const group = grouped.find((g) => g.providerId === providerId);
-		if (!group || group.models.length === 0) return;
-
-		const modelIds = group.models
-			.map((m) => String(m.id ?? m.model_id ?? m.modelId ?? ""))
-			.filter(Boolean);
-
-		// Compute default context windows for recognized model families only.
-		const existing = state.modelContextWindows;
-		const additions: Record<string, number> = {};
-		for (const id of modelIds) {
-			const key = `${prefix}:${id}`;
-			if (existing[key] != null) continue;
-			const def = getModelDefaultContextWindow(id);
-			if (def != null) additions[key] = def;
-		}
-		if (Object.keys(additions).length === 0) return;
-
-		// Silently persist the new context windows.
-		const nextState: ProvidersState = {
-			...state,
-			modelContextWindows: { ...state.modelContextWindows, ...additions },
-		};
-		dispatchers.mergeContextWindows(additions);
-		try {
-			await saveProvidersState(nextState);
-		} catch {
-			// Ignore — the values remain in local state for the user to save manually.
-		}
-	}, [selectedProvider, state, qc, dispatchers, saveProvidersState]);
-
+		// The refreshed listing changes model lists and the windows their rows show.
+		await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+		await qc.invalidateQueries({ queryKey: ["settings"] });
+		await qc.invalidateQueries({ queryKey: modelCatalogKeys.all });
+	}, [selectedProvider, state, qc]);
 	autoFetchAndFillRef.current = autoFetchAndFill;
 
-	if (isLoading) return <Loader />;
+	if (isTokenDanceCallback) return <Outlet />;
+	if (isLoading) {
+		return (
+			<Stack gap="md" p="md" aria-busy="true" data-testid="providers-settings-skeleton">
+				<Group justify="space-between">
+					<Title order={2}>{t(isAddingProvider ? "addProvider" : "providersTitle")}</Title>
+					{isAddingProvider && (
+						<Button
+							variant="subtle"
+							onClick={() =>
+								void navigate({ to: "/settings/providers", search: {}, replace: true })
+							}
+						>
+							{t("addProviderBack")}
+						</Button>
+					)}
+				</Group>
+				<Skeleton height={42} />
+				<Skeleton height={180} />
+				<Skeleton height={240} />
+			</Stack>
+		);
+	}
+
+	if (isAddingProvider) {
+		return (
+			<TokenDanceAddContext
+				value={
+					user?.role === "admin"
+						? { login: tokenDanceLogin, restoredAddPage, consumeRestoredAddPage }
+						: null
+				}
+			>
+				<ProviderAddContext value={handleAddProvider}>
+					<ProviderImportContext value={importContext}>
+						{restoreFetchError && (
+							<Alert color="yellow">
+								{t("tokendance.settingsUnavailable")}
+								<Button
+									size="xs"
+									variant="light"
+									onClick={() => setReturnEpoch((value) => value + 1)}
+								>
+									{t("tokendance.retryRestore")}
+								</Button>
+							</Alert>
+						)}
+						<Outlet />
+					</ProviderImportContext>
+				</ProviderAddContext>
+			</TokenDanceAddContext>
+		);
+	}
 
 	// ── Render overview or config view ──
 	const renderContent = () => {
@@ -862,26 +1198,46 @@ export function SettingsProvidersPage() {
 					providerLabel={selectedProviderLabel}
 					onClose={() => setSelectedProvider(null)}
 				>
-					<ProviderSectionContent
-						providerKey={selectedProvider}
-						pluginProvider={selectedPluginProvider}
-						state={state}
-						dispatchers={dispatchers}
-						providerModelsMap={providerModelsMap}
-						pluginModelsByPrefix={pluginModelsByPrefix}
-						anthropicModelsMap={anthropicModelsMap}
-						nugModelsMap={nugModelsMap}
-						geminiModelsMap={geminiModelsMap}
-						isCustomApiProviderDirty={isCustomApiProviderDirty}
-						isNugProviderDirty={isNugProviderDirty}
-						getPrefixError={getPrefixError}
-						getUniquePrefix={getUniquePrefix}
-						onTestModel={setTestingModel}
-						onServerContextWindowsMerge={handleServerContextWindowsMerge}
-						onSaveBeforeRefresh={confirmSaveBeforeRefresh}
-						onSaveBeforeNugAction={saveBeforeNugAction}
-						onNugLoginSuccess={saveNugLoginResult}
-					/>
+					{selectedProvider === "tokendance" && tokenDance?.connected ? (
+						<TokenDanceSection
+							connection={tokenDance}
+							enabled={!tokenDanceDisabled}
+							onToggleEnabled={() =>
+								dispatchers.setPlatformDisabled("tokendance", !tokenDanceDisabled)
+							}
+							hiddenModels={state.hiddenModels}
+							onToggleHidden={dispatchers.toggleHidden}
+							onBatchToggleHidden={dispatchers.batchToggleHidden}
+							modelProtocols={state.modelProtocols}
+							onModelProtocolChange={dispatchers.setModelProtocol}
+							onTestModel={setTestingModel}
+							onLogin={() => tokenDanceLogin()}
+							onChanged={refreshTokenDanceSettings}
+							onDeleted={() => setSelectedProvider(null)}
+						/>
+					) : (
+						<ProviderSectionContent
+							providerKey={selectedProvider}
+							pluginProvider={selectedPluginProvider}
+							state={state}
+							dispatchers={dispatchers}
+							providerModelsMap={providerModelsMap}
+							commandcodeModels={commandcodeModels}
+							pluginModelsByPrefix={pluginModelsByPrefix}
+							anthropicModelsMap={anthropicModelsMap}
+							nugModelsMap={nugModelsMap}
+							geminiModelsMap={geminiModelsMap}
+							isCustomApiProviderDirty={isCustomApiProviderDirty}
+							isNugProviderDirty={isNugProviderDirty}
+							getPrefixError={getPrefixError}
+							getUniquePrefix={getUniquePrefix}
+							onTestModel={setTestingModel}
+							onSaveBeforeRefresh={confirmSaveBeforeRefresh}
+							onSaveBeforeNugAction={saveBeforeNugAction}
+							onNugLoginSuccess={saveNugLoginResult}
+							onRefreshCommandCodeModels={refreshCommandCodeModels}
+						/>
+					)}
 				</ProviderConfigView>
 			);
 		}
@@ -890,9 +1246,18 @@ export function SettingsProvidersPage() {
 			<ProviderOverviewView
 				groups={providerGroups}
 				hiddenModels={state.hiddenModels}
-				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
+				onToggleProviderDisabled={(prefix) => {
+					// 平台集成（codex / Command Code / TokenDance）的开关一律写成草稿，
+					// 由底部保存条统一提交 —— 见 PLATFORM_PROVIDER_PREFIXES 的约定。
+					if (isPlatformProviderPrefix(prefix)) {
+						const group = providerGroups.find((item) => item.prefix === prefix);
+						if (!group) return;
+						dispatchers.setPlatformDisabled(prefix, !group.disabled);
+						return;
+					}
+					dispatchers.toggleProviderDisabled(prefix);
+				}}
 				onOpenProviderConfig={setSelectedProvider}
-				onAddProvider={handleAddProvider}
 				selectedProvider={selectedProvider}
 			/>
 		);
@@ -900,6 +1265,19 @@ export function SettingsProvidersPage() {
 
 	return (
 		<>
+			{restoreFetchError && (
+				<Alert color="yellow">
+					{t("tokendance.settingsUnavailable")}
+					<Button size="xs" variant="light" onClick={() => setReturnEpoch((value) => value + 1)}>
+						{t("tokendance.retryRestore")}
+					</Button>
+				</Alert>
+			)}
+			{restoreError && (
+				<Alert color="yellow" onClose={() => setRestoreError(false)} withCloseButton>
+					{t("tokendance.draftUnavailable")}
+				</Alert>
+			)}
 			<Box
 				style={{
 					height: isMobile ? undefined : "calc(100vh - 80px)",
@@ -933,7 +1311,7 @@ export function SettingsProvidersPage() {
 			</Box>
 
 			<Affix position={{ bottom: `calc(24px + ${SAFE_AREA_INSET_BOTTOM})`, right: 24 }}>
-				<Transition transition="slide-up" mounted={isDirty}>
+				<Transition transition="slide-up" mounted={providerSettingsDirty}>
 					{(styles) => (
 						<Group
 							gap="xs"
@@ -997,6 +1375,8 @@ interface ProviderSectionContentProps {
 	state: ProvidersState;
 	dispatchers: ReturnType<typeof useProvidersDispatch>;
 	providerModelsMap: Record<string, ModelOption[]>;
+	/** Command Code 的模型（已带 `CommandCode:` 前缀），由后端从 Provider API 拉取并缓存。 */
+	commandcodeModels: ModelOption[];
 	/** Plugin provider models keyed by prefix (the detail area's source for plugin providers). */
 	pluginModelsByPrefix: Record<string, ModelOption[]>;
 	anthropicModelsMap: Record<string, ModelOption[]>;
@@ -1007,10 +1387,11 @@ interface ProviderSectionContentProps {
 	getPrefixError: (prefix: string, id: string) => string | undefined;
 	getUniquePrefix: (base: string, id: string) => string;
 	onTestModel: (model: string) => void;
-	onServerContextWindowsMerge?: (windows: Record<string, number>) => void;
 	onSaveBeforeRefresh: () => Promise<boolean>;
 	onSaveBeforeNugAction: () => Promise<boolean>;
 	onNugLoginSuccess: (providerId: string, apiKey: string, username: string) => Promise<boolean>;
+	/** 刷新 Command Code 的模型列表（草稿未保存时由页面负责先落盘）。 */
+	onRefreshCommandCodeModels: () => Promise<void>;
 }
 
 function ProviderSectionContent({
@@ -1019,6 +1400,7 @@ function ProviderSectionContent({
 	state,
 	dispatchers,
 	providerModelsMap,
+	commandcodeModels,
 	pluginModelsByPrefix,
 	anthropicModelsMap,
 	nugModelsMap,
@@ -1028,12 +1410,34 @@ function ProviderSectionContent({
 	getPrefixError,
 	getUniquePrefix,
 	onTestModel,
-	onServerContextWindowsMerge,
 	onSaveBeforeRefresh,
 	onSaveBeforeNugAction,
 	onNugLoginSuccess,
+	onRefreshCommandCodeModels,
 }: ProviderSectionContentProps) {
 	// Platform providers: matched by prefix
+	if (providerKey === "CommandCode") {
+		return (
+			<CommandCodeSection
+				value={state.commandCode}
+				onChange={dispatchers.setCommandCode}
+				onToggleDisabled={() =>
+					dispatchers.setPlatformDisabled("CommandCode", !state.commandCode.disabled)
+				}
+				models={commandcodeModels}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				onBatchToggleHidden={dispatchers.batchToggleHidden}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				modelProtocols={state.modelProtocols}
+				onModelProtocolChange={dispatchers.setModelProtocol}
+				onTestModel={onTestModel}
+				onRefreshModels={onRefreshCommandCodeModels}
+			/>
+		);
+	}
+
 	if (providerKey === "codex") {
 		return (
 			<CodexSection
@@ -1041,8 +1445,8 @@ function ProviderSectionContent({
 				onToggleHidden={dispatchers.toggleHidden}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
+				modelProtocols={state.modelProtocols}
+				onModelProtocolChange={dispatchers.setModelProtocol}
 				onTestModel={onTestModel}
 			/>
 		);
@@ -1068,10 +1472,10 @@ function ProviderSectionContent({
 					hiddenModels: state.hiddenModels,
 					onToggleHidden: dispatchers.toggleHidden,
 					onBatchToggleHidden: dispatchers.batchToggleHidden,
-					modelContextWindows: state.modelContextWindows,
-					onContextWindowChange: dispatchers.handleContextWindowChange,
 					customModels: state.customModels,
 					onCustomModelsChange: dispatchers.setCustomModels,
+					modelProtocols: state.modelProtocols,
+					onModelProtocolChange: dispatchers.setModelProtocol,
 					onTestModel,
 				}}
 			/>
@@ -1091,16 +1495,15 @@ function ProviderSectionContent({
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}
 				onBatchToggleHidden={dispatchers.batchToggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
 				isProviderDirty={isCustomApiProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
+				modelProtocols={state.modelProtocols}
+				onModelProtocolChange={dispatchers.setModelProtocol}
 				getPrefixError={getPrefixError}
 				getUniquePrefix={getUniquePrefix}
 				onTestModel={onTestModel}
 				onSaveBeforeRefresh={onSaveBeforeRefresh}
-				onMergeContextWindows={onServerContextWindowsMerge}
 				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
 			/>
 		);
@@ -1114,9 +1517,6 @@ function ProviderSectionContent({
 				providerModelsMap={nugModelsMap}
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
-				onMergeContextWindows={onServerContextWindowsMerge}
 				isProviderDirty={isNugProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}

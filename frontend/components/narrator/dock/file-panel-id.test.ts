@@ -4,7 +4,6 @@ import type { DockviewApi, SerializedDockview } from "dockview-react";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
-import { createDetachedPanelDockValue } from "../../graph/dock/detached-panel-context";
 import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
 import {
 	type FilePanelParams,
@@ -129,8 +128,11 @@ describe("focus file panel editing ownership", () => {
 
 		expect(body).toContain("dock?.narratorId ?? props.params.hostNarratorId");
 		expect(body).toContain("props.api.updateParameters({ ...props.params, hostNarratorId })");
-		expect(body).toContain('getFilePreviewType(filePath ?? "") === "text"');
-		expect(body).toContain(") : isText ? (");
+		const shared = await Bun.file(
+			new URL("../file-panel/FilePanelContent.tsx", import.meta.url),
+		).text();
+		expect(shared).toContain('getFilePreviewType(filePath) === "text"');
+		expect(body).toContain("<FilePanelContent");
 		expect(body).toContain("narratorId={fileNarratorId}");
 		expect(body).toContain("referenceOrigin={referenceOrigin}");
 		expect(body).toContain("navigationRequestId={highlightRequestId}");
@@ -379,19 +381,6 @@ describe("device-scoped navigation", () => {
 		});
 	});
 
-	it("detached panels do not pretend to have a file opener without a source dock", () => {
-		const input = { narratorId: "n", chapterId: "c", apiRef: { current: null } };
-		expect(
-			createDetachedPanelDockValue({ ...input, sourceDock: undefined }).openFilePanel,
-		).toBeUndefined();
-		const openFilePanel = () => {};
-		const addFileReference = () => {};
-		const sourceDock = { openFilePanel, addFileReference } as unknown as NarratorDockContextValue;
-		const detached = createDetachedPanelDockValue({ ...input, sourceDock });
-		expect(detached.openFilePanel).toBe(openFilePanel);
-		expect(detached.addFileReference).toBe(addFileReference);
-	});
-
 	it("file bridges are scoped per narrator and stale unregister cannot remove the replacement", () => {
 		const store = new WorkspaceDockStore({ current: null });
 		const calls: string[] = [];
@@ -623,8 +612,11 @@ describe("historical file panels", () => {
 		expect(body).toContain("reference={toolEdit}");
 		expect(body).toContain("key={toolEditReferenceKey(toolEdit)}");
 		expect(body).toMatch(/toolEdit \? `.* · Edit`/);
-		expect(body.indexOf("<ToolEditFileViewer")).toBeLessThan(body.indexOf("<FileEditorContent"));
-		expect(body).toContain(") : isText ? (");
+		expect(body).toContain("<FilePanelContent");
+		expect(body.indexOf("<ToolEditFileViewer")).toBeLessThan(body.indexOf("<FilePanelContent"));
+		expect(body).toMatch(
+			/\) : \(\s*<DockviewNarratorPanelVisibilityProvider api=\{props.api\}>\s*<FilePanelContent/,
+		);
 		expect(body).toMatch(
 			/filePanelResourceId\(\s*filePath,\s*deviceId,\s*referenceOrigin,\s*toolEdit,\s*props.params.fileNarratorId,/,
 		);

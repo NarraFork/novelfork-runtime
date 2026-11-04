@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
@@ -41,16 +40,16 @@ export interface ActiveNarrator {
 	_modelRef?: string;
 	/** Persisted selection, kept separate from the pool-authorized runtime reference. */
 	_modelSelectionRef?: string;
-	/** Cached inheritance edge; only active sessions participate in live propagation. */
-	_followParentNarratorId?: string | null;
+	/** Cached model-source edge; only active sessions participate in live propagation. */
+	_modelSourceNarratorId?: string | null;
 	/** Invalidates asynchronous inheritance resolutions after a manual/parent model change. */
 	_modelRefreshVersion?: number;
 	_modelRefreshPending?: Promise<void>;
 	_modelRefreshError?: unknown;
 	/** Fixed effort mandated by the inherited model's selected pool entry. */
 	_inheritedReasoningEffort?: ReasoningEffort;
-	/** Parent's own override for a `__parent__` child; ranks below the child's override. */
-	_parentReasoningEffort?: ReasoningEffort;
+	/** The followed source's own override; ranks below this session's override. */
+	_sourceReasoningEffort?: ReasoningEffort;
 	model: string;
 	provider: string;
 	/** Settings revision used to derive `_modelRef` / `_reasoningEffortRef` into runtime values. */
@@ -88,16 +87,16 @@ export interface ActiveNarrator {
 	/** Set when ExitPlanMode completes — the loop should restart with a user message.
 	 *  "continue" = no compact; "compact" = compact was performed, needs fresh context. */
 	_planApprovedContinue?: "continue" | "compact";
-	/** Cached chapter ID (set when narrator is bound to an active chapter) */
-	_chapterId?: string;
-	/** Cached project ID (set when narrator is bound to a chapter with a project) */
+	/**
+	 * Plan approval that landed while the approving response was still streaming. The
+	 * restart (plan compact + pass abort) runs once that assistant message is finalized,
+	 * so the response is recorded and persisted whole before the pass ends.
+	 */
+	_planApprovalFinish?: () => Promise<void>;
+	/** Cached project ID (set when the narrator has a project context) */
 	_projectId?: string;
-	/** Cached chapter role (trunk/branch/exploration/review) */
-	_chapterRole?: string;
 	/** Narrator kind for specialized standalone types (e.g. "knowledge" steward). */
 	_narratorKind?: "knowledge";
-	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
-	_worktreePath?: string;
 	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plans/plan-{id}.md */
 	_planFileId?: string;
 	/** Plan file path — set when entering plan mode, passed to EnterPlanMode tool for the prompt */
@@ -122,8 +121,6 @@ export interface ActiveNarrator {
 	_preparedPlanModes?: Map<string, PreparedPlanMode>;
 	/** Legacy permission mode snapshot from before entering plan mode; retained for migration/UI context. */
 	_previousPermissionMode?: string;
-	/** Cached base branch (for commits-ahead tracking) */
-	_baseBranch?: string;
 	/** Trailing-edge throttle timer for git status tracking */
 	_gitTrackTimer?: ReturnType<typeof setTimeout>;
 	/** ID of the partial assistant message being incrementally built via block_complete events */
@@ -222,8 +219,10 @@ export interface ActiveNarrator {
 	 * but has not yet been consumed by a rebuilt in-memory agent history.
 	 */
 	_pendingHistoryCompactSeq?: number;
-	/** Token usage baseline at the start of the current turn (for round token totals). */
-	_tokenUsageBaseline?: TokenUsageSnapshot;
+	/** Cumulative ordinary input + output from completed requests owned by this active narrator. */
+	_requestTokenTotal?: number;
+	/** Cumulative request-token baseline at the start of the current pass. */
+	_tokenUsageBaseline?: number;
 	/** Guard against infinite auto-continuation when continuation turns make no effective progress. */
 	_continuationSuppressed?: boolean;
 	/** Whether the current pass is a normal task continuation or a blocked-task recovery turn. */
@@ -233,6 +232,12 @@ export interface ActiveNarrator {
 	_continuationStallKey?: string;
 	/** Completed tool count used to keep the spec (tasks.json) reminder cadence across loop runs. */
 	_todoReminderCompletedToolCount?: number;
+	/**
+	 * An outline session's state when its current run started, for the turn-end note
+	 * (`maybeDeliverOutlineTurnEndNote`): the completed tool count and the revision of its open
+	 * tasks. Unset outside outline sessions, and once the note was left in this run.
+	 */
+	_outlineTurnStart?: { toolCount: number; revision: string | null };
 	/** Completed tool count when the tasks.json reminder was last injected. */
 	_lastTasksReminderCompletedToolCount?: number;
 	/** Completed tool count when the behavior fence was last injected. */
@@ -327,6 +332,8 @@ export interface BufferCreator {
 
 /** Shape stored in DB for text files that were saved to a temp directory. */
 export interface SavedBufferedFile {
+	originalName?: string;
+	sourceMimeType?: string;
 	filename: string;
 	path: string;
 	size: number;
@@ -338,9 +345,13 @@ export interface BufferedExecutionIntent {
 	modelOverride?: { model: string; mode: "temporary" | "permanent" };
 	/** Built-in control command; execute only after the previous owner has finalized. */
 	controlCommand?: boolean;
+	/** Text a person said (a bot's chat): never parsed as a queued `/new` or `/goal`. */
+	literal?: boolean;
 }
 
 export interface BufferedMessage {
+	hasComposerDocument?: boolean;
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	executionIntent?: BufferedExecutionIntent;
 	id: string;
@@ -348,6 +359,7 @@ export interface BufferedMessage {
 	/** Server-accepted immutable bytes; summaries expose only reference metadata. */
 	fileReferences?: FileReferenceSnapshot[];
 	images?: ImageRef[];
+	media?: import("@shared/media-attachments").MediaRef[];
 	textFiles?: File[];
 	bufferedAt: string;
 	commandText?: string | null;
@@ -461,20 +473,20 @@ export const knowledgeInjectionCycleStates = hotSafe<Map<string, KnowledgeInject
  * Reset reusable upstream provider/session state for the active narrator before
  * its next model request. Returns false when the narrator is not currently active.
  *
- * Every caller reaches here right after an operation that cleared the persisted
- * `apiConversationId` (compact finalize, plan compact, clear-context), so the
- * teardown CAS baseline is moved to null in step. Without that, teardown would
- * compare against the pre-compact id, lose the CAS, and never persist the fresh
- * id — costing the next activation a needless cold upstream session. Claiming the
- * empty column is safe here precisely because the new id belongs to a session
- * that has only ever carried post-compact history.
+ * Breaking transport continuation is not a new cache identity. Compact and
+ * replay can require a full request while retaining the same conversation key.
+ * Callers that explicitly cleared persisted identity must opt into moving the
+ * teardown CAS baseline. Existing compact writers clear the stored id, so their
+ * callers pass persistedIdentityCleared while preserving the live conversation key.
  */
-export function resetActiveUpstreamSession(narratorId: string): boolean {
+export function resetActiveUpstreamSession(
+	narratorId: string,
+	options: { persistedIdentityCleared?: boolean } = {},
+): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
-	active.conversationId = randomUUID();
 	active._resetUpstreamSessionOnNextRequest = true;
-	active._persistedConversationId = null;
+	if (options.persistedIdentityCleared) active._persistedConversationId = null;
 	return true;
 }
 
@@ -510,7 +522,7 @@ export function invalidateWorkspaceTreeCache(worktreePath: string): void {
  * with whoever is writing the *directory*, and that is not only the narrator being
  * rolled back: subagents share their parent's cwd, and a background subagent keeps
  * writing after the parent loop returned — so the parent reads as idle while its
- * child is still mutating files. Other narrators attached to the same chapter are
+ * child is still mutating files. Other narrators working in the same directory are
  * the same situation.
  *
  * Reads `_loopRunning` rather than the DB status because that flag is the
@@ -568,47 +580,6 @@ export const pendingPermissions = hotSafe<Map<string, PendingPermission>>(
 	"narrafork.pendingPermissions",
 	() => new Map(),
 );
-
-// === Active subagent runtime settings (lightweight, for getRuntimeSettingsOverride) ===
-
-export interface ActiveSubagentSettings {
-	model: string;
-	reasoningEffort: ReasoningEffort | null;
-}
-
-export const activeSubagentSettings = createRuntimeMapView("subagentSettings");
-
-export function registerActiveSubagent(
-	narratorId: string,
-	model: string,
-	reasoningEffort: ReasoningEffort | null | undefined,
-): void {
-	activeSubagentSettings.set(narratorId, {
-		model,
-		reasoningEffort: reasoningEffort ?? null,
-	});
-}
-
-export function unregisterActiveSubagent(narratorId: string): void {
-	activeSubagentSettings.delete(narratorId);
-}
-
-export function updateActiveSubagentModel(narratorId: string, model: string): boolean {
-	const s = activeSubagentSettings.get(narratorId);
-	if (!s) return false;
-	s.model = model;
-	return true;
-}
-
-export function updateActiveSubagentReasoningEffort(
-	narratorId: string,
-	reasoningEffort: ReasoningEffort | null,
-): boolean {
-	const s = activeSubagentSettings.get(narratorId);
-	if (!s) return false;
-	s.reasoningEffort = reasoningEffort;
-	return true;
-}
 
 export interface PendingDangerConfirmation {
 	narratorId: string;
@@ -867,20 +838,33 @@ function admissionWorkFor(narratorId: string): NarratorWorkAdmission[] {
 
 /** Resolve ownership from persisted parent links, never a request's broadcast/cwd hint. */
 export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<string> {
-	const [{ db }, { narrators }, { eq }] = await Promise.all([
+	const [database, { narrators }, { eq }] = await Promise.all([
 		import("../db"),
 		import("../db/schema"),
 		import("drizzle-orm"),
 	]);
+	const { db } = database;
+	let postgresQuery: import("./context-composition-history").ContextQuery | undefined;
+	if (database.activeDatabaseBackend === "postgres") {
+		if (!database.postgresRuntime) throw new AppError("PostgreSQL runtime is not connected", 503);
+		const { postgresContextQuery } = await import("./context-composition-history");
+		postgresQuery = postgresContextQuery(database.postgresRuntime.client.sql);
+	}
 	const seen = new Set<string>();
 	let id = narratorId;
 	while (seen.size < 32 && !seen.has(id)) {
 		seen.add(id);
 		// Admission is a frequent metadata read; never load prompts or compact summaries.
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { id: true, variant: true, parentNarratorId: true },
-		});
+		const narrator = postgresQuery
+			? await postgresQuery.get<{ id: string; variant: string; parentNarratorId: string | null }>(
+					`SELECT id, variant, parent_narrator_id AS "parentNarratorId"
+					 FROM narrators WHERE id = ?`,
+					[id],
+				)
+			: await db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { id: true, variant: true, parentNarratorId: true },
+				});
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (!isSubagentVariant(narrator.variant)) return id;
 		if (!narrator.parentNarratorId) break;

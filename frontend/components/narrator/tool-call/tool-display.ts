@@ -41,6 +41,7 @@ export type ToolCategory =
 	| "taskOutput"
 	| "agent"
 	| "await"
+	| "stop"
 	| "send"
 	| "ask"
 	| "plan"
@@ -52,6 +53,7 @@ export type ToolCategory =
 	| "skill"
 	| "browser"
 	| "knowledge"
+	| "outline"
 	| "schedule"
 	| "contextAsk"
 	| "workspace"
@@ -140,6 +142,9 @@ const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeAdmin",
 ]);
 
+/** The block outline: reads, searches and edits of the team's versioned notes. */
+const OUTLINE_TOOLS = new Set(["OutlineRead", "OutlineSearch", "OutlineEdit"]);
+
 export function getCategory(name: string, input?: unknown): ToolCategory {
 	// Spec task-queue file operations render as a task list, not a raw file diff.
 	if (input !== undefined && isSpecTasksToolUse(name, input)) return "tasks";
@@ -154,6 +159,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (AGENT_TOOLS.has(name)) return "agent";
 	if (AWAIT_TOOLS.has(name)) return "await";
+	if (name === "Stop") return "stop";
 	if (SEND_TOOLS.has(name)) return "send";
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
@@ -166,8 +172,20 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
+	if (OUTLINE_TOOLS.has(name)) return "outline";
 	if (CONTEXT_ASK_TOOLS.has(name)) return "contextAsk";
-	if (["Worktree", "SwitchWorkingDirectory", "SwitchDevice"].includes(name)) return "workspace";
+	if (
+		[
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+			"SwitchWorkingDirectory",
+			"SwitchDevice",
+		].includes(name)
+	)
+		return "workspace";
 	return "generic";
 }
 
@@ -193,6 +211,7 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 		case "file":
 			return "violet";
 		case "bash":
+		case "stop":
 			return "orange";
 		case "search":
 			return "cyan";
@@ -238,6 +257,10 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "grape";
 		case "knowledge":
 			return "grape";
+		// Teal like the spec task list: the outline is where plans and tasks are written, and
+		// the glyph tells it from a web step.
+		case "outline":
+			return "teal";
 		case "pipeline":
 			return "indigo";
 		case "terminal":
@@ -287,7 +310,12 @@ export {
 
 // Local aliases so the summary builders below can call these directly (a
 // re-export does not bind the names in this module's scope).
-import { extractField, extractNumericField, isTruncated } from "@shared/pretext-layout/tool-detail";
+import {
+	extractField,
+	extractNumericField,
+	isTruncated,
+	parseLiveOutputChars,
+} from "@shared/pretext-layout/tool-detail";
 import { readLeafText } from "@shared/pretext-layout/tool-io-projection";
 import {
 	hasSubagentToolInputSummary,
@@ -314,11 +342,6 @@ function extractStringArrayField(val: unknown, key: string): string[] {
 	return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
 }
 
-/** True when `value` is the cumulative-char payload ContextAsk streams via emitOutput. */
-function isNumericOutputString(value: unknown): value is string {
-	return typeof value === "string" && /^\d+$/.test(value.trim());
-}
-
 /**
  * Live character count for a running ContextAsk, or null.
  *
@@ -327,10 +350,31 @@ function isNumericOutputString(value: unknown): value is string {
  * streaming body of digits.
  */
 function contextAskLiveOutputChars(metadata: Record<string, unknown> | undefined): number | null {
-	const raw = metadata?._streamingOutput;
-	if (!isNumericOutputString(raw)) return null;
-	const n = Number(raw.trim());
-	return Number.isFinite(n) && n >= 0 ? n : null;
+	return parseLiveOutputChars(metadata?._streamingOutput);
+}
+
+/**
+ * Live output char count for a running Agent/Await card, or null.
+ *
+ * Same bare-count convention as ContextAsk (`_streamingOutput` carries plain
+ * digits), but sourced from the SHARED parser so every tool reads the payload
+ * identically. The server streams it from the subagent's `stream_text` deltas
+ * (see narrator-event-handler's `noteSubagentOutputText`).
+ *
+ * Deliberately NOT gated on terminal status here: a summary has no status
+ * input, and the streaming entry's residual count is replaced by the persisted
+ * card within a frame of completion — the same trade ContextAsk already makes.
+ * (The detail body in `classifyAwait` IS gated, because it receives `status`.)
+ */
+function liveOutputChars(metadata: Record<string, unknown> | undefined): number | null {
+	return parseLiveOutputChars(metadata?._streamingOutput);
+}
+
+/** Localized "N chars" fragment for a live output counter, with English fallback. */
+function liveOutputCharsLabel(labels: Record<string, string> | undefined, chars: number): string {
+	return labels?.liveOutputChars
+		? labels.liveOutputChars.replace("{count}", String(chars))
+		: `${chars} chars`;
 }
 
 /** Resolved target label for a ContextAsk call (metadata title wins over input.id). */
@@ -423,6 +467,55 @@ export function knowledgeSummary(
 	}
 }
 
+/**
+ * Header summary for the outline tools, shared by every renderer: the address read, the query,
+ * or the edits made, completed from persisted metadata (block and result counts, the commit).
+ */
+export function outlineSummary(
+	toolName: string,
+	input: unknown,
+	metadata?: Record<string, unknown>,
+): string {
+	const meta = metadata ?? {};
+	switch (toolName) {
+		case "OutlineRead": {
+			const address = extractField(input, "address") || readLeafText(meta.address) || "";
+			const asOf = extractField(input, "asOf") || String(extractNumericField(input, "asOf") ?? "");
+			const blocks = typeof meta.blocks === "number" ? meta.blocks : undefined;
+			const parts = [address ? short(address, 48) : "spaces"];
+			if (asOf) parts.push(`as of ${short(asOf, 24)}`);
+			if (blocks != null) parts.push(`${blocks} blocks`);
+			return parts.join(" · ");
+		}
+		case "OutlineSearch": {
+			const query = extractField(input, "query") || readLeafText(meta.query) || "";
+			const count = typeof meta.resultCount === "number" ? meta.resultCount : undefined;
+			if (!query) return count != null ? `${count} results` : "Search";
+			return count != null ? `${short(query, 48)} · ${count}` : short(query, 60);
+		}
+		case "OutlineEdit": {
+			const raw =
+				input && !isTruncated(input) && typeof input === "object"
+					? (input as Record<string, unknown>).edits
+					: undefined;
+			const edits = Array.isArray(raw) ? raw : [];
+			const commit = meta.commit && typeof meta.commit === "object" ? meta.commit : null;
+			const seq = commit ? (commit as Record<string, unknown>).seq : undefined;
+			const kinds = new Map<string, number>();
+			for (const edit of edits) {
+				if (!edit || typeof edit !== "object") continue;
+				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
+				if (kind) kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
+			}
+			const parts = [...kinds].map(([kind, n]) => (n === 1 ? kind : `${kind} ×${n}`));
+			if (typeof seq === "number") parts.push(`#${seq}`);
+			return parts.length > 0 ? parts.join(" · ") : "Edit";
+		}
+		default:
+			return toolName;
+	}
+}
+
 /** Only routing fields belong in a collapsed notification row, never its message body. */
 function notificationSummary(input: unknown): string {
 	const action = extractField(input, "action");
@@ -483,8 +576,18 @@ export function getSummary(
 		if (filePath) return `${basename(filePath)} (${chars} chars)`;
 		return chars > 0 ? `${chars} chars` : "";
 	}
+	// Keep old Bash/Agent cancellation cards readable without rewriting stored history.
+	const legacyStop = extractField(input, "stop");
+	if (legacyStop && (BASH_TOOLS.has(toolName) || AGENT_TOOLS.has(toolName))) {
+		return `${labels?.stopTask || "Stop"}: ${short(legacyStop, 60)}`;
+	}
 	const cat = getCategory(toolName, input);
 	switch (cat) {
+		case "stop": {
+			const type = extractField(input, "type");
+			const id = extractField(metadata, "targetLabel") || extractField(input, "id");
+			return short([type, id].filter(Boolean).join(": ") || toolName, 80);
+		}
 		case "workspace":
 			return short(workspaceSummary(toolName, input, labels), 80);
 		case "read": {
@@ -576,22 +679,38 @@ export function getSummary(
 				extractField(input, "subagent_type"),
 				extractField(input, "description"),
 			].filter(Boolean);
-			return parts.length > 0 ? parts.join(": ") : toolName;
+			const base = parts.length > 0 ? parts.join(": ") : toolName;
+			// A running subagent's reply length, ticking on the folded row too.
+			const live = liveOutputChars(metadata);
+			return live != null ? `${base} · ${liveOutputCharsLabel(labels, live)}` : base;
 		}
 		case "await": {
 			const awaitType = extractField(input, "type") || "task";
-			// Prefer the server-resolved alias; a bare nanoid selector is truncated.
+			// Prefer the session TITLE (what the child's own tab shows) over the slug:
+			// `targetTitle` lands with the tool's returned metadata, while
+			// `_awaitAgentTitle` is the live transport field for a wait in flight.
+			// A bare nanoid selector is truncated.
+			const title =
+				extractField(metadata, "targetTitle") || extractField(metadata, "_awaitAgentTitle");
 			const id =
+				(title ? short(title, 60) : "") ||
 				agentTargetDisplay(
 					metadata?.targetLabel as string | undefined,
 					extractField(input, "id"),
-				) || "unknown";
+				) ||
+				"unknown";
 			const waitForText = extractField(input, "wait_for_text");
-			return waitForText
+			const base = waitForText
 				? `${awaitType}: ${id} · wait "${short(waitForText, 24)}"`
 				: `${awaitType}: ${id}`;
+			// The awaited child's live output length, same bare-count convention.
+			const live = liveOutputChars(metadata);
+			return live != null ? `${base} · ${liveOutputCharsLabel(labels, live)}` : base;
 		}
 		case "send": {
+			// No live output counter here by design: a Send's result is the REPLY the
+			// other side writes, not text this call streams — the count would measure
+			// someone else's output, which the child's own Agent card already shows.
 			const selectors = communicationSelectors(input);
 			const targets = resolveCommunicationTargets(metadata, metadata?._sendDeliveryTargets);
 			const targetLabels =
@@ -692,6 +811,8 @@ export function getSummary(
 		}
 		case "knowledge":
 			return knowledgeSummary(toolName, input, metadata);
+		case "outline":
+			return outlineSummary(toolName, input, metadata);
 		case "contextAsk": {
 			const target = contextAskTargetLabel(input, metadata);
 			const questionCount = contextAskQuestionCount(input, metadata);

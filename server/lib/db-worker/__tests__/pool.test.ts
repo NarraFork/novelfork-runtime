@@ -302,7 +302,7 @@ describe("worker pool", () => {
 			"narrator_messages",
 		]);
 		const messages = result.tables.find((table) => table.name === "narrator_messages");
-		expect(messages?.rowCount).toBe(200);
+		expect(messages?.rowCount).toBeNull();
 		expect(messages?.category).toBe("sessions");
 		// `approxContentBytes` is the APPROXIMATE mode's output and is deliberately 0 when `dbstat`
 		// is available (that path skips the extra `SUM(length(...))` full-table scan, since dbstat
@@ -369,17 +369,51 @@ describe("worker pool", () => {
 	 */
 	test("grows to the configured concurrency for simultaneous tasks", async () => {
 		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "4";
-		const tasks = ["narrators", "projects", "api_requests", "narrator_messages"].map((name) =>
-			runReadTask<StorageScanTablesResult>(dbPath, {
-				kind: "storageScanTables",
-				tableNames: [name],
-			}),
+		const releasePath = join(home, "release-concurrent-tasks");
+		const specifier = writeWorkerFixture(
+			home,
+			"barrier-worker.ts",
+			`
+	import { existsSync } from "node:fs";
+	self.onmessage = async (event) => {
+		if (event.data?.type !== "task") return;
+		const { requestId, params } = event.data;
+		postMessage({ type: "progress", requestId, tableName: params.tableNames[0], done: 0, total: 1 });
+		while (!existsSync(${JSON.stringify(releasePath)})) await Bun.sleep(10);
+		postMessage({ type: "result", requestId, result: params.tableNames[0], durationMs: 0 });
+	};
+	`,
 		);
-		// Sample while the tasks are still in flight: all four must be resident simultaneously.
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		const peak = getDbWorkerPoolStats().workers;
-		await Promise.all(tasks);
-		expect(peak).toBe(4);
+		setDbWorkerSpecifiersForTest([specifier]);
+		const started = new Set<string>();
+		const allStarted = Promise.withResolvers<void>();
+		const names = ["narrators", "projects", "api_requests", "narrator_messages"];
+		const tasks = names.map((name) =>
+			runReadTask<string>(
+				dbPath,
+				{ kind: "storageScanTables", tableNames: [name] },
+				{
+					timeoutMs: 60_000,
+					onProgress: ({ tableName }) => {
+						started.add(tableName);
+						if (started.size === names.length) allStarted.resolve();
+					},
+				},
+			),
+		);
+		const completed = Promise.all(tasks);
+		try {
+			// Readiness can take longer than 50ms on CI. Hold every task at a barrier instead
+			// of sampling startup timing; four resident workers alone would not prove concurrency.
+			await Promise.race([allStarted.promise, completed]);
+			expect(started.size).toBe(4);
+			expect(getDbWorkerPoolStats().workers).toBe(4);
+			expect(getDbWorkerPoolStats().busy).toBe(4);
+		} finally {
+			writeFileSync(releasePath, "release");
+			await completed;
+		}
+		expect(await completed).toEqual(names);
 	}, 90_000);
 
 	test("serves more concurrent tasks than workers by queueing", async () => {
@@ -432,13 +466,14 @@ describe("worker pool", () => {
 		setDbWorkerSpecifiersForTest([
 			writeWorkerFixture(home, "timeout-worker.ts", HANGING_WORKER_BODY),
 		]);
-		await expect(
-			runReadTask(
-				dbPath,
-				{ kind: "storageScanTables", tableNames: ["narrator_messages"] },
-				{ timeoutMs: 50 },
-			),
-		).rejects.toThrow(/timed out/);
+		const failure = await runReadTask(
+			dbPath,
+			{ kind: "storageScanTables", tableNames: ["narrator_messages"] },
+			{ timeoutMs: 50 },
+		).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toMatch(/timed out/);
+		expect(failure).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
 		// The timed-out worker is retired, so restoring production resolution must be enough
 		// for the next task; no pool reset is allowed to hide poisoning here.
 		setDbWorkerSpecifiersForTest(null);
@@ -581,6 +616,7 @@ describe("worker pool", () => {
 			writeWorkerFixture(home, "hanging-worker.ts", HANGING_WORKER_BODY),
 		]);
 		const blocker = runReadTask(dbPath, { kind: "storageScanContext" }, { timeoutMs: 10_000 });
+		blocker.catch(() => {}); // Keep fixture cleanup handled even when a later assertion fails.
 		await new Promise((resolve) => setTimeout(resolve, 150));
 		expect(getDbWorkerPoolStats().busy).toBe(1);
 
@@ -590,7 +626,10 @@ describe("worker pool", () => {
 			{ kind: "storageScanTables", tableNames: ["narrators"] },
 			{ timeoutMs: 50 },
 		);
-		await expect(queued).rejects.toThrow(/timed out/);
+		const failure = await queued.catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toMatch(/timed out/);
+		expect(failure).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
 		const elapsed = Date.now() - startedAt;
 		expect(elapsed).toBeGreaterThanOrEqual(40);
 		expect(elapsed).toBeLessThan(1_000);

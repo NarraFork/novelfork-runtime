@@ -5,7 +5,6 @@ import { askUserQuestionTool } from "./ask-user-question";
 import { awaitTool } from "./await";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
-import { concludeReviewTool } from "./conclude-review";
 import { contextAskTool } from "./context-ask";
 import { dangerCancelTool, dangerConfirmTool } from "./danger-reflection";
 import { DEFAULT_OFF_TOOL_NAMES } from "./default-off-tools";
@@ -17,6 +16,7 @@ import {
 	exitPlanReviseTool,
 } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
+import { genUiTool } from "./gen-ui";
 import { globTool } from "./glob";
 import { grepTool } from "./grep";
 import { hookAdminTool } from "./hook-admin";
@@ -28,6 +28,7 @@ import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { notificationTool } from "./notification";
+import { outlineEditTool, outlineReadTool, outlineSearchTool } from "./outline";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
@@ -41,6 +42,7 @@ import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
+import { stopTool } from "./stop";
 import { structSedTool } from "./struct-sed";
 import { structViewTool } from "./struct-view";
 import { switchDeviceTool } from "./switch-device";
@@ -49,10 +51,11 @@ import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
+import { toolSearchTool } from "./tool-search";
 import { transferFileTool } from "./transfer-file";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
-import { worktreeTool } from "./worktree";
+import { agentWorktreeTools, worktreeTool } from "./worktree";
 import { writeTool } from "./write";
 
 /**
@@ -69,6 +72,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Eval", evalTool],
 	["Terminal", terminalTool],
 	["ShareFile", shareFileTool],
+	["GenUI", genUiTool],
 	["Notification", notificationTool],
 	["Recall", recallTool],
 	["Browser", browserTool],
@@ -86,6 +90,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],
 	["KnowledgeReview", knowledgeReviewTool],
+	["OutlineEdit", outlineEditTool],
 	["StartPipeline", startPipelineTool],
 	["ExtractPipeline", extractPipelineTool],
 ]);
@@ -122,18 +127,12 @@ export const KNOWLEDGE_KIND_DENY_CORE: ReadonlySet<string> = new Set<string>([
 	"WebFetch",
 ]);
 
-/**
- * Review-only tools — only injected for narrators in review chapters.
- */
-export const REVIEW_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
-	["ConcludeReview", concludeReviewTool],
-]);
-
 /** Core tools provider — always-available tools. */
 const coreProvider: ToolProvider = {
 	name: "core",
 	tools() {
 		return [
+			toolSearchTool,
 			bashTool,
 			readTool,
 			writeTool,
@@ -148,6 +147,7 @@ const coreProvider: ToolProvider = {
 			enterPlanModeTool,
 			exitPlanModeTool,
 			agentTool,
+			stopTool,
 			awaitTool,
 			contextAskTool,
 			sendTool,
@@ -158,9 +158,12 @@ const coreProvider: ToolProvider = {
 			knowledgeSearchTool,
 			knowledgeReadTool,
 			knowledgeLibraryTool,
+			outlineReadTool,
+			outlineSearchTool,
 			switchDeviceTool,
 			switchWorkingDirectoryTool,
 			worktreeTool,
+			...agentWorktreeTools,
 			requestPermissionRuleTool,
 			transferFileTool,
 			dangerConfirmTool,
@@ -182,19 +185,10 @@ const optionalProvider: ToolProvider = {
 	},
 };
 
-/** Review tools provider — injected for review narrators. */
-const reviewProvider: ToolProvider = {
-	name: "review",
-	tools() {
-		return [...REVIEW_TOOLS.values()];
-	},
-};
-
 /** Register all core tools into the singleton registry */
 export function registerCoreTools(): void {
 	toolRegistry.registerProvider(coreProvider);
 	toolRegistry.registerProvider(optionalProvider);
-	toolRegistry.registerProvider(reviewProvider);
 }
 
 // Register after this module has finished initializing provider constants. Keeping the

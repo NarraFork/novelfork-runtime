@@ -1,12 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { DEFAULTS, deepMerge } from "@server/lib/settings";
+import { normalizeLegacySettingsPatch, updateSettingsSchema } from "@server/routes/settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import {
+	DEFAULT_RECORDING_REQUEST_BYTES,
+	DEFAULT_RECORDING_RESPONSE_BYTES,
+	MAX_RECORDING_REQUEST_BYTES,
+	MAX_RECORDING_RESPONSE_BYTES,
+	MIN_RECORDING_WINDOW_BYTES,
+} from "@shared/request-recording";
 import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 	normalizeContextManagementDraft,
 } from "../components/narrator/context-management/types";
 import en from "../locales/en/settings.json";
 import zh from "../locales/zh-CN/settings.json";
+import { readRequestRecordingSettings } from "./useInstanceSettings";
 
 const hook = readFileSync(new URL("./useInstanceSettings.ts", import.meta.url), "utf8");
 const page = readFileSync(new URL("../routes/settings/agent.tsx", import.meta.url), "utf8");
@@ -14,6 +24,110 @@ const section = readFileSync(
 	new URL("../components/settings/AgentSection.tsx", import.meta.url),
 	"utf8",
 );
+
+describe("request evidence settings", () => {
+	test("missing settings use bounded ring defaults with auto-pin off", () => {
+		const expected = {
+			ringEnabled: true,
+			ringRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
+			ringResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
+			autoPin: "off" as const,
+		};
+		expect(readRequestRecordingSettings()).toEqual(expected);
+		expect(readRequestRecordingSettings(DEFAULTS.requestEvidence)).toEqual(expected);
+	});
+	test("false, zero and auto-pin values remain explicit independent values", () => {
+		const config = {
+			ringEnabled: false,
+			ringRequestBytes: 0,
+			ringResponseBytes: 0,
+			autoPin: "errors" as const,
+		};
+		expect(readRequestRecordingSettings(config)).toEqual(config);
+		expect(
+			readRequestRecordingSettings(
+				deepMerge(DEFAULTS, { requestEvidence: config }).requestEvidence,
+			),
+		).toEqual(config);
+	});
+	test("PATCH accepts independent zero/full byte capacities and every auto-pin mode", () => {
+		for (const [ringRequestBytes, ringResponseBytes] of [
+			[0, 0],
+			[MIN_RECORDING_WINDOW_BYTES, MIN_RECORDING_WINDOW_BYTES],
+			[MAX_RECORDING_REQUEST_BYTES, MAX_RECORDING_RESPONSE_BYTES],
+		]) {
+			for (const autoPin of ["off", "errors", "all"] as const) {
+				const requestEvidence = {
+					ringEnabled: false,
+					ringRequestBytes,
+					ringResponseBytes,
+					autoPin,
+				};
+				expect(updateSettingsSchema.parse({ requestEvidence }).requestEvidence).toEqual(
+					requestEvidence,
+				);
+			}
+		}
+	});
+	test("PATCH rejects bad capacities, non-boolean switches and unknown auto-pin modes", () => {
+		for (const [field, max] of [
+			["ringRequestBytes", MAX_RECORDING_REQUEST_BYTES],
+			["ringResponseBytes", MAX_RECORDING_RESPONSE_BYTES],
+		] as const) {
+			for (const value of [-1, 0.5, 1, MIN_RECORDING_WINDOW_BYTES - 1, max + 1, "16", null]) {
+				expect(
+					updateSettingsSchema.safeParse({ requestEvidence: { [field]: value } }).success,
+				).toBe(false);
+			}
+		}
+		expect(
+			updateSettingsSchema.safeParse({ requestEvidence: { ringEnabled: "true" } }).success,
+		).toBe(false);
+		expect(
+			updateSettingsSchema.safeParse({ requestEvidence: { autoPin: "sometimes" } }).success,
+		).toBe(false);
+	});
+	test("legacy agent.requestDump* PATCH keys map onto requestEvidence; explicit section wins", () => {
+		expect(
+			normalizeLegacySettingsPatch({
+				agent: {
+					requestDumpRecordingEnabled: false,
+					requestDumpRequestBytes: 0,
+					requestDumpEnabled: true,
+					requestDumpErrorsOnly: true,
+				},
+			}),
+		).toEqual({
+			agent: {},
+			requestEvidence: { ringEnabled: false, ringRequestBytes: 0, autoPin: "errors" },
+		});
+		expect(
+			normalizeLegacySettingsPatch({
+				agent: { requestDumpEnabled: true },
+				requestEvidence: { autoPin: "off" },
+			}),
+		).toEqual({ agent: {}, requestEvidence: { autoPin: "off" } });
+	});
+	test("all evidence fields roundtrip through controlled settings and bilingual labels", () => {
+		for (const field of ["ringEnabled", "ringRequestBytes", "ringResponseBytes", "autoPin"]) {
+			expect(hook).toContain(`${field}: state.${field}`);
+			expect(page).toContain(`${field}={is.${field}}`);
+			const setter = `set${field[0].toUpperCase()}${field.slice(1)}`;
+			expect(page).toContain(`${setter}={is.${setter}}`);
+			expect(section).toContain(`props.${setter}`);
+		}
+		for (const locale of [en, zh]) {
+			expect(locale.requestEvidenceRingEnabled).toBeTruthy();
+			expect(locale.requestEvidenceRingEnabledDesc).toContain("/save_dump");
+			expect(locale.requestEvidenceRequestCapacity).toBeTruthy();
+			expect(locale.requestEvidenceResponseCapacity).toBeTruthy();
+			expect(locale.requestEvidenceCapacityDesc).toContain("0");
+			expect(locale.requestEvidenceAutoPinDesc).toContain("512MiB");
+			for (const mode of ["off", "errors", "all"] as const)
+				expect(locale[`requestEvidenceAutoPin_${mode}`]).toBeTruthy();
+		}
+	});
+});
 
 describe("permission rule auto-approval settings wiring", () => {
 	test("defaults off, forwards the administrator boundary, and persists independently of danger reflection", () => {

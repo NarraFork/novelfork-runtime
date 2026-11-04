@@ -13,10 +13,8 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { WriteConflictError } from "@server/db/backend/write-port";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
-import { setChapterWriteStore } from "../chapter-write/store";
 import { setKnowledgeWriteStore } from "../knowledge/store";
 import { composePostgresStores } from "../postgres-composition";
-import { setProjectArchiveMainStore } from "../project-archive/store";
 import { setProjectReadAdapter } from "../read";
 import { setRegistrationAccountStore } from "../registration/store";
 import { unbindPostgresSearchClientForTests } from "../search/postgres-store";
@@ -469,6 +467,7 @@ describe("postgres runtime queue: producer-half admission/read surface (P2)", ()
 			byteSize: 4,
 			payloadRefJson: null,
 			imagesJson: null,
+			mediaJson: null,
 			textFilePathsJson: null,
 			fileReferencesJson: null,
 			metadataJson: "{}",
@@ -495,6 +494,7 @@ describe("postgres runtime queue: producer-half admission/read surface (P2)", ()
 						byteSize: 4,
 						payloadRefJson: null,
 						imagesJson: null,
+						mediaJson: null,
 						textFilePathsJson: null,
 						fileReferencesJson: null,
 						metadataJson: "{}",
@@ -570,8 +570,6 @@ describe("postgres runtime queue: composition-root binding (the P2 consumption p
 		setPostgresRuntimeQueue(undefined);
 		setRegistrationAccountStore(undefined);
 		setKnowledgeWriteStore(undefined);
-		setChapterWriteStore(undefined);
-		setProjectArchiveMainStore(undefined);
 		setProjectReadAdapter(undefined);
 		unbindPostgresSearchClientForTests();
 	});

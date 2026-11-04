@@ -28,8 +28,10 @@
  * - Membership never silently exceeds `WORKSPACE_PANEL_MAX`.
  */
 
+import type { WorkspaceChangeReason } from "@shared/workspace-events";
 import {
 	isWorkspacePanelKind,
+	normalizeWorkspaceOutlineConfig,
 	WORKSPACE_PANEL_CONFIG_MAX_BYTES,
 	WORKSPACE_PANEL_MAX,
 	type WorkspacePanel,
@@ -42,12 +44,36 @@ import { userRecentTabs, workspacePanels, workspaces } from "../db/schema";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { broadcastToUser } from "../websocket/narrator-ws";
 import { applyWorkspaceMembershipProjection } from "./recent-tabs-service";
 
 type WorkspacePanelRow = typeof workspacePanels.$inferSelect;
 
 /** Gap between sort orders so a later insert can land between two panels. */
 const SORT_ORDER_GAP = 1_000;
+
+/**
+ * Tell this user's OTHER connected devices that a workspace they may have open
+ * changed, so they re-fetch instead of waiting for a window refocus.
+ *
+ * The frame is an invalidation signal (ids + revision only); the arrangement
+ * blob stays on the HTTP read path. Membership writes do not bump
+ * `layoutRevision`, so it is only carried for layout saves.
+ */
+function broadcastWorkspaceChanged(
+	userId: string,
+	workspaceId: string,
+	reason: WorkspaceChangeReason,
+	layoutRevision?: number,
+): void {
+	try {
+		broadcastToUser(userId, { type: "workspace_changed", workspaceId, reason, layoutRevision });
+	} catch (error) {
+		// A broadcast must never fail the write it announces: the mutation already
+		// committed, and the next focus/refetch still converges the other devices.
+		logger.warn("workspace change broadcast failed", { workspaceId, reason, error });
+	}
+}
 
 /**
  * Whether a stored row is still a membership kind.
@@ -88,6 +114,23 @@ function parseConfig(configJson: string | null): unknown {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * An outline member's config, reduced to `{ spaceId, blockId, view }`. A config without a valid
+ * space id is refused: such a row would render as a panel that names nothing. Whether the
+ * person may read the space is not checked here; the panel reads through the outline routes,
+ * which answer for an unreadable space exactly as for a missing one.
+ */
+function outlineMemberConfig(config: unknown) {
+	const normalized = normalizeWorkspaceOutlineConfig(config);
+	if (!normalized) {
+		throw new ValidationError(
+			"An outline panel needs a valid spaceId",
+			"WORKSPACE_PANEL_CONFIG_INVALID",
+		);
+	}
+	return normalized;
 }
 
 function serializeConfig(config: unknown): string | null {
@@ -201,6 +244,12 @@ function recoverFromParams(params: unknown): RecoveredPanel | null {
 		const narratorId = record.narratorId;
 		if (typeof narratorId !== "string" || !narratorId) return null;
 		return { kind, narratorId, config: null };
+	}
+	if (kind === "outline") {
+		// A session's outline resource names its host and stays in the layout.
+		if (typeof record.hostNarratorId === "string") return null;
+		const config = normalizeWorkspaceOutlineConfig(record);
+		return config ? { kind, narratorId: null, config } : null;
 	}
 	return { kind, narratorId: null, config: record };
 }
@@ -393,7 +442,12 @@ export async function addWorkspacePanel(
 	const now = new Date();
 	const id = generateId();
 	const sortOrder = (existingPanels.at(-1)?.sortOrder ?? 0) + SORT_ORDER_GAP;
-	const configJson = input.kind === "narrator" ? null : serializeConfig(input.config);
+	const configJson =
+		input.kind === "narrator"
+			? null
+			: serializeConfig(
+					input.kind === "outline" ? outlineMemberConfig(input.config) : input.config,
+				);
 	// `kind` is pinned to the membership union rather than inferred: the column's enum is
 	// wider (it still carries the retired `"plugin"`), and letting inference widen here
 	// would silently allow a non-membership kind to be written.
@@ -419,6 +473,8 @@ export async function addWorkspacePanel(
 	} else {
 		db.insert(workspacePanels).values(row).run();
 	}
+
+	broadcastWorkspaceChanged(userId, workspaceId, "membership");
 
 	return {
 		panel: {
@@ -457,9 +513,10 @@ export async function removeWorkspacePanel(
 			workspaceId: null,
 			panelMembership: { action: "remove", panelId: row.id },
 		});
-		return;
+	} else {
+		db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
 	}
-	db.delete(workspacePanels).where(eq(workspacePanels.id, panelId)).run();
+	broadcastWorkspaceChanged(userId, workspaceId, "membership");
 }
 
 /** Rejection code for a layout save that raced another client. */
@@ -515,7 +572,9 @@ export async function saveWorkspaceLayout(
 		});
 		throw new WorkspaceLayoutConflictError(current?.layoutRevision ?? 0);
 	}
-	return { layoutRevision: updated[0].layoutRevision };
+	const layoutRevision = updated[0].layoutRevision;
+	broadcastWorkspaceChanged(userId, workspaceId, "layout", layoutRevision);
+	return { layoutRevision };
 }
 
 /**
@@ -542,7 +601,7 @@ export async function updateWorkspacePanelConfig(
 			"WORKSPACE_PANEL_NOT_CONFIGURABLE",
 		);
 	}
-	const configJson = serializeConfig(config);
+	const configJson = serializeConfig(row.kind === "outline" ? outlineMemberConfig(config) : config);
 	await db
 		.update(workspacePanels)
 		.set({ configJson, updatedAt: new Date() })

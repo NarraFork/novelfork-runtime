@@ -1,13 +1,19 @@
 import { db } from "@server/db";
-import { narratorMessages, narratorToolCalls } from "@server/db/schema";
+import { narratorMessages } from "@server/db/schema";
+import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
 import { eq } from "drizzle-orm";
 import type { CostEstimate } from "./cost-estimate";
-import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
-import { type PriceField, referencePriceNumber, resolveModelPricing, pricingFromReferenceSnapshot } from "./model-pricing";
+import {
+	type PriceField,
+	pricingFromReferenceSnapshot,
+	referencePriceNumber,
+	resolveModelPricing,
+} from "./model-pricing";
 
 export type { CostData, CostEstimate, CostStatus } from "./cost-estimate";
 
 export interface UsageData {
+	/** Non-cached input; cache reads and writes are disjoint counters, normalized by the adapter. */
 	inputTokens: number;
 	outputTokens: number;
 	cachedInputTokens?: number;
@@ -18,6 +24,7 @@ export interface UsageData {
 }
 
 export function buildUsageDataFromSnapshot(snapshot?: {
+	promptTokens?: number;
 	inputTokens?: number;
 	completionTokens?: number;
 	cachedInputTokens?: number;
@@ -28,38 +35,32 @@ export function buildUsageDataFromSnapshot(snapshot?: {
 }): UsageData | null {
 	if (!snapshot) return null;
 	if (
+		snapshot.promptTokens == null &&
 		snapshot.inputTokens == null &&
 		snapshot.completionTokens == null &&
 		snapshot.cachedInputTokens == null &&
-		snapshot.cacheCreationInputTokens == null
+		snapshot.cacheCreationInputTokens == null &&
+		snapshot.cacheCreation5mTokens == null &&
+		snapshot.cacheCreation1hTokens == null
 	) {
 		return null;
 	}
+	const cacheRead = snapshot.cachedInputTokens ?? 0;
+	const cacheWrite = Math.max(
+		snapshot.cacheCreationInputTokens ?? 0,
+		(snapshot.cacheCreation5mTokens ?? 0) + (snapshot.cacheCreation1hTokens ?? 0),
+	);
 	return {
-		inputTokens: snapshot.inputTokens ?? 0,
+		inputTokens:
+			snapshot.inputTokens ?? Math.max(0, (snapshot.promptTokens ?? 0) - cacheRead - cacheWrite),
 		outputTokens: snapshot.completionTokens ?? 0,
-		cachedInputTokens: snapshot.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: snapshot.cacheCreationInputTokens ?? 0,
+		cachedInputTokens: cacheRead,
+		cacheCreationInputTokens: cacheWrite,
 		cacheCreation5mInputTokens: snapshot.cacheCreation5mTokens ?? 0,
 		cacheCreation1hInputTokens: snapshot.cacheCreation1hTokens ?? 0,
 		reasoningTokens: snapshot.reasoningTokens ?? 0,
 	};
 }
-
-/**
- * Providers whose reported `input_tokens` is the *total* prompt size, cached
- * tokens included. For these, the cached portion must be subtracted before
- * applying the full input rate or those tokens get billed twice — once at the
- * input rate and again at the cache-read rate.
- *
- * Anthropic is the opposite: `input_tokens` already excludes
- * `cache_read_input_tokens` and `cache_creation_input_tokens`, so subtracting
- * would undercount.
- *
- * This set describes token semantics, not price coverage. Every provider's
- * reference price comes from the effective catalog; NUG actual billing stays separate.
- */
-const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set(["openai", "codex", "nug", "gemini"]);
 
 /**
  * Attribute a USD cost to one request's token usage using the official
@@ -82,12 +83,13 @@ export function calculateCost(
 
 export function calculateCostDetailed(
 	usage: UsageData,
-	provider: string,
+	_provider: string,
 	model: string,
 	snapshot?: ReferencePricingSnapshot,
 ): CostEstimate {
 	// An explicit unknown snapshot must never fall back to a newly published price.
-	const pricing = snapshot === undefined ? resolveModelPricing(model) : pricingFromReferenceSnapshot(snapshot);
+	const pricing =
+		snapshot === undefined ? resolveModelPricing(model) : pricingFromReferenceSnapshot(snapshot);
 	const tokens = (value?: number) =>
 		typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
 	const cacheRead = tokens(usage.cachedInputTokens);
@@ -95,12 +97,10 @@ export function calculateCostDetailed(
 		tokens(usage.cacheCreationInputTokens),
 		tokens(usage.cacheCreation5mInputTokens) + tokens(usage.cacheCreation1hInputTokens),
 	);
-	const reportedInput = tokens(usage.inputTokens);
-	const inclusive = PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT.has(provider.toLowerCase());
-	const input = inclusive ? Math.max(0, reportedInput - cacheRead) : reportedInput;
-	const promptTokens = inclusive
-		? reportedInput + cacheWrite
-		: reportedInput + cacheRead + cacheWrite;
+	// Adapters normalize protocol-specific totals once. Provider identity (notably
+	// NUG's mixed protocols) cannot tell us whether a counter includes caching.
+	const input = tokens(usage.inputTokens);
+	const promptTokens = input + cacheRead + cacheWrite;
 	const counts: Record<PriceField, number> = {
 		input,
 		output: tokens(usage.outputTokens),
@@ -160,41 +160,6 @@ export function calculateCostDetailed(
 	};
 }
 
-/**
- * 更新工具调用的 token 使用和费用信息
- */
-export async function updateToolCallUsage(
-	toolCallId: string,
-	usage: UsageData,
-	provider: string,
-	model: string,
-): Promise<void> {
-	const cost = calculateCostDetailed(usage, provider, model);
-
-	const updateData: Record<string, unknown> = {
-		inputTokens: usage.inputTokens,
-		outputTokens: usage.outputTokens,
-		cacheReadTokens: usage.cachedInputTokens || 0,
-		cacheCreationTokens: usage.cacheCreationInputTokens || 0,
-		cacheCreation5mTokens: usage.cacheCreation5mInputTokens || 0,
-		cacheCreation1hTokens: usage.cacheCreation1hInputTokens || 0,
-		provider,
-		model,
-		costStatus: cost.status,
-		costMissingFields: cost.missingFields,
-	};
-
-	if (cost) {
-		updateData.inputCost = cost.inputCost;
-		updateData.outputCost = cost.outputCost;
-		updateData.cacheCreationCost = cost.cacheCreationCost;
-		updateData.cacheReadCost = cost.cacheReadCost;
-		updateData.totalCost = cost.totalCost;
-	}
-
-	await db.update(narratorToolCalls).set(updateData).where(eq(narratorToolCalls.id, toolCallId));
-}
-
 export async function updateMessageUsage(
 	messageId: string,
 	usage: UsageData,
@@ -251,18 +216,77 @@ export function extractAnthropicUsage(usage: {
  */
 export function extractOpenAIUsage(usage: {
 	prompt_tokens?: number;
+	input_tokens?: number;
 	completion_tokens?: number;
+	output_tokens?: number;
 	prompt_tokens_details?: {
 		cached_tokens?: number;
+		cache_write_tokens?: number;
+		cache_creation_tokens?: number;
 	};
+	input_tokens_details?: {
+		cached_tokens?: number;
+		cache_write_tokens?: number;
+		cache_creation_tokens?: number;
+	};
+	cached_tokens?: number;
+	cached_input_tokens?: number;
+	cache_read_input_tokens?: number;
+	cache_read_tokens?: number;
+	cache_write_tokens?: number;
+	cache_creation_input_tokens?: number;
+	cache_write_input_tokens?: number;
+	cache_creation_tokens?: number;
 	completion_tokens_details?: {
 		reasoning_tokens?: number;
 	};
+	output_tokens_details?: {
+		reasoning_tokens?: number;
+	};
 }): UsageData {
+	const cacheTokens = (value?: number) =>
+		value == null ? undefined : Number.isFinite(value) ? Math.max(value, 0) : 0;
+	const firstPositive = (...values: Array<number | undefined>) =>
+		values.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0) ??
+		(values.some((value) => value != null) ? 0 : undefined);
+	// Nested counters are authoritative, including an explicit zero. Top-level
+	// relay aliases instead use the first positive finite counter.
+	const cachedInputTokens = cacheTokens(
+		usage.input_tokens_details?.cached_tokens ??
+			usage.prompt_tokens_details?.cached_tokens ??
+			firstPositive(
+				usage.cache_read_input_tokens,
+				usage.cache_read_tokens,
+				usage.cached_input_tokens,
+				usage.cached_tokens,
+			),
+	);
+	const cacheCreationInputTokens = cacheTokens(
+		usage.input_tokens_details?.cache_write_tokens ??
+			usage.prompt_tokens_details?.cache_write_tokens ??
+			usage.input_tokens_details?.cache_creation_tokens ??
+			usage.prompt_tokens_details?.cache_creation_tokens ??
+			firstPositive(
+				usage.cache_write_tokens,
+				usage.cache_creation_input_tokens,
+				usage.cache_write_input_tokens,
+				usage.cache_creation_tokens,
+			),
+	);
+	// Both OpenAI protocols report the full prompt, including cache reads/writes.
 	return {
-		inputTokens: usage.prompt_tokens ?? 0,
-		outputTokens: usage.completion_tokens ?? 0,
-		cachedInputTokens: usage.prompt_tokens_details?.cached_tokens || 0,
-		reasoningTokens: usage.completion_tokens_details?.reasoning_tokens || 0,
+		inputTokens: Math.max(
+			(usage.input_tokens ?? usage.prompt_tokens ?? 0) -
+				(cachedInputTokens ?? 0) -
+				(cacheCreationInputTokens ?? 0),
+			0,
+		),
+		outputTokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
+		cachedInputTokens,
+		cacheCreationInputTokens,
+		reasoningTokens:
+			usage.output_tokens_details?.reasoning_tokens ??
+			usage.completion_tokens_details?.reasoning_tokens ??
+			0,
 	};
 }

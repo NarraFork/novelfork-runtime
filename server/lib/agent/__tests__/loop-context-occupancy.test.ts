@@ -11,7 +11,7 @@ let requestReadyObserver: (() => void) | undefined;
 const model = "claude-sonnet-4-20250514";
 const adapter: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		await params.onInputCharacters?.(inputPlans[attempt] ?? null);
@@ -22,9 +22,6 @@ const adapter: ProviderAdapter = {
 			yield event;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -69,7 +66,7 @@ async function runWithConfig(
 			...overrides,
 		},
 		"hello",
-		[],
+		{ rows: [] },
 	))
 		events.push(event);
 	inputPlans = [];
@@ -88,6 +85,55 @@ const text = { text: "The final answer contains enough text for a nonzero output
 const windowSize = getModelContextWindow(model, "anthropic") ?? 0;
 
 describe("independent upstream context occupancy", () => {
+	test("output-only usage is persisted without inventing prompt occupancy", async () => {
+		const { ends, contexts } = await run([{ usage: { completionTokens: 9 } }, text]);
+		expect(ends.at(-1)?.usage?.completionTokens).toBe(9);
+		expect(ends.at(-1)?.usage?.promptTokens).toBeUndefined();
+		expect(ends.at(-1)?.usage?.inputTokens).toBeUndefined();
+		expect(contexts).toHaveLength(0);
+	});
+
+	for (const finalUsage of [{ promptTokens: 100, completionTokens: 0 }, { completionTokens: 0 }]) {
+		test(`explicit zero output corrects a previous nonzero count: ${JSON.stringify(finalUsage)}`, async () => {
+			const { ends } = await run([
+				{ usage: { promptTokens: 100, inputTokens: 100, completionTokens: 8 } },
+				{ usage: finalUsage },
+				text,
+			]);
+			expect(ends.at(-1)?.usage).toMatchObject({
+				promptTokens: 100,
+				inputTokens: 100,
+				completionTokens: 0,
+			});
+		});
+	}
+
+	test("all-zero prompt/output placeholders preserve earlier measured billing", async () => {
+		const { ends } = await run([measured, placeholder, text]);
+		expect(ends.at(-1)?.usage).toMatchObject(measured.usage);
+	});
+
+	test("a fully cached final prompt replaces earlier ordinary input with zero", async () => {
+		const { ends, contexts } = await run([
+			{ usage: { promptTokens: 1000, inputTokens: 1000, cachedInputTokens: 0 } },
+			{
+				usage: {
+					promptTokens: 1000,
+					inputTokens: 0,
+					cachedInputTokens: 1000,
+					completionTokens: 10,
+				},
+			},
+			text,
+		]);
+		expect(ends.at(-1)?.usage).toMatchObject({
+			promptTokens: 1000,
+			inputTokens: 0,
+			cachedInputTokens: 1000,
+			completionTokens: 10,
+		});
+		expect(contexts.at(-1)?.snapshot?.occupiedTokens).toBe(1000);
+	});
 	test("overflow display preserves token/window arithmetic without changing compact occupancy cap", async () => {
 		const { ends, contexts } = await run([
 			{

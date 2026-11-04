@@ -1,10 +1,11 @@
-import { readFileSync } from "node:fs";
 import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
-import { outputToText } from "@shared/agent-protocol/tool-output";
-import { modelTextFromContentBlocks } from "@shared/native-injection";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
-import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
+import {
+	mapGenericReasoningEffort,
+	modelAcceptsReasoningEffort,
+} from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
@@ -13,7 +14,6 @@ import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import type { OpenAIProviderConfig } from "../settings";
 import { getReasoningEffortBlocklist, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
-import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
 import { getHttpCodexUserAgent, getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
@@ -36,8 +36,27 @@ import {
 	markRuntimeSystemMessage,
 	reportInputCharacters,
 } from "./input-characters";
+import {
+	assertNativeMediaPayload,
+	chatAudioMedia,
+	chatNativeMedia,
+	chatVideoMedia,
+	createNativeMediaDumpEncoder,
+	rejectNativeMedia,
+	responsesVideoMedia,
+	storedMessageMedia,
+	supportsNativeMediaProtocolInput,
+	visitNativeMedia,
+} from "./native-media";
 import { buildOpencodeSessionHeader } from "./opencode-session";
+import {
+	type NeutralTurn,
+	projectHistory,
+	type ResolvedImage,
+	webSearchSummary,
+} from "./projection";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -48,27 +67,37 @@ import type {
 } from "./provider";
 import {
 	assertModelInputModalities,
-	effectiveProviderMetadata,
+	effectiveModelProfile,
 	resolveMetadataReasoning,
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
+import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { createRequestBodyEncoder, stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
-import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
-import { resolveToolJsonSchema } from "./tool-registry";
 import {
-	type AgentToolUse,
-	ApiError,
-	isDeepSeekModel,
-	mapDeepSeekEffort,
-	type ResolvedToolDefinition,
-} from "./types";
+	openAIChatResponseFormat,
+	openAIResponsesTextFormat,
+	structuredResult,
+} from "./response-format";
+import {
+	isStructuredOutputRejection,
+	modelLacksNativeStructuredOutput,
+	rememberMissingNativeStructuredOutput,
+	structuredOutputRelayKey,
+	withSchemaInstruction,
+} from "./structured-output-fallback";
+import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
+import type { ToolLoadingChange, ToolLoadingTarget } from "./tool-loading";
+import { resolveToolJsonSchema } from "./tool-registry";
+import { type AgentToolUse, ApiError, isDeepSeekModel, type ResolvedToolDefinition } from "./types";
 import {
 	omitUnsupportedParameters,
 	parseUnsupportedParameter,
 	stripUnsupportedParameter,
 	withUnsupportedParameterFallback,
 } from "./unsupported-parameter-fallback";
+import { orderUserContent } from "./user-content-order";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
 
@@ -78,7 +107,7 @@ export function applyOpenAIModelMetadata(
 	apiMode: OpenAIApiMode,
 	requested?: number,
 ): void {
-	const metadata = effectiveProviderMetadata(model);
+	const metadata = effectiveModelProfile(model);
 	// Codex endpoints (including NUG Codex) do not accept max_output_tokens.
 	// Ordinary Responses and Chat Completions retain the configured output ceiling.
 	if (apiMode !== "codex") {
@@ -108,41 +137,62 @@ export function applyOpenAIModelMetadata(
 	assertModelInputModalities(model, body, metadata);
 }
 
-function parsedUsageToUsageData(usage: unknown): GenerateMetaResult["usage"] {
-	if (typeof usage !== "object" || usage === null) return null;
-	const data = usage as Record<string, unknown>;
-	const details =
-		typeof data.output_tokens_details === "object" && data.output_tokens_details !== null
-			? (data.output_tokens_details as Record<string, unknown>)
-			: undefined;
-	const inputDetails =
-		typeof data.input_tokens_details === "object" && data.input_tokens_details !== null
-			? (data.input_tokens_details as Record<string, unknown>)
-			: undefined;
-	const numberValue = (...keys: string[]) => {
-		for (const key of keys) {
-			const value = data[key];
-			if (typeof value === "number") return value;
-		}
-		return undefined;
-	};
+/** Parsed stream events already carry disjoint counters; never subtract cache twice. */
+function parsedUsageToUsageData(
+	usage: NonNullable<ParsedStreamEvent["usage"]>,
+): NonNullable<GenerateMetaResult["usage"]> {
 	return {
-		inputTokens: numberValue("inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0,
-		outputTokens:
-			numberValue("completionTokens", "outputTokens", "completion_tokens", "output_tokens") ?? 0,
-		cachedInputTokens:
-			numberValue("cachedInputTokens", "cached_input_tokens") ??
-			(typeof inputDetails?.cached_tokens === "number" ? inputDetails.cached_tokens : 0),
-		cacheCreationInputTokens:
-			numberValue("cacheCreationInputTokens", "cache_creation_input_tokens") ?? 0,
-		cacheCreation5mInputTokens:
-			numberValue("cacheCreation5mTokens", "cache_creation_5m_tokens") ?? 0,
-		cacheCreation1hInputTokens:
-			numberValue("cacheCreation1hTokens", "cache_creation_1h_tokens") ?? 0,
-		reasoningTokens:
-			numberValue("reasoningTokens", "reasoning_tokens") ??
-			(typeof details?.reasoning_tokens === "number" ? details.reasoning_tokens : 0),
+		inputTokens: usage.inputTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
+		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
+		reasoningTokens: usage.reasoningTokens ?? 0,
 	};
+}
+
+// The parser's tool map is created per request/attempt, including Codex WS.
+// Keep partial usage under the same lifetime instead of leaking it across retries.
+const openAIUsageState = new WeakMap<object, NonNullable<ParsedStreamEvent["usage"]>>();
+
+/** Merge reported counters first; derive net input only after cache updates. */
+function openAIUsageToParsedUsage(
+	usage: Parameters<typeof extractOpenAIUsage>[0],
+	request: object,
+): NonNullable<ParsedStreamEvent["usage"]> {
+	const merged = { ...openAIUsageState.get(request) };
+	const normalized = extractOpenAIUsage(usage);
+	const prompt = usage.input_tokens ?? usage.prompt_tokens;
+	// Relays can finish with a zero prompt placeholder and output-only accounting.
+	if (prompt != null && (prompt > 0 || merged.promptTokens == null)) {
+		merged.promptTokens = prompt;
+	}
+	if (usage.output_tokens != null || usage.completion_tokens != null) {
+		merged.completionTokens = normalized.outputTokens;
+	}
+	if (normalized.cachedInputTokens !== undefined) {
+		merged.cachedInputTokens = normalized.cachedInputTokens;
+	}
+	if (normalized.cacheCreationInputTokens !== undefined) {
+		merged.cacheCreationInputTokens = normalized.cacheCreationInputTokens;
+	}
+	if (
+		usage.output_tokens_details?.reasoning_tokens != null ||
+		usage.completion_tokens_details?.reasoning_tokens != null
+	) {
+		merged.reasoningTokens = normalized.reasoningTokens;
+	}
+	if (merged.promptTokens != null) {
+		merged.inputTokens = Math.max(
+			merged.promptTokens -
+				(merged.cachedInputTokens ?? 0) -
+				(merged.cacheCreationInputTokens ?? 0),
+			0,
+		);
+	}
+	openAIUsageState.set(request, merged);
+	return merged;
 }
 
 /** Resolve apiMode from provider config, with backward compat for the old `responsesApi` boolean. */
@@ -212,10 +262,7 @@ export function appendCodexNativeTools(
 	model: string,
 	options?: { webSearch?: boolean; imageGeneration?: boolean },
 ): void {
-	if (
-		options?.webSearch === false ||
-		effectiveProviderMetadata(model).nativeSearch?.supported === false
-	) {
+	if (options?.webSearch === false || effectiveModelProfile(model).nativeSearch === false) {
 		removeNativeTool(tools, "web_search");
 	} else if (!hasNativeTool(tools, "web_search")) {
 		tools.push({ type: "web_search" });
@@ -224,7 +271,10 @@ export function appendCodexNativeTools(
 		removeNativeTool(tools, "image_generation");
 		return;
 	}
-	if (!supportsCodexImageGeneration(model)) return;
+	if (!supportsCodexImageGeneration(model)) {
+		removeNativeTool(tools, "image_generation");
+		return;
+	}
 	if (!hasNativeTool(tools, "image_generation")) {
 		tools.push({
 			type: "image_generation",
@@ -236,12 +286,37 @@ export function appendCodexNativeTools(
 	applyCodexImageGenerationDefaults(tools);
 }
 
+/**
+ * Hosted capability revocation is an explicit prefix exception: this Codex adapter
+ * has no verified execution allow-list separate from its declarations. Remove a
+ * disabled hosted tool even when that changes the prefix; never mutate epoch tools.
+ */
+export function withCodexNativeTools(
+	baseline: readonly unknown[],
+	model: string,
+	options: { webSearch?: boolean; imageGeneration?: boolean },
+): unknown[] {
+	const tools = baseline.map((tool) => {
+		if (!tool || typeof tool !== "object") return tool;
+		const type = (tool as { type?: string }).type;
+		return type === "web_search" || type === "image_generation" ? { ...tool } : tool;
+	});
+	appendCodexNativeTools(tools, model, options);
+	logger.debug("Codex native capability policy may change the cached prefix", {
+		protocol: "codex-responses",
+		prefixException: "native-capability-policy",
+		webSearch: hasNativeTool(tools, "web_search"),
+		imageGeneration: hasNativeTool(tools, "image_generation"),
+	});
+	return tools;
+}
+
 /** Declared catalog tiers constrain requests; unknown models keep the selected effort. */
 export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
-	return resolveMetadataReasoning(effectiveProviderMetadata(model), reasoningEffort);
+	return resolveMetadataReasoning(effectiveModelProfile(model), reasoningEffort, model);
 }
 
 /**
@@ -257,7 +332,7 @@ export function resolveCodexRequestReasoningEffort(
 		normalizeCodexReasoningEffort(
 			model,
 			reasoningEffort ??
-				effectiveProviderMetadata(model).reasoning?.defaultLevel ??
+				effectiveModelProfile(model).reasoning?.defaultLevel ??
 				settings.agent.defaultReasoningEffort ??
 				"max",
 		) ?? "none"
@@ -272,8 +347,7 @@ export function resolveCodexRequestReasoningEffort(
  * all, which hid the tier menu for every other third-party model.
  *
  * Three shapes, because the field names are not interchangeable:
- *   - DeepSeek (completions): `thinking` block + `reasoning_effort`, and only
- *     high/max are accepted upstream.
+ *   - DeepSeek (completions): `thinking` block + metadata-resolved `reasoning_effort`.
  *   - Responses-compatible: `reasoning.effort`, matching the OpenAI Responses
  *     schema that these relays emulate. `encrypted_content` is NOT requested —
  *     that is a Codex-specific include handled on the Codex path.
@@ -285,23 +359,24 @@ function applyGenericReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): void {
-	const metadata = effectiveProviderMetadata(model);
-	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort);
+	const metadata = effectiveModelProfile(model);
+	reasoningEffort = resolveMetadataReasoning(metadata, reasoningEffort, model);
 	if (!reasoningEffort) return;
 	const bareModel = parseModelId(model).model;
+	const acceptsEffort = modelAcceptsReasoningEffort(bareModel, getReasoningEffortBlocklist());
 
-	// DeepSeek keeps its own wire shape (thinking block + two effective tiers).
+	// DeepSeek requires a thinking switch; effort tiers come from model metadata.
 	if (!usesResponsesEndpoint(apiMode) && isDeepSeekModel(bareModel)) {
 		if (reasoningEffort === "none") {
 			body.thinking = { type: "disabled" };
 			return;
 		}
 		body.thinking = { type: "enabled" };
-		const effort = mapDeepSeekEffort(reasoningEffort);
-		if (effort) body.reasoning_effort = effort;
+		if (acceptsEffort) body.reasoning_effort = reasoningEffort;
 		return;
 	}
 
+	if (!acceptsEffort) return;
 	const effort = metadata.reasoning?.levels?.length
 		? reasoningEffort
 		: mapGenericReasoningEffort(bareModel, reasoningEffort, getReasoningEffortBlocklist());
@@ -410,7 +485,10 @@ export type OAIContentPart =
 	| { type: "image_url"; image_url: { url: string }; imageRef?: string }
 	| { type: "input_text"; text: string }
 	| { type: "input_image"; image_url: string; imageRef?: string }
-	| { type: "output_text"; text: string };
+	| { type: "output_text"; text: string }
+	| { type: "input_audio"; input_audio: { data: string; format: "wav" | "mp3" } }
+	| { type: "video_url"; video_url: { url: string } }
+	| { type: "input_video"; video_url: string };
 
 interface ResponsesToolImage {
 	format: string;
@@ -422,11 +500,14 @@ interface ResponsesFunctionCallOutputMessage {
 	call_id: string;
 	output: string;
 	_images?: ResponsesToolImage[];
+	_nativeMedia?: readonly NativeMediaInput[];
 }
 
 export interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
 	content?: string | OAIContentPart[] | null;
+	/** Kimi dynamic tool loading: tools a `system` message declares from its position on. */
+	tools?: OAITool[];
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
 	/**
@@ -444,6 +525,21 @@ export interface OAIMessage {
 	_reasoningTextFallback?: string;
 }
 
+/**
+ * Thinking-mode Chat Completions relays (DeepSeek, GLM, Kimi, MiniMax, QwQ, …)
+ * reject a follow-up when any assistant message omits `reasoning_content`.
+ * Captured text is copied in by the caller; this only fills the gap with an
+ * empty string, which is what those APIs accept for a turn that produced none.
+ * Credential-strict models must not call this — the official API rejects the field.
+ */
+function ensureCompletionsReasoningContent(messages: OAIMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role === "assistant" && msg.reasoning_content == null) {
+			msg.reasoning_content = "";
+		}
+	}
+}
+
 export interface OAIToolCall {
 	id: string;
 	type: "function";
@@ -458,21 +554,6 @@ interface OAITool {
 type ResponsesReasoningBlock = {
 	text: string;
 	providerMetadata?: import("./types").ReasoningProviderMetadata;
-	outputIndex?: number;
-};
-
-type ResponsesWebSearchBlock = {
-	id: string;
-	query?: string;
-	queries?: string[];
-	outputIndex?: number;
-	action?: import("./provider").WebSearchAction;
-};
-
-type ResponsesImageGenerationBlock = {
-	id: string;
-	revisedPrompt?: string;
-	result?: string;
 	outputIndex?: number;
 };
 
@@ -556,27 +637,18 @@ export class OpenAIProvider implements ProviderAdapter {
 	/** Whether to use Responses WebSocket for codex mode (experimental). */
 	private useWebSocket: boolean;
 
-	/**
-	 * The model the current chat() run targets. Remembered so the synchronous
-	 * pushAssistantTurn — which has no model parameter — can classify reasoning
-	 * blocks the same way (strict credential handling vs plain-text relay).
-	 */
-	private activeModel?: string;
-
 	/** Reasoning-source identity override (NUG injects its channel identity). */
 	private reasoningSourceOverride?: string;
 
-	constructor(config: OpenAIProviderConfig, proxy?: string) {
+	constructor(
+		config: OpenAIProviderConfig,
+		proxy?: string,
+		private transport?: ProviderTransport,
+	) {
 		this.config = config;
 		this.apiMode = resolveApiMode(config);
 		this.proxy = proxy;
 		this.useWebSocket = !!(config.codexWebSocket && this.apiMode === "codex");
-		this.activeModel = config.defaultModel;
-	}
-
-	/** Remember the model a chat() run targets (see {@link activeModel}). */
-	noteActiveModel(model: string): void {
-		this.activeModel = model;
 	}
 
 	/**
@@ -591,6 +663,12 @@ export class OpenAIProvider implements ProviderAdapter {
 
 	setReasoningSourceOverride(source: string | undefined): void {
 		this.reasoningSourceOverride = source;
+	}
+
+	toolLoadingTarget(): ToolLoadingTarget {
+		return this.responsesFormat
+			? { protocol: "openai-responses", codexBackend: this.apiMode === "codex" }
+			: { protocol: "completions-compatible" };
 	}
 
 	/** Convenience: does the current mode use Responses API message format? */
@@ -619,79 +697,70 @@ export class OpenAIProvider implements ProviderAdapter {
 		const proxy = this.proxy
 			? applyProxyExemptions(this.proxy, target)
 			: resolveProxyForUrl(target, this.config.proxy);
-		return fetchWithNetworkDiagnostics(input, init, { proxy });
+		return runProviderTransport(this.transport, input, init, (target, options) =>
+			fetchWithNetworkDiagnostics(target, options, {
+				proxy,
+				redactText: this.transport?.redactText,
+			}),
+		);
 	}
+	private usesQwenOmniChatMedia(model: string): boolean {
+		return (
+			!this.responsesFormat &&
+			/(?:^|:)qwen\d+(?:\.\d+)?-omni(?:[.-]|$)/i.test(parseModelId(model).model)
+		);
+	}
+	private nativeMediaProtocol(model: string): "completions" | "responses" | "unsupported" {
+		if (!this.responsesFormat) return "completions";
+		if (this.apiMode === "codex") return "unsupported";
+		// Ark's input_video is an extension, not a universal OpenAI Responses capability.
+		// Keep relay/channel model identifiers intact while recognizing the Doubao family.
+		if (/(?:^|:)doubao-/i.test(parseModelId(model).model)) return "responses";
+		try {
+			if (/^ark\.[a-z0-9-]+\.volces\.com$/i.test(new URL(this.config.baseUrl || "").hostname))
+				return "responses";
+		} catch {
+			// An invalid/missing endpoint does not advertise Ark's video extension.
+		}
+		return "unsupported";
+	}
+
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		return supportsNativeMediaProtocolInput(this.nativeMediaProtocol(model), media, model);
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.responsesFormat) {
 			// Responses API & Codex: flat format { type: "function", name, description, parameters, strict }
-			return tools.map((tool) => ({
-				type: "function",
-				name: tool.name,
-				description: tool.description,
-				parameters: resolveToolJsonSchema(tool),
-				strict: false, // Strict mode disabled by default (can be made configurable later)
-			}));
+			return tools.map(formatResponsesTool);
 		}
 		// Completions: nested format { type: "function", function: { ... } }
-		return tools.map(
-			(tool): OAITool => ({
-				type: "function",
-				function: {
-					name: tool.name,
-					description: tool.description,
-					parameters: resolveToolJsonSchema(tool),
-				},
-			}),
-		);
+		return tools.map(formatCompletionsTool);
 	}
 
 	async buildHistory(
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		if (this.responsesFormat) {
-			return await buildResponsesHistory(dbMessages, narratorId, {
-				strict: hasCredentialBoundReasoning(model),
-				currentSource: this.getActiveReasoningSource(),
-			});
-		}
-		const result = buildOAIHistory(dbMessages);
-		// Chat Completions path: reasoning replay policy is inverted from a
-		// DeepSeek exemption to a credential-strictness split:
-		//   - Non-strict relay models (GLM, Kimi, MiniMax, QwQ, DeepSeek…) treat
-		//     reasoning as plain text: merge `_reasoningBlocks` back into
-		//     `reasoning_content` so the model sees its own prior thoughts.
-		//   - Credential-strict models (Claude-family ids, official OpenAI ids)
-		//     never send `reasoning_content`: the official API rejects the field,
-		//     and without valid encrypted credentials the reasoning is dropped.
-		const strict = hasCredentialBoundReasoning(model);
-		for (const msg of result.history) {
-			// biome-ignore lint/suspicious/noExplicitAny: OAIMessage has _reasoningBlocks
-			const m = msg as any;
-			if (m._reasoningBlocks) {
-				if (!strict && !m.reasoning_content) {
-					const reasoningText = m._reasoningBlocks
-						.map((b: { text: string }) => b.text)
-						.join("\n\n");
-					if (reasoningText) {
-						m.reasoning_content = reasoningText;
-					}
-				}
-				delete m._reasoningBlocks;
-			}
-			if (m._reasoningTextFallback !== undefined) {
-				delete m._reasoningTextFallback;
-			}
-			// Relay thinking models require reasoning_content on ALL assistant
-			// messages (not just those with tool_calls). When switching from a
-			// non-thinking model, historical messages lack this field — patch
-			// with empty string so the API doesn't reject the request.
-			if (!strict && m.role === "assistant" && m.reasoning_content == null) {
-				m.reasoning_content = "";
-			}
-		}
-		return result;
+	): Promise<BuiltHistory> {
+		this.assertMediaInput(model, dbMessages.flatMap(storedMessageMedia));
+		// Strictness belongs to the bare model; a provider prefix (`nug:`, a custom one)
+		// must not turn a credential-bound model into a relay.
+		const strict = hasCredentialBoundReasoning(parseModelId(model).model);
+		const projected = await projectHistory(
+			dbMessages,
+			{ strict, reasoningSource: this.getActiveReasoningSource() },
+			narratorId,
+		);
+		return {
+			history: this.responsesFormat
+				? responsesWireHistory(projected.turns, { strict })
+				: completionsWireHistory(projected.turns, { strict }),
+			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
+		};
 	}
 
 	injectSystemPrompt(
@@ -710,7 +779,121 @@ export class OpenAIProvider implements ProviderAdapter {
 		h.unshift(markRuntimeSystemMessage({ role, content }) as unknown as OAIMessage);
 	}
 
+	private assertResponsesMediaInput(model: string, values: unknown): void {
+		assertModelInputModalities(model, values);
+		visitNativeMedia(values, (item, modality) => {
+			if (modality !== "video") {
+				rejectNativeMedia("Ark Responses", item);
+				return;
+			}
+			if (item.type === "input_video") {
+				const url = item.video_url;
+				const prefix = typeof url === "string" && /^data:(video\/mp4);base64,/.exec(url);
+				if (!prefix || typeof url !== "string")
+					throw new Error("Ark Responses input_video requires an MP4 base64 data URL.");
+				responsesVideoMedia({
+					type: "video",
+					mediaType: prefix[1],
+					base64: url.slice(prefix[0].length),
+				});
+			} else if (typeof item.mediaId === "string") {
+				if (
+					!supportsNativeMediaProtocolInput(
+						"responses",
+						{
+							type: "video",
+							mediaType: String(item.mediaType),
+						},
+						model,
+					)
+				)
+					throw new Error(
+						`Ark Responses input_video only supports MP4 video, not ${item.mediaType}.`,
+					);
+			} else {
+				responsesVideoMedia(item as unknown as NativeMediaInput);
+			}
+		});
+	}
+	private assertMediaInput(model: string, values: unknown): void {
+		if (this.nativeMediaProtocol(model) === "responses") {
+			this.assertResponsesMediaInput(model, values);
+			return;
+		}
+		if (this.responsesFormat) {
+			rejectNativeMedia(this.apiMode === "codex" ? "Codex Responses" : "OpenAI Responses", values);
+			return;
+		}
+		assertModelInputModalities(model, values);
+		const qwenOmni = this.usesQwenOmniChatMedia(model);
+		visitNativeMedia(values, (item, modality) => {
+			if (modality === "video") {
+				if (item.type === "video_url") {
+					const url = (item.video_url as { url?: unknown } | undefined)?.url;
+					const prefix =
+						typeof url === "string" &&
+						(qwenOmni
+							? /^data:(video\/(?:mp4|quicktime))?;base64,/
+							: /^data:(video\/(?:mp4|quicktime));base64,/
+						).exec(url);
+					if (!prefix || typeof url !== "string")
+						throw new Error("Chat Completions video_url requires an MP4/MOV base64 data URL.");
+					chatVideoMedia({
+						type: "video",
+						mediaType: prefix[1] || "video/mp4",
+						base64: url.slice(prefix[0].length),
+					});
+				} else if (typeof item.mediaId === "string") {
+					if (
+						!supportsNativeMediaProtocolInput(
+							"completions",
+							{
+								type: "video",
+								mediaType: String(item.mediaType),
+							},
+							model,
+						)
+					)
+						throw new Error(
+							`Chat Completions video_url only supports MP4/MOV video, not ${item.mediaType}.`,
+						);
+				} else {
+					chatVideoMedia(item as unknown as NativeMediaInput);
+				}
+				return;
+			}
+			if (item.type === "input_audio") {
+				const audio = item.input_audio as { data?: string; format?: string } | undefined;
+				if (!audio || !["wav", "mp3"].includes(audio.format ?? ""))
+					throw new Error("OpenAI Chat Completions input_audio only supports WAV/MP3.");
+				let data = audio.data ?? "";
+				if (qwenOmni && typeof data === "string" && data.startsWith("data:")) {
+					const prefix = /^data:(audio\/(?:wav|mp3|mpeg))?;base64,/.exec(data);
+					if (
+						!prefix ||
+						(prefix[1] && (prefix[1] === "audio/wav" ? "wav" : "mp3") !== audio.format)
+					)
+						throw new Error("Qwen Omni input_audio requires a matching WAV/MP3 base64 data URL.");
+					data = data.slice(prefix[0].length);
+				}
+				assertNativeMediaPayload({
+					type: "audio",
+					mediaType: `audio/${audio.format}`,
+					base64: data,
+				});
+			} else if (typeof item.mediaId === "string") {
+				if (!["audio/wav", "audio/mp3", "audio/mpeg"].includes(String(item.mediaType)))
+					throw new Error(
+						`OpenAI Chat Completions input_audio only supports WAV/MP3, not ${item.mediaType}.`,
+					);
+			} else {
+				chatAudioMedia(item as unknown as NativeMediaInput);
+			}
+		});
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		this.assertMediaInput(params.model, [params.media, params.history, params.toolResults]);
 		// Use WebSocket mode for codex if enabled
 		if (this.useWebSocket) {
 			yield* this.chatCodexWebSocket(params);
@@ -739,20 +922,21 @@ export class OpenAIProvider implements ProviderAdapter {
 					outputLength: tr.output?.length,
 					hasImages: Array.isArray(tr._images) && tr._images.length > 0,
 				});
-				messages.push(...expandResponsesToolResultMessage(tr));
 			}
+			messages.push(
+				...expandResponsesToolResults(params.toolResults as ResponsesFunctionCallOutputMessage[]),
+			);
 		} else {
-			for (const tr of params.toolResults as OAIToolResult[]) {
-				messages.push({
-					role: "tool",
-					tool_call_id: tr.tool_call_id,
-					content: tr.content,
-				});
-			}
+			messages.push(...expandChatToolResults(params.toolResults as OAIToolResult[]));
 		}
 
 		// Append current user message (skip "." continuation markers unless images are attached)
-		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
+		const currentUserMessage = buildOAIUserMessage(
+			params.content,
+			params.images,
+			params.media,
+			this.responsesFormat ? responsesNativeMediaParts : chatNativeMediaParts,
+		);
 		if (currentUserMessage) {
 			messages.push(currentUserMessage);
 		} else if (params.toolResults.length === 0 && params.content) {
@@ -764,7 +948,6 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		// ── Build request body & endpoint based on apiMode ──
 		const model = parseModelId(params.model).model;
-		this.noteActiveModel(model);
 		let endpoint: string;
 		let body: Record<string, unknown>;
 
@@ -779,7 +962,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			for (const msg of messages) {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
 				const m = msg as any;
-				if (m.role === "developer" || m.role === "system") {
+				if (!isResponsesInputItem(m) && (m.role === "developer" || m.role === "system")) {
 					// Accumulate instructions from developer/system messages
 					if (typeof m.content === "string") {
 						instructions += (instructions ? "\n\n" : "") + m.content;
@@ -821,14 +1004,12 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
-				const toolsArr = (body.tools ?? []) as unknown[];
-				appendCodexNativeTools(toolsArr, params.model, {
+				body.tools = withCodexNativeTools(tools, params.model, {
 					webSearch:
 						this.codexWebSearchEnabled &&
 						isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
 					imageGeneration: this.codexImageGenerationEnabled,
 				});
-				body.tools = toolsArr;
 			}
 
 			const normalizedCodexReasoningEffort =
@@ -841,8 +1022,9 @@ export class OpenAIProvider implements ProviderAdapter {
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
 			} else {
-				// Plain responses-compatible relays: send the effort hint too. These
-				// used to get nothing at all, so their tier menu was dead weight.
+				// Plain Responses relays (apiMode "responses", e.g. NUG delegates):
+				// send the effort hint too. These used to get nothing at all, so
+				// their tier menu was dead weight.
 				applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 			}
 
@@ -863,9 +1045,16 @@ export class OpenAIProvider implements ProviderAdapter {
 		} else {
 			// Completions: POST /chat/completions
 			endpoint = `${baseUrl}/chat/completions`;
+			// Thinking-mode relays reject a request unless every assistant message
+			// carries reasoning_content, including steps that produced none.
+			if (!hasCredentialBoundReasoning(model)) {
+				ensureCompletionsReasoningContent(messages);
+			}
 			body = {
 				model,
-				messages,
+				messages: this.usesQwenOmniChatMedia(params.model)
+					? qwenOmniChatMessages(messages)
+					: messages,
 				stream: true,
 				stream_options: { include_usage: true },
 			};
@@ -893,23 +1082,24 @@ export class OpenAIProvider implements ProviderAdapter {
 		// (observed: NUG Responses relays refusing `max_output_tokens`). Only safe
 		// before any stream event has been yielded — after that the consumer has
 		// already seen partial output and a silent re-send would duplicate it.
+		const encodeBody = createRequestBodyEncoder();
+		const encodeDump = createNativeMediaDumpEncoder();
 		for (let attempt = 0; ; attempt++) {
 			if (turnState && this.apiMode === "codex") {
 				requestHeaders["x-codex-turn-state"] = turnState;
 			}
-			params.requestDump?.beginResponseAttempt(
-				{
-					transport: "http",
-					url: endpoint,
-					headers: sanitizeHeaders(requestHeaders),
-					body,
-				},
-				settings.agent?.requestDumpMaxSize,
-			);
-
 			await reportInputCharacters(params, body);
-			const bodyText = JSON.stringify(body);
+			const bodyText = await encodeBody(body, params.signal);
+			params.requestDump?.beginResponseAttempt({
+				transport: "http",
+				method: "POST",
+				url: endpoint,
+				headers: sanitizeHeaders(requestHeaders),
+				bodyText: await encodeDump(body, bodyText, params.signal),
+			});
+
 			params.onRequestStart?.();
+			params.streamProgress?.beginAttempt();
 			const response = await this.pfetch(endpoint, {
 				method: "POST",
 				headers: requestHeaders,
@@ -929,6 +1119,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				turnState = response.headers.get("x-codex-turn-state");
 			}
 
+			params.streamProgress?.onHeaders(response.status);
 			params.requestDump?.setResponseMeta({
 				status: response.status,
 				headers: sanitizeHeaders(response.headers),
@@ -943,7 +1134,11 @@ export class OpenAIProvider implements ProviderAdapter {
 				if (attempt === 0 && stripUnsupportedParameter(body, params.model, error)) continue;
 				throw error;
 			}
-			const capture = captureResponseStream(response.body, params.requestDump);
+			const capture = captureResponseStream(
+				response.body,
+				params.requestDump,
+				params.streamProgress,
+			);
 			let yieldedEvent = false;
 			try {
 				if (!response.ok) {
@@ -1005,16 +1200,6 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Whether the model a chat() run targets (falling back to the configured
-	 * default) treats reasoning as credential-bound. Drives the retention
-	 * split: strict models drop uncredentialed reasoning, relay models echo
-	 * the plain text back.
-	 */
-	private isCredentialStrict(): boolean {
-		return hasCredentialBoundReasoning(this.activeModel ?? this.config.defaultModel ?? "");
-	}
-
-	/**
 	 * Wrap parseSSEStream to detect Responses API format from Codex gateways.
 	 * Only relevant for "codex" mode — completions mode ignores the marker.
 	 */
@@ -1026,150 +1211,6 @@ export class OpenAIProvider implements ProviderAdapter {
 				logger.debug("Codex gateway confirmed Responses API format");
 			}
 			yield evt;
-		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		_isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-	): unknown {
-		// Removed debug log to prevent log spam in high-frequency scenarios
-		if (this.responsesFormat) {
-			return buildResponsesToolResultMessage(toolUseId, output, images);
-		}
-		return { tool_call_id: toolUseId, content: output } satisfies OAIToolResult;
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const h = history as OAIMessage[];
-		if (this.responsesFormat) {
-			for (const tr of toolResults as ResponsesFunctionCallOutputMessage[]) {
-				h.push(...expandResponsesToolResultMessage(tr));
-			}
-			const userMessage = buildOAIUserMessage(content, images);
-			if (userMessage) h.push(userMessage);
-			return;
-		}
-		for (const tr of toolResults as OAIToolResult[]) {
-			h.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-		}
-		const userMessage = buildOAIUserMessage(content, images);
-		if (userMessage) h.push(userMessage);
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: import("./provider").WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		_redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const h = history as OAIMessage[];
-		if (orderedContent && this.responsesFormat) {
-			// Reuse history replay's source validation and native-item serialization,
-			// but never sort the accumulator's encounter order or split a reasoning item.
-			const orderedTools = orderedContent.filter((block) => block.type === "tool_use");
-			h.push(
-				...buildResponsesAssistantItemsFromStoredContent(
-					{
-						id: "",
-						role: "assistant",
-						contentText: null,
-						parentToolUseId: null,
-						messageUuid: messageId ?? null,
-						contentJson: orderedContent.map((block) =>
-							block.type === "tool_use" ? { ...block, id: block.toolUseId } : block,
-						),
-						toolCalls: orderedTools.map((tool) => ({
-							toolUseId: tool.toolUseId,
-							toolName: tool.name,
-							inputJson: tool.input,
-							outputJson: null,
-							status: "success",
-						})),
-					},
-					{ strict: this.isCredentialStrict(), currentSource: this.getActiveReasoningSource() },
-					true,
-				),
-			);
-			return;
-		}
-		if (orderedContent) {
-			// Chat Completions has no interleaved-content wire representation. Keep
-			// every text/reasoning fragment in encounter order inside its native lane.
-			text = orderedContent
-				.filter((block) => block.type === "text")
-				.map((block) => block.text)
-				.join("");
-			reasoningBlocks = orderedContent.filter((block) => block.type === "reasoning");
-			toolUses = orderedContent.filter((block) => block.type === "tool_use");
-		}
-		if (this.responsesFormat) {
-			const items = buildResponsesAssistantTurnItems(
-				text,
-				toolUses,
-				reasoningBlocks,
-				webSearches,
-				messageId,
-				imageGenerations,
-				textOutputIndex,
-				this.isCredentialStrict(),
-			);
-			for (const item of items) {
-				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				h.push(item as any);
-			}
-		} else {
-			// Use empty string instead of null: although the official OpenAI spec
-			// allows content:null when tool_calls is present, many OpenAI-compatible
-			// endpoints (local inference servers, translating proxies/gateways) reject
-			// null content outright. An empty string is accepted everywhere.
-			const msg: OAIMessage = { role: "assistant", content: text || "" };
-			if (toolUses.length > 0) {
-				msg.tool_calls = toolUses.map((tu) => ({
-					id: tu.toolUseId,
-					type: "function" as const,
-					function: { name: tu.name, arguments: JSON.stringify(tu.input) },
-				}));
-			}
-			// Pass reasoning_content back for relay models that replay reasoning as
-			// plain text (DeepSeek, QwQ, GLM, Kimi…). Credential-strict models must
-			// not receive the field at all — the official API rejects it.
-			if (!this.isCredentialStrict() && reasoningBlocks?.length) {
-				const reasoningText = reasoningBlocks.map((b) => b.text).join("\n\n");
-				if (reasoningText) {
-					msg.reasoning_content = reasoningText;
-				}
-			}
-			h.push(msg);
 		}
 	}
 
@@ -1193,6 +1234,90 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		const bareModel = parseModelId(model).model;
 
+		// Native structured output first. A relay that has already proven it
+		// rejects or ignores the constraint is downgraded to restating the schema in the
+		// instruction instead — the fields are still recoverable, but the strict
+		// guarantee is gone.
+		const relayKey = structuredOutputRelayKey(this.apiMode, model);
+		const useNativeFormat =
+			!!options?.responseFormat && !modelLacksNativeStructuredOutput(relayKey);
+		const instruction =
+			options?.responseFormat && !useNativeFormat
+				? withSchemaInstruction(systemInstruction, options.responseFormat)
+				: systemInstruction;
+		/** Learn from a native attempt that came back without structure. */
+		const learnFrom = (result: GenerateMetaResult): GenerateMetaResult => {
+			if (useNativeFormat && result.responseFormatDegraded && !result.outputTruncated) {
+				rememberMissingNativeStructuredOutput(relayKey);
+			}
+			return result;
+		};
+		const requestWithFallback = async (
+			body: Record<string, unknown>,
+			run: (body: Record<string, unknown>) => Promise<GenerateMetaResult>,
+		) => {
+			const responseFormat = options?.responseFormat;
+			if (!responseFormat) return withUnsupportedParameterFallback(model, body, run);
+			let nativeFormat = useNativeFormat;
+			const responses = usesResponsesEndpoint(this.apiMode);
+			const downgrade = () => {
+				options?.signal?.throwIfAborted();
+				nativeFormat = false;
+				rememberMissingNativeStructuredOutput(relayKey);
+				const fallbackInstruction = withSchemaInstruction(instruction, responseFormat);
+				if (responses) {
+					const textOptions = body.text as Record<string, unknown> | undefined;
+					if (textOptions) {
+						delete textOptions.format;
+						if (Object.keys(textOptions).length === 0) delete body.text;
+					}
+					body.instructions = fallbackInstruction;
+				} else {
+					delete body.response_format;
+					body.messages = [
+						{ role: "system", content: fallbackInstruction },
+						{ role: "user", content: text },
+					];
+				}
+			};
+			const attempt = async () => {
+				options?.signal?.throwIfAborted();
+				// The generic fallback may already have stripped this field, including
+				// from a previous request. Preserve the schema as an instruction then too.
+				const format = responses
+					? (body.text as Record<string, unknown> | undefined)?.format
+					: body.response_format;
+				if (nativeFormat && !format) downgrade();
+				try {
+					return await run(body);
+				} catch (error) {
+					if (
+						!nativeFormat ||
+						!isStructuredOutputRejection(error, responses ? "text.format" : "response_format")
+					) {
+						throw error;
+					}
+					downgrade();
+					return run(body);
+				}
+			};
+			omitUnsupportedParameters(body, model);
+			try {
+				return await attempt();
+			} catch (error) {
+				options?.signal?.throwIfAborted();
+				// Reuse the generic parameter recovery, but do not let it turn a
+				// non-400 or callback error into a schema capability downgrade.
+				if (
+					!(error instanceof ApiError) ||
+					error.status !== 400 ||
+					!stripUnsupportedParameter(body, model, error)
+				)
+					throw error;
+				return attempt();
+			}
+		};
+
 		if (usesResponsesEndpoint(this.apiMode)) {
 			const body: Record<string, unknown> = {
 				model: bareModel,
@@ -1200,8 +1325,8 @@ export class OpenAIProvider implements ProviderAdapter {
 				store: false,
 			};
 			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
-			if (systemInstruction) {
-				body.instructions = systemInstruction;
+			if (instruction) {
+				body.instructions = instruction;
 			} else if (this.apiMode === "codex") {
 				// Codex gateway requires non-empty instructions on /responses.
 				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
@@ -1217,12 +1342,23 @@ export class OpenAIProvider implements ProviderAdapter {
 				applyGenerateReasoningOptions(body, this.apiMode, model, options);
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
+			// The Responses API carries the output constraint as `text.format`,
+			// not `response_format`. Merge rather than assign so a future
+			// `text.verbosity` survives.
+			if (useNativeFormat && options?.responseFormat) {
+				body.text = {
+					...(body.text && typeof body.text === "object"
+						? (body.text as Record<string, unknown>)
+						: {}),
+					...openAIResponsesTextFormat(options.responseFormat),
+				};
+			}
 			const conversationId = codexIdentity?.conversationId;
 			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
 			// request of the SAME turn and must replay the token the first
 			// response handed back (codex-rs sends it as an HTTP header here).
 			const turnState: { value: string | null } = { value: null };
-			return withUnsupportedParameterFallback(model, body, (retryBody) =>
+			const result = await requestWithFallback(body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
 					apiKey,
@@ -1233,12 +1369,13 @@ export class OpenAIProvider implements ProviderAdapter {
 					turnState,
 				),
 			);
+			return learnFrom(result);
 		}
 
 		// Completions: POST /chat/completions
 		const messages: Array<{ role: "system" | "user"; content: string }> = [];
-		if (systemInstruction) {
-			messages.push({ role: "system", content: systemInstruction });
+		if (instruction) {
+			messages.push({ role: "system", content: instruction });
 		}
 		messages.push({ role: "user", content: text });
 		const body: Record<string, unknown> = {
@@ -1249,9 +1386,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, model, options);
 		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
-		return withUnsupportedParameterFallback(model, body, (retryBody) =>
+		if (useNativeFormat && options?.responseFormat) {
+			body.response_format = openAIChatResponseFormat(options.responseFormat);
+		}
+		const result = await requestWithFallback(body, (retryBody) =>
 			this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, retryBody, options?.signal, options),
 		);
+		return learnFrom(result);
 	}
 
 	async generateWithHistory(
@@ -1361,7 +1502,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify(body),
+			body: await stringifyRequestBody(body, signal),
 			signal,
 		});
 		// Capture the turn's sticky-routing token before status handling so even
@@ -1394,7 +1535,8 @@ export class OpenAIProvider implements ProviderAdapter {
 			return {
 				text,
 				...(outputTruncated && { outputTruncated }),
-				usage: parsedUsageToUsageData(json.usage),
+				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+				...structuredResult(options, text, "OpenAI Responses"),
 			};
 		}
 
@@ -1424,7 +1566,12 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(options, text, "OpenAI Responses"),
+		};
 	}
 
 	private async requestChatCompletionsTextWithMeta(
@@ -1440,7 +1587,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify(body),
+			body: await stringifyRequestBody(body, signal),
 			signal,
 		});
 
@@ -1485,6 +1632,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				...(outputTruncated && { outputTruncated }),
 				contextPercent: undefined,
 				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+				...structuredResult(options, text, "OpenAI Chat Completions"),
 			};
 		}
 
@@ -1514,7 +1662,13 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, contextPercent: undefined, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			contextPercent: undefined,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(options, text, "OpenAI Chat Completions"),
+		};
 	}
 
 	/**
@@ -1611,7 +1765,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		const request = this.buildCodexWebSocketRequest(params);
-		const sessionKey = params.stickySessionKey ?? params.conversationId;
+		const sessionKey =
+			params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId;
 		const fingerprint = this.resolveFingerprint(params.conversationId);
 
 		try {
@@ -1634,7 +1789,6 @@ export class OpenAIProvider implements ProviderAdapter {
 				userAgent: fingerprint.userAgent,
 				extraHeaders: fingerprint.headers,
 				requestDump: params.requestDump,
-				requestDumpMaxBytes: settings.agent?.requestDumpMaxSize,
 			})) {
 				yield stampReasoningSource(event, this.getActiveReasoningSource());
 			}
@@ -1659,28 +1813,15 @@ export class OpenAIProvider implements ProviderAdapter {
 	private buildCodexWebSocketRequest(params: ChatParams): CodexResponsesRequestBody {
 		const model = parseModelId(params.model).model;
 		const messages: OAIMessage[] = [...(params.history as OAIMessage[])];
-		for (const tr of params.toolResults as Array<{
-			type: string;
-			call_id: string;
-			output: string;
-			_images?: Array<{ format: string; base64: string }>;
-		}>) {
-			messages.push({
-				type: "function_call_output",
-				call_id: tr.call_id,
-				output: tr.output,
-			} as unknown as OAIMessage);
-			if (tr._images?.length) {
-				messages.push({
-					role: "user",
-					content: tr._images.map((img) => ({
-						type: "input_image",
-						image_url: `data:image/${img.format};base64,${img.base64}`,
-					})),
-				} as unknown as OAIMessage);
-			}
-		}
-		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
+		messages.push(
+			...expandResponsesToolResults(params.toolResults as ResponsesFunctionCallOutputMessage[]),
+		);
+		const currentUserMessage = buildOAIUserMessage(
+			params.content,
+			params.images,
+			params.media,
+			(media) => [chatNativeMedia(media)],
+		);
 		if (currentUserMessage) {
 			messages.push(currentUserMessage);
 		} else if (params.toolResults.length === 0 && params.content) {
@@ -1692,7 +1833,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		for (const msg of messages) {
 			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
 			const role = (msg as any).role;
-			if (role === "system" || role === "developer") {
+			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
 				if (typeof msg.content === "string") {
 					instructions += (instructions ? "\n\n" : "") + msg.content;
 				}
@@ -1721,8 +1862,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		if (!instructions) markRuntimeInstructions(request);
-		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, params.model, {
+		const tools = withCodexNativeTools(params.tools, params.model, {
 			webSearch:
 				this.codexWebSearchEnabled &&
 				isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
@@ -1827,11 +1967,11 @@ function createOpenAIApiError(response: Response, rawBody: string): ApiError {
 /** Parse a /responses JSON payload with a clearer error message. */
 function parseResponsesJson(raw: string): {
 	output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
-	usage?: unknown;
+	usage?: Parameters<typeof extractOpenAIUsage>[0];
 } {
 	return parseJsonWithPreview<{
 		output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
-		usage?: unknown;
+		usage?: Parameters<typeof extractOpenAIUsage>[0];
 	}>(raw, "OpenAI API returned non-JSON responses payload");
 }
 
@@ -1854,6 +1994,21 @@ function extractResponsesText(
 interface OAIToolResult {
 	tool_call_id: string;
 	content: string;
+	_images?: ResponsesToolImage[];
+	_nativeMedia?: NativeMediaInput[];
+}
+
+function expandChatToolResults(results: OAIToolResult[]): OAIMessage[] {
+	const messages: OAIMessage[] = results.map((result) => ({
+		role: "tool",
+		tool_call_id: result.tool_call_id,
+		content: result.content,
+	}));
+	const media = results.flatMap((result) =>
+		(result._nativeMedia ?? []).flatMap((item) => chatNativeMediaParts(item, result.tool_call_id)),
+	);
+	if (media.length) messages.push({ role: "user", content: media });
+	return messages;
 }
 
 // === Helpers ===
@@ -2057,6 +2212,7 @@ async function* _parseResponsesAPIStream(
 
 export interface ResponsesAPIChunk {
 	type?: string;
+	usage?: Parameters<typeof extractOpenAIUsage>[0];
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	item?: any;
 	// biome-ignore lint/suspicious/noExplicitAny: provider-native content part
@@ -2290,9 +2446,8 @@ export function parseResponsesAPIEvent(
 
 	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
 	const results: ParsedStreamEvent[] = [];
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic gateway response may have usage at top level
-	const usage = chunk.response?.usage || (chunk as any).usage;
-	if (usage?.input_tokens != null) {
+	const usage = chunk.response?.usage ?? chunk.usage;
+	if (usage) {
 		logger.debug("OpenAI Responses API usage found", {
 			type,
 			inputTokens: usage.input_tokens,
@@ -2301,13 +2456,7 @@ export function parseResponsesAPIEvent(
 			cachedInputTokens: usage.input_tokens_details?.cached_tokens,
 		});
 		results.push({
-			usage: {
-				promptTokens: usage.input_tokens,
-				inputTokens: usage.input_tokens,
-				completionTokens: usage.output_tokens,
-				reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? undefined,
-				cachedInputTokens: usage.input_tokens_details?.cached_tokens ?? undefined,
-			},
+			usage: openAIUsageToParsedUsage(usage, toolAccum),
 		});
 	}
 
@@ -3133,20 +3282,7 @@ function parseSSELine(
 			hasPromptTokens: promptTokens != null,
 			usage: chunk.usage,
 		});
-		if (promptTokens != null) {
-			return [
-				{
-					usage: {
-						promptTokens,
-						inputTokens: promptTokens,
-						completionTokens: chunk.usage.completion_tokens,
-						reasoningTokens: chunk.usage.completion_tokens_details?.reasoning_tokens ?? undefined,
-						cachedInputTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? undefined,
-					},
-				},
-			];
-		}
-		return [];
+		return [{ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) }];
 	}
 
 	// ── Responses API: function call start (item with call_id + name) ──
@@ -3261,6 +3397,9 @@ function parseSSELine(
 
 	const delta = choice.delta;
 	const results: ParsedStreamEvent[] = [];
+	if (chunk.usage) {
+		results.push({ usage: openAIUsageToParsedUsage(chunk.usage, toolAccum) });
+	}
 	const result: ParsedStreamEvent = {};
 
 	// A chunk may contain all three lanes. Publish content before any tool can
@@ -3269,14 +3408,23 @@ function parseSSELine(
 	// emit `reasoning_content`, while OpenRouter-style layers emit only `reasoning`.
 	// Reading just one silently drops the other's thinking stream, so accept both;
 	// a non-empty `reasoning_content` wins when a relay happens to send both.
+	// Some relays put the full thinking text on the final `message` instead of
+	// streaming it through `delta`. Prefer a non-empty delta, then that snapshot,
+	// so the next request can pass the original reasoning_content back.
 	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific fields
 	const deltaAny = delta as any;
-	const reasoning: unknown = deltaAny.reasoning_content || deltaAny.reasoning;
+	// biome-ignore lint/suspicious/noExplicitAny: gateway-specific fields
+	const messageAny = (choice as { message?: any }).message;
+	const reasoning: unknown =
+		deltaAny?.reasoning_content ||
+		deltaAny?.reasoning ||
+		messageAny?.reasoning_content ||
+		messageAny?.reasoning;
 	if (typeof reasoning === "string" && reasoning) results.push({ reasoning });
-	if (delta.content) results.push({ text: delta.content });
+	if (delta?.content) results.push({ text: delta.content });
 
 	// Tool call deltas — emit as toolUseChunk for early execution support
-	if (delta.tool_calls) {
+	if (delta?.tool_calls) {
 		for (const tc of delta.tool_calls) {
 			const idx = tc.index;
 
@@ -3509,138 +3657,158 @@ function findActiveReasoningAccum(
 
 // === History builder ===
 
+// Qwen Omni's documented local audio/video inputs carry Data URIs, not raw audio Base64.
+// Keep the conversion at the final wire boundary so current, history and Read agree.
+function qwenOmniMediaDataUri(data: string): string {
+	const base64 = data.startsWith("data:") ? data.slice(data.indexOf(",") + 1) : data;
+	return `data:;base64,${base64}`;
+}
+
+function qwenOmniChatMessages(messages: OAIMessage[]): OAIMessage[] {
+	return messages.map((message) => {
+		if (!Array.isArray(message.content)) return message;
+		return {
+			...message,
+			content: message.content.map((part): OAIContentPart => {
+				if (part.type === "input_audio")
+					return {
+						...part,
+						input_audio: { ...part.input_audio, data: qwenOmniMediaDataUri(part.input_audio.data) },
+					};
+				if (part.type === "video_url")
+					return {
+						...part,
+						video_url: { ...part.video_url, url: qwenOmniMediaDataUri(part.video_url.url) },
+					};
+				return part;
+			}),
+		};
+	});
+}
+/** Keep each label and optional tool-call source adjacent to its media bytes. */
+function nativeMediaParts(
+	media: NativeMediaInput,
+	part: OAIContentPart,
+	textType: "text" | "input_text",
+	toolCallId?: string,
+): OAIContentPart[] {
+	const filename =
+		typeof media.filename === "string" && media.filename.length ? media.filename : undefined;
+	if (!filename && !toolCallId) return [part];
+	const metadata = {
+		...(filename ? { filename } : {}),
+		type: media.type,
+		mediaType: media.mediaType,
+		...(toolCallId ? { toolCallId } : {}),
+	};
+	return [
+		{
+			type: textType,
+			text:
+				`Native media attachment metadata: ${JSON.stringify(metadata)}\n` +
+				`The following ${media.type} content is included directly in this message. The filename is an attachment label, not a device file path. Use this attachment for this message; do not substitute a file path from earlier conversation history.`,
+		},
+		part,
+	];
+}
+
+function chatNativeMediaParts(media: NativeMediaInput, toolCallId?: string): OAIContentPart[] {
+	return nativeMediaParts(media, chatNativeMedia(media), "text", toolCallId);
+}
+
+function responsesNativeMediaParts(media: NativeMediaInput, toolCallId?: string): OAIContentPart[] {
+	return nativeMediaParts(media, responsesVideoMedia(media), "input_text", toolCallId);
+}
+
 function buildOAIUserMessage(
 	content: string,
 	images?: Array<{ format: string; base64: string }>,
+	media?: NativeMediaInput[],
+	nativeMediaParts: (media: NativeMediaInput) => OAIContentPart[] = chatNativeMediaParts,
 ): OAIMessage | null {
 	const hasText = !!content && content !== ".";
 	const hasImages = !!images?.length;
-	if (!hasText && !hasImages) return null;
+	if (!hasText && !hasImages && !media?.length) return null;
 
-	if (hasImages) {
-		const parts: OAIContentPart[] = [
-			{ type: "text", text: hasText ? content : "[user sent image(s)]" },
-		];
-		for (const img of images) {
-			parts.push({
-				type: "image_url",
-				image_url: { url: `data:image/${img.format};base64,${img.base64}` },
-			});
-		}
+	if (hasImages || media?.length) {
+		const parts = orderUserContent(
+			hasText ? content : hasImages ? "[user sent image(s)]" : "",
+			images ?? [],
+			"after",
+		).map(
+			(part): OAIContentPart =>
+				part.type === "text"
+					? { type: "text", text: part.text }
+					: {
+							type: "image_url",
+							image_url: { url: `data:image/${part.image.format};base64,${part.image.base64}` },
+						},
+		);
+		parts.push(...(media ?? []).flatMap((item) => nativeMediaParts(item)));
 		return { role: "user", content: parts };
 	}
 
 	return { role: "user", content };
 }
 
-function buildResponsesUserMessage(content: string): OAIMessage {
-	return { role: "user", content: [{ type: "input_text", text: content }] } as OAIMessage;
-}
-
 function buildResponsesToolResultMessage(
 	toolUseId: string,
 	output: string,
 	images?: ResponsesToolImage[],
+	media?: readonly NativeMediaInput[],
 ): ResponsesFunctionCallOutputMessage {
 	return {
 		type: "function_call_output",
 		call_id: toolUseId,
 		output,
 		...(images?.length ? { _images: images } : {}),
+		...(media?.length ? { _nativeMedia: media } : {}),
 	};
 }
 
-function expandResponsesToolResultMessage(
-	message: ResponsesFunctionCallOutputMessage,
-): OAIMessage[] {
-	const items: OAIMessage[] = [
-		{
+function expandResponsesToolResults(messages: ResponsesFunctionCallOutputMessage[]): OAIMessage[] {
+	const output = (message: ResponsesFunctionCallOutputMessage) =>
+		({
 			type: "function_call_output",
 			call_id: message.call_id,
 			output: message.output,
-		} as unknown as OAIMessage,
-	];
-	if (message._images?.length) {
-		items.push({
-			role: "user",
-			content: message._images.map((img) => ({
-				type: "input_image",
-				image_url: `data:image/${img.format};base64,${img.base64}`,
-			})),
-		} as unknown as OAIMessage);
-	}
+		}) as unknown as OAIMessage;
+	const images = (message: ResponsesFunctionCallOutputMessage, attributed = false): OAIMessage[] =>
+		message._images?.length
+			? [
+					{
+						role: "user",
+						content: message._images.flatMap((img) => [
+							...(attributed
+								? [
+										{
+											type: "input_text",
+											text: `Tool result image source: ${JSON.stringify({ toolCallId: message.call_id })}`,
+										},
+									]
+								: []),
+							{
+								type: "input_image",
+								image_url: `data:image/${img.format};base64,${img.base64}`,
+							},
+						]),
+					} as unknown as OAIMessage,
+				]
+			: [];
+	if (!messages.some((message) => message._nativeMedia?.length))
+		return messages.flatMap((message) => [output(message), ...images(message)]);
+
+	// Native media follows all parallel outputs; retain image provenance when separated.
+	const items = messages.map(output);
+	for (const message of messages) items.push(...images(message, messages.length > 1));
+	const content = messages.flatMap((message) =>
+		(message._nativeMedia ?? []).flatMap((media) =>
+			responsesNativeMediaParts(media, message.call_id),
+		),
+	);
+	if (content.length) items.push({ role: "user", content });
 	return items;
 }
-
-async function buildResponsesUserMessageFromDbMessage(
-	msg: DbMessage,
-	narratorId?: string,
-): Promise<OAIMessage | null> {
-	const ownerNarratorId = msg.narratorId ?? narratorId;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	const content: OAIContentPart[] = [];
-	let sawTextBlock = false;
-	for (const block of blocks as Array<Record<string, unknown>>) {
-		if (block.type === "text" && typeof block.text === "string") {
-			sawTextBlock = true;
-			if (block.text.length > 0) {
-				content.push({ type: "input_text", text: block.text });
-			}
-			continue;
-		}
-		if (block.type === "image" && typeof block.imageId === "string" && ownerNarratorId) {
-			const uploadNarratorId =
-				typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : ownerNarratorId;
-			const filePath = getImagePath(uploadNarratorId, block.imageId);
-			if (!filePath) {
-				logger.warn("Responses history image missing on disk; skipping replay", {
-					narratorId,
-					messageNarratorId: msg.narratorId ?? null,
-					effectiveNarratorId: ownerNarratorId,
-					uploadNarratorId,
-					messageId: msg.id,
-					imageId: block.imageId,
-				});
-				continue;
-			}
-			try {
-				const result = await imageToBase64(filePath);
-				const mimeToFormat: Record<string, string> = {
-					"image/png": "png",
-					"image/jpeg": "jpeg",
-					"image/gif": "gif",
-					"image/webp": "webp",
-				};
-				const effectiveMime =
-					result.detectedMediaType ??
-					(typeof block.mediaType === "string" ? block.mediaType : "image/png");
-				content.push({
-					type: "input_image",
-					image_url: `data:image/${mimeToFormat[effectiveMime] ?? "png"};base64,${result.base64}`,
-				});
-			} catch (error) {
-				logger.warn("Failed to rebuild Responses history image; skipping replay", {
-					narratorId,
-					messageNarratorId: msg.narratorId ?? null,
-					effectiveNarratorId: ownerNarratorId,
-					uploadNarratorId,
-					messageId: msg.id,
-					imageId: block.imageId,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
-	}
-	if (content.length > 0) {
-		return { role: "user", content } as unknown as OAIMessage;
-	}
-	const fallbackText = msg.contentText || "";
-	if (fallbackText && !sawTextBlock) {
-		return buildResponsesUserMessage(fallbackText);
-	}
-	return null;
-}
-
 /** Legacy unmarked text may be a summary, even on DeepSeek; never infer native bytes. */
 function serializeResponsesReasoning(
 	block: ResponsesReasoningBlock,
@@ -3669,141 +3837,11 @@ function serializeResponsesReasoning(
 	return undefined;
 }
 
-function buildResponsesPreludeItems(
-	reasoningBlocks?: ResponsesReasoningBlock[],
-	webSearchBlocks?: ResponsesWebSearchBlock[],
-	imageGenerationBlocks?: ResponsesImageGenerationBlock[],
-	text?: string,
-	messageId?: string,
-	textOutputIndex?: number,
-	strict = true,
-): { items: OAIMessage[] } {
-	const entries: Array<{ item: OAIMessage; outputIndex?: number; sourceIndex: number }> = [];
-	const fallbackParts: string[] = [];
-	let sourceIndex = 0;
-	for (const block of reasoningBlocks ?? []) {
-		const text = block.text?.trim() ?? "";
-		const nativeItem = serializeResponsesReasoning(block, { strict }, true);
-		if (nativeItem) {
-			// These blocks belong to the current in-memory upstream turn. Preserve
-			// its encrypted credential or explicitly identified native plaintext.
-			entries.push({
-				item: nativeItem,
-				outputIndex: block.outputIndex,
-				sourceIndex: sourceIndex++,
-			});
-		} else if (!strict && text) {
-			// Genuine plain-text relay (no credential protocol): degrade to text so
-			// the model still sees its own prior thoughts.
-			fallbackParts.push(text);
-		}
-		// Strict + no credential: dropped entirely (the official API rejects
-		// unsigned reasoning replay).
-	}
-	for (const block of webSearchBlocks ?? []) {
-		// Use the stored action if available; fall back to building a search action from query/queries.
-		const action =
-			block.action ??
-			(block.query || block.queries?.length
-				? {
-						type: "search",
-						...(block.query ? { query: block.query } : {}),
-						...(Array.isArray(block.queries) && block.queries.length > 0
-							? { queries: block.queries }
-							: {}),
-					}
-				: undefined);
-		if (!action) continue;
-		entries.push({
-			item: {
-				type: "web_search_call",
-				// NOTE: `id` is intentionally omitted — the upstream Responses API
-				// does not accept it on input items (codex-rs skips serializing it).
-				status: "completed",
-				action,
-			} as unknown as OAIMessage,
-			outputIndex: block.outputIndex,
-			sourceIndex: sourceIndex++,
-		});
-	}
-	for (const block of imageGenerationBlocks ?? []) {
-		entries.push({
-			item: {
-				type: "image_generation_call",
-				id: block.id,
-				status: "completed",
-				result: block.result ?? "",
-				...(block.revisedPrompt ? { revised_prompt: block.revisedPrompt } : {}),
-			} as unknown as OAIMessage,
-			outputIndex: block.outputIndex,
-			sourceIndex: sourceIndex++,
-		});
-	}
-	const assistantText = mergeAssistantText(text ?? "", fallbackParts.join("\n"));
-	if (assistantText) {
-		entries.push({
-			item: {
-				...(messageId ? { id: messageId } : {}),
-				role: "assistant",
-				content: [{ type: "output_text", text: assistantText }],
-			} as unknown as OAIMessage,
-			outputIndex: textOutputIndex,
-			sourceIndex: sourceIndex++,
-		});
-	}
-	entries.sort((a, b) =>
-		compareOptionalOutputIndex(a.outputIndex, b.outputIndex, a.sourceIndex, b.sourceIndex),
-	);
-	return { items: entries.map((entry) => entry.item) };
-}
-
 function mergeAssistantText(text: string, reasoningFallbackText: string): string {
 	const trimmedText = text.trim();
 	const trimmedFallback = reasoningFallbackText.trim();
 	if (trimmedFallback && trimmedText) return `${trimmedFallback}\n\n${trimmedText}`;
 	return trimmedFallback || trimmedText;
-}
-
-function buildResponsesAssistantTurnItems(
-	text: string,
-	toolUses: AgentToolUse[],
-	reasoningBlocks?: ResponsesReasoningBlock[],
-	webSearches?: ResponsesWebSearchBlock[],
-	messageId?: string,
-	imageGenerations?: ResponsesImageGenerationBlock[],
-	textOutputIndex?: number,
-	strict = true,
-): OAIMessage[] {
-	const items: OAIMessage[] = [];
-	const prelude = buildResponsesPreludeItems(
-		reasoningBlocks,
-		webSearches,
-		imageGenerations,
-		text,
-		messageId,
-		textOutputIndex,
-		strict,
-	);
-	items.push(...prelude.items);
-	for (const tu of toolUses) {
-		items.push({
-			type: "function_call",
-			call_id: tu.toolUseId,
-			name: tu.name,
-			arguments: JSON.stringify(tu.input),
-		} as unknown as OAIMessage);
-	}
-	return items;
-}
-
-function buildResponsesAssistantMessageItem(text: string, messageId?: string): OAIMessage | null {
-	const trimmed = text.trim();
-	if (!trimmed) return null;
-	return {
-		...(messageId ? { id: messageId } : {}),
-		role: "assistant",
-		content: [{ type: "output_text", text: trimmed }],
-	} as unknown as OAIMessage;
 }
 
 /**
@@ -3821,428 +3859,275 @@ interface ReasoningReplayOptions {
 	currentSource?: string;
 }
 
-function buildResponsesAssistantItemsFromStoredContent(
-	msg: DbMessage,
-	options: ReasoningReplayOptions,
-	preserveTextBlocks = false,
-): OAIMessage[] {
-	type StoredAssistantBlock =
-		| { type: "text"; text?: string; outputIndex?: number }
-		| {
-				type: "reasoning";
-				text?: string;
-				providerMetadata?: import("./types").ReasoningProviderMetadata;
-				outputIndex?: number;
-		  }
-		| {
-				type: "web_search";
-				id: string;
-				query?: string;
-				queries?: string[];
-				outputIndex?: number;
-				action?: import("./provider").WebSearchAction;
-		  }
-		| {
-				type: "image_generation";
-				id: string;
-				revisedPrompt?: string;
-				result?: string;
-				savedPath?: string;
-				outputIndex?: number;
-		  }
-		| { type: "tool_use"; id: string; name?: string; input?: Record<string, unknown> }
-		| { type: string; [key: string]: unknown };
-
-	const blocks = (Array.isArray(msg.contentJson) ? msg.contentJson : []) as StoredAssistantBlock[];
-	const completedToolCalls = new Map(
-		(msg.toolCalls ?? [])
-			.filter((tc) => tc.status === "success" || tc.status === "fail")
-			.filter((tc) => tc.toolName && tc.toolUseId)
-			.map((tc) => [tc.toolUseId, tc]),
-	);
-	const items: OAIMessage[] = [];
-	const textBuffer: string[] = [];
-	const consumedToolUseIds = new Set<string>();
-	let messageIdAvailable = msg.messageUuid ?? undefined;
-
-	const flushTextBuffer = () => {
-		const text = textBuffer.join("\n");
-		textBuffer.length = 0;
-		const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
-		if (item) {
-			items.push(item);
-			messageIdAvailable = undefined;
-		}
+/** One tool in Responses API shape; also an entry of an `additional_tools` item. */
+function formatResponsesTool(tool: ResolvedToolDefinition) {
+	return {
+		type: "function",
+		name: tool.name,
+		description: tool.description,
+		parameters: resolveToolJsonSchema(tool),
+		strict: false, // Strict mode disabled by default (can be made configurable later)
 	};
-
-	for (const block of blocks) {
-		if (block.type === "text") {
-			if (typeof block.text === "string" && block.text.length > 0) {
-				textBuffer.push(block.text);
-				if (preserveTextBlocks) flushTextBuffer();
-			}
-			continue;
-		}
-
-		if (block.type === "reasoning") {
-			flushTextBuffer();
-			const reasoningBlock = block as Extract<StoredAssistantBlock, { type: "reasoning" }>;
-			const text = typeof reasoningBlock.text === "string" ? reasoningBlock.text.trim() : "";
-			const nativeItem = serializeResponsesReasoning(
-				{ ...reasoningBlock, text: reasoningBlock.text ?? "" },
-				options,
-			);
-			if (nativeItem) {
-				items.push(nativeItem);
-			} else if (!options.strict && text) {
-				// Genuine plain-text relay (or foreign encrypted block we must not echo
-				// to this upstream): degrade to an assistant message so the model still
-				// sees its own prior thoughts.
-				const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
-				if (item) {
-					items.push(item);
-					messageIdAvailable = undefined;
-				}
-			}
-			continue;
-		}
-
-		if (block.type === "web_search") {
-			flushTextBuffer();
-			const webSearchBlock = block as Extract<StoredAssistantBlock, { type: "web_search" }>;
-			// Use stored action if available; fall back to building a search action from query/queries.
-			const action =
-				webSearchBlock.action ??
-				(webSearchBlock.query ||
-				(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0)
-					? {
-							type: "search",
-							...(webSearchBlock.query ? { query: webSearchBlock.query } : {}),
-							...(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0
-								? { queries: webSearchBlock.queries }
-								: {}),
-						}
-					: undefined);
-			if (!action) continue;
-			items.push({
-				type: "web_search_call",
-				// NOTE: `id` is intentionally omitted — the upstream Responses API
-				// does not accept it on input items (codex-rs skips serializing it).
-				status: "completed",
-				action,
-			} as unknown as OAIMessage);
-			continue;
-		}
-
-		if (block.type === "image_generation") {
-			flushTextBuffer();
-			const igBlock = block as Extract<StoredAssistantBlock, { type: "image_generation" }>;
-			let result = igBlock.result ?? "";
-			// If result is empty but savedPath exists, read from file
-			// TODO: readFileSync blocks the event loop; refactor
-			// buildResponsesAssistantItemsFromStoredContent to async to use
-			// fs.promises.readFile instead.
-			if (!result && igBlock.savedPath) {
-				try {
-					const fileData = readFileSync(igBlock.savedPath);
-					result = fileData.toString("base64");
-				} catch {
-					// File may have been deleted — skip this block
-				}
-			}
-			if (!result) continue;
-			if (igBlock.savedPath) {
-				items.push({
-					role: "developer",
-					content: buildImageGenerationSavedPathInstruction(igBlock.savedPath),
-				} as unknown as OAIMessage);
-			}
-			items.push({
-				type: "image_generation_call",
-				id: igBlock.id,
-				status: "completed",
-				result,
-				...(igBlock.revisedPrompt ? { revised_prompt: igBlock.revisedPrompt } : {}),
-			} as unknown as OAIMessage);
-			continue;
-		}
-
-		if (block.type === "tool_use") {
-			flushTextBuffer();
-			const toolUseBlock = block as Extract<StoredAssistantBlock, { type: "tool_use" }>;
-			const toolCall = completedToolCalls.get(toolUseBlock.id);
-			// Defensive guard: replaying a function_call without a persisted completed
-			// tool call would create an invalid Responses history (missing the paired
-			// function_call_output). If the DB/tool-call relation is missing, skip the
-			// orphaned tool_use block instead of sending malformed history.
-			if (!toolCall?.toolName) continue;
-			consumedToolUseIds.add(toolUseBlock.id);
-			items.push({
-				type: "function_call",
-				call_id: toolUseBlock.id,
-				name: toolCall.toolName,
-				arguments: JSON.stringify(toolCall.inputJson ?? toolUseBlock.input ?? {}),
-			} as unknown as OAIMessage);
-		}
-	}
-
-	flushTextBuffer();
-	for (const [toolUseId, toolCall] of completedToolCalls.entries()) {
-		if (consumedToolUseIds.has(toolUseId)) continue;
-		items.push({
-			type: "function_call",
-			call_id: toolUseId,
-			name: toolCall.toolName,
-			arguments: JSON.stringify(toolCall.inputJson ?? {}),
-		} as unknown as OAIMessage);
-	}
-	return items;
 }
 
-function compareOptionalOutputIndex(
-	a: number | undefined,
-	b: number | undefined,
-	aSourceIndex: number,
-	bSourceIndex: number,
-): number {
-	if (a != null && b != null) return a - b || aSourceIndex - bSourceIndex;
-	if (a != null) return -1;
-	if (b != null) return 1;
-	return aSourceIndex - bSourceIndex;
+/**
+ * Input item declaring tools loaded at this position. Tools in it become callable from
+ * this point on; earlier items and the top-level `tools` stay untouched.
+ */
+function additionalToolsItem(change: ToolLoadingChange): OAIMessage {
+	return {
+		type: "additional_tools",
+		role: "developer",
+		tools: change.additions.flatMap((addition) =>
+			addition.definition ? [formatResponsesTool(addition.definition)] : [],
+		),
+	} as unknown as OAIMessage;
 }
 
-async function buildResponsesHistory(
-	dbMessages: DbMessage[],
-	narratorId?: string,
-	options: ReasoningReplayOptions = { strict: true },
-): Promise<{
-	history: OAIMessage[];
-	trailingToolResults: ResponsesFunctionCallOutputMessage[];
-}> {
-	// Filter model-visible messages: user, assistant, sys (system context)
-	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
-	const topLevel = dbMessages.filter(
-		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
-	);
+/** Input items that carry a `role` but are not messages and must stay in `input`. */
+export function isResponsesInputItem(message: unknown): boolean {
+	return (message as { type?: unknown }).type === "additional_tools";
+}
 
-	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-		topLevel.pop();
-	}
-
+/**
+ * Second projection stage for the Responses API: neutral turns → input items.
+ *
+ * Assistant message items carry no id: the send path rebuilds them without one, so an
+ * id here would never reach the wire. Reasoning and image generation items keep theirs.
+ */
+function responsesWireHistory(
+	turns: readonly NeutralTurn[],
+	options: { strict: boolean },
+): OAIMessage[] {
 	const history: OAIMessage[] = [];
-	let pendingToolResults: ResponsesFunctionCallOutputMessage[] = [];
-
-	for (const msg of topLevel) {
-		if (msg.role === "assistant") {
-			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
-			pendingToolResults = [];
-
-			const assistantItems = buildResponsesAssistantItemsFromStoredContent(msg, options);
-			if (assistantItems.length === 0) {
-				continue;
-			}
-			history.push(...assistantItems);
-
-			if (msg.toolCalls) {
-				for (const tc of msg.toolCalls) {
-					if (tc.status === "success" || tc.status === "fail") {
-						pendingToolResults.push(
-							buildResponsesToolResultMessage(tc.toolUseId, outputToText(tc.outputJson)),
-						);
-					}
-				}
-			}
-		} else if (msg.role === "user") {
-			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
-			pendingToolResults = [];
-			const userMessage = await buildResponsesUserMessageFromDbMessage(msg, narratorId);
-			if (userMessage) history.push(userMessage);
-		} else if (msg.role === "sys") {
-			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
-			pendingToolResults = [];
-			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const text = modelTextFromContentBlocks(content) || msg.contentText || "";
-			// Emit sys context as a user-role input item rather than a developer
-			// message. Developer/system items get hoisted into top-level
-			// `instructions` (and, on Gemini-translating proxies, into
-			// `system_instruction`), which can leave the conversation `input`
-			// empty on turns whose only new content is a sys message (e.g. goal
-			// continuation). Keeping it as a user turn guarantees non-empty input.
-			if (text) {
-				history.push(buildResponsesUserMessage(text));
-			}
-		}
-	}
-
-	return { history, trailingToolResults: pendingToolResults };
-}
-
-function buildOAIHistory(dbMessages: DbMessage[]): {
-	history: OAIMessage[];
-	trailingToolResults: OAIToolResult[];
-} {
-	// Filter model-visible messages: user, assistant, sys (system context)
-	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
-	const topLevel = dbMessages.filter(
-		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
-	);
-
-	// Drop the last user message — it's sent as the current message
-	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-		topLevel.pop();
-	}
-
-	const history: OAIMessage[] = [];
-	let pendingToolResults: OAIToolResult[] = [];
-
-	for (const msg of topLevel) {
-		if (msg.role === "assistant") {
-			// Flush pending tool results as role: "tool" messages
-			for (const tr of pendingToolResults) {
-				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-			}
-			pendingToolResults = [];
-
-			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const textParts = content
-				.filter((b: { type: string }) => b.type === "text")
-				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
-
-			// Extract reasoning blocks with their provider metadata for Responses API replay
-			const reasoningBlocks = content
-				.filter((b: { type: string }) => b.type === "reasoning")
-				.map(
-					(b: {
-						text: string;
-						providerMetadata?: import("./types").ReasoningProviderMetadata;
-					}) => ({
-						text: b.text,
-						providerMetadata: b.providerMetadata,
-					}),
+	const assistantText = (text: string) =>
+		({ role: "assistant", content: [{ type: "output_text", text }] }) as unknown as OAIMessage;
+	for (const turn of turns) {
+		if (turn.kind === "input") {
+			for (const item of turn.items) {
+				if (item.toolChange)
+					history.push(additionalToolsItem(item.toolChange as ToolLoadingChange));
+				// Runtime context stays a user item: developer items would be hoisted into
+				// `instructions`, which can leave the input empty and changes the prefix.
+				const content: OAIContentPart[] = orderUserContent(item.text, item.images, "before").map(
+					(part) =>
+						part.type === "text"
+							? { type: "input_text", text: part.text }
+							: { type: "input_image", image_url: dataUrl(part.image) },
 				);
-
-			// Extract web_search blocks — these are Codex native searches persisted as content blocks.
-			// Replay them as user context so the model knows it searched previously.
-			const webSearchBlocks = content.filter(
-				(b: { type: string }) => b.type === "web_search",
-			) as Array<{
-				type: "web_search";
-				id: string;
-				query?: string;
-				queries?: string[];
-				action?: import("./provider").WebSearchAction;
-			}>;
-			if (webSearchBlocks.length > 0) {
-				const searchSummary = webSearchBlocks
-					.map((ws) => {
-						const action = ws.action;
-						if (action?.type === "open_page" && action.url)
-							return `[Web search: opened ${action.url}]`;
-						if (action?.type === "find_in_page") {
-							const parts = [action.pattern ? `'${action.pattern}'` : null, action.url].filter(
-								Boolean,
-							);
-							return `[Web search: find ${parts.join(" in ")}]`;
-						}
-						const q =
-							ws.query ||
-							action?.query ||
-							ws.queries?.join(", ") ||
-							action?.queries?.join(", ") ||
-							"unknown";
-						return `[Web search: ${q}]`;
-					})
-					.join("\n");
-				history.push({ role: "user", content: searchSummary });
+				content.push(...(item.media ?? []).flatMap((media) => responsesNativeMediaParts(media)));
+				if (content.length) history.push({ role: "user", content } as unknown as OAIMessage);
 			}
-
-			const completedToolUseIds = new Set(
-				msg.toolCalls
-					?.filter((tc) => tc.status === "success" || tc.status === "fail")
-					.map((tc) => tc.toolUseId) ?? [],
+			continue;
+		}
+		if (turn.kind === "tool_results") {
+			history.push(
+				...expandResponsesToolResults(
+					turn.results.map((result) =>
+						buildResponsesToolResultMessage(
+							result.wireId,
+							result.text,
+							result.images,
+							result.media,
+						),
+					),
+				),
 			);
-
-			const toolCalls: OAIToolCall[] =
-				msg.toolCalls
-					?.filter((tc) => tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId))
-					.map((tc) => ({
-						id: tc.toolUseId,
-						type: "function" as const,
-						function: {
-							name: tc.toolName,
-							arguments: JSON.stringify(tc.inputJson ?? {}),
-						},
-					})) ?? [];
-
-			const hasText = text.length > 0;
-			const hasReasoningBlocks = reasoningBlocks.length > 0;
-			if (!hasText && toolCalls.length === 0 && !hasReasoningBlocks) {
-				// Skip empty assistant stubs (can happen after interrupted streaming).
-				// Keeping them would become `content: null` in Responses API input and
-				// trigger validation errors.
+			continue;
+		}
+		const texts: string[] = [];
+		const flushText = () => {
+			const text = texts.join("\n").trim();
+			texts.length = 0;
+			if (text) history.push(assistantText(text));
+		};
+		for (const item of turn.items) {
+			if (item.kind === "text") {
+				texts.push(item.text);
 				continue;
 			}
-
-			// OpenAI requires assistant messages to have content (string|null) or tool_calls.
-			// Use an empty string rather than null: many OpenAI-compatible endpoints
-			// (local inference servers, translating proxies/gateways) reject null content
-			// even though the official spec permits it when tool_calls is present.
-			const assistantMsg: OAIMessage = { role: "assistant", content: hasText ? text : "" };
-			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-			// Attach reasoning blocks and plain-text fallback for Responses API history.
-			if (reasoningBlocks.length > 0) {
-				assistantMsg._reasoningBlocks = reasoningBlocks;
-				assistantMsg._reasoningTextFallback = buildReasoningTextFallback(reasoningBlocks);
-			}
-			history.push(assistantMsg);
-
-			// Collect tool results
-			if (msg.toolCalls) {
-				for (const tc of msg.toolCalls) {
-					if (tc.status === "success" || tc.status === "fail") {
-						pendingToolResults.push({
-							tool_call_id: tc.toolUseId,
-							content: outputToText(tc.outputJson),
-						});
+			flushText();
+			switch (item.kind) {
+				case "reasoning": {
+					const openai = (item.credentials.openai ?? {}) as {
+						itemId?: string;
+						reasoningEncryptedContent?: string;
+						textFormat?: string;
+					};
+					const text = item.text.trim();
+					if (openai.reasoningEncryptedContent && item.sameSource) {
+						history.push({
+							type: "reasoning",
+							id: openai.itemId,
+							summary: text ? [{ type: "summary_text", text }] : [],
+							encrypted_content: openai.reasoningEncryptedContent,
+						} as unknown as OAIMessage);
+					} else if (
+						!options.strict &&
+						item.sameSource &&
+						openai.textFormat === "reasoning_text" &&
+						item.text
+					) {
+						history.push({
+							type: "reasoning",
+							id: openai.itemId,
+							content: [{ type: "reasoning_text", text: item.text }],
+						} as unknown as OAIMessage);
+					} else if (!options.strict && text) {
+						// A relay echoes reasoning it cannot replay natively as plain text, so the
+						// model still sees its earlier thinking; strict models drop it.
+						history.push(assistantText(text));
 					}
+					break;
 				}
-			}
-		} else if (msg.role === "user") {
-			// Flush pending tool results before user message
-			for (const tr of pendingToolResults) {
-				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-			}
-			pendingToolResults = [];
-
-			const text = msg.contentText || "";
-			if (text) {
-				history.push({ role: "user", content: text });
-			}
-		} else if (msg.role === "sys") {
-			for (const tr of pendingToolResults) {
-				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-			}
-			pendingToolResults = [];
-
-			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const textParts = content
-				.filter((b: { type: string }) => b.type === "text")
-				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
-			// Emit sys context as a user-role message rather than a system message.
-			// Gemini-translating proxies hoist every system message into
-			// `system_instruction`, which can leave `contents` empty on turns
-			// whose only new content is a sys message (e.g. goal continuation) and
-			// trigger "contents is not specified". A user turn keeps it visible to
-			// the model while guaranteeing non-empty conversation content.
-			if (text) {
-				history.push({ role: "user", content: text });
+				case "web_search": {
+					const action =
+						item.action ??
+						(item.query || item.queries?.length
+							? {
+									type: "search",
+									...(item.query ? { query: item.query } : {}),
+									...(item.queries?.length ? { queries: item.queries } : {}),
+								}
+							: undefined);
+					// The upstream rejects `id` on input web_search_call items.
+					if (action)
+						history.push({
+							type: "web_search_call",
+							status: "completed",
+							action,
+						} as unknown as OAIMessage);
+					break;
+				}
+				case "image_generation":
+					if (!item.result) break;
+					history.push({
+						type: "image_generation_call",
+						id: item.wireId,
+						status: "completed",
+						result: item.result,
+						...(item.revisedPrompt ? { revised_prompt: item.revisedPrompt } : {}),
+					} as unknown as OAIMessage);
+					// Where the image was saved. A user item, not developer, so the request's
+					// instructions stay the same for the whole conversation.
+					if (item.savedPath)
+						history.push({
+							role: "user",
+							content: [
+								{
+									type: "input_text",
+									text: buildImageGenerationSavedPathInstruction(item.savedPath),
+								},
+							],
+						} as unknown as OAIMessage);
+					break;
+				case "tool_call":
+					history.push({
+						type: "function_call",
+						call_id: item.wireId,
+						name: item.name,
+						arguments: JSON.stringify(item.input),
+					} as unknown as OAIMessage);
+					break;
+				default:
+					break;
 			}
 		}
+		flushText();
 	}
+	return history;
+}
 
-	return { history, trailingToolResults: pendingToolResults };
+/** One tool in Chat Completions shape; also an entry of a Kimi `system` tools message. */
+function formatCompletionsTool(tool: ResolvedToolDefinition): OAITool {
+	return {
+		type: "function",
+		function: {
+			name: tool.name,
+			description: tool.description,
+			parameters: resolveToolJsonSchema(tool),
+		},
+	};
+}
+
+/**
+ * Kimi's dynamic tool loading: a `system` message whose `tools` become callable from
+ * this position on, beside the top-level `tools`. Definitions must be complete.
+ */
+function systemToolsMessage(change: ToolLoadingChange): OAIMessage {
+	return {
+		role: "system",
+		tools: change.additions.flatMap((addition) =>
+			addition.definition ? [formatCompletionsTool(addition.definition)] : [],
+		),
+	};
+}
+
+/** Second projection stage for Chat Completions: neutral turns → messages. */
+function completionsWireHistory(
+	turns: readonly NeutralTurn[],
+	options: { strict: boolean },
+): OAIMessage[] {
+	const history: OAIMessage[] = [];
+	for (const turn of turns) {
+		if (turn.kind === "input") {
+			for (const item of turn.items) {
+				if (item.toolChange) history.push(systemToolsMessage(item.toolChange as ToolLoadingChange));
+				const message = buildOAIUserMessage(
+					item.text,
+					item.images.flatMap((image) => (image ? [image] : [])),
+					item.media ? [...item.media] : undefined,
+				);
+				if (message) history.push(message);
+			}
+			continue;
+		}
+		if (turn.kind === "tool_results") {
+			for (const result of turn.results)
+				history.push({ role: "tool", tool_call_id: result.wireId, content: result.text });
+			// All parallel calls must be answered before a media user turn.
+			const media = turn.results.flatMap((result) =>
+				(result.media ?? []).flatMap((item) => chatNativeMediaParts(item, result.wireId)),
+			);
+			if (media.length) history.push({ role: "user", content: media });
+			continue;
+		}
+		const searches = turn.items.filter((item) => item.kind === "web_search");
+		// Searches ran on the provider; the model only learns of them as context.
+		if (searches.length)
+			history.push({ role: "user", content: searches.map(webSearchSummary).join("\n") });
+		const text = turn.items.flatMap((item) => (item.kind === "text" ? [item.text] : [])).join("\n");
+		const toolCalls: OAIToolCall[] = turn.items.flatMap((item) =>
+			item.kind === "tool_call"
+				? [
+						{
+							id: item.wireId,
+							type: "function" as const,
+							function: { name: item.name, arguments: JSON.stringify(item.input) },
+						},
+					]
+				: [],
+		);
+		const reasoning = options.strict
+			? ""
+			: turn.items
+					.flatMap((item) => (item.kind === "reasoning" && item.text ? [item.text] : []))
+					.join("\n\n");
+		if (!text && !toolCalls.length && !reasoning) continue;
+		// An empty string, not null: many compatible endpoints reject null content even
+		// next to tool_calls.
+		const message: OAIMessage = { role: "assistant", content: text };
+		if (toolCalls.length) message.tool_calls = toolCalls;
+		if (reasoning) message.reasoning_content = reasoning;
+		history.push(message);
+	}
+	// Relay thinking models require reasoning_content on every assistant message.
+	if (!options.strict) ensureCompletionsReasoningContent(history);
+	return history;
+}
+
+function dataUrl(image: ResolvedImage): string {
+	return `data:image/${image.format};base64,${image.base64}`;
 }
 
 /**
@@ -4268,39 +4153,6 @@ function relayReasoningText(
 		.map((rb) => rb.text?.trim() ?? "")
 		.filter((text) => text.length > 0)
 		.join("\n");
-}
-
-/**
- * Build a plain-text reasoning fallback for blocks that cannot be replayed as
- * Responses API reasoning items (for example because encrypted_content is absent).
- */
-function buildReasoningTextFallback(
-	reasoningBlocks:
-		| Array<{
-				text: string;
-				providerMetadata?: import("./types").ReasoningProviderMetadata;
-		  }>
-		| undefined,
-): string {
-	if (!reasoningBlocks?.length) return "";
-
-	const parts: string[] = [];
-	for (const block of reasoningBlocks) {
-		const text = block.text?.trim();
-		if (!text) continue;
-		const openaiMeta = block.providerMetadata?.openai;
-		if (openaiMeta?.reasoningEncryptedContent) {
-			continue;
-		}
-		if (openaiMeta?.itemId) {
-			logger.debug("Using non-replayable historical reasoning summary as text fallback", {
-				itemId: openaiMeta.itemId,
-			});
-		}
-		parts.push(text);
-	}
-
-	return parts.join("\n");
 }
 
 // === Responses API history converter ===

@@ -2,11 +2,15 @@ import { ActionIcon, Box, Button, Group, Tooltip } from "@mantine/core";
 import { IconPaperclip } from "@tabler/icons-react";
 import type { RefObject } from "react";
 import { useTranslation } from "react-i18next";
+import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
 import { resolveComposerActionSlot } from "./composer-action-slot";
 import { NarratorComposer, type NarratorComposerHandle } from "./NarratorComposer";
 import { type QueueMode, SendOptionsSplitButton } from "./SendOptionsSplitButton";
+import { StableActionLabel } from "./StableActionLabel";
 
 export interface NarratorComposerRowProps {
+	/** 顺便提问 from a message-list selection; absent hides the action. */
+	onAskSelection?: (input: AskSelectionInput) => Promise<void>;
 	// Core refs
 	fileInputRef: RefObject<HTMLInputElement | null>;
 	composerRef: RefObject<NarratorComposerHandle | null>;
@@ -31,6 +35,15 @@ export interface NarratorComposerRowProps {
 	// File handling
 	onFileInputChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
 	onComposerPasteImages: (files: File[]) => void;
+	attachedImages?: File[];
+	attachedTextFiles?: File[];
+	attachedMedia?: File[];
+	attachmentsHydrating?: boolean;
+	attachmentsRestoreFailed?: boolean;
+	onRetryAttachments?: () => void;
+	restoredAttachmentResources?: ReadonlyMap<string, File>;
+	onAttachmentsChange?: (images: File[], textFiles: File[], media: File[]) => void;
+	onDocumentAssetsChange?: (ids: readonly string[]) => void;
 
 	// Actions
 	onSendWithMode: (mode: QueueMode) => void | Promise<void>;
@@ -93,6 +106,9 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 	const hasInput = props.composerHasText;
 	const hasAttachments = props.composerHasAttachments;
 	const sendLabel = props.isActive ? t(`queueMode_${props.enterQueueMode}`) : tc("send");
+	const idleCandidates = [tc("send"), t("retry"), t("continue")];
+	const stableIdleLabel = (label: string) =>
+		props.isActive ? label : <StableActionLabel label={label} candidates={idleCandidates} />;
 
 	// Wrap a primary button as the right segment of the split send-options control
 	const withSendOptions = (
@@ -184,7 +200,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 		if (showRetry) {
 			return withSendOptions(
 				<Button key="retry" onClick={props.onRetry}>
-					{t("retry")}
+					{stableIdleLabel(t("retry"))}
 				</Button>,
 			);
 		}
@@ -193,7 +209,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 		if (showContinue) {
 			return withSendOptions(
 				<Button key="continue" onClick={props.onContinue}>
-					{t("continue")}
+					{stableIdleLabel(t("continue"))}
 				</Button>,
 			);
 		}
@@ -208,7 +224,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 					loading={props.isSending}
 				>
 					{!props.isActive
-						? sendLabel
+						? stableIdleLabel(sendLabel)
 						: props.queuedMessagesCount > 0
 							? `${t("queue")} (${props.queuedMessagesCount})`
 							: t("queue")}
@@ -259,7 +275,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 								}}
 							/>
 						)}
-						<span style={{ position: "relative" }}>{sendLabel}</span>
+						<span style={{ position: "relative" }}>{stableIdleLabel(sendLabel)}</span>
 					</Button>
 				</Tooltip>,
 			);
@@ -273,7 +289,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 				disabled={!hasInput && !hasAttachments}
 				loading={props.isSending}
 			>
-				{sendLabel}
+				{stableIdleLabel(sendLabel)}
 			</Button>,
 		);
 	};
@@ -294,75 +310,88 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 		editing: !!props.editingMessageState,
 	});
 
+	const actions =
+		actionSlot === "taken-over" ? (
+			<Group gap="xs" align="end" wrap="wrap" justify="flex-end">
+				{renderPrimaryActionButton()}
+				<Tooltip label={t("stopTakeoverHint")} position="top">
+					<Button
+						key="stop-takeover"
+						color="grape"
+						variant="outline"
+						onClick={props.onStopTakeover}
+						loading={props.stopTakeoverMutationPending}
+					>
+						{t("stopTakeover")}
+					</Button>
+				</Tooltip>
+			</Group>
+		) : actionSlot === "takeover" ? (
+			<Button
+				key="takeover"
+				color="grape"
+				variant="light"
+				onClick={props.onTakeover}
+				loading={props.takeoverMutationPending}
+			>
+				{t("takeover")}
+			</Button>
+		) : (
+			renderPrimaryActionButton()
+		);
+
 	return (
-		<Box
-			px="md"
-			style={{
-				paddingBottom: "var(--mantine-spacing-xs)",
-				flexShrink: 0,
-			}}
-		>
+		<Box px="md" style={{ paddingBottom: "var(--mantine-spacing-xs)", flexShrink: 0 }}>
 			<input
 				ref={props.fileInputRef}
 				type="file"
 				multiple
 				style={{ display: "none" }}
 				onChange={props.onFileInputChange}
+				disabled={props.isSending}
 			/>
-			<Group gap="xs" align="end" wrap="nowrap">
-				<Tooltip label={t("attachFile")}>
-					<ActionIcon
-						variant="subtle"
-						color="gray"
-						onClick={() => props.fileInputRef.current?.click()}
-						mb={4}
-					>
-						<IconPaperclip size={18} />
-					</ActionIcon>
-				</Tooltip>
-				{/* Always mounted, including canTakeover — see actionSlot comment. */}
-				<NarratorComposer
-					ref={props.composerRef}
-					narratorId={props.narratorId}
-					sendingRef={props.sendingRef}
-					appendInputRef={props.appendInputRef}
-					permEnterActive={props.effectiveFocusIndex != null}
-					hasAttachments={props.composerHasAttachments}
-					enterMode={props.enterQueueMode}
-					ctrlEnterMode={props.ctrlEnterQueueMode}
-					onSendWithMode={props.onSendWithMode}
-					onTextFlagsChange={props.setComposerHasText}
-					onPasteImages={props.onComposerPasteImages}
-				/>
-				{actionSlot === "taken-over" ? (
-					<Group gap="xs" align="end" wrap="nowrap">
-						{renderPrimaryActionButton()}
-						<Tooltip label={t("stopTakeoverHint")} position="top">
-							<Button
-								key="stop-takeover"
-								color="grape"
-								variant="outline"
-								onClick={props.onStopTakeover}
-								loading={props.stopTakeoverMutationPending}
-							>
-								{t("stopTakeover")}
-							</Button>
-						</Tooltip>
-					</Group>
-				) : actionSlot === "takeover" ? (
-					<Button
-						key="takeover"
-						color="grape"
-						variant="light"
-						onClick={props.onTakeover}
-						loading={props.takeoverMutationPending}
-					>
-						{t("takeover")}
-					</Button>
-				) : (
-					renderPrimaryActionButton()
-				)}
-			</Group>
+			<NarratorComposer
+				ref={props.composerRef}
+				narratorId={props.narratorId}
+				sendingRef={props.sendingRef}
+				sending={props.isSending}
+				appendInputRef={props.appendInputRef}
+				permEnterActive={props.effectiveFocusIndex != null}
+				hasAttachments={props.composerHasAttachments}
+				enterMode={props.enterQueueMode}
+				ctrlEnterMode={props.ctrlEnterQueueMode}
+				onSendWithMode={props.onSendWithMode}
+				onTextFlagsChange={props.setComposerHasText}
+				onPasteImages={props.onComposerPasteImages}
+				attachedImages={props.attachedImages}
+				attachedTextFiles={props.attachedTextFiles}
+				attachedMedia={props.attachedMedia}
+				attachmentsHydrating={props.attachmentsHydrating}
+				attachmentsRestoreFailed={props.attachmentsRestoreFailed}
+				onRetryAttachments={props.onRetryAttachments}
+				restoredAttachmentResources={props.restoredAttachmentResources}
+				onAttachmentsChange={props.onAttachmentsChange}
+				onDocumentAssetsChange={props.onDocumentAssetsChange}
+				onAskSelection={props.onAskSelection}
+				controls={
+					<Tooltip label={t("attachFile")}>
+						<ActionIcon
+							aria-label={t("attachFile")}
+							variant="subtle"
+							color="gray"
+							disabled={props.isSending}
+							onMouseDown={(event) => event.preventDefault()}
+							onClick={() => {
+								props.composerRef.current?.captureAttachmentSelection();
+								props.fileInputRef.current?.click();
+							}}
+						>
+							<IconPaperclip size={18} />
+						</ActionIcon>
+					</Tooltip>
+				}
+				actions={actions}
+			/>
 		</Box>
 	);
 }

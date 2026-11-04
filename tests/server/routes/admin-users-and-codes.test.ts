@@ -21,9 +21,10 @@ const { adminRoutes } = await import("../../../server/routes/admin");
 
 const NOW = "2026-08-12T00:00:00.000Z";
 const ADMIN_ID = "admin-1";
+const NON_ADMIN_ID = "user-1";
 
 function appForRole(role: "admin" | "user") {
-	const user = { sub: role === "admin" ? ADMIN_ID : "user-1", role, iat: 0, exp: 2 ** 31 };
+	const user = { sub: role === "admin" ? ADMIN_ID : NON_ADMIN_ID, role, iat: 0, exp: 2 ** 31 };
 	const app = new Hono();
 	app.use("*", async (c, next) => {
 		c.set("auth", { type: "session", user });
@@ -53,17 +54,21 @@ function post(path: string, body: unknown, role: "admin" | "user" = "admin") {
 
 beforeEach(async () => {
 	cleanDb(sqlite);
-	// The acting administrator must exist: created rows reference them.
-	await db.insert(users).values({
-		id: ADMIN_ID,
-		username: "root-admin",
-		passwordHash: "x",
-		role: "admin",
-		createdAt: NOW,
-	});
+	// `assertAdmin` authorizes against the LIVE role read through the session store
+	// (which runs on this mocked db), never the token's `role` claim. Both acting
+	// principals must therefore exist as rows: the admin resolves to role "admin"
+	// (→ allowed), and the non-admin to role "user" (→ 403 ADMIN_REQUIRED, not the
+	// 401 USER_GONE an unseeded actor would raise). The admin row is also referenced
+	// by the accounts/codes it provisions.
+	await db.insert(users).values([
+		{ id: ADMIN_ID, username: "root-admin", passwordHash: "x", role: "admin", createdAt: NOW },
+		{ id: NON_ADMIN_ID, username: "plain-user", passwordHash: "x", role: "user", createdAt: NOW },
+	]);
 });
 
-afterEach(() => cleanDb(sqlite));
+afterEach(() => {
+	cleanDb(sqlite);
+});
 
 afterAll(() => {
 	mock.module("../../../server/db", () => realDbModule);
@@ -129,10 +134,8 @@ describe("POST /users", () => {
 /**
  * Role changes and the token generation.
  *
- * A session JWT carries its own `role` claim and `assertAdmin` reads that claim, so a
- * demotion that only clears the existence cache leaves the target's already-issued
- * token passing `requireAdmin` until it expires — the version check the cache serves
- * compares `tokenVersion`, not the role.
+ * The role is read live on every request, so a role change takes effect on the next
+ * request by itself and never needs to end the target's sessions.
  */
 describe("PATCH /users/:id role changes", () => {
 	async function seedUser(id: string, role: "admin" | "user") {
@@ -161,14 +164,14 @@ describe("PATCH /users/:id role changes", () => {
 		return row?.tokenVersion ?? -1;
 	}
 
-	test("a demotion revokes the target's existing sessions", async () => {
+	test("a demotion does not revoke sessions", async () => {
 		await seedUser("second-admin", "admin");
 		const before = await tokenVersionOf("second-admin");
 
 		const res = await patch("/users/second-admin", { role: "user" });
 
 		expect(res.status).toBe(200);
-		expect(await tokenVersionOf("second-admin")).toBeGreaterThan(before);
+		expect(await tokenVersionOf("second-admin")).toBe(before);
 	});
 
 	test("a promotion does not revoke sessions", async () => {
@@ -184,8 +187,7 @@ describe("PATCH /users/:id role changes", () => {
 	});
 
 	test("re-applying the same role revokes nothing", async () => {
-		// Not a demotion: there is no stale elevated claim to invalidate, so a no-op
-		// write must not sign the user out.
+		// A no-op write must not sign the user out.
 		await seedUser("plain", "user");
 		const before = await tokenVersionOf("plain");
 

@@ -1,14 +1,16 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { type McpLoadingMode, resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import { eventBus } from "../event-bus";
 import { logger } from "../logger";
 import type { McpServerConfig } from "../settings";
 import { settings } from "../settings";
 import { createTransport } from "./transports";
 
-/** Timeout for initial MCP server connection + tool discovery (ms). */
+/** Timeout for a connection or one discovery page, not the entire directory (ms). */
 const CONNECT_TIMEOUT_MS = 30_000;
 
 /** Delay before attempting auto-reconnect after unexpected disconnect (ms). */
@@ -35,6 +37,7 @@ export interface McpServerConfigProjection {
 	url?: string;
 	envKeys: string[];
 	headerKeys: string[];
+	mode: McpLoadingMode;
 	enabled: boolean;
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
 	toolPermissions?: Array<{ toolName: string; behavior: string; enabled?: boolean }>;
@@ -65,7 +68,8 @@ export function projectMcpServerConfig(config: McpServerConfig): McpServerConfig
 		...(config.url !== undefined && { url: config.url }),
 		envKeys: Object.keys(config.env ?? {}).sort(),
 		headerKeys: Object.keys(config.headers ?? {}).sort(),
-		enabled: config.enabled,
+		mode: resolveMcpLoadingMode(config),
+		enabled: resolveMcpLoadingMode(config) !== "disabled",
 		...(config.defaultBehavior !== undefined && { defaultBehavior: config.defaultBehavior }),
 		...(config.toolPermissions !== undefined && { toolPermissions: config.toolPermissions }),
 	};
@@ -96,7 +100,7 @@ class McpManager {
 	/** Initialize: connect all enabled servers from settings. */
 	async initialize(): Promise<void> {
 		const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
-		const enabled = servers.filter((s) => s.enabled);
+		const enabled = servers.filter((s) => resolveMcpLoadingMode(s) !== "disabled");
 		if (enabled.length === 0) return;
 
 		logger.info(`MCP: initializing ${enabled.length} server(s)`);
@@ -167,9 +171,9 @@ class McpManager {
 			// Listen for tools/list_changed notifications — re-fetch tools when server updates them
 			client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
 				try {
-					const refreshed = await client.listTools();
+					const tools = await listAllTools(client);
 					if (this.clients.get(config.id) !== entry || !this.isCurrentConfig(config)) return;
-					entry.tools = refreshed.tools ?? [];
+					entry.tools = tools;
 					logger.info(`MCP: "${config.name}" tools updated, now ${entry.tools.length} tool(s)`);
 					this.onToolsChanged?.();
 				} catch (err) {
@@ -178,17 +182,13 @@ class McpManager {
 			});
 
 			// Discover tools
-			const result = await withTimeout(
-				client.listTools(),
-				CONNECT_TIMEOUT_MS,
-				`MCP listTools for "${config.name}"`,
-			);
+			const tools = await listAllTools(client);
 			if (this.clients.get(config.id) !== entry || !this.isCurrentConfig(config)) {
 				if (this.clients.get(config.id) === entry) this.clients.delete(config.id);
 				await transport.close?.();
 				return;
 			}
-			entry.tools = result.tools ?? [];
+			entry.tools = tools;
 			entry.status = "connected";
 			entry.error = undefined;
 			entry.reconnectAttempts = 0;
@@ -256,8 +256,8 @@ class McpManager {
 	 *
 	 * Prefers a lightweight `tools/list` on the live connection — the case where an
 	 * upstream (e.g. JetBrains MCP) toggles APIs but never sends `tools/list_changed`.
-	 * Falls back to a full reconnect when there is no live client or the re-list
-	 * fails. Does not change the persisted `enabled` intent: a disabled server is
+	 * Reconnects a missing client or an expired HTTP session. Other discovery errors
+	 * keep the previous complete directory. Does not change persisted intent: a disabled server is
 	 * reported as an error rather than silently brought up.
 	 */
 	async refresh(serverId: string): Promise<McpRefreshResult> {
@@ -269,7 +269,7 @@ class McpManager {
 		if (!config) {
 			return { ok: false, toolCount: 0, error: `MCP server "${serverId}" is not configured` };
 		}
-		if (!config.enabled) {
+		if (resolveMcpLoadingMode(config) === "disabled") {
 			return { ok: false, toolCount: 0, error: `MCP server "${config.name}" is disabled` };
 		}
 
@@ -286,22 +286,21 @@ class McpManager {
 		if (entry && !this.isCurrentConfig(entry.config)) return cancelled();
 		if (entry?.status === "connected" && entry.client) {
 			try {
-				const result = await withTimeout(
-					entry.client.listTools(),
-					CONNECT_TIMEOUT_MS,
-					`MCP refresh tools for "${config.name}"`,
-				);
+				const tools = await listAllTools(entry.client);
 				if (!stillCurrent()) return cancelled();
-				entry.tools = result.tools ?? [];
+				entry.tools = tools;
 				logger.info(`MCP: refreshed tools for "${config.name}", now ${entry.tools.length} tool(s)`);
 				this.onToolsChanged?.();
 				return { ok: true, toolCount: entry.tools.length };
 			} catch (err) {
-				logger.warn(
-					`MCP: refresh listTools failed for "${config.name}", reconnecting: ${
-						err instanceof Error ? err.message : String(err)
-					}`,
-				);
+				if (!stillCurrent()) return cancelled();
+				const error = err instanceof Error ? err.message : String(err);
+				logger.warn(`MCP: refresh listTools failed for "${config.name}": ${error}`);
+				// The SDK leaves an expired HTTP session open; a plain re-list cannot repair it.
+				// Other discovery errors keep the working transport and last complete directory.
+				if (!(err instanceof StreamableHTTPError && err.code === 404)) {
+					return { ok: false, toolCount: entry.tools.length, error };
+				}
 			}
 		}
 
@@ -323,7 +322,7 @@ class McpManager {
 	/** Refresh the tool list of every enabled configured server. */
 	async refreshAll(): Promise<Array<{ serverId: string; name: string } & McpRefreshResult>> {
 		const servers = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).filter(
-			(s) => s.enabled,
+			(s) => resolveMcpLoadingMode(s) !== "disabled",
 		);
 		const settled = await Promise.allSettled(servers.map((s) => this.refresh(s.id)));
 		return settled.map((result, idx) => {
@@ -349,14 +348,14 @@ class McpManager {
 		// Disconnect removed or disabled servers
 		for (const [id] of this.clients) {
 			const cfg = configMap.get(id);
-			if (!cfg?.enabled) {
+			if (!cfg || resolveMcpLoadingMode(cfg) === "disabled") {
 				await this.disconnect(id);
 			}
 		}
 
 		// Connect new or reconnect changed servers
 		for (const cfg of servers) {
-			if (!cfg.enabled) continue;
+			if (resolveMcpLoadingMode(cfg) === "disabled") continue;
 			const existing = this.clients.get(cfg.id);
 			if (!existing || this.configChanged(existing.config, cfg)) {
 				await this.connect(cfg);
@@ -441,8 +440,7 @@ class McpManager {
 			transport = createTransport(config);
 			const client = new Client({ name: "narrafork-test", version: "0.1.0" }, { capabilities: {} });
 			await client.connect(transport);
-			const result = await client.listTools();
-			const tools = result.tools ?? [];
+			const tools = await listAllTools(client);
 			await transport.close?.();
 			return { ok: true, tools };
 		} catch (err) {
@@ -500,7 +498,12 @@ class McpManager {
 		const current = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).find(
 			(s) => s.id === config.id,
 		);
-		return !!current?.enabled && config.enabled && !this.configChanged(current, config);
+		return (
+			!!current &&
+			resolveMcpLoadingMode(current) !== "disabled" &&
+			resolveMcpLoadingMode(config) !== "disabled" &&
+			!this.configChanged(current, config)
+		);
 	}
 
 	private configChanged(a: McpServerConfig, b: McpServerConfig): boolean {
@@ -517,6 +520,25 @@ class McpManager {
 }
 
 export const mcpManager = new McpManager();
+
+/** Bound each SDK request, not the total directory: a healthy next page may continue. */
+async function listAllTools(client: Client): Promise<Tool[]> {
+	const tools: Tool[] = [];
+	const cursors = new Set<string>();
+	let cursor: string | undefined;
+	do {
+		const page = await client.listTools(cursor === undefined ? undefined : { cursor }, {
+			timeout: CONNECT_TIMEOUT_MS,
+		});
+		for (const tool of page.tools ?? []) tools.push(tool);
+		cursor = page.nextCursor;
+		if (cursor !== undefined) {
+			if (cursors.has(cursor)) throw new Error("MCP tools/list returned a repeated cursor");
+			cursors.add(cursor);
+		}
+	} while (cursor !== undefined);
+	return tools;
+}
 
 /** Race a promise against a timeout. */
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {

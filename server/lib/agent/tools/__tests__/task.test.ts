@@ -1,9 +1,11 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { settings } from "../../../settings";
-import type { AgentConfig, ToolContext, ToolUpdateExecutionLease } from "../../types";
+import { delegationRegistration } from "../../../validators/runtime-registration";
+import type { ToolContext, ToolUpdateExecutionLease } from "../../types";
 
 const runCalls: Array<Record<string, unknown>> = [];
 let agentTool: typeof import("../task").agentTool;
+let buildSubagentModelContext: typeof import("../task").buildSubagentModelContext;
 let realNarratorSubagent: typeof import("@server/services/narrator-subagent");
 
 beforeAll(async () => {
@@ -16,7 +18,7 @@ beforeAll(async () => {
 			return "<subagent_id>inspect-lease</subagent_id>\n\ndone";
 		}),
 	}));
-	({ agentTool } = await import("../task"));
+	({ agentTool, buildSubagentModelContext } = await import("../task"));
 });
 
 afterAll(() => {
@@ -25,7 +27,7 @@ afterAll(() => {
 });
 
 describe("Agent task tool", () => {
-	test("schema advertises fixed global tiers but never invents one for unconfigured models", () => {
+	test("prompt context advertises fixed tiers while the schema remains static", () => {
 		// Pool entries must also be *visible* models, or filterSubagentModels drops them
 		// from the schema description (which is the behaviour under test, not a bug).
 		settings.agent.customModels = [
@@ -50,9 +52,11 @@ describe("Agent task tool", () => {
 		const schema = agentTool.rawJsonSchema as {
 			properties: Record<string, { description: string }>;
 		};
-		expect(schema.properties.model.description).toContain("p:review [fixed reasoning_effort=high]");
-		expect(schema.properties.model.description).toContain("p:search [fixed reasoning_effort=none]");
-		expect(schema.properties.model.description).not.toContain("p:legacy [fixed");
+		const context = buildSubagentModelContext();
+		expect(context).toContain("p:review [fixed reasoning_effort=high]");
+		expect(context).toContain("p:search [fixed reasoning_effort=none]");
+		expect(context).not.toContain("p:legacy [fixed");
+		expect(schema.properties.model.description).not.toContain("p:review");
 		// A fixed effort for a model outside its type pool must not be advertised as a
 		// pool tier. The id may still appear in the unrestricted-types dump below.
 		expect(schema.properties.model.description).not.toContain("p:not-in-pool [fixed");
@@ -69,11 +73,9 @@ describe("Agent task tool", () => {
 		settings.agent.subagentAllowedModels = { explore: ["p:global"], plan: [], general: [] };
 		settings.agent.subagentModelReasoningEfforts = { explore: { "p:global": "high" } };
 		const custom = "explore: p:custom [fixed reasoning_effort=medium]";
-		const schema = agentTool.getRawJsonSchema?.({
-			subagentModelRestrictionDescription: custom,
-		} as AgentConfig) as { properties: Record<string, { description: string }> };
-		expect(schema.properties.model.description).toContain(custom);
-		expect(schema.properties.model.description).not.toContain("p:global");
+		const context = buildSubagentModelContext({ subagentModelRestrictionDescription: custom });
+		expect(context).toContain(custom);
+		expect(context).not.toContain("p:global");
 	});
 
 	test("passes the executeTool lease into the subagent runner for transfer", async () => {
@@ -178,6 +180,7 @@ describe("Agent archive / unarchive commands", () => {
 		status: string;
 		title: string | null;
 		traits?: unknown;
+		runtimeRegistrationJson?: unknown;
 	};
 
 	const narrators = new Map<string, FakeNarrator>();
@@ -264,18 +267,28 @@ describe("Agent archive / unarchive commands", () => {
 			interruptAndArchiveSubagent: async (id: string) => {
 				const n = narrators.get(id);
 				if (!n) return { ok: false, error: "not_found", id };
+				const alreadyArchived = n.status === "archived";
 				cancelled.push(id);
 				hardInterrupts.push(id);
 				closed.push(id);
-				statusUpdates.push({ id, status: "archived" });
-				n.status = "archived";
-				return { ok: true, alreadyArchived: false, archived: true, interrupted: true, id };
+				if (!alreadyArchived) {
+					statusUpdates.push({ id, status: "archived" });
+					n.status = "archived";
+				}
+				return { ok: true, alreadyArchived, archived: !alreadyArchived, interrupted: true, id };
 			},
 			archiveRetiredSubagents: async (ids: readonly string[]) =>
 				ids.map((id) => ({ ok: true, id, alreadyArchived: false, archived: true })),
 		}));
 
-		({ agentTool } = await import("../task"));
+		// In-memory fixtures carry no stored ceiling; the real ceiling path is covered by
+		// narrator-unified-runtime-contract.test.ts.
+		const traitLayers = await import("@server/services/trait-layer-service");
+		const { UNRESTRICTED_RUNTIME_POLICY } = await import("@server/services/agent-runtime/policy");
+		spyOn(traitLayers, "resolveNarratorRuntimePolicy").mockResolvedValue(
+			UNRESTRICTED_RUNTIME_POLICY,
+		);
+		({ agentTool, buildSubagentModelContext } = await import("../task"));
 	});
 
 	afterAll(() => {
@@ -315,6 +328,7 @@ describe("Agent archive / unarchive commands", () => {
 			id: "child-1",
 			parentNarratorId: "parent",
 			variant: "subagent:general",
+			runtimeRegistrationJson: delegationRegistration("parent", "general"),
 			status: "working",
 			title: "Run Tests",
 		});
@@ -322,6 +336,7 @@ describe("Agent archive / unarchive commands", () => {
 			id: "foreign",
 			parentNarratorId: "other-parent",
 			variant: "subagent:general",
+			runtimeRegistrationJson: delegationRegistration("other-parent", "general"),
 			status: "idle",
 			title: "Foreign",
 		});
@@ -368,9 +383,12 @@ describe("Agent archive / unarchive commands", () => {
 
 	test("archive rejects non-subagents and foreign subagents", async () => {
 		seed();
+		// Archiving is a control grant: a session nobody registered as controllable
+		// (here the caller itself) is refused the same way as a foreign one.
 		const notSub = await agentTool.execute({ archive: "parent" }, makeCtx());
 		expect(notSub.isError).toBe(true);
-		expect(notSub.output).toContain("not a subagent");
+		expect(notSub.output).toContain("not a direct child");
+		expect(narrators.get("parent")?.status).toBe("working");
 
 		const foreign = await agentTool.execute({ archive: "foreign" }, makeCtx("parent"));
 		expect(foreign.isError).toBe(true);
@@ -397,10 +415,26 @@ describe("Agent archive / unarchive commands", () => {
 		expect(narrators.get("child-1")?.status).toBe("idle");
 	});
 
-	test("stop, archive, and unarchive are mutually exclusive", async () => {
+	test("archive and unarchive are mutually exclusive", async () => {
 		seed();
-		const result = await agentTool.execute({ stop: "a", archive: "b" }, makeCtx());
+		const result = await agentTool.execute({ archive: "a", unarchive: "b" }, makeCtx());
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("mutually exclusive");
+	});
+
+	test("legacy stop is hidden and explicitly rejected without launching or archiving", async () => {
+		seed();
+		const schema = agentTool.rawJsonSchema as { properties: Record<string, unknown> };
+		expect(schema.properties).not.toHaveProperty("stop");
+		for (const args of [{ stop: "child-1" }, { stop: "child-1", archive: "child-1" }]) {
+			expect(agentTool.parameters.safeParse(args).success).toBe(false);
+			const result = await agentTool.execute(args, makeCtx());
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("Stop");
+		}
+		expect(cancelled).toEqual([]);
+		expect(hardInterrupts).toEqual([]);
+		expect(statusUpdates).toEqual([]);
+		expect(runCalls.filter((c) => c.parentNarratorId === "parent")).toHaveLength(0);
 	});
 });

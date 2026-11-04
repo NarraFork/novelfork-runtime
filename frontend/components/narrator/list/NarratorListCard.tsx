@@ -1,46 +1,27 @@
-import {
-	ActionIcon,
-	Avatar,
-	Badge,
-	Card,
-	Group,
-	Loader,
-	Stack,
-	Text,
-	Tooltip,
-} from "@mantine/core";
+import { ActionIcon, Avatar, Badge, Card, Group, Stack, Text, Tooltip } from "@mantine/core";
 import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconRobot,
+	IconServer,
 	IconSubtask,
 	IconTerminal2,
 	IconTrash,
 } from "@tabler/icons-react";
 import { Link } from "@tanstack/react-router";
-import type { MouseEvent, PointerEvent } from "react";
+import type { MouseEvent, PointerEvent, ReactNode } from "react";
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
+import { useNarratorIsOptimizingPrompt } from "../../../hooks/usePromptOptimizeTask";
 import { FOLLOW_DEFAULT_MODEL, FOLLOW_PARENT_MODEL } from "../../../lib/constants";
 import { formatSmartTime } from "../../../lib/format";
 import { startPointerDrag } from "../../../lib/panel-drag";
 import { highlightSearchText } from "../../../lib/search-utils";
-import { getEffectiveNarratorDisplay, statusAccentColor } from "../../../lib/status-registry";
+import { getEffectiveNarratorDisplay } from "../../../lib/status-registry";
+import { NarratorStatusIcon } from "../../nav/NarratorStatusIcon";
 import { UserAvatar } from "../../UserAvatar";
 import { NarratorAvatar } from "../header/NarratorAvatar";
-
-const ATTENTION_TAG_PRIORITY = [
-	"error",
-	"model_unavailable",
-	"quota_exhausted",
-	"compacting",
-	"background_compacting",
-	"suspended",
-	"manual_override",
-	"reflecting",
-	"interrupted",
-	"unread",
-] as const;
 
 const MAX_NARRATOR_LIST_TITLE_CHARS = 500;
 const MAX_NARRATOR_LIST_META_CHARS = 1_000;
@@ -74,15 +55,6 @@ export interface NarratorListViewer {
 	avatarImageId: string | null;
 }
 
-export interface NarratorListChapter {
-	id: string;
-	title: string;
-	projectId: string;
-	projectName: string | null;
-	status: string;
-	role: string;
-}
-
 export interface NarratorListItem {
 	id: string;
 	title?: string | null;
@@ -93,13 +65,16 @@ export interface NarratorListItem {
 	messageCount?: number | null;
 	/** Custom avatar image id; absent → the identicon derived from the narrator id. */
 	avatarImageId?: string | null;
+	/** Public trait tags; only `bot` is read here (it changes what opening the card shows). */
+	traits?: string[] | null;
 	createdAt: string;
 	lastMessageAt?: string | null;
 	activeTerminalCount?: number | null;
 	activeBackgroundTaskCount?: number | null;
+	activeBackgroundWorkCount?: number | null;
+	activeBackgroundServiceCount?: number | null;
 	containerCount?: number | null;
 	runningContainerCount?: number | null;
-	chapter?: NarratorListChapter | null;
 	viewers?: NarratorListViewer[] | null;
 }
 
@@ -126,26 +101,6 @@ interface ArchivedNarratorListCardProps extends BaseNarratorListCardProps {
 }
 
 type NarratorListCardProps = ActiveNarratorListCardProps | ArchivedNarratorListCardProps;
-
-/** Compute the status badge display for a narrator in the list view. */
-function getNarratorBadgeInfo(
-	status: string,
-	substatus?: string[] | null,
-): { color: string; labelKey: string } | null {
-	const display = getEffectiveNarratorDisplay(status, substatus ?? undefined);
-	const activeSubstatus = ATTENTION_TAG_PRIORITY.find((tag) => substatus?.includes(tag));
-	const showBadge =
-		!!activeSubstatus ||
-		(status !== "idle" && status !== "working") ||
-		(status === "working" && substatus?.includes("planning"));
-	if (!showBadge) return null;
-	const labelKey = activeSubstatus
-		? `status_${activeSubstatus}`
-		: substatus?.includes("planning")
-			? "status_planning"
-			: `status_${status}`;
-	return { color: statusAccentColor(display), labelKey };
-}
 
 function NarratorTitle({
 	narrator,
@@ -200,11 +155,25 @@ function NarratorBadges({
 	mobile?: boolean;
 }) {
 	const activeTerminals = narrator.activeTerminalCount ?? 0;
-	const activeBackgroundTasks = narrator.activeBackgroundTaskCount ?? 0;
+	const { t } = useTranslation("common");
+	const activeBackgroundTasks =
+		narrator.activeBackgroundWorkCount ?? narrator.activeBackgroundTaskCount ?? 0;
+	const activeServices = narrator.activeBackgroundServiceCount ?? 0;
 	const containers = narrator.containerCount ?? 0;
 	const runningContainers = narrator.runningContainerCount ?? 0;
 	return (
 		<>
+			{narrator.traits?.includes("bot") && (
+				<Badge
+					size="xs"
+					variant="light"
+					color="grape"
+					leftSection={<IconRobot size={10} />}
+					style={mobile ? { flexShrink: 0 } : undefined}
+				>
+					{t("botBadge")}
+				</Badge>
+			)}
 			{activeTerminals > 0 && (
 				<Badge
 					size="xs"
@@ -227,6 +196,19 @@ function NarratorBadges({
 					{activeBackgroundTasks}
 				</Badge>
 			)}
+			{activeServices > 0 && (
+				<Tooltip label={t("activeBackgroundServices", { count: activeServices })}>
+					<Badge
+						size="xs"
+						variant="light"
+						color="teal"
+						leftSection={<IconServer size={10} />}
+						style={mobile ? { flexShrink: 0 } : undefined}
+					>
+						{activeServices}
+					</Badge>
+				</Tooltip>
+			)}
 			{containers > 0 && (
 				<Badge
 					size="xs"
@@ -244,13 +226,8 @@ function NarratorBadges({
 
 function ProjectCwdLine({ narrator }: { narrator: NarratorListItem }) {
 	const { t } = useTranslation("narrators");
-	const chapter = narrator.chapter;
-	if (!chapter?.projectName && !narrator.cwd) return null;
+	if (!narrator.cwd) return null;
 	const parts = [
-		chapter?.projectName &&
-			t("projectLabel", {
-				name: clampNarratorListText(chapter.projectName, MAX_NARRATOR_LIST_META_CHARS),
-			}),
 		narrator.cwd &&
 			t("cwdLabel", {
 				path: clampNarratorListText(narrator.cwd, MAX_NARRATOR_LIST_META_CHARS),
@@ -303,7 +280,7 @@ function CreatedLastMessageText({ narrator }: { narrator: NarratorListItem }) {
 }
 
 /**
- * Avatar wrapper that starts a cross-region drag of this narrator.
+ * Icon wrapper that starts a cross-region drag of this narrator.
  *
  * The same handle the sidebar rows use (`RecentTabs`' `handleIconPointerDown`): the
  * `panel-drag` singleton takes ownership of the pointer, and the sidebar / workspace docks
@@ -316,12 +293,10 @@ function CreatedLastMessageText({ narrator }: { narrator: NarratorListItem }) {
  */
 function NarratorDragHandle({
 	narrator,
-	size,
-	label,
+	children,
 }: {
 	narrator: NarratorListItem;
-	size: number;
-	label: string;
+	children: ReactNode;
 }) {
 	const handlePointerDown = useCallback(
 		(event: PointerEvent<HTMLSpanElement>) => {
@@ -339,23 +314,62 @@ function NarratorDragHandle({
 	);
 
 	return (
-		<Tooltip label={label} openDelay={500} position="top">
-			<span
-				onPointerDown={handlePointerDown}
-				style={{
-					display: "inline-flex",
-					cursor: "grab",
-					// Claim the touch gesture for the drag singleton; otherwise the browser
-					// keeps vertical movement for scrolling and the drag never starts.
-					touchAction: "none",
-				}}
-			>
-				<NarratorAvatar
-					narratorId={narrator.id}
-					avatarImageId={narrator.avatarImageId}
-					title={narrator.title}
+		<span
+			onPointerDown={handlePointerDown}
+			style={{
+				display: "inline-flex",
+				cursor: "grab",
+				// Claim the touch gesture for the drag singleton; otherwise the browser
+				// keeps vertical movement for scrolling and the drag never starts.
+				touchAction: "none",
+			}}
+		>
+			{children}
+		</span>
+	);
+}
+
+/**
+ * The status icon, identical to the sidebar's recent-tabs icon (`NarratorStatusIcon`).
+ * The list page does not track drafts or scheduled spawning, so those two corner
+ * markers are simply absent here; the reasoning marker rides on `substatus` and DOES
+ * appear, same as the sidebar. Colour, fill, background-work half-fill and the centre
+ * shape all match the sidebar.
+ */
+function NarratorListStatusIcon({
+	narrator,
+	size,
+	dragHint,
+}: {
+	narrator: NarratorListItem;
+	size: number;
+	dragHint?: string;
+}) {
+	const { t } = useTranslation("common");
+	const display = getEffectiveNarratorDisplay(narrator.status, narrator.substatus ?? undefined);
+	const statusLabel = t(display.i18nKey);
+	// Same registry the sidebar reads — the request belongs to the narrator, not to
+	// whichever composer happens to be mounted.
+	const isOptimizingPrompt = useNarratorIsOptimizingPrompt(narrator.id);
+	// The badge is decorative to sighted users but carries real state, so name it.
+	const accessibleLabel = isOptimizingPrompt
+		? `${statusLabel} · ${t("optimizeInProgress", { ns: "narrator" })}`
+		: statusLabel;
+	return (
+		<Tooltip
+			label={dragHint ? `${statusLabel} · ${dragHint}` : statusLabel}
+			openDelay={500}
+			position="top"
+			events={{ hover: true, focus: true, touch: true }}
+		>
+			<span role="img" aria-label={accessibleLabel} style={{ display: "inline-flex" }}>
+				<NarratorStatusIcon
 					size={size}
-					showTooltip={false}
+					status={narrator.status}
+					substatus={narrator.substatus}
+					activeBackgroundWorkCount={narrator.activeBackgroundWorkCount}
+					activeBackgroundTaskCount={narrator.activeBackgroundTaskCount}
+					isOptimizingPrompt={isOptimizingPrompt}
 				/>
 			</span>
 		</Tooltip>
@@ -371,9 +385,6 @@ function ActiveNarratorCard({
 	onArchive,
 }: ActiveNarratorListCardProps) {
 	const { t } = useTranslation("narrators");
-	const { t: tn } = useTranslation("narrator");
-	const substatus = Array.isArray(narrator.substatus) ? narrator.substatus : [];
-	const badge = getNarratorBadgeInfo(narrator.status, substatus);
 
 	return (
 		<Card
@@ -402,16 +413,10 @@ function ActiveNarratorCard({
 				<Group justify="space-between" wrap="nowrap">
 					<Group gap="xs" style={{ minWidth: 0 }}>
 						{/* Desktop only: the mobile sidebar is a drawer, so there is nowhere
-						    to drop and the handle would just break tapping the avatar. */}
-						<NarratorDragHandle narrator={narrator} size={20} label={t("dragToSidebar")} />
-						{narrator.status === "working" && (
-							<Loader size={14} color={substatus.includes("planning") ? "green" : undefined} />
-						)}
-						{badge && (
-							<Badge size="xs" color={badge.color}>
-								{tn(badge.labelKey)}
-							</Badge>
-						)}
+						    to drop and the handle would just break tapping the icon. */}
+						<NarratorDragHandle narrator={narrator}>
+							<NarratorListStatusIcon narrator={narrator} size={20} dragHint={t("dragToSidebar")} />
+						</NarratorDragHandle>
 						<Text fw={500} truncate>
 							<NarratorTitle narrator={narrator} localQuery={localQuery} />
 						</Text>
@@ -450,21 +455,7 @@ function ActiveNarratorCard({
 			<Stack gap={4} hiddenFrom="sm">
 				<Group gap={6} wrap="nowrap" justify="space-between">
 					<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-						<NarratorAvatar
-							narratorId={narrator.id}
-							avatarImageId={narrator.avatarImageId}
-							title={narrator.title}
-							size={18}
-							showTooltip={false}
-						/>
-						{narrator.status === "working" && (
-							<Loader size={12} color={substatus.includes("planning") ? "green" : undefined} />
-						)}
-						{badge && (
-							<Badge size="xs" color={badge.color}>
-								{tn(badge.labelKey)}
-							</Badge>
-						)}
+						<NarratorListStatusIcon narrator={narrator} size={18} />
 						<Text fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
 							<NarratorTitle narrator={narrator} localQuery={localQuery} />
 						</Text>

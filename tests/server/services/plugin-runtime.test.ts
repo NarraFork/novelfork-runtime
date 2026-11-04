@@ -287,6 +287,57 @@ describe("ContentLengthFrameParser", () => {
 		parser.end();
 	});
 
+	it("copies a fragmented large UTF-8 body once and parses the following frame", () => {
+		const envelope: JsonRpcEnvelope = {
+			jsonrpc: "2.0",
+			id: "large",
+			result: { text: "中文".repeat(350_000) },
+		};
+		const bodyBytes = encoder.encode(JSON.stringify(envelope)).byteLength;
+		const first = encodeContentLengthFrame(envelope);
+		const next: JsonRpcEnvelope = { jsonrpc: "2.0", method: "next" };
+		const second = encodeContentLengthFrame(next);
+		const combined = new Uint8Array(first.length + second.length);
+		combined.set(first);
+		combined.set(second, first.length);
+
+		for (const chunkSize of [257, 4093]) {
+			const parser = new ContentLengthFrameParser({ maxBodyBytes: bodyBytes });
+			const parsed: JsonRpcEnvelope[] = [];
+			const bodyBuffers = new Set<Uint8Array>();
+			let copiedBytes = 0;
+			let bodyCopiedBytes = 0;
+			const originalSet = Uint8Array.prototype.set;
+			const copy = spyOn(Uint8Array.prototype, "set").mockImplementation(function (
+				this: Uint8Array,
+				source: ArrayLike<number>,
+				offset?: number,
+			) {
+				copiedBytes += source.length;
+				if (this.byteLength === bodyBytes) {
+					bodyBuffers.add(this);
+					bodyCopiedBytes += source.length;
+				}
+				originalSet.call(this, source, offset);
+			});
+			try {
+				parsed.push(...parser.feed(combined.subarray(0, 7)));
+				for (let offset = 7; offset < combined.length; offset += chunkSize) {
+					parsed.push(...parser.feed(combined.subarray(offset, offset + chunkSize)));
+				}
+				parser.end();
+			} finally {
+				copy.mockRestore();
+			}
+			// The body uses one destination and is copied exactly once, regardless
+			// of fragmentation; bounded header concatenation adds only small overhead.
+			expect(bodyBuffers.size).toBe(1);
+			expect(bodyCopiedBytes).toBe(bodyBytes);
+			expect(copiedBytes).toBeLessThan(combined.byteLength + 64 * 1024);
+			expect(parsed).toEqual([envelope, next]);
+		}
+	});
+
 	it("parses multiple frames from one chunk", () => {
 		const parser = new ContentLengthFrameParser();
 		const first = encodeContentLengthFrame({ jsonrpc: "2.0", method: "one" });
@@ -327,6 +378,56 @@ describe("ContentLengthFrameParser", () => {
 });
 
 describe("LocalProcessRunner", () => {
+	it("applies inbound start budgets without overriding an explicit constructor cap", async () => {
+		const defaultLimit = 1024 * 1024;
+		const largeLimit = 2 * defaultLimit;
+		const message: JsonRpcEnvelope = {
+			jsonrpc: "2.0",
+			id: "large",
+			result: "中".repeat(400_000),
+		};
+		const frame = encodeContentLengthFrame(message);
+		for (const [constructorCap, startBudget, expectedLimit, accepts] of [
+			[undefined, undefined, defaultLimit, false],
+			[undefined, largeLimit, largeLimit, true],
+			[512, largeLimit, 512, false],
+			[largeLimit, undefined, largeLimit, true],
+			[largeLimit, 512, 512, false],
+		] as const) {
+			const raw = makeRawProcess();
+			const messages: JsonRpcEnvelope[] = [];
+			const errors: Error[] = [];
+			const runner = new LocalProcessRunner({
+				spawn: () => raw.process,
+				maxBodyBytes: constructorCap,
+				killProcessTree: false,
+			});
+			const handle = await runner.start({
+				command: ["fixture"],
+				cwd: fixtureCwd,
+				maxInboundBodyBytes: startBudget,
+				onError: (error) => errors.push(error),
+			});
+			handle.onMessage((value) => messages.push(value));
+			try {
+				expect(handle.maxInboundFrameBytes).toBe(expectedLimit);
+				raw.pushStdout(frame);
+				await eventually(() => messages.length > 0 || errors.length > 0);
+				if (accepts) {
+					expect(messages).toEqual([message]);
+					expect(errors).toEqual([]);
+				} else {
+					expect(messages).toEqual([]);
+					expect(errors).toEqual([expect.objectContaining({ code: "body_too_large" })]);
+					expect(raw.wasKilled()).toBe(true);
+				}
+			} finally {
+				handle.kill();
+				await handle.exited;
+			}
+		}
+	});
+
 	it("encodes once and limits UTF-8 body bytes without counting headers", async () => {
 		const message: JsonRpcEnvelope = { jsonrpc: "2.0", method: "bytes", params: "中文" };
 		const bodyBytes = encoder.encode(JSON.stringify(message)).byteLength;
@@ -489,6 +590,31 @@ describe("LocalProcessRunner", () => {
 });
 
 describe("PluginRuntime", () => {
+	it("passes the configured inbound frame budget to the runner", async () => {
+		const runner = new FakeRunner();
+		const start = spyOn(runner, "start");
+		const maxFrameBytes = 2 * 1024 * 1024;
+		const maxOutboundFrameBytes = 3 * 1024 * 1024;
+		const runtime = new PluginRuntime({
+			...baseRuntimeOptions,
+			runner,
+			maxFrameBytes,
+			maxOutboundFrameBytes,
+		});
+		try {
+			await runtime.start();
+			expect(start).toHaveBeenCalledWith(
+				expect.objectContaining({
+					maxInboundBodyBytes: maxFrameBytes,
+					maxOutboundBodyBytes: maxOutboundFrameBytes,
+				}),
+			);
+		} finally {
+			await runtime.shutdown();
+			start.mockRestore();
+		}
+	});
+
 	it("performs hello/initialize/activate/health and grants no capabilities by default", async () => {
 		const runner = new FakeRunner();
 		const runtime = new PluginRuntime({ ...baseRuntimeOptions, runner });
@@ -790,14 +916,34 @@ describe("RuntimeSupervisor", () => {
 			restartMaxDelayMs: 1,
 			restartJitterRatio: 0,
 		});
+		const restarted = Promise.withResolvers<void>();
+		const quarantined = Promise.withResolvers<void>();
 		const runtime = supervisor.register({
 			...baseRuntimeOptions,
 			...realProcessRunnerOptions,
-			command: [bunPath, fixturePath, "crash"],
+			onStateChange(state) {
+				if (state === "active" && runtime.generation === 2) restarted.resolve();
+				if (state === "quarantine") quarantined.resolve();
+			},
 		});
-		await supervisor.start("com.example.runtime");
-		await eventually(() => runtime.state === "quarantine", process.platform === "win32" ? 12_000 : 1_500);
-		expect(supervisor.getDiagnostics("com.example.runtime")[0]?.state).toBe("quarantine");
+		const crashOwnedFixture = () => {
+			const pid = runtime.pid;
+			if (!pid) throw new Error("Expected this fixture's active child PID");
+			process.kill(pid, "SIGKILL");
+		};
+		try {
+			await supervisor.start("com.example.runtime");
+			expect(runtime.state).toBe("active");
+			crashOwnedFixture();
+			await restarted.promise;
+			expect(runtime.generation).toBe(2);
+			crashOwnedFixture();
+			await quarantined.promise;
+			expect(runtime.generation).toBe(2);
+			expect(supervisor.getDiagnostics("com.example.runtime")[0]?.state).toBe("quarantine");
+		} finally {
+			await supervisor.shutdown();
+		}
 	}, realProcessTestTimeoutMs);
 
 	it("handles slow and malformed real-process fixtures", async () => {

@@ -10,12 +10,13 @@
  * the host's `types.ts`.
  */
 
-import type { ModelMetadata } from "../model-catalog/schema/catalog";
+import type { NativeMediaFallbackWarning } from "../media-attachments";
+import type { ReferencePricing } from "../model-catalog/profile";
 
 /** Immutable reference-rate snapshot captured when the upstream request starts.
  * null means captured unknown, never permission to consult a later catalog. */
 export interface ReferencePricingSnapshot {
-	referencePricing: NonNullable<ModelMetadata["referencePricing"]> | null;
+	referencePricing: ReferencePricing | null;
 	catalogVersion: string;
 	localRevision: number;
 	modelId?: string;
@@ -31,6 +32,8 @@ export type ApiRequestDiagnosticSource =
 	| "parser";
 
 export interface ApiRequestDiagnostics {
+	/** Present only for the first-party TokenDance connection, never inferred from model names. */
+	tokendanceRecoveryAction?: import("../tokendance").TokenDanceRecoveryAction;
 	schema: "narrafork.error-diagnostics.v1";
 	source?: ApiRequestDiagnosticSource | string;
 	phase?: string;
@@ -40,8 +43,13 @@ export interface ApiRequestDiagnostics {
 	errorType?: string;
 	message?: string;
 	responseSnippet?: string;
+	/** Upstream correlation ID; never an internal attempt or database ID. */
 	requestId?: string;
 	providerRequestId?: string;
+	/** Exact loop attempt ID used by the local request recorder. */
+	recordingRequestId?: string;
+	/** Persisted api_requests.id for this exact attempt. */
+	apiRequestId?: string;
 	provider?: string;
 	model?: string;
 	channelName?: string;
@@ -137,6 +145,7 @@ export interface KnowledgeInjectionRecord {
 	compactSeq: number;
 	triggerToolCallId?: string | null;
 	hits: Array<{
+		scope?: "personal" | "global";
 		entryId: string;
 		entryRevisionId?: string | null;
 		summary?: string | null;
@@ -163,8 +172,10 @@ export interface WebSearchAction {
 
 export interface DbMessage {
 	id: string;
-	/** Original owner narrator for this persisted message row. */
+	/** Owner narrator for this persisted message row (a copy belongs to its holder). */
 	narratorId?: string;
+	/** The narrator that wrote it; unchanged by copies (§6.3). Null means the owner. */
+	authorNarratorId?: string | null;
 	role: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown;
 	contentText: string | null;
@@ -181,10 +192,17 @@ export interface DbToolCall {
 	status: string;
 }
 
+/**
+ * A complete model history: every persisted row, the latest input and any tool results
+ * the model has not answered yet included, so a request needs no separate current turn
+ * for persisted content.
+ */
 export interface BuiltHistory {
 	history: unknown[];
-	trailingToolResults: unknown[];
-	trailingUserText?: string;
+	/** Persisted input rows emitted into history (delivery receipts, de-duplication). */
+	replayedInjectionMessageIds?: readonly string[];
+	/** Request-scoped visible file fallbacks; persisted media references remain unchanged. */
+	mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 }
 
 // === Stream event emitted by provider.chat() ===
@@ -265,11 +283,11 @@ export interface ParsedStreamEvent {
 		/** Upstream identity that minted the thought signature. */
 		thoughtSignatureSource?: string;
 	};
-	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
+	/** Protocol-normalized usage; input/cache buckets are disjoint for every provider. */
 	usage?: {
-		/** Total prompt footprint occupying context window; may include cache read/write depending on provider. */
+		/** Total prompt footprint occupying context, including cache reads and writes. */
 		promptTokens?: number;
-		/** Raw uncached input tokens billed as normal input. */
+		/** Non-cached input tokens billed as normal input; do not subtract cache counters again. */
 		inputTokens?: number;
 		completionTokens?: number;
 		/** Reasoning tokens (o1/o3 models) */

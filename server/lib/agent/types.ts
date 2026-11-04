@@ -7,10 +7,16 @@ import type {
 	ReasoningProviderMetadata,
 	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
+import type {
+	MediaContentBlock,
+	NativeMediaFallbackWarning,
+	NativeMediaInput,
+} from "@shared/media-attachments";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
+import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
 
 // === API error and bounded diagnostics ===
 
@@ -109,9 +115,16 @@ export interface ToolContext {
 	/** Eval-only audited Read bridge; never exposes the runner configuration. */
 	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
 	recheckAuthorization?: () => Promise<void>;
+	/** Trusted synchronous policy fence; invoke after awaits, immediately before a deferred side effect. */
+	assertFinalExecutionPermission?: () => void;
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
+	/**
+	 * Fires when the user queues guidance for this pass. Ordinary tools ignore it and run
+	 * to completion; only a pure wait (Await) ends early so the guidance is read sooner.
+	 */
+	guidanceSignal?: AbortSignal;
 	/** Provider prefix of the session driving this tool call (e.g. "anthropic"). */
 	provider?: string;
 	/** Model ID of the session driving this tool call (may carry a provider prefix). */
@@ -139,8 +152,6 @@ export interface ToolContext {
 			totalTokens?: number;
 		};
 	}>;
-	/** Chapter ID the narrator belongs to (cached to avoid repeated DB lookups) */
-	chapterId?: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
 	planFileId?: string;
 	/** Plan file path — set during plan mode, passed to EnterPlanMode tool for the result prompt */
@@ -149,14 +160,14 @@ export interface ToolContext {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
-	/** Active chapter worktree root, used for cwd recovery suggestions. */
-	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** Skills blocked by narrator custom traits. `all` blocks every skill. */
 	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Server-resolved capability ceiling, copied from AgentConfig, never tool input. */
 	runtimePolicy?: RuntimePolicy;
+	/** Copied from `AgentConfig.bot`: a bot's own loop stays free for the conversation. */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/**
@@ -356,6 +367,10 @@ export interface ToolResult {
 	fatal?: boolean;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Actual bytes for the next provider request, never persisted in events. */
+	media?: NativeMediaInput[];
+	/** Durable asset references used to reconstruct native media on history replay. */
+	mediaRefs?: MediaContentBlock[];
 }
 
 export type ContributedToolRisk = "read" | "draft-write" | "confirmed-write" | "destructive";
@@ -371,13 +386,13 @@ export interface ContributedToolPermissionPolicy {
 
 export interface ToolDefinition {
 	name: string;
-	description: string | ((config: AgentConfig) => string);
+	description: string;
 	parameters: z.ZodType;
+	/** Optional bounded, actionable validation feedback; never includes raw tool input. */
+	formatValidationError?: (error: z.ZodError) => string;
 	/** Pre-built JSON Schema to send to providers, bypassing zodToJsonSchema conversion.
 	 *  Used by MCP tools to preserve the original inputSchema without lossy Zod round-tripping. */
 	rawJsonSchema?: Record<string, unknown>;
-	/** Optional dynamic schema override for tools that depend on current agent config. */
-	getRawJsonSchema?: (config: AgentConfig) => Record<string, unknown>;
 	/** Declarative execution routing; absent means the tool is not filesystem/device routed. */
 	executionRouting?: ToolExecutionRouting;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
@@ -400,8 +415,8 @@ export interface ToolDefinition {
 	};
 }
 
-/** ToolDefinition with description resolved to a plain string (after dynamic evaluation) */
-export type ResolvedToolDefinition = ToolDefinition & { description: string };
+/** Compatibility alias: tool definitions are already static. */
+export type ResolvedToolDefinition = ToolDefinition;
 
 // === Permission ===
 
@@ -454,8 +469,11 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 // === Agent events (yielded by the loop) ===
 
 export type AgentEvent =
+	| { type: "media_fallback"; warnings: NativeMediaFallbackWarning[] }
 	| {
 			type: "assistant_message";
+			/** False when an errored/truncated response is retained for already-started tools. */
+			outputCompleted?: boolean;
 			text: string;
 			toolUses: AgentToolUse[];
 			/** Internal persistence receipt for tools missing an incremental block. */
@@ -469,11 +487,14 @@ export type AgentEvent =
 			type: "stream_text";
 			text: string;
 			outputIndex?: number;
-			/** Attempt-scoped identity and revision shared with persisted content. */
-			blockId?: string;
-			blockRevision?: number;
+			/**
+			 * Attempt-scoped identity and revision shared with persisted content: every delta
+			 * names its element, so clients match it to its block (protocol v2).
+			 */
+			blockId: string;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "tool_call";
@@ -500,7 +521,10 @@ export type AgentEvent =
 			completedAt?: number;
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
+			mediaRefs?: MediaContentBlock[];
 			metadata?: Record<string, unknown>;
+			/** Images the tool returned; the consumer saves them and stores references. */
+			images?: Array<{ format: string; base64: string }>;
 	  }
 	/**
 	 * The tool passed its permission gate and final admission — execution begins NOW.
@@ -702,7 +726,8 @@ export type AgentEvent =
 			 *  - `credentials` (default): a NUG model's entire credential pool is
 			 *    disabled. When it comes back is unknowable, so the caller parks on the
 			 *    shared availability poller and resumes when the model reports available.
-			 *  - `quota`: a Kimi coding-plan allowance is used up. The reset instant is
+			 *  - `quota`: a Kimi coding-plan or OpenCode Go allowance is used up (or an
+			 *    OpenCode rate limit named a long wait). The reset instant is
 			 *    published upstream, so `resumeAt` carries it and the caller sleeps to
 			 *    it instead of polling — unless the reset lies beyond the wait budget,
 			 *    in which case `resumeAt` is absent while `quotaResetAt` is not, and the
@@ -718,6 +743,10 @@ export type AgentEvent =
 			nugModelId?: string;
 			/** How recovery is awaited; `credentials` when omitted. */
 			waitKind?: "credentials" | "quota";
+			/** Which plan a `quota` wait belongs to; `kimi` when omitted (older events). */
+			quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
+			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
+			quotaBucket?: string;
 			/**
 			 * Epoch ms at which the turn may be replayed. Present for a `quota` wait
 			 * whose reset is inside the wait budget — its ABSENCE on a `quota` wall
@@ -738,10 +767,11 @@ export type AgentEvent =
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
-			blockId?: string;
-			blockRevision?: number;
+			/** As on `stream_text`: the element this delta extends. */
+			blockId: string;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "context_usage";
@@ -827,20 +857,11 @@ export type AgentEvent =
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
-			rawDump?: unknown;
 			errorMessage?: string;
 			diagnostics?: ApiRequestDiagnostics;
-			/** Force raw-dump persistence regardless of the errors-only setting. */
-			forceDumpPersist?: boolean;
-			/**
-			 * Turn-scoped key marking several attempts as re-sends of ONE request, so their
-			 * identical dumps share a single spilled file instead of filling the newest-N
-			 * dump directory with multi-MB near-duplicates.
-			 */
-			dumpSpillReuseToken?: string;
 	  }
 	| { type: "silent_disconnect" }
-	| { type: "done" };
+	| { type: "done"; reason?: "reasoning_only_idle" };
 
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
@@ -851,6 +872,8 @@ export type ContentBlock =
 			/** Display/persistence identity, never an upstream replay credential. */
 			id?: string;
 			revision?: number;
+			/** False for durable checkpoints; true only at a successful completion boundary. */
+			completed?: boolean;
 			/** Raw stream length before citation-marker cleanup. */
 			rawTextLength?: number;
 			/**
@@ -867,6 +890,8 @@ export type ContentBlock =
 			outputIndex?: number;
 			id?: string;
 			revision?: number;
+			/** False for durable checkpoints; true only at a successful completion boundary. */
+			completed?: boolean;
 			/** Raw stream length before citation-marker cleanup. */
 			rawTextLength?: number;
 	  }
@@ -924,19 +949,25 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Bash",
 	"Agent",
 	"Await",
+	"Stop",
 	"Send",
 	"TeamStatus",
 	"AskUserQuestion",
 	"Question",
 	"Skill",
 	"LearningGuide",
+	// Visibility only: narrator-permission admits show, never create.
+	"GenUI",
+	...OUTLINE_READ_TOOLS,
+	// Planning writes the outline: OutlineEdit then writes only the session's own space.
+	OUTLINE_EDIT_TOOL,
 ]);
 
 // === Agent config ===
 
 // Single source of truth for the reasoning-effort tier union (shared with the
 // frontend). Re-exported here so existing importers keep their import path.
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 
 export type { ReasoningEffort };
 
@@ -945,10 +976,45 @@ export interface RuntimeSettingsOverride {
 	reasoningEffort?: ReasoningEffort | null;
 }
 
+/** One pending model-input fragment; an ID identifies its already-persisted message row. */
+export interface AgentInputPart {
+	text: string;
+	messageId?: string;
+}
+
+export interface AgentAfterToolsInput {
+	text: string;
+	/** Ordered fragments covering text, so a rebuild can replace only the rows it actually replayed. */
+	parts?: readonly AgentInputPart[];
+	onConsumed?: () => void;
+}
+
+/**
+ * What an agent loop's first request is built from.
+ *
+ * `rows` are the conversation (`DbMessage` rows, the stored shape); the loop keeps them
+ * as its transcript (`loop-transcript.ts`) and projects every request that has no
+ * host-built history from them. A host that already built the request from the same
+ * rows passes that history as `built`, which then is what the first request sends.
+ */
+export interface AgentLoopHistory {
+	rows: readonly import("./provider").DbMessage[];
+	built?: unknown[];
+}
+
+/** A host's rebuild: the rows of the conversation and the history built from them. */
 export interface AgentHistoryReplacement {
 	history: unknown[];
-	pendingToolResults: unknown[];
+	/** The rows `history` was built from; they replace the loop's transcript. */
+	rows: readonly import("./provider").DbMessage[];
+	mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 	systemPrompt?: string;
+	/** Persisted input rows the rebuilt history carries. */
+	replayedInjectionMessageIds?: readonly string[];
+	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
+	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** The same registry candidates used to build `toolLoading`; applied only together with it. */
+	toolCandidates?: readonly ToolDefinition[];
 }
 
 export interface AgentConfig {
@@ -972,10 +1038,20 @@ export interface AgentConfig {
 	onToolsCharacters?: (toolsChars: number) => void | Promise<void>;
 	locale?: string;
 	signal: AbortSignal;
-	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
-	chapterId?: string;
 	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
 	runtimePolicy?: RuntimePolicy;
+	/**
+	 * Where this session's tasks live (`services/task-source`), resolved once per pass. Under
+	 * `outline` every tool route to `spec://` answers with a hint to use the outline tools
+	 * instead, and taskReflection never runs. Absent means spec.
+	 */
+	taskBackend?: "spec" | "outline";
+	/**
+	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
+	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
+	 * when the message is delivered.
+	 */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
@@ -1018,8 +1094,6 @@ export interface AgentConfig {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
-	/** Active chapter worktree root, used for cwd recovery suggestions. */
-	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** User who triggered this loop turn — flows into ToolContext.userId for knowledge ACL. */
@@ -1108,7 +1182,7 @@ export interface AgentConfig {
 		reason: "validation_rejected" | "cancelled_before_dispatch" | "preview" | "invocation_rejected",
 		claimed: boolean,
 	) => Promise<void>;
-	/** Host evidence persistence (not an observer): failures must reject execution. */
+	/** Optional host no-dispatch history; failures preserve the actual tool outcome. */
 	recordToolNoDispatch?: (
 		ctx: ToolContext,
 		toolName: "Write" | "Edit" | "StructSed",
@@ -1145,6 +1219,16 @@ export interface AgentConfig {
 	resetUpstreamSessionOnFirstRequest?: boolean;
 	/** Filter tools available to this agent (subagent/tool-trait restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
+	/**
+	 * Optional-tool loading state of the history this pass was built from. The loop
+	 * keeps managed tools out of `toolFilter` and decides their place here instead
+	 * (see `tool-loading.ts`).
+	 */
+	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** Registry candidates already materialized by the host for this pass's first request. */
+	toolCandidates?: readonly ToolDefinition[];
+	/** Live loaded state of a managed tool; a call to an unloaded one is rejected. */
+	isToolLoaded?: (name: string) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
 	disabledTools?: Set<string> | string[];
 	/** Optional hard allow-list. Unlike toolFilter, this is enforced again at execution time. */
@@ -1171,16 +1255,33 @@ export interface AgentConfig {
 		options?: PermissionHandlerOptions,
 	) => Promise<PermissionResult>;
 	onEvent?: (event: AgentEvent) => void;
+	/** Awaited before every actual provider request, including retries and auxiliary
+	 * reflections. Unlike history hooks, this survives reflection configuration and
+	 * does not require prefix/tool-loading state. Rejection must prevent dispatch. */
+	beforeProviderRequest?: () => Promise<void>;
 	/**
 	 * Called before each non-first turn in the agent loop.
-	 * If it returns a new history + pendingToolResults, the loop replaces its
-	 * internal state — used for mid-turn context pruning and forced rebuilds
-	 * before model/provider switches.
+	 * If it returns a rebuilt history, the loop replaces its history and transcript —
+	 * used for mid-turn context pruning and forced rebuilds before model/provider switches.
 	 */
 	onBeforeTurn?: (
 		turnIndex: number,
 		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
 	) => Promise<AgentHistoryReplacement | null>;
+	/**
+	 * Rebuild the history a request is sent with, from persisted rows.
+	 *
+	 * When present, every request after the first is built by this instead of from the
+	 * loop's own transcript, so a live request is byte-for-byte what a later rebuild of
+	 * the same rows produces. Everything the model saw in earlier turns is persisted by
+	 * then (assistant steps, tool results, notice rows); only text no row carries is
+	 * still sent as the request's current content. Hosts without a store leave it unset.
+	 */
+	rebuildRequestHistory?: () => Promise<AgentHistoryReplacement>;
+	/** Whether the initial history ends with tool results the model has not answered. */
+	historyEndsWithToolResults?: boolean;
+	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
+	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**
@@ -1203,9 +1304,9 @@ export interface AgentConfig {
 	 * Called once per turn, after tool results are settled.
 	 */
 	getAfterToolsInjections?: () =>
-		| Promise<string | { text: string; onConsumed?: () => void }>
+		| Promise<string | AgentAfterToolsInput>
 		| string
-		| { text: string; onConsumed?: () => void };
+		| AgentAfterToolsInput;
 	/** Exact source history adopted at the provider-input boundary, never during preparation. */
 	onModelInputConsumed?: (
 		sourceHistory: unknown[],
@@ -1223,7 +1324,7 @@ export interface AgentConfig {
 	 * producers that still appended their text INSIDE a tool result's string; with this
 	 * they become rows like every other injection.
 	 *
-	 * Returns the text to fold into the current turn, or "" when the host declined
+	 * Returns a text fragment with its message ID (or legacy text), or "" when the host declined
 	 * (missing hook, write failure). Callers must treat a failure as "not delivered"
 	 * rather than falling back to a side-car, or the content would arrive twice.
 	 */
@@ -1249,7 +1350,7 @@ export interface AgentConfig {
 		 * flag for a warning the model never received.
 		 */
 		pipelineExitConfirmationStateId?: string;
-	}) => Promise<string> | string;
+	}) => Promise<string | AgentInputPart> | string | AgentInputPart;
 	/**
 	 * Completed-tool count to resume from, persisted by the caller across loop runs.
 	 *
@@ -1274,12 +1375,20 @@ export interface AgentConfig {
 	 */
 	getModelOverride?: () => string | null;
 	/**
-	 * Called after each serial tool or complete parallel-safe group. If true,
-	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
+	 * Host-side stop (plan approved, workspace invalidated, reflection decided). Checked
+	 * after each serial tool or complete parallel-safe group. If true, the loop exits
+	 * gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
-	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
-	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
+	/**
+	 * Queued user input wants the model's attention. Never skips a tool call: every call
+	 * the response produced still runs, and the loop ends the turn once the step's tools
+	 * have settled instead of sending the next provider request. One-shot like shouldStop.
+	 */
+	shouldYieldToInput?: () => boolean;
+	/** Event-driven immediate guidance: cut the provider response at the next tool-call
+	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
+	 * Supply a fresh signal for each loop invocation. */
 	guidanceSignal?: AbortSignal;
 	/** Urgent guidance: cancel provider and tool IO, then persist results and soft-stop.
 	 * Unlike signal, this does not mark the whole narrator run as user-interrupted. */
@@ -1333,18 +1442,6 @@ export interface AgentConfig {
 /** Whether a model name refers to a DeepSeek model. */
 export function isDeepSeekModel(model: string): boolean {
 	return model.toLowerCase().includes("deepseek");
-}
-
-/**
- * Map reasoning effort to DeepSeek effort value.
- * DeepSeek's reasoning_effort param only accepts "high" and "max". Uses the
- * shared clamp (就近、并列偏高): low/medium → high, xhigh/max → max.
- */
-export function mapDeepSeekEffort(reasoningEffort: string | undefined): "high" | "max" | undefined {
-	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	return clampReasoningEffort(reasoningEffort as ReasoningEffort, ["high", "max"]) as
-		| "high"
-		| "max";
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

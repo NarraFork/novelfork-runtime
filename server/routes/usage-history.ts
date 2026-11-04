@@ -1,25 +1,22 @@
-import {
-	buildRawDumpEnvelope,
-	isServableDumpFilePath,
-	REQUEST_DUMP_SPILL_POINTER_SCHEMA,
-	redactSpillPointerPaths,
-} from "@server/lib/api-request-dump-store";
-import { buildAttachmentDisposition } from "@server/lib/content-disposition";
 import { ValidationError } from "@server/lib/errors";
-import { logger } from "@server/lib/logger";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
+import { tokenRecalculationRangeSchema } from "@server/lib/validators/token-recalculation";
 import { requireAdmin, requireAuth } from "@server/middleware/auth";
 import {
 	listProviderCredentialTotals,
 	serializeCredentialUsageTotalsList,
 } from "@server/services/credential-usage-totals";
 import {
-	type RawDumpSource,
+	getTokenRecalculationService,
+	type TokenRecalculationService,
+} from "@server/services/token-recalculation-service";
+import {
 	type UsageHistoryService,
 	usageHistoryService,
 } from "@server/services/usage-history-service";
 import { listUserUsageTotals } from "@server/services/user-usage-totals";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 
 export type UsageHistoryRouteService = Pick<
@@ -30,7 +27,6 @@ export type UsageHistoryRouteService = Pick<
 	| "getUsageStats"
 	| "getUsageTimeSeries"
 	| "getUsageRecord"
-	| "getRawDumpSource"
 	| "getUsageBreakdown"
 	| "getUsageTimeSeriesStacked"
 >;
@@ -40,13 +36,13 @@ interface UsageHistoryRouteOptions {
 	requireAdmin?: typeof requireAdmin;
 	service?: UsageHistoryRouteService;
 	listUserUsageTotals?: typeof listUserUsageTotals;
+	recalculationService?: Pick<TokenRecalculationService, "get" | "start" | "cancel">;
 }
 
 // 查询参数 schema
 const listFilterShape = {
 	userId: z.string().trim().max(128).optional(),
 	narratorId: z.string().optional(),
-	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
 	credentialId: z.string().optional(),
@@ -73,7 +69,6 @@ const cursorListQuerySchema = z.object({
 const statsQuerySchema = z.object({
 	userId: z.string().trim().max(128).optional(),
 	narratorId: z.string().optional(),
-	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
 	credentialId: z.string().optional(),
@@ -99,7 +94,17 @@ const credentialTotalsQuerySchema = z.object({
 
 const breakdownQuerySchema = statsQuerySchema.extend({
 	dimension: z.enum(["provider", "model", "kind", "user"]),
-	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	metric: z.enum([
+		"requests",
+		"tokens",
+		"cost",
+		"inputTokens",
+		"outputTokens",
+		"cachedInputTokens",
+		"cacheCreationTokens",
+		"cacheHitRate",
+		"reasoningTokens",
+	]),
 	cluster: z
 		.enum(["true", "false", "1", "0"])
 		.default("true")
@@ -108,7 +113,17 @@ const breakdownQuerySchema = statsQuerySchema.extend({
 
 const stackedTimeSeriesQuerySchema = statsQuerySchema.extend({
 	dimension: z.enum(["provider", "model", "kind", "user"]),
-	metric: z.enum(["requests", "tokens", "cost", "inputTokens", "outputTokens", "reasoningTokens"]),
+	metric: z.enum([
+		"requests",
+		"tokens",
+		"cost",
+		"inputTokens",
+		"outputTokens",
+		"cachedInputTokens",
+		"cacheCreationTokens",
+		"cacheHitRate",
+		"reasoningTokens",
+	]),
 	granularity: z.enum(["hour", "day", "month"]).default("day"),
 	topN: z.coerce.number().int().positive().max(10).default(5),
 	cluster: z
@@ -117,75 +132,6 @@ const stackedTimeSeriesQuerySchema = statsQuerySchema.extend({
 		.transform((v) => v === "true" || v === "1"),
 });
 
-/**
- * Extract a spilled dump's file path from a stored `raw_dump_json`, or null.
- *
- * Validates the path against the directories dumps are written to. The value came from our
- * own database, so this is defense in depth: a corrupted or hand-edited row must not turn
- * the download route into an arbitrary-file reader.
- */
-function readSpillFilePath(rawDumpJson: string): string | null {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(rawDumpJson);
-	} catch {
-		return null;
-	}
-	if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-	const spill = (parsed as { spill?: unknown }).spill;
-	if (spill == null || typeof spill !== "object" || Array.isArray(spill)) return null;
-	const { schema, filePath } = spill as { schema?: unknown; filePath?: unknown };
-	if (schema !== REQUEST_DUMP_SPILL_POINTER_SCHEMA) return null;
-	if (typeof filePath !== "string" || !isServableDumpFilePath(filePath)) return null;
-	return filePath;
-}
-
-/**
- * The row's dump, wrapped in the same envelope a spill file carries, with the spill
- * pointer's server-side path removed.
- *
- * Both download paths must hand back one shape. Returning the bare `raw_dump_json` here
- * made the response shape depend on whether the dump happened to exceed a row budget —
- * an invisible difference to whoever writes the tooling that reads these files, and it
- * dropped the request identity (narrator/chapter/project/credential) that the previous
- * client-side export attached. A dump gets forwarded to whoever is helping diagnose it, so
- * "which conversation was this" has to travel with it.
- *
- * Only reached when no file is served, so the parse cost is paid on a bounded head (the row
- * is clamped to the inline ceiling) rather than on a multi-MB file. An unparseable row is
- * still enveloped, with the text preserved verbatim under `dumpText`: re-encoding would
- * destroy the malformed text someone is trying to read, and silently returning it bare
- * would break the shape promise for exactly the rows that need explaining.
- */
-function inlineDumpEnvelope(record: RawDumpSource, rawDumpJson: string): string {
-	const meta = {
-		requestId: record.id,
-		createdAt: record.createdAt,
-		narratorId: record.narratorId,
-		narratorTitle: record.narratorTitle,
-		chapterId: record.chapterId,
-		chapterTitle: record.chapterTitle,
-		projectId: record.projectId,
-		kind: record.kind,
-		provider: record.provider,
-		model: record.model,
-		credentialId: record.credentialId,
-		credentialName: record.credentialName,
-		errorMessage: record.errorMessage,
-	};
-	try {
-		return JSON.stringify(
-			buildRawDumpEnvelope(meta, redactSpillPointerPaths(JSON.parse(rawDumpJson))),
-		);
-	} catch {
-		return JSON.stringify({
-			...buildRawDumpEnvelope(meta, null),
-			dumpParseError: "The stored dump is not valid JSON; its text is preserved verbatim below.",
-			dumpText: rawDumpJson,
-		});
-	}
-}
-
 export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {}) {
 	const routes = new Hono();
 	const authMiddleware = options.requireAuth ?? requireAuth;
@@ -193,6 +139,29 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	const service = options.service ?? usageHistoryService;
 
 	routes.use("*", authMiddleware, adminMiddleware);
+
+	const recalculation = () => options.recalculationService ?? getTokenRecalculationService();
+	routes.get("/token-recalculation", (c) => c.json({ job: recalculation().get() }));
+	routes.post(
+		"/token-recalculation",
+		bodyLimit({
+			maxSize: 1024,
+			onError: (c) =>
+				c.json({ code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 1024 bytes" }, 413),
+		}),
+		async (c) => {
+			const body = await c.req.json().catch((error: unknown) => {
+				if (error instanceof Error && error.name === "BodyLimitError") throw error;
+				throw new ValidationError("Invalid JSON body");
+			});
+			const range = tokenRecalculationRangeSchema.safeParse(body);
+			if (!range.success) throw new ValidationError("Invalid UTC date range");
+			return c.json({ job: recalculation().start(range.data) }, 202);
+		},
+	);
+	routes.post("/token-recalculation/:id/cancel", (c) =>
+		c.json({ job: recalculation().cancel(c.req.param("id")) }),
+	);
 
 	// Lifetime totals are independent of the date-filtered, removable history.
 	routes.get("/user-totals", (c) => {
@@ -333,74 +302,6 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 			{ signal: c.req.raw.signal },
 		);
 		return c.json(result);
-	});
-
-	/**
-	 * GET /api/usage-history/:id/raw-dump
-	 *
-	 * Download the COMPLETE dump for one request, as an attachment.
-	 *
-	 * The point of this route is that "download" must never hand back a preview. A dump
-	 * larger than the row budget lives in a file (see `api-request-dump-store`), and
-	 * building the response from the database row would silently return the truncated head
-	 * — the failure this route exists to remove. So when the row carries a spill pointer,
-	 * the file is streamed verbatim.
-	 *
-	 * Registered before `/:id` so the literal sub-path wins.
-	 */
-	routes.get("/:id/raw-dump", async (c) => {
-		const id = c.req.param("id");
-		if (!id) return c.json({ error: "Missing usage record ID" }, 400);
-
-		const record = await service.getRawDumpSource(id);
-		if (!record) return c.json({ error: "Usage record not found" }, 404);
-		if (!record.rawDumpJson) {
-			return c.json(
-				{
-					error:
-						"No raw dump stored for this request. Dumps are retained when request dumping is enabled, when a leak is detected, or when the upstream rejected the request body.",
-				},
-				404,
-			);
-		}
-
-		const fileName = `api-request-${record.createdAt.replace(/[:.]/g, "-")}-${record.id}.json`;
-		const attachmentHeaders = {
-			// octet-stream, never application/json: the payload is attacker-influenced text
-			// on a same-origin URL, so an honest content type would invite sniffing.
-			"Content-Type": "application/octet-stream",
-			"Content-Disposition": buildAttachmentDisposition(fileName),
-			// A dump is served under a session credential and may be re-spilled or pruned.
-			"Cache-Control": "no-store",
-			"X-Content-Type-Options": "nosniff",
-		} as const;
-
-		const spillPath = readSpillFilePath(record.rawDumpJson);
-		if (spillPath) {
-			const file = Bun.file(spillPath);
-			if (await file.exists()) {
-				// Stream the file as-is. Parsing it here to re-wrap it would pull the whole
-				// multi-MB dump onto the main thread for no gain.
-				return new Response(file, { headers: attachmentHeaders });
-			}
-			// Pruned or hand-deleted: fall through to the inline head rather than 404, so the
-			// user still gets the part that survived plus the pointer explaining what is missing.
-			logger.warn("Spilled API request dump file is missing; serving the inline head", {
-				requestId: record.id,
-				filePath: spillPath,
-			});
-			// Falls through to the row-serving path below.
-		}
-
-		// Every path that serves the ROW rather than the file goes through here: the file was
-		// pruned, the pointer was unusable, or the dump never spilled. A row that carries a
-		// pointer carries an absolute server path naming the host's OS account, and a
-		// downloaded dump gets forwarded to whoever is helping diagnose it — so the path is
-		// stripped regardless of WHY the row is being served. Redacting only on the
-		// pruned-file branch would have left the unusable-pointer branch leaking it.
-		return new Response(inlineDumpEnvelope(record, record.rawDumpJson), {
-			headers: attachmentHeaders,
-		});
 	});
 
 	/**

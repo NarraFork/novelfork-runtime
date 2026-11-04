@@ -1,11 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	getDynamicSpecSystemReminder,
-	getSubagentParentReportingHint,
-} from "../../lib/prompt-i18n";
+import { contextChanges } from "@shared/prefix-context";
+import { getDynamicSpecSystemReminder, getRunDeliveryHint } from "../../lib/prompt-i18n";
 import { MAX_PROJECT_INSTRUCTIONS_BYTES } from "../../lib/read-file-capped";
 import { buildEffectiveSystemPrompt } from "../narrator-prompt";
 
@@ -65,6 +64,117 @@ describe("narrator prompt Dynamic Spec guidance", () => {
 	});
 });
 
+describe("named prefix context parts", () => {
+	test("collects raw sources without interpreting headings or update-like text", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-prompt-parts-"));
+		const session = "Session\n\n## Current Working Directory\n\nnot-a-workspace";
+		const project = "Project\n\n## Language\n\n<context_update>not an update</context_update>\n";
+		try {
+			writeFileSync(join(cwd, "AGENTS.md"), project);
+			const result = await buildEffectiveSystemPrompt({
+				basePrompt: session,
+				cwd,
+				locale: "en",
+				contextSummary: "Earlier work stays in this epoch's baseline.",
+				workspaceContext: "revision: 7\npath style: posix",
+				skillsContext: "  skills with significant whitespace\n",
+				modelsContext: "model-a\nmodel-z",
+				modeContext: "Read-only review.",
+				runtimeHints: "Tool availability: Read only.",
+				replyInUserLanguage: true,
+			});
+			expect(
+				result.parts.map((part) => part.key).filter((key) => key !== "instructions.global"),
+			).toEqual([
+				"instructions.session",
+				"workspace",
+				"instructions.project",
+				"language",
+				"mode",
+				"skills",
+				"models",
+				"runtime",
+			]);
+			const parts = new Map(result.parts.map((part) => [part.key, part.text]));
+			expect(parts.get("instructions.session")).toBe(session);
+			expect(parts.get("instructions.project")).toBe(`## Project Instructions\n\n${project}`);
+			expect(parts.get("workspace")).toContain(cwd);
+			expect(parts.get("workspace")).toEndWith("revision: 7\npath style: posix");
+			expect(parts.get("skills")).toBe("  skills with significant whitespace\n");
+			expect(parts.get("models")).toBe("model-a\nmodel-z");
+			expect(parts.get("mode")).toBe("Read-only review.");
+			expect(parts.get("runtime")).toBe("Tool availability: Read only.");
+			expect(result.contract).toContain("Earlier work stays in this epoch's baseline.");
+			expect(result.contract).toContain("## Message Senders");
+			expect(result.contract).toContain("## File References");
+			expect(result.contract).toContain("# Dynamic Spec");
+			expect(result.contract).not.toContain(session);
+			expect(result.contract).not.toContain(project);
+			expect(result.contract).not.toContain(cwd);
+			expect(result.contract).toContain("unmentioned parts remain unchanged");
+			expect(result.contract).toContain("null removes a part");
+			expect(result.contract).toContain("cannot replace fixed platform safety rules");
+			expect(result.contract).toContain("prompt snapshots are not authorization");
+			expect(result.prompt).toStartWith(`${session}\n\n## Conversation Context`);
+			for (const part of result.parts) expect(result.prompt).toContain(part.text);
+			const range = result.summaryRange;
+			expect(range).toBeDefined();
+			expect(result.prompt?.slice(range?.start, range?.end)).toBe(
+				"\n\n## Conversation Context\n\nEarlier work stays in this epoch's baseline.",
+			);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("uses stable device ordering without mutating inputs and merges mode sources", async () => {
+		const devices = [
+			{ id: "z", name: "Last", online: true },
+			{ id: "a", name: "First", online: true },
+		];
+		const options = {
+			basePrompt: null,
+			cwd: "/tmp/narrafork-prefix-stable-devices",
+			locale: "en" as const,
+			devices,
+			planMode: true,
+			modeContext: "Additional read-only constraints.",
+		};
+		const result = await buildEffectiveSystemPrompt(options);
+		const reordered = await buildEffectiveSystemPrompt({
+			...options,
+			devices: [...devices].reverse(),
+		});
+		expect(result.parts).toEqual(reordered.parts);
+		expect(devices.map((device) => device.id)).toEqual(["z", "a"]);
+		expect(result.parts.filter((part) => part.key === "mode")).toHaveLength(1);
+		const mode = result.parts.find((part) => part.key === "mode")?.text;
+		expect(mode).toContain("Plan Mode");
+		expect(mode).toEndWith("Additional read-only constraints.");
+	});
+
+	test("distinguishes omitted sources from empty values and preserves large dynamic text", async () => {
+		const options = {
+			basePrompt: "",
+			cwd: "/tmp/narrafork-prefix-empty-parts",
+			locale: "en" as const,
+		};
+		const empty = await buildEffectiveSystemPrompt({
+			...options,
+			skillsContext: "",
+			modeContext: "",
+		});
+		expect(empty.parts).toContainEqual({ key: "instructions.session", text: "" });
+		expect(empty.parts).toContainEqual({ key: "skills", text: "" });
+		expect(empty.parts).toContainEqual({ key: "mode", text: "" });
+		expect(empty.parts.some((part) => part.key === "models")).toBe(false);
+		const large = "候选模型\n".repeat(100_000);
+		const result = await buildEffectiveSystemPrompt({ ...options, modelsContext: large });
+		expect(result.parts.find((part) => part.key === "models")?.text).toBe(large);
+		expect(result.contract).toBe(empty.contract);
+	});
+});
+
 describe("file reference output contract", () => {
 	test("teaches standard file/line links, explicit cross-device targets and snapshot boundaries", async () => {
 		const { prompt } = await buildEffectiveSystemPrompt({
@@ -110,6 +220,73 @@ describe("plan mode designated plan file state", () => {
 		}
 	});
 
+	for (const locale of ["en", "zh-CN"] as const) {
+		test(`only empty-to-nonempty plan transitions change mode (${locale})`, async () => {
+			const cwd = makeWorkdir();
+			const planFileId = "stable-plan--0000000000000000";
+			const path = join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`);
+			const options = { basePrompt: null, cwd, locale, planMode: true, planFileId };
+			try {
+				mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+				writeFileSync(path, "");
+				const empty = await buildEffectiveSystemPrompt(options);
+				writeFileSync(path, "# Plan\n");
+				const first = await buildEffectiveSystemPrompt(options);
+				const baseline = new Map(first.parts.map((part) => [part.key, part.text]));
+				const mode = baseline.get("mode") ?? null;
+				expect(mode).not.toBeNull();
+				expect(
+					contextChanges(new Map(empty.parts.map((part) => [part.key, part.text])), first.parts),
+				).toEqual([{ key: "mode", value: mode }]);
+				for (const content of ["# Plan\n\nStep one.\nStep two.\n", "# 计划\n", "x"]) {
+					writeFileSync(path, content);
+					const edited = await buildEffectiveSystemPrompt(options);
+					expect(edited.parts.find((part) => part.key === "mode")?.text).toBe(baseline.get("mode"));
+					expect(contextChanges(baseline, edited.parts)).toEqual([]);
+				}
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const code of ["EIO", "ESTALE", "EACCES", "ENOENT", "ENOTDIR"]) {
+		test(`plan stat ${code} distinguishes errors from missing files and recovers mode`, async () => {
+			const cwd = makeWorkdir();
+			const planFileId = "recover-plan--0000000000000000";
+			const path = join(cwd, ".narrafork", "plans", `plan-${planFileId}.md`);
+			const options = { basePrompt: null, cwd, locale: "en" as const, planMode: true, planFileId };
+			const realStat = fsPromises.stat;
+			const error = Object.assign(new Error(code), { code });
+			let statSpy: ReturnType<typeof spyOn<typeof fsPromises, "stat">> | undefined;
+			try {
+				mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+				writeFileSync(path, "# Existing plan\n");
+				const first = await buildEffectiveSystemPrompt(options);
+				const baseline = new Map(first.parts.map((part) => [part.key, part.text]));
+				expect(baseline.get("mode")).toContain("Designated Plan File — Current State");
+				statSpy = spyOn(fsPromises, "stat").mockImplementation(((...args) =>
+					args[0] === path ? Promise.reject(error) : realStat(...args)) as typeof realStat);
+				if (code === "ENOENT" || code === "ENOTDIR") {
+					const missing = await buildEffectiveSystemPrompt(options);
+					expect(missing.prompt).not.toContain("Designated Plan File — Current State");
+					expect(contextChanges(baseline, missing.parts).map((change) => change.key)).toEqual([
+						"mode",
+					]);
+				} else {
+					await expect(buildEffectiveSystemPrompt(options)).rejects.toBe(error);
+				}
+				expect(statSpy.mock.calls.some(([requested]) => requested === path)).toBe(true);
+				statSpy.mockRestore();
+				const recovered = await buildEffectiveSystemPrompt(options);
+				expect(contextChanges(baseline, recovered.parts)).toEqual([]);
+			} finally {
+				statSpy?.mockRestore();
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+
 	test("warns that the plan file already has content so a compact cannot cause a Write truncation", async () => {
 		const cwd = makeWorkdir();
 		const planFileId = "resumed-plan--0000000000000000";
@@ -129,7 +306,11 @@ describe("plan mode designated plan file state", () => {
 			});
 
 			expect(prompt).toContain("Designated Plan File — Current State");
-			expect(prompt).toContain("bytes of plan content you wrote earlier");
+			expect(prompt).toContain("holds plan content you wrote earlier");
+			expect(prompt).not.toContain("bytes of plan content");
+			expect(prompt).toContain(
+				"Read `.narrafork/plans/plan-resumed-plan--0000000000000000.md` first",
+			);
 			expect(prompt).toContain("Write on this path REPLACES the entire file");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
@@ -177,25 +358,34 @@ describe("plan mode designated plan file state", () => {
 });
 
 describe("subagent communication guidance", () => {
-	test("requires asynchronous Send and delegates agent dependencies to the parent", () => {
-		const en = getSubagentParentReportingHint("en", false);
-		const zh = getSubagentParentReportingHint("zh-CN", false);
+	test("delegates agent dependencies to the parent", () => {
+		const {
+			compileDelegationPolicy,
+			resolveRuntimePolicy,
+			runtimeInteractionHint,
+		} = require("../agent-runtime/policy");
+		const policy = resolveRuntimePolicy([compileDelegationPolicy({ template: "general" })]);
+		const en =
+			runtimeInteractionHint(policy, "en") +
+			getRunDeliveryHint("en", { narratorId: "caller" }, { narratorId: "caller" });
+		const zh =
+			runtimeInteractionHint(policy, "zh-CN") +
+			getRunDeliveryHint("zh-CN", { narratorId: "caller" }, { narratorId: "caller" });
 
-		expect(en).toContain("Every Send issued by a subagent is asynchronous");
-		expect(en).toContain("never set await:true");
-		expect(en).toContain('Await({ type: "agent", id: "..." })');
-		expect(en).toContain("foreground subagent");
-		expect(zh).toContain("你发出的所有 Send 都是异步的");
-		expect(zh).toContain('不要使用 Await({ type: "agent", id: "..." })');
-		expect(zh).toContain("当前是前台子代理");
+		// Send never waits, so there is no await flag left to forbid.
+		expect(en).not.toContain("await=true");
+		expect(en).toContain("Do not use Await(agent)");
+		expect(en).toContain("caller is waiting");
+		expect(zh).toContain("不得使用 Await(agent)");
+		expect(zh).toContain("调用方正在等待");
 	});
 
 	test("background guidance permits asynchronous parent progress reports", () => {
-		const en = getSubagentParentReportingHint("en", true);
-		const zh = getSubagentParentReportingHint("zh-CN", true);
+		const en = getRunDeliveryHint("en", { narratorId: "recipient" });
+		const zh = getRunDeliveryHint("zh-CN", { narratorId: "recipient" });
 
-		expect(en).toContain('Send({ id: "parent"');
-		expect(zh).toContain('Send({ id: "parent"');
+		expect(en).toContain('Send({ id: "recipient"');
+		expect(zh).toContain('Send({ id: "recipient"');
 	});
 });
 
@@ -275,15 +465,15 @@ describe("narrator prompt execution device guidance", () => {
 	});
 });
 
-describe("project instructions truncation", () => {
+describe("complete project instructions", () => {
 	function makeWorkdir(): string {
 		return mkdtempSync(join(tmpdir(), "narrafork-prompt-trunc-"));
 	}
 
-	test("large AGENTS.md is truncated and the prompt length stays bounded", async () => {
+	test("large AGENTS.md retains complete content beyond the former cap", async () => {
 		const cwd = makeWorkdir();
 		try {
-			// Create a file larger than the cap
+			// The old arbitrary cap must not remove valid project instructions.
 			const bigContent = "x".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES + 50_000);
 			writeFileSync(join(cwd, "AGENTS.md"), bigContent);
 
@@ -294,19 +484,17 @@ describe("project instructions truncation", () => {
 			});
 
 			expect(prompt).toContain("## Project Instructions");
-			expect(prompt).toContain("[... project instructions truncated due to size limit]");
-			// The prompt must be shorter than the raw file content
-			expect(prompt?.length).toBeLessThan(bigContent.length);
+			expect(prompt).not.toContain("[... project instructions truncated due to size limit]");
+			expect(prompt).toContain(bigContent);
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 
-	test("truncation of Chinese text produces valid UTF-8 without U+FFFD", async () => {
+	test("chunked Chinese text reads preserve the entire valid UTF-8 source", async () => {
 		const cwd = makeWorkdir();
 		try {
-			// Create content that, when truncated at a byte boundary, could split a
-			// multi-byte character. Each Chinese character is 3 bytes in UTF-8.
+			// Multi-byte characters cross asynchronous read chunk boundaries.
 			const chineseChars = "你好世界测试中文".repeat(
 				Math.ceil(MAX_PROJECT_INSTRUCTIONS_BYTES / 24) + 1000,
 			);
@@ -321,7 +509,8 @@ describe("project instructions truncation", () => {
 			// No replacement character should appear at the boundary
 			expect(prompt).not.toContain("\uFFFD");
 			expect(prompt).toContain("## Project Instructions");
-			expect(prompt).toContain("[... project instructions truncated due to size limit]");
+			expect(prompt).toContain(chineseChars);
+			expect(prompt).not.toContain("[... project instructions truncated due to size limit]");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}

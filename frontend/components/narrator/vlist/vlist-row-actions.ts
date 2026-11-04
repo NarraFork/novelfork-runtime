@@ -17,7 +17,7 @@
  * the row's tool metadata (vlist-tool-meta.ts).
  */
 
-import type { RevertScope } from "../../../lib/api/narrators";
+import type { RevertActionConfirmOptions } from "../../../lib/api/narrators";
 import type {
 	CustomMessageMenuItem,
 	MessageContextMenuActions,
@@ -57,12 +57,14 @@ export interface VListRowHandlers {
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,
-		revertOpts: { skipRevert: boolean; scope?: RevertScope },
+		revertOpts: RevertActionConfirmOptions,
 		opts?: {
 			keepImageIds: string[];
 			newImages: File[];
 			keepTextFilePaths: string[];
 			newTextFiles: File[];
+			fileReferences?: import("@shared/file-reference").FileReference[];
+			composerDocument?: import("@shared/composer-document").ComposerDocument;
 		},
 	) => Promise<boolean>;
 	/** Persist edited ASSISTANT text without truncating later messages. */
@@ -90,8 +92,6 @@ export interface VListRowHandlers {
 	onOpenKnowledgeEntry?: (entryId: string, scope: "global" | "personal") => void;
 	/** Open the Dynamic Spec panel with one `spec://` file selected. */
 	onOpenSpecFile?: (uri: string) => void;
-	/** Open a chapter (a review's own chapter, a merge's source chapter). */
-	onOpenChapter?: (chapterId: string) => void;
 	/** Detach a running subagent to a background task; absent → item hidden. */
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Detach this running foreground Bash tool call, not a child narrator. */

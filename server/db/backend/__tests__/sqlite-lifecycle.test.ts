@@ -187,7 +187,7 @@ describe("SQLite lifecycle startup sequence", () => {
 		// statement about ORDER rather than about FTS being absent altogether.
 		const afterwards = tableNames(lifecycle.connection).filter((name) => name.endsWith("_fts"));
 		expect(afterwards).toContain("narrator_messages_fts");
-		expect(afterwards).toContain("chapters_fts");
+		expect(afterwards).toContain("narrators_fts");
 	}, 120_000);
 
 	test("patches a column an older build never created", async () => {
@@ -357,6 +357,29 @@ describe("repeated initialisation (Bun --hot)", () => {
 		// The marker is still there, so the NEXT real startup can act on it.
 		const { readPendingDatabaseRepair } = await import("../../integrity-state");
 		expect(readPendingDatabaseRepair()?.state).toBe("pending");
+	}, 120_000);
+
+	test("a queued index repair runs on the next real startup, never on a hot reload", async () => {
+		const lifecycle = await newLifecycle();
+		await lifecycle.start();
+		const { readPendingFtsRepair, recordFtsRepair } = await import("../../integrity-state");
+		expect(
+			recordFtsRepair({
+				tables: ["narrators_fts"],
+				details: "synthetic index finding",
+				detectedAt: new Date().toISOString(),
+			}).ok,
+		).toBe(true);
+
+		await lifecycle.start();
+		expect(readPendingFtsRepair()?.tables).toEqual(["narrators_fts"]);
+		lifecycle.connection.close();
+
+		resetHotState();
+		const next = await newLifecycle();
+		await next.start();
+		expect(readPendingFtsRepair()).toBeNull();
+		expect(tableNames(next.connection)).toContain("narrators_fts");
 	}, 120_000);
 
 	test("a marker whose repair budget is spent does not block startup", async () => {

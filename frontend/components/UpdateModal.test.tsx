@@ -1,0 +1,1253 @@
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { MantineProvider } from "@mantine/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import i18next from "i18next";
+import { parseHTML } from "linkedom";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { I18nextProvider, initReactI18next } from "react-i18next";
+import { api } from "../lib/api";
+import * as pwa from "../lib/pwa";
+import { type UpdateSourceSettings, updateSettingsKey } from "../lib/update-source";
+import type { PreparedUpdateStatus } from "../lib/update-state";
+import common from "../locales/en/common.json";
+import commonZh from "../locales/zh-CN/common.json";
+
+mock.module("./common/confirm-dialog-context", () => ({
+	useConfirmDialog: () => async () => true,
+}));
+mock.module("./narrator/markdown/MarkdownContent", () => ({
+	MarkdownContent: ({ text }: { text: string }) => <div>{text}</div>,
+}));
+const { UpdateModal } = await import("./UpdateModal");
+const { UpdateBadge } = await import("./UpdateBadge");
+const originalCheck = api.checkUpdate;
+const originalGetSettings = api.getSettings;
+const originalUpdateSettings = api.updateSettings;
+const originalStatus = api.getUpdateStatus;
+const originalApply = api.applyUpdate;
+const originalCancel = api.cancelUpdate;
+const originalNotes = api.getUpdateNotes;
+const globals = new Map<string, PropertyDescriptor | undefined>();
+const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+let root: Root | undefined;
+let container: HTMLElement;
+let client: QueryClient;
+let ready = false;
+let appliedVersion: string | undefined;
+let appliedPreparedId: string | undefined;
+const originalIdentity = {
+	id: "artifact-a",
+	version: "1.1.0",
+	sha512: "hash-a",
+	sizeBytes: 1024,
+	sourceIdentity: {
+		source: "github" as const,
+		repository: "fork/project",
+		channel: "stable" as const,
+		platform: "linux-x64",
+	},
+};
+const translation = i18next.createInstance();
+await translation.use(initReactI18next).init({
+	lng: "en",
+	resources: { en: { common }, "zh-CN": { common: commonZh } },
+	interpolation: { escapeValue: false },
+});
+
+function install(key: string, value: unknown) {
+	globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+	Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
+}
+
+beforeEach(() => {
+	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	for (const key of [
+		"window",
+		"document",
+		"navigator",
+		"HTMLElement",
+		"Element",
+		"Node",
+		"Document",
+		"ShadowRoot",
+		"Event",
+	])
+		install(key, key === "window" ? window : window[key as keyof typeof window]);
+	// linkedom's window timers delegate to globalThis. Own both timeout and RAF
+	// work for this DOM lifetime: Mantine's nested RAF can leave a transition
+	// timeout behind even after React unmounts its owner.
+	install(
+		"setTimeout",
+		(callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+			const timer = nativeSetTimeout(() => {
+				pendingTimers.delete(timer);
+				callback(...args);
+			}, delay);
+			pendingTimers.add(timer);
+			return timer;
+		},
+	);
+	install("clearTimeout", (timer: ReturnType<typeof setTimeout>) => {
+		pendingTimers.delete(timer);
+		nativeClearTimeout(timer);
+	});
+	install("IS_REACT_ACT_ENVIRONMENT", true);
+	install("requestAnimationFrame", (callback: FrameRequestCallback) =>
+		setTimeout(() => callback(Date.now()), 0),
+	);
+	install("cancelAnimationFrame", (id: ReturnType<typeof setTimeout>) => clearTimeout(id));
+	install("matchMedia", () => ({
+		matches: false,
+		addEventListener() {},
+		removeEventListener() {},
+		addListener() {},
+		removeListener() {},
+	}));
+	install(
+		"ResizeObserver",
+		class {
+			observe() {}
+			unobserve() {}
+			disconnect() {}
+		},
+	);
+	install("getComputedStyle", () => ({ getPropertyValue: () => "", overflowY: "visible" }));
+	install("localStorage", { getItem: () => null, setItem() {}, removeItem() {} });
+	ready = false;
+	appliedVersion = undefined;
+	appliedPreparedId = undefined;
+	client = new QueryClient({
+		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+	});
+	client.setQueryData(["health"], { status: "ok", version: "1.0.0", platform: "linux" });
+	client.setQueryData(["settings"], {
+		update: { source: "github", githubRepository: "fork/project" },
+	});
+	api.getUpdateStatus = async () => ({
+		ready,
+		preparedIdentity: ready ? originalIdentity : undefined,
+		version: "1.1.0",
+		canAutoRestart: true,
+		newBinaryPath: "/binary",
+		instructions: { manual: false, message: "ready" },
+	});
+	api.applyUpdate = async (version, preparedId) => {
+		appliedVersion = version;
+		appliedPreparedId = preparedId;
+		return { success: false, error: "test stops before restart" };
+	};
+	container = window.document.createElement("div") as unknown as HTMLElement;
+	window.document.body.appendChild(container);
+});
+
+afterEach(async () => {
+	await act(async () => root?.unmount());
+	root = undefined;
+	client.clear();
+	container.remove();
+	api.getUpdateStatus = originalStatus;
+	api.applyUpdate = originalApply;
+	api.cancelUpdate = originalCancel;
+	api.getUpdateNotes = originalNotes;
+	api.checkUpdate = originalCheck;
+	api.getSettings = originalGetSettings;
+	api.updateSettings = originalUpdateSettings;
+	await translation.changeLanguage("en");
+	clearDOMTimers();
+	expect(pendingTimers.size).toBe(0);
+	for (const [key, descriptor] of globals) {
+		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+		else Reflect.deleteProperty(globalThis, key);
+	}
+	globals.clear();
+});
+afterAll(() => mock.restore());
+
+function clearDOMTimers() {
+	for (const timer of pendingTimers) nativeClearTimeout(timer);
+	pendingTimers.clear();
+}
+
+test.each([
+	"nested RAF",
+	"transition timeout",
+])("DOM teardown cancels a pending %s before restoring window", async (stage) => {
+	let called = false;
+	await new Promise<void>((resolve) => {
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => {
+				if (stage === "nested RAF") called = true;
+				else {
+					window.setTimeout(() => {
+						called = true;
+					}, 10);
+					resolve();
+				}
+			});
+			if (stage === "nested RAF") resolve();
+		});
+	});
+	expect(pendingTimers.size).toBe(1);
+	clearDOMTimers();
+	expect(pendingTimers.size).toBe(0);
+	// Use the native clock so cleanup cannot cancel the verification itself.
+	await new Promise((resolve) => nativeSetTimeout(resolve, 20));
+	expect(called).toBe(false);
+});
+
+async function settle() {
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	});
+}
+
+async function render(
+	strategy: "full" | "zstd" = "full",
+	update: UpdateSourceSettings = { source: "github", githubRepository: "fork/project" },
+) {
+	root = createRoot(container);
+	await act(async () =>
+		root?.render(
+			<MantineProvider env="test">
+				<I18nextProvider i18n={translation}>
+					<QueryClientProvider client={client}>
+						<UpdateModal
+							opened
+							onClose={() => {}}
+							data={{
+								latestVersion: "1.1.0",
+								releaseNotes: "Old recommendation notes",
+								strategy,
+								downloadSize: strategy === "zstd" ? 128 : 1024,
+								totalSize: 1024,
+								settingsKey: updateSettingsKey(update),
+								releaseInfo: {
+									version: "1.1.0",
+									source: update.source ?? "github",
+									repository: update.githubRepository ?? "fork/project",
+									releaseDate: "2026-01-01",
+									path: "unused",
+									sha512: "hash",
+									files: [],
+								},
+							}}
+						/>
+					</QueryClientProvider>
+				</I18nextProvider>
+			</MantineProvider>,
+		),
+	);
+	await settle();
+}
+
+async function changeSavedSource() {
+	await act(async () => {
+		client.setQueryData(["settings"], {
+			update: { source: "update-server", githubRepository: "fork/project" },
+		});
+	});
+	await settle();
+}
+
+function findButton(text: string) {
+	return [...document.querySelectorAll("button")].find((button) =>
+		button.textContent?.includes(text),
+	);
+}
+
+async function renderBadge() {
+	root ??= createRoot(container);
+	await act(async () =>
+		root?.render(
+			<MantineProvider env="test">
+				<I18nextProvider i18n={translation}>
+					<QueryClientProvider client={client}>
+						<UpdateBadge />
+					</QueryClientProvider>
+				</I18nextProvider>
+			</MantineProvider>,
+		),
+	);
+	await settle();
+}
+
+async function openBadge() {
+	const badge = document.querySelector<HTMLElement>(".mantine-Badge-root");
+	expect(badge).not.toBeNull();
+	await act(async () => badge?.click());
+	await settle();
+}
+
+function installPersistentDownload() {
+	const signals: AbortSignal[] = [];
+	const bodies: Array<{ retry: boolean }> = [];
+	const previousFetch = globalThis.fetch;
+	install(
+		"fetch",
+		Object.assign(
+			async (_url: unknown, init?: RequestInit) => {
+				const signal = init?.signal;
+				if (!signal) throw new Error("missing download signal");
+				signals.push(signal);
+				bodies.push(JSON.parse(String(init?.body)));
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(
+								new TextEncoder().encode(
+									'event: progress\ndata: {"phase":"downloading","bytesDownloaded":1,"totalBytes":100,"percent":1}\n\n',
+								),
+							);
+							signal.addEventListener("abort", () =>
+								controller.error(new DOMException("cancelled", "AbortError")),
+							);
+						},
+					}),
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			},
+			{ preconnect: previousFetch.preconnect },
+		),
+	);
+	return { signals, bodies };
+}
+
+const githubSettings: UpdateSourceSettings = {
+	source: "github",
+	githubRepository: "fork/project",
+};
+const serverSettings: UpdateSourceSettings = {
+	source: "update-server",
+	serverUrl: "https://updates.example/base",
+	githubRepository: "fork/project",
+};
+
+function successfulCheck() {
+	return {
+		updateAvailable: true,
+		currentVersion: "1.0.0",
+		latestVersion: "1.1.0",
+		source: "github" as const,
+		repository: "fork/project",
+		releaseInfo: {
+			version: "1.1.0",
+			source: "github" as const,
+			repository: "fork/project",
+			releaseDate: "2026-01-01",
+			path: "unused",
+			sha512: "hash",
+			files: [],
+		},
+	};
+}
+
+describe("UpdateModal failed recovery cleanup", () => {
+	function failedCleanup(overrides: Partial<PreparedUpdateStatus> = {}): PreparedUpdateStatus {
+		return {
+			ready: true,
+			canAutoRestart: true,
+			version: "1.1.0",
+			preparedIdentity: originalIdentity,
+			instructions: { manual: false, message: "ready" },
+			scheduled: true,
+			phase: "restarting",
+			cancelRequested: true,
+			cleanupRetryPending: true,
+			error: "Recovery rollback failed: retained source evidence",
+			...overrides,
+		};
+	}
+
+	test.each([
+		true,
+		false,
+	])("cleanup failure with scheduled=%s exposes retry, never a new apply or readiness wait", async (scheduled) => {
+		api.getUpdateStatus = async () => failedCleanup({ scheduled });
+		const wait = spyOn(pwa, "waitForUpdatedServerAndReload").mockResolvedValue();
+		try {
+			await render();
+			expect(document.body.textContent).toContain(
+				"Recovery rollback failed: retained source evidence",
+			);
+			expect(document.body.textContent).not.toContain(common.updateRestartingDescription);
+			expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+			expect(findButton(common.updateSchedule)).toBeUndefined();
+			expect(findButton(common.updateForceShutdown)).toBeUndefined();
+			expect(wait).not.toHaveBeenCalled();
+			expect(appliedVersion).toBeUndefined();
+		} finally {
+			wait.mockRestore();
+		}
+	});
+
+	test("cleanup retry remains reachable when prepared binary metadata is no longer ready", async () => {
+		api.getUpdateStatus = async () => failedCleanup({ ready: false, preparedIdentity: undefined });
+		await render();
+		expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+		expect(findButton(common.updateSchedule)).toBeUndefined();
+	});
+
+	test("normal restart hides cancellation, but a cleanup failure aborts its existing readiness poll", async () => {
+		let status = failedCleanup({
+			cleanupRetryPending: false,
+			cancelRequested: false,
+			error: undefined,
+		});
+		api.getUpdateStatus = async () => status;
+		let waitSignal: AbortSignal | undefined;
+		const wait = spyOn(pwa, "waitForUpdatedServerAndReload").mockImplementation((options) => {
+			waitSignal = options?.signal;
+			return new Promise<void>((resolve) =>
+				waitSignal?.addEventListener("abort", () => resolve(), { once: true }),
+			);
+		});
+		try {
+			await render();
+			expect(wait).toHaveBeenCalledTimes(1);
+			expect(waitSignal?.aborted).toBe(false);
+			expect(document.body.textContent).toContain(common.updateRestartingDescription);
+			expect(findButton(common.updateCancelSchedule)).toBeUndefined();
+			expect(findButton(common.updateRetryCancellation)).toBeUndefined();
+			status = failedCleanup();
+			await act(async () => {
+				client.setQueryData(["update-status", "1.1.0"], status);
+			});
+			await settle();
+			expect(waitSignal?.aborted).toBe(true);
+			expect(wait).toHaveBeenCalledTimes(1);
+			expect(document.body.textContent).not.toContain(common.updateRestartingDescription);
+			expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+			expect(findButton(common.updateSchedule)).toBeUndefined();
+		} finally {
+			wait.mockRestore();
+		}
+	});
+
+	test.each([
+		"response",
+		"throw",
+	])("failed cancellation %s preserves retry; success restores the same prepared selector", async (failure) => {
+		let status = failedCleanup();
+		api.getUpdateStatus = async () => status;
+		let cancellations = 0;
+		api.cancelUpdate = async () => {
+			if (++cancellations === 1) {
+				if (failure === "throw") throw new Error("Retry rollback still failed");
+				return { success: false, cancelled: false, error: "Retry rollback still failed" };
+			}
+			status = {
+				...status,
+				cleanupRetryPending: false,
+				cancelRequested: false,
+				scheduled: false,
+				phase: "idle",
+				errorKind: "cancelled",
+				error: "cancelled",
+			};
+			return { success: true, cancelled: true, scheduled: false, phase: "idle" };
+		};
+		await render();
+		await act(async () => findButton(common.updateRetryCancellation)?.click());
+		await settle();
+		expect(cancellations).toBe(1);
+		expect(document.body.textContent).toContain("Retry rollback still failed");
+		expect(findButton(common.updateRetryCancellation)?.disabled).toBe(false);
+		expect(findButton(common.updateSchedule)).toBeUndefined();
+		expect(appliedVersion).toBeUndefined();
+		await act(async () => findButton(common.updateRetryCancellation)?.click());
+		await settle();
+		expect(cancellations).toBe(2);
+		expect(findButton(common.updateRetryCancellation)).toBeUndefined();
+		expect(document.body.textContent).toContain(common.updateScheduleCancelled);
+		expect(findButton(common.updateSchedule)).toBeDefined();
+		expect(appliedVersion).toBeUndefined();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe(originalIdentity.id);
+	});
+});
+
+describe("UpdateModal deferred release notes", () => {
+	function recommendation() {
+		return {
+			...successfulCheck(),
+			releaseInfo: {
+				...successfulCheck().releaseInfo,
+				notesDeferred: true,
+				notesAvailable: true,
+				sourceIdentity: originalIdentity.sourceIdentity,
+				sha512: originalIdentity.sha512,
+				files: [{ url: "unused", size: 1024, sha512: originalIdentity.sha512 }],
+			},
+		};
+	}
+	function setup() {
+		client.setQueryData(["auth", "me"], { id: "admin", role: "admin" });
+		const check = recommendation();
+		api.checkUpdate = async () => check;
+		return check;
+	}
+	test("badge checks do not fetch notes; opening requests the exact identity", async () => {
+		const check = setup();
+		const requests: unknown[] = [];
+		api.getUpdateNotes = async (identity) => {
+			requests.push(identity);
+			return { notes: "Lazy verified notes" };
+		};
+		await renderBadge();
+		expect(requests).toHaveLength(0);
+		await openBadge();
+		expect(requests).toEqual([
+			{
+				version: check.releaseInfo.version,
+				sha512: check.releaseInfo.sha512,
+				sourceIdentity: check.releaseInfo.sourceIdentity,
+			},
+		]);
+		expect(document.body.textContent).toContain("Lazy verified notes");
+	});
+	test("legacy or mismatched prepared artifacts never request new source notes", async () => {
+		const check = setup();
+		ready = true;
+		check.releaseInfo.sha512 = "different-hash";
+		let calls = 0;
+		api.getUpdateNotes = async () => {
+			calls++;
+			return { notes: "Wrong notes" };
+		};
+		await renderBadge();
+		await openBadge();
+		expect(calls).toBe(0);
+		expect(document.body.textContent).not.toContain("Wrong notes");
+		expect(findButton(common.updateSchedule)).toBeDefined();
+	});
+	test("notes failure does not block verified download", async () => {
+		setup();
+		api.getUpdateNotes = async () => {
+			throw new Error("Notes unavailable");
+		};
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).toContain(common.updateNotesUnavailable);
+		expect(findButton(common.download)).toBeDefined();
+		expect(findButton(common.download)?.disabled).toBe(false);
+	});
+	test.each([
+		"source",
+		"preparedId",
+	])("a %s change cancels old notes and discards a late success", async (change) => {
+		setup();
+		ready = change === "preparedId";
+		let resolve: ((value: { notes: string }) => void) | undefined;
+		let signal: AbortSignal | undefined;
+		api.getUpdateNotes = (_identity, cancellation) => {
+			signal = cancellation;
+			return new Promise((done) => {
+				resolve = done;
+			});
+		};
+		await renderBadge();
+		await openBadge();
+		expect(signal).toBeDefined();
+		if (change === "source") await changeSavedSource();
+		else {
+			await act(async () =>
+				client.setQueryData(["update-status", "1.1.0"], {
+					ready: true,
+					version: "1.1.0",
+					canAutoRestart: true,
+					preparedIdentity: { ...originalIdentity, id: "replacement" },
+					instructions: { manual: false, message: "ready" },
+				}),
+			);
+			await settle();
+		}
+		expect(signal?.aborted).toBe(true);
+		await act(async () => resolve?.({ notes: "Stale late notes" }));
+		await settle();
+		expect(document.body.textContent).not.toContain("Stale late notes");
+	});
+});
+
+describe("UpdateModal saved source changes", () => {
+	test.each([
+		"repository",
+		"hash",
+		"size",
+	])("same-version prepared artifact never adopts new %s notes", async (changed) => {
+		ready = true;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		const recommendation = successfulCheck();
+		const repository = changed === "repository" ? "other/project" : "fork/project";
+		const sourceIdentity = { ...originalIdentity.sourceIdentity, repository };
+		client.setQueryData(["settings"], {
+			update: { source: "github", githubRepository: repository },
+		});
+		api.checkUpdate = async () => ({
+			...recommendation,
+			repository,
+			releaseInfo: {
+				...recommendation.releaseInfo,
+				repository,
+				sourceIdentity,
+				sha512: changed === "hash" ? "hash-b" : "hash-a",
+				files: [{ url: "unused", size: changed === "size" ? 2048 : 1024, sha512: "unused" }],
+				releaseNotes: "Wrong artifact B notes",
+			},
+		});
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).not.toContain("Wrong artifact B notes");
+		expect(document.body.textContent).toContain("GitHub: fork/project");
+		expect(document.body.textContent).toContain("hash-a");
+		expect(findButton(common.updateSchedule)).toBeDefined();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("an existing schedule retains its artifact after a new recommendation and a failed check", async () => {
+		const status = {
+			ready: true,
+			version: "1.1.0",
+			canAutoRestart: true,
+			preparedIdentity: originalIdentity,
+			scheduled: true,
+			targetVersion: "1.1.0",
+			phase: "draining_background_bash" as const,
+			pendingBackgroundBashCount: 1,
+			instructions: { manual: false, message: "ready" },
+		};
+		api.getUpdateStatus = async () => status;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		client.setQueryData(["update-status", "1.1.0"], status);
+		const recommendation = successfulCheck();
+		api.checkUpdate = async () => ({
+			...recommendation,
+			releaseInfo: { ...recommendation.releaseInfo, releaseNotes: "Unrelated B notes" },
+		});
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).toContain("hash-a");
+		expect(document.body.textContent).not.toContain("Unrelated B notes");
+		expect(findButton(common.updateSchedule)).toBeUndefined();
+		api.checkUpdate = async () => {
+			throw new Error("offline");
+		};
+		await act(async () => {
+			await client.invalidateQueries({ queryKey: ["update-check"] });
+		});
+		await settle();
+		expect(document.body.textContent).toContain(common.updatePillWaiting);
+		expect(document.body.textContent).toContain("hash-a");
+		expect(client.getQueryData(["update-status", "1.1.0"])).toMatchObject({
+			scheduled: true,
+			preparedIdentity: originalIdentity,
+		});
+	});
+
+	test("legacy prepared metadata stays explicitly applicable without borrowing the current source", async () => {
+		ready = true;
+		api.getUpdateStatus = async () => ({
+			ready: true,
+			version: "1.1.0",
+			canAutoRestart: true,
+			preparedIdentity: { ...originalIdentity, sourceIdentity: null },
+			instructions: { manual: false, message: "ready" },
+		});
+		await render();
+		expect(document.body.textContent).toContain(common.updatePreparedUnknownSource);
+		expect(document.body.textContent).not.toContain("GitHub: fork/project");
+		expect(document.body.textContent).not.toContain("Old recommendation notes");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("a verified full identity match may show release notes for the prepared artifact", async () => {
+		ready = true;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		const recommendation = successfulCheck();
+		api.checkUpdate = async () => ({
+			...recommendation,
+			releaseInfo: {
+				...recommendation.releaseInfo,
+				sourceIdentity: originalIdentity.sourceIdentity,
+				sha512: originalIdentity.sha512,
+				files: [
+					{ url: "unused", size: originalIdentity.sizeBytes, sha512: originalIdentity.sha512 },
+				],
+				releaseNotes: "Correct artifact A notes",
+			},
+		});
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).toContain("Correct artifact A notes");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("a status replacement cannot silently retarget the selected same-version artifact", async () => {
+		ready = true;
+		await render();
+		await act(async () => {
+			client.setQueryData(["update-status", "1.1.0"], {
+				ready: true,
+				version: "1.1.0",
+				canAutoRestart: true,
+				preparedIdentity: { ...originalIdentity, id: "artifact-b", sha512: "hash-b" },
+				instructions: { manual: false, message: "ready" },
+			});
+		});
+		await settle();
+		expect(document.body.textContent).toContain("hash-a");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+	});
+
+	test("reopening reviews the current artifact instead of a previous SSE download result", async () => {
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		api.checkUpdate = async () => successfulCheck();
+		const previousFetch = globalThis.fetch;
+		install(
+			"fetch",
+			Object.assign(
+				async () =>
+					new Response(
+						`data: ${JSON.stringify({ success: true, version: "1.1.0", preparedIdentity: originalIdentity, instructions: { manual: false, message: "ready" } })}\n\n`,
+					),
+				{ preconnect: previousFetch.preconnect },
+			),
+		);
+		await renderBadge();
+		await openBadge();
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(document.body.textContent).toContain("hash-a");
+		const replacement = {
+			ready: true,
+			version: "1.1.0",
+			canAutoRestart: true,
+			preparedIdentity: { ...originalIdentity, id: "artifact-b", sha512: "hash-b" },
+			instructions: { manual: false, message: "ready" },
+		};
+		api.getUpdateStatus = async () => replacement;
+		await act(async () => {
+			client.setQueryData(["update-status", "1.1.0"], replacement);
+		});
+		await settle();
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-a");
+		await act(async () => findButton(common.close)?.click());
+		await settle();
+		await openBadge();
+		expect(document.body.textContent).toContain("hash-b");
+		expect(document.body.textContent).not.toContain("hash-a");
+		await act(async () => findButton(common.updateSchedule)?.click());
+		expect(appliedPreparedId).toBe("artifact-b");
+	});
+
+	test.each([
+		"version",
+		"repository",
+	])("a completed download cannot block a fresh %s selection", async (change) => {
+		const first = {
+			latestVersion: "1.1.0",
+			settingsKey: updateSettingsKey(githubSettings),
+			releaseInfo: {
+				...successfulCheck().releaseInfo,
+				sourceIdentity: originalIdentity.sourceIdentity,
+				sha512: originalIdentity.sha512,
+				files: [{ url: "unused", sha512: originalIdentity.sha512, size: 1024 }],
+			},
+		};
+		const version = change === "version" ? "1.2.0" : "1.1.0";
+		const repository = change === "repository" ? "other/project" : "fork/project";
+		const nextSettings = { ...githubSettings, githubRepository: repository };
+		const second = {
+			latestVersion: version,
+			settingsKey: updateSettingsKey(nextSettings),
+			releaseInfo: {
+				...first.releaseInfo,
+				version,
+				repository,
+				sha512: "hash-b",
+				sourceIdentity: { ...originalIdentity.sourceIdentity, repository },
+				files: [{ url: "unused", sha512: "hash-b", size: 1024 }],
+			},
+		};
+		let downloads = 0;
+		const previousFetch = globalThis.fetch;
+		install(
+			"fetch",
+			Object.assign(
+				async () => {
+					downloads++;
+					return new Response(
+						`data: ${JSON.stringify({
+							success: true,
+							version: downloads === 1 ? "1.1.0" : version,
+							preparedIdentity:
+								downloads === 1
+									? originalIdentity
+									: {
+											...originalIdentity,
+											id: "artifact-b",
+											version,
+											sha512: "hash-b",
+											sourceIdentity: second.releaseInfo.sourceIdentity,
+										},
+							instructions: { manual: false, message: "ready" },
+						})}\n\n`,
+					);
+				},
+				{ preconnect: previousFetch.preconnect },
+			),
+		);
+		root = createRoot(container);
+		const show = async (data: typeof first, opened: boolean) => {
+			await act(async () =>
+				root?.render(
+					<MantineProvider env="test">
+						<I18nextProvider i18n={translation}>
+							<QueryClientProvider client={client}>
+								<UpdateModal opened={opened} onClose={() => {}} data={data} />
+							</QueryClientProvider>
+						</I18nextProvider>
+					</MantineProvider>,
+				),
+			);
+			await settle();
+		};
+		await show(first, true);
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(downloads).toBe(1);
+		expect(document.body.textContent).toContain("hash-a");
+		await show(first, false);
+		await act(async () => {
+			client.setQueryData(["settings"], { update: nextSettings });
+		});
+		await show(second, true);
+		expect(findButton("Download")).toBeDefined();
+		expect(document.body.textContent).not.toContain(common.updatePhaseComplete);
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(downloads).toBe(2);
+		expect(document.body.textContent).toContain("hash-b");
+	});
+
+	test("the badge waits for saved settings, then opens a downloadable recommendation", async () => {
+		client.removeQueries({ queryKey: ["settings"] });
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		let resolveSettings!: (value: Awaited<ReturnType<typeof api.getSettings>>) => void;
+		let checkCalls = 0;
+		api.getSettings = () =>
+			new Promise((resolve) => {
+				resolveSettings = resolve;
+			});
+		api.checkUpdate = async () => {
+			checkCalls++;
+			return successfulCheck();
+		};
+		const { signals } = installPersistentDownload();
+		await renderBadge();
+		expect(resolveSettings).toBeDefined();
+		expect(checkCalls).toBe(0);
+		expect(document.querySelector(".mantine-Badge-root")).toBeNull();
+		await act(async () =>
+			resolveSettings({
+				update: { ...githubSettings, serverUrl: "https://narrafork-update.b.domexie.cn" },
+			}),
+		);
+		await settle();
+		expect(checkCalls).toBe(1);
+		await openBadge();
+		expect(findButton("Download")).toBeDefined();
+		expect(document.body.textContent).not.toContain(common.updateSourceChanged);
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(signals).toHaveLength(1);
+		expect(signals[0].aborted).toBe(false);
+	});
+
+	test.each([
+		{
+			name: "GitHub ignores server URL and product",
+			initial: githubSettings,
+			next: { ...githubSettings, serverUrl: "https://other.example", product: "other" },
+		},
+		{
+			name: "GitHub repository case",
+			initial: githubSettings,
+			next: { ...githubSettings, githubRepository: "FORK/Project" },
+		},
+
+		{
+			name: "server URL normalization",
+			initial: serverSettings,
+			next: { ...serverSettings, serverUrl: "https://UPDATES.example:443/base/" },
+		},
+		{
+			name: "empty server uses built-in URL",
+			initial: { ...serverSettings, serverUrl: "" },
+			next: {
+				...serverSettings,
+				serverUrl: "https://narrafork-update.b.domexie.cn/",
+				product: "narrafork",
+			},
+		},
+	])("inactive or equivalent settings keep download usable: $name", async ({ initial, next }) => {
+		client.setQueryData(["settings"], { update: initial });
+		await render("full", initial);
+		await act(async () => client.setQueryData(["settings"], { update: next }));
+		await settle();
+		expect(document.body.textContent).not.toContain(common.updateSourceChanged);
+		expect(findButton("Download")).toBeDefined();
+		const { signals } = installPersistentDownload();
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(signals).toHaveLength(1);
+	});
+
+	test.each([
+		{ name: "source", initial: githubSettings, next: serverSettings },
+		{
+			name: "mirror repository",
+			initial: serverSettings,
+			next: { ...serverSettings, githubRepository: "another/project" },
+		},
+		{
+			name: "GitHub repository",
+			initial: githubSettings,
+			next: { ...githubSettings, githubRepository: "another/project" },
+		},
+		{
+			name: "GitHub channel",
+			initial: githubSettings,
+			next: { ...githubSettings, channel: "beta" as const },
+		},
+		{
+			name: "server URL",
+			initial: serverSettings,
+			next: { ...serverSettings, serverUrl: "https://another.example" },
+		},
+		{
+			name: "server product",
+			initial: serverSettings,
+			next: { ...serverSettings, product: "other" },
+		},
+		{
+			name: "server channel",
+			initial: serverSettings,
+			next: { ...serverSettings, channel: "beta" as const },
+		},
+	])("active settings invalidate permanently: $name", async ({ initial, next }) => {
+		client.setQueryData(["settings"], { update: initial });
+		await render("full", initial);
+		await act(async () => client.setQueryData(["settings"], { update: next }));
+		await settle();
+		expect(document.body.textContent).toContain(common.updateSourceChanged);
+		expect(findButton("Download")).toBeUndefined();
+		await act(async () => client.setQueryData(["settings"], { update: initial }));
+		await settle();
+		expect(findButton("Download")).toBeUndefined();
+	});
+
+	test.each([
+		"reset",
+		"unmount",
+	])("badge download aborts on %s and can retry after remount", async (action) => {
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		api.checkUpdate = async () => successfulCheck();
+		const { signals, bodies } = installPersistentDownload();
+		await renderBadge();
+		await openBadge();
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(signals).toHaveLength(1);
+		expect(signals[0].aborted).toBe(false);
+		// Closing only hides the dialog; it keeps the hook and cancellation handle alive.
+		const close = document.querySelector<HTMLButtonElement>(".mantine-Modal-close");
+		expect(close).not.toBeNull();
+		await act(async () => close?.click());
+		await settle();
+		expect(signals[0].aborted).toBe(false);
+		await openBadge();
+		expect(findButton("Cancel")).toBeDefined();
+		if (action === "reset") {
+			api.checkUpdate = async () => ({ updateAvailable: false, currentVersion: "1.0.0" });
+			await act(async () => {
+				client.setQueryData(["settings"], { update: serverSettings });
+				await client.resetQueries({ queryKey: ["update-check"] });
+			});
+		} else await act(async () => root?.render(null));
+		await settle();
+		expect(signals[0].aborted).toBe(true);
+		expect(signals).toHaveLength(1);
+		// Re-mount with a fresh recommendation, then cancel and retry a new request.
+		await act(async () => {
+			client.setQueryData(["settings"], { update: githubSettings });
+			client.setQueryData(["update-check"], {
+				...successfulCheck(),
+				settingsKey: updateSettingsKey(githubSettings),
+			});
+		});
+		await renderBadge();
+		await openBadge();
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(signals).toHaveLength(2);
+		expect(signals[1].aborted).toBe(false);
+		await act(async () => findButton("Cancel")?.click());
+		await settle();
+		expect(signals[1].aborted).toBe(true);
+		expect(findButton("Download")).toBeDefined();
+		await act(async () => findButton("Download")?.click());
+		await settle();
+		expect(signals).toHaveLength(3);
+		expect(signals[2].aborted).toBe(false);
+		expect(bodies[2].retry).toBe(false);
+	});
+
+	test("GitHub incremental recommendations show patch size and update to full on fallback", async () => {
+		let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+		const stream = new ReadableStream<Uint8Array>({
+			start(value) {
+				controller = value;
+			},
+		});
+		const previousFetch = globalThis.fetch;
+		install(
+			"fetch",
+			Object.assign(
+				async () => new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+				{ preconnect: previousFetch.preconnect },
+			),
+		);
+		const encoder = new TextEncoder();
+		try {
+			await render("zstd");
+			expect(document.body.textContent).toContain(common.updateStrategyZstd);
+			expect(document.body.textContent).toContain("Incremental update: 128 B / 1.0 KB");
+			await act(async () => findButton("Download")?.click());
+			await settle();
+			await act(async () =>
+				controller?.enqueue(
+					encoder.encode(
+						'event: progress\ndata: {"phase":"downloading","strategy":"full","fallback":true,"bytesDownloaded":1,"totalBytes":1024,"percent":0}\n\n',
+					),
+				),
+			);
+			await settle();
+			expect(document.body.textContent).toContain(common.updateDeltaFallback);
+			expect(document.body.textContent).toContain(common.updateStrategyFull);
+			expect(document.body.textContent).not.toContain("Incremental update: 128 B / 1.0 KB");
+			await act(async () => {
+				controller?.enqueue(
+					encoder.encode('event: complete\ndata: {"success":true,"version":"1.1.0"}\n\n'),
+				);
+				controller?.close();
+				controller = undefined;
+			});
+			await settle();
+			expect(document.body.textContent).toContain(common.updateDeltaFallback);
+			expect(document.body.textContent).toContain(common.updateStrategyFull);
+		} finally {
+			try {
+				controller?.close();
+			} catch {
+				/* The hook may already have cancelled its reader. */
+			}
+		}
+	});
+	test.each([
+		"sse-error",
+		"stream-error",
+	])("failed full fallback keeps its actual strategy and warning: %s", async (failure) => {
+		let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+		const stream = new ReadableStream<Uint8Array>({
+			start(value) {
+				controller = value;
+			},
+		});
+		const previousFetch = globalThis.fetch;
+		install(
+			"fetch",
+			Object.assign(
+				async () => new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+				{ preconnect: previousFetch.preconnect },
+			),
+		);
+		const encoder = new TextEncoder();
+		try {
+			await render("zstd");
+			await act(async () => findButton("Download")?.click());
+			await settle();
+			await act(async () =>
+				controller?.enqueue(
+					encoder.encode(
+						'event: progress\ndata: {"phase":"downloading","strategy":"full","fallback":true,"bytesDownloaded":1,"totalBytes":1024,"percent":0}\n\n',
+					),
+				),
+			);
+			await settle();
+			await act(async () => {
+				if (failure === "sse-error") {
+					controller?.enqueue(
+						encoder.encode(
+							'event: error\ndata: {"phase":"error","error":"Full download failed"}\n\n',
+						),
+					);
+					controller?.close();
+				} else controller?.error(new Error("Full download failed"));
+				controller = undefined;
+			});
+			await settle();
+			expect(document.body.textContent).toContain("Full download failed");
+			expect(document.body.textContent).toContain(common.updateDeltaFallback);
+			expect(document.body.textContent).toContain(common.updateStrategyFull);
+			expect(document.body.textContent).not.toContain(common.updateStrategyZstd);
+		} finally {
+			try {
+				controller?.close();
+			} catch {
+				/* Already closed or cancelled. */
+			}
+		}
+	});
+	test("the header keeps the prepared target when a new source recommends a different version", async () => {
+		ready = true;
+		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		client.setQueryData(["update-check"], {
+			updateAvailable: true,
+			currentVersion: "1.0.0",
+			latestVersion: "1.1.0",
+		});
+		api.checkUpdate = async () => ({
+			updateAvailable: true,
+			currentVersion: "1.0.0",
+			latestVersion: "2.0.0",
+			source: "update-server",
+		});
+		root = createRoot(container);
+		await act(async () =>
+			root?.render(
+				<MantineProvider env="test">
+					<I18nextProvider i18n={translation}>
+						<QueryClientProvider client={client}>
+							<UpdateBadge />
+						</QueryClientProvider>
+					</I18nextProvider>
+				</MantineProvider>,
+			),
+		);
+		await settle();
+		await changeSavedSource();
+		await act(async () => {
+			await client.resetQueries({ queryKey: ["update-check"] });
+		});
+		await settle();
+		expect(document.body.textContent).toContain("Ready: v1.1.0");
+		const badge = [...document.querySelectorAll<HTMLElement>(".mantine-Badge-root")].find(
+			(element) => element.textContent === "Ready: v1.1.0",
+		);
+		expect(badge).toBeDefined();
+		await act(async () => badge?.click());
+		await settle();
+		expect(document.body.textContent).toContain("Update v1.1.0");
+		const schedule = findButton(common.updateSchedule);
+		expect(schedule).toBeDefined();
+		await act(async () => schedule?.click());
+		await settle();
+		expect(appliedVersion).toBe("1.1.0");
+	});
+
+	test("shows source and full strategy, then removes stale notes and download action", async () => {
+		await render();
+		expect(document.body.textContent).toContain("GitHub: fork/project");
+		expect(document.body.textContent).toContain("Full download");
+		expect(document.body.textContent).toContain("Old recommendation notes");
+		expect(findButton("Download")).toBeDefined();
+		await changeSavedSource();
+		expect(document.body.textContent).toContain(common.updateSourceChanged);
+		expect(document.body.textContent).not.toContain("Old recommendation notes");
+		expect(findButton("Download")).toBeUndefined();
+		await act(async () => {
+			client.setQueryData(["settings"], {
+				update: { source: "github", githubRepository: "fork/project" },
+			});
+		});
+		await settle();
+		expect(findButton("Download")).toBeUndefined();
+	});
+
+	test("a prepared binary remains applicable after the source changes", async () => {
+		ready = true;
+		await render();
+		await changeSavedSource();
+		const schedule = findButton(common.updateSchedule);
+		expect(schedule).toBeDefined();
+		await act(async () => schedule?.click());
+		await settle();
+		expect(appliedVersion).toBe("1.1.0");
+	});
+});
+
+describe("UpdateBadge first-check mirror dialog", () => {
+	async function renderFailedChineseCheck() {
+		await translation.changeLanguage("zh-CN");
+		client.setQueryData(["auth", "me"], { id: "admin", role: "admin" });
+		const settings = {
+			update: { source: "github" as const, githubRepository: "NarraFork/NarraFork" },
+		};
+		client.setQueryData(["settings"], settings);
+		api.getSettings = async () => settings;
+		api.checkUpdate = async () => ({
+			updateAvailable: false,
+			currentVersion: "1.0.0",
+			source: "github",
+			errorCode: "TIMEOUT",
+		});
+		await renderBadge();
+		await settle();
+	}
+
+	test("shows a Chinese prompt even without an available-update badge; cancel never saves", async () => {
+		let writes = 0;
+		api.updateSettings = async () => {
+			writes++;
+			return {};
+		};
+		await renderFailedChineseCheck();
+		expect(document.querySelector(".mantine-Badge-root")).toBeNull();
+		expect(document.body.textContent).toContain(commonZh.updateMirrorPromptTitle);
+		expect(document.body.textContent).toContain(commonZh.updateMirrorPromptDescription);
+		expect(findButton(commonZh.updateMirrorSwitch)).toBeDefined();
+		await act(async () => findButton(commonZh.updateMirrorKeepGithub)?.click());
+		await settle();
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
+		expect(writes).toBe(0);
+	});
+
+	test("save failure remains visible and the confirmation button can retry", async () => {
+		let writes = 0;
+		api.updateSettings = async () => {
+			writes++;
+			throw new Error("offline");
+		};
+		await renderFailedChineseCheck();
+		await act(async () => findButton(commonZh.updateMirrorSwitch)?.click());
+		await settle();
+		expect(document.body.textContent).toContain(commonZh.updateMirrorSwitchFailed);
+		expect(findButton(commonZh.updateMirrorSwitch)?.disabled).toBe(false);
+		api.updateSettings = async () => {
+			writes++;
+			return { update: { source: "update-server" } };
+		};
+		await act(async () => findButton(commonZh.updateMirrorSwitch)?.click());
+		await settle();
+		expect(writes).toBe(2);
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
+	});
+});

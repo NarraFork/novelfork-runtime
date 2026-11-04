@@ -15,7 +15,9 @@ import {
 	ordinaryBufferReorder,
 	resolveBufferQueueMode,
 } from "@shared/buffer-queue-mode";
+import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
+import type { MediaRef } from "@shared/media-attachments";
 import { MAX_EDIT_TEXT_FILES_PER_MESSAGE, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
@@ -25,6 +27,11 @@ import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
 } from "../lib/agent/file-reference-projection";
+import {
+	parseOptionalComposerDocument,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../lib/composer-document";
 import { AppError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -56,6 +63,18 @@ const STAGING_RECONCILE_ATTEMPTS = 3;
 const STAGING_RECONCILE_DELAYS_MS = [0, 25, 100] as const;
 const store = createMailboxStore(db);
 const pending = ["queued", "failed"] as const;
+
+/** Runtime callers can carry extra fields; only portable references enter the queue. */
+function copyMediaRef(item: MediaRef, fallbackNarratorId?: string): MediaRef {
+	const uploadNarratorId = item.uploadNarratorId || fallbackNarratorId;
+	return {
+		mediaId: item.mediaId,
+		filename: item.filename,
+		mediaType: item.mediaType,
+		size: item.size,
+		...(uploadNarratorId ? { uploadNarratorId } : {}),
+	};
+}
 
 type StagingAwareMailbox = RuntimeQueuePort["mailbox"] & RuntimeMailboxStagingLookup;
 type StagingResolution =
@@ -292,6 +311,8 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	humanReplyContext?: import("@shared/reply-context").ReplyContext;
+	composerDocumentPath?: string;
 	queueMode?: BufferQueueMode;
 	executionIntent?: BufferedMessage["executionIntent"];
 	stagingId?: string;
@@ -342,7 +363,13 @@ export async function persistBufferedTextFiles(
 			taken.add(name);
 			const path = join(dir, name);
 			// Register before write so a partial write is cleaned after failure too.
-			saved.push({ filename: name, path, size: file.size });
+			saved.push({
+				filename: name,
+				path,
+				size: file.size,
+				originalName: file.name,
+				sourceMimeType: file.type,
+			});
 			await writeBufferedFile(path, file);
 		}
 		return saved;
@@ -440,7 +467,11 @@ export function loadBufferedTextFiles(saved: SavedBufferedFile[]): File[] {
 			throw new Error("Buffered attachment exceeds size limit");
 		// Bun's file-backed Blob retains the path instead of synchronously loading a
 		// potentially 100MB attachment into the request/event-loop heap.
-		return [new File([Bun.file(s.path)], s.filename, { type: "text/plain" })];
+		return [
+			new File([Bun.file(s.path)], s.originalName ?? s.filename, {
+				type: s.sourceMimeType ?? "text/plain",
+			}),
+		];
 	});
 }
 /** These inputs must cross the old loop's finalizer (including temporary-model restore). */
@@ -465,7 +496,18 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 		get text() {
 			return payload ? readManagedText(payload.path) : row.text;
 		},
+		hasComposerDocument: !!metadata.composerDocumentPath,
+		get composerDocument() {
+			return metadata.composerDocumentPath
+				? parseOptionalComposerDocument(
+						JSON.parse(readManagedText(metadata.composerDocumentPath, 2 * 1024 * 1024)),
+					)
+				: undefined;
+		},
 		images: json<ImageRef[] | undefined>(row.imagesJson, undefined),
+		media: json<MediaRef[] | undefined>(row.mediaJson, undefined)?.map((item) =>
+			copyMediaRef(item, row.narratorId),
+		),
 		get fileReferences() {
 			return freezeFileReferenceSnapshots(
 				metadata.fileReferencesPath
@@ -608,10 +650,22 @@ export async function enqueueBufferedMessage(
 	frontOrder: "stack" | "fifo" = "stack",
 	executionIntent?: BufferedMessage["executionIntent"],
 	queueMode?: BufferQueueMode,
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
+	humanReplyContext?: import("@shared/reply-context").ReplyContext,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+	humanReplyContext = humanReplyContext ? { ...humanReplyContext } : undefined;
+	composerDocument = parseOptionalComposerDocument(composerDocument);
+	validateComposerProjection(
+		composerDocument,
+		text,
+		(fileReferences ?? []).map((snapshot) => snapshot.reference),
+	);
+	validateComposerAssets(composerDocument, images ?? [], textFiles ?? [], media ?? []);
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
 	images = images?.map((image) => ({ ...image }));
+	media = media?.map((item) => copyMediaRef(item, narratorId));
 	creator = creator ? { ...creator } : creator;
 	textFiles = textFiles ? [...textFiles] : undefined;
 	let saved: SavedBufferedFile[] = [];
@@ -631,7 +685,13 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
+		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode, humanReplyContext };
+		if (composerDocument)
+			metadata.composerDocumentPath = await writeStagingText(
+				stagingId,
+				"composer",
+				JSON.stringify(composerDocument),
+			);
 		if (queueMode) frontOrder = queueMode === "interrupt" ? "stack" : "fifo";
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
@@ -664,6 +724,7 @@ export async function enqueueBufferedMessage(
 			commandText,
 			bashCommand,
 			imagesJson: images?.length ? JSON.stringify(images) : null,
+			mediaJson: media?.length ? JSON.stringify(media) : null,
 			creatorJson: creator ? JSON.stringify(creator) : null,
 			textFilePathsJson: saved.length ? JSON.stringify(saved) : null,
 			fileReferencesJson,
@@ -769,7 +830,9 @@ export async function enqueueBufferedMessage(
 	}
 }
 export interface BufferedMessageAttachmentUpdate {
+	composerDocument?: ComposerDocument;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	textFiles?: File[];
 	savedFiles?: SavedBufferedFile[];
 	fileReferences?: FileReferenceSnapshot[];
@@ -789,6 +852,21 @@ export async function updateBufferedMessage(
 		!pending.includes(row.state as "queued" | "failed")
 	)
 		return false;
+	const current = projectMailboxUserMessage(row);
+	opts.composerDocument = parseOptionalComposerDocument(opts.composerDocument);
+	validateComposerProjection(
+		opts.composerDocument,
+		text,
+		(opts.fileReferences ?? current.fileReferences ?? []).map((snapshot) => snapshot.reference),
+	);
+	validateComposerAssets(
+		opts.composerDocument,
+		opts.images ?? current.images ?? [],
+		opts.textFiles ??
+			(opts.savedFiles ? loadBufferedTextFiles(opts.savedFiles) : current.textFiles) ??
+			[],
+		opts.media ?? current.media ?? [],
+	);
 	const bytes = Buffer.byteLength(text);
 	if (bytes > MAX_BUFFERED_PAYLOAD_BYTES)
 		throw new Error("Edited input exceeds mailbox size limit");
@@ -796,6 +874,7 @@ export async function updateBufferedMessage(
 	opts = {
 		...opts,
 		images: opts.images?.map((image) => ({ ...image })),
+		media: opts.media?.map((item) => copyMediaRef(item, narratorId)),
 		savedFiles: opts.savedFiles?.map((file) => ({ ...file })),
 		fileReferences:
 			opts.fileReferences === undefined
@@ -807,6 +886,16 @@ export async function updateBufferedMessage(
 	const prepared: string[] = [];
 	const superseded: string[] = [];
 	try {
+		if (metadata.composerDocumentPath) superseded.push(metadata.composerDocumentPath);
+		delete metadata.composerDocumentPath;
+		if (opts.composerDocument) {
+			metadata.composerDocumentPath = await writeStagingText(
+				stagingId,
+				"composer",
+				JSON.stringify(opts.composerDocument),
+			);
+			prepared.push(metadata.composerDocumentPath);
+		}
 		let payloadRefJson: string | null = null;
 		if (bytes > MAILBOX_LIMITS.inlineBytes) {
 			const path = await writeStagingText(stagingId, "body", text);
@@ -843,6 +932,12 @@ export async function updateBufferedMessage(
 				: opts.images.length
 					? JSON.stringify(opts.images)
 					: null;
+		const mediaJson =
+			opts.media === undefined
+				? row.mediaJson
+				: opts.media.length
+					? JSON.stringify(opts.media)
+					: null;
 		const textFilePathsJson =
 			opts.savedFiles === undefined
 				? row.textFilePathsJson
@@ -853,6 +948,7 @@ export async function updateBufferedMessage(
 		if (
 			[
 				imagesJson,
+				mediaJson,
 				textFilePathsJson,
 				fileReferencesJson,
 				metadataJson,
@@ -873,6 +969,7 @@ export async function updateBufferedMessage(
 						byteSize: bytes,
 						payloadRefJson,
 						imagesJson,
+						mediaJson,
 						textFilePathsJson,
 						fileReferencesJson,
 						metadataJson,
@@ -891,6 +988,7 @@ export async function updateBufferedMessage(
 								bufferedAt: new Date().toISOString(),
 								updatedAt: new Date().toISOString(),
 								imagesJson,
+								mediaJson,
 								textFilePathsJson,
 								fileReferencesJson,
 								metadataJson,
@@ -1206,6 +1304,32 @@ export async function releaseBufferedMessage(
 	if (port) await port.mailbox.failClaim(claim, error);
 	else store.failClaim(claim, error);
 }
+/**
+ * Drop a claimed queued message the consumer refuses to deliver, without materializing it: the
+ * row is cancelled through its exact claim (no other owner's claim is touched, nothing is
+ * requeued) and its staged text files go with it. A message that is not claimed is not dropped:
+ * the caller claims the exact row first, so what it drops is what it read. Returns whether a row
+ * was dropped.
+ */
+export async function dropBufferedMessage(
+	narratorId: string,
+	msg: BufferedMessage,
+	reason: string,
+): Promise<boolean> {
+	const claim = msg._mailboxClaim;
+	if (!claim || claim.narratorId !== narratorId) return false;
+	const stagingId = msg._stagingId ?? msg.id;
+	const port = pgQueue();
+	if (port) {
+		if (!(await port.mailbox.cancelClaim(claim, reason))) return false;
+		await cleanupStagingPg(port, stagingId);
+		return true;
+	}
+	if (!store.cancelClaim(claim, reason)) return false;
+	cleanupBufferedTextFiles(stagingId);
+	return true;
+}
+
 export async function restoreBufferedMessage(
 	narratorId: string,
 	msg: BufferedMessage,
@@ -1228,6 +1352,7 @@ export interface BufferedTextFileSummary {
 	size: number;
 }
 export interface BufferMessageSummary {
+	hasComposerDocument?: boolean;
 	queueMode?: BufferQueueMode;
 	state?: "queued" | "failed";
 	error?: string | null;
@@ -1236,6 +1361,7 @@ export interface BufferMessageSummary {
 	bufferedAt: string;
 	imageCount: number;
 	images: BufferedImageSummary[];
+	media: MediaRef[];
 	textFiles: BufferedTextFileSummary[];
 	fileReferences: FileReference[];
 	creator?: BufferCreator | null;
@@ -1250,15 +1376,18 @@ export function toBufferSummary(
 		| "text"
 		| "bufferedAt"
 		| "images"
+		| "media"
 		| "textFiles"
 		| "_savedFiles"
 		| "creator"
 		| "priority"
 		| "queueMode"
 		| "fileReferences"
+		| "hasComposerDocument"
 	>[],
 ): BufferMessageSummary[] {
 	return msgs.map((m) => ({
+		hasComposerDocument: m.hasComposerDocument || undefined,
 		id: m.id,
 		state: m.state,
 		error: m.error,
@@ -1271,6 +1400,7 @@ export function toBufferSummary(
 		})(),
 		bufferedAt: m.bufferedAt,
 		imageCount: m.images?.length ?? 0,
+		media: (m.media ?? []).map((item) => copyMediaRef(item)),
 		images: (m.images ?? []).map((image) => ({
 			imageId: image.imageId,
 			filename: image.filename,

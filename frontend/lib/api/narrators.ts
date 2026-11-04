@@ -1,29 +1,49 @@
-import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrator";
+import type {
+	AsyncQuestion,
+	HumanAttentionDetail,
+	PendingPermission,
+} from "@frontend/types/narrator";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
+import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
-import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
+import type { ComposerDocument } from "@shared/composer-document";
+import type {
+	FileChangeEvidenceUncertaintyWarning,
+	FileChangeRevertAction,
+	FileChangeRevertApplyResponse,
+} from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
+import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import type { MediaRef } from "@shared/media-attachments";
+import type { NarratorNavigationSummary, NarratorPanelState } from "@shared/narrator-panel-state";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
 	type TextDocumentRange,
 	type TextDocumentRef,
 } from "@shared/pretext-layout/text-document";
+import type { RequestRecordingDetail, SavedRecording } from "@shared/request-recording";
 import type { ToolRoutineMode } from "@shared/routine-modes";
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import i18next from "i18next";
+import { decodeBlockMessage, decodeBlockPage } from "../block-protocol";
+import { narratorLoadingMetrics } from "../narrator-loading-metrics";
+import { createSharedInflight, type SharedReadOptions } from "../shared-inflight";
+import type { GitIdentity } from "./auth";
 import {
 	ApiError,
-	absorbRenewedToken,
 	apiBase,
 	authorizedFetch,
+	clearTokenOnSessionFailure,
 	getToken,
 	postFormDataWithProgress,
 	readFetchError,
 	request,
 } from "./client";
+import { mediaUploadError } from "./media-upload-validation";
 import type {
 	ApiEntity,
 	BlacklistCmd,
@@ -51,6 +71,77 @@ import type {
 	WhitelistDir,
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
+
+export interface ComposerDocumentDetail {
+	composerDocument?: ComposerDocument;
+	/** These summaries are read together with the document, never from a stale list row. */
+	images?: {
+		id?: string;
+		imageId: string;
+		filename?: string;
+		mediaType?: string;
+		width?: number;
+		height?: number;
+		size?: number;
+		sourceMimeType?: string;
+		uploadNarratorId?: string;
+	}[];
+	textFiles?: { filename: string; size: number; filePath?: string; index?: number }[];
+	media?: MediaRef[];
+	text?: string;
+	fileReferences?: FileReference[];
+	bodyRevision?: number;
+}
+
+export interface NarratorPanelStateOptions extends SharedReadOptions {
+	permissionsCursor?: string;
+	bufferCursor?: string;
+}
+
+export type NarratorPanelStateResponse = NarratorPanelState<
+	PendingPermission,
+	BufferMessageSummary
+>;
+
+export type NarratorDetail = ApiEntity & {
+	navigationSummary?: NarratorNavigationSummary;
+};
+
+const sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
+
+/** Live-request deduplication only; safety reconciliation never adopts query-cache permissions. */
+export function getNarratorPanelState(id: string, options: NarratorPanelStateOptions = {}) {
+	const { permissionsCursor, bufferCursor } = options;
+	const scope = getToken();
+	const key = JSON.stringify([scope, id, permissionsCursor ?? null, bufferCursor ?? null]);
+	return sharePanelStateRead(
+		key,
+		async (signal) => {
+			const controller = new AbortController();
+			const abort = () => controller.abort(signal.reason);
+			signal.addEventListener("abort", abort, { once: true });
+			if (signal.aborted) abort();
+			const timer = setTimeout(
+				() => controller.abort(new Error("Panel state read timed out")),
+				10_000,
+			);
+			try {
+				const params = new URLSearchParams();
+				if (permissionsCursor) params.set("permissionsCursor", permissionsCursor);
+				if (bufferCursor) params.set("bufferCursor", bufferCursor);
+				const query = params.toString();
+				return await request<NarratorPanelStateResponse>(
+					`/narrators/${encodeURIComponent(id)}/panel-state${query ? `?${query}` : ""}`,
+					{ signal: controller.signal },
+				);
+			} finally {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", abort);
+			}
+		},
+		options,
+	);
+}
 
 /** Bounded source lane: timeout, packet bytes and caller cancellation are independent of document size. */
 async function requestTextDocumentJson<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -264,12 +355,20 @@ export type RevertWarning =
 			sampleFilePaths: string[];
 	  };
 
-export type RevertAction = "rollback_to_block" | "delete_tool_block" | "revert_files";
+export type RevertAction = FileChangeRevertAction;
 
 export interface RevertActionTarget {
 	messageId: string;
 	blockIndex?: number;
+	/**
+	 * The server's id for the block holding `blockIndex`, read from the row the action
+	 * was picked on (§5.5). A block action (rollback, tool block deletion) names it.
+	 */
+	blockId?: string;
 }
+
+/** A message element an action starts from, with the server's id for its block. */
+export type BlockTarget = RevertActionTarget & { blockIndex: number; blockId: string };
 
 /** The exact durable plan reviewed by the user, never a request to re-plan. */
 export interface RevertPlanConfirmation {
@@ -307,21 +406,11 @@ export interface RevertHistorySummary {
  * Advisory only: listing a blocker never authorizes a wider plan.
  */
 export interface RevertBlocker {
-	kind:
-		| "running_tool"
-		| "uncoordinated_activity"
-		| "write_lease"
-		| "pending_mutation"
-		| "recovery_hold"
-		| "narrator_busy"
-		| "planner_busy"
-		| "scope_not_active"
-		| "pending_operation";
+	kind: "running_tool" | "narrator_busy" | "planner_busy";
 	toolCallId?: string;
 	toolName?: string;
 	operationId?: string;
 	messageId?: string;
-	leaseId?: string;
 	detail?: string;
 }
 
@@ -358,7 +447,7 @@ export interface RevertPlanFile {
 		canonicalPath: string;
 	};
 	expectedStateJson: { kind: "absent" | "regular" | "symlink" | "unknown" };
-	desiredStateJson: { kind: "absent" | "regular" | "symlink" };
+	desiredStateJson: { kind: "absent" | "regular" | "symlink" | "unknown"; reason?: string };
 }
 
 export interface RevertPlanFilesPage {
@@ -368,13 +457,7 @@ export interface RevertPlanFilesPage {
 	executable: false;
 }
 
-export interface RevertPlanApplyResult {
-	planId: string;
-	status: "committed" | "compensated" | "recovery_required";
-	journalStatus: string;
-	settling: boolean;
-	reason: string | null;
-}
+export type RevertPlanApplyResult = FileChangeRevertApplyResponse;
 
 export type RevertPlanPreviewIssue =
 	| "expired"
@@ -398,37 +481,12 @@ export interface RevertPreviewFile {
 	deviceId: string;
 	filePath: string;
 	willBeDeleted: boolean;
-}
-
-export interface RevertPreviewFileWithContent extends RevertPreviewFile {
-	currentContent: string | null;
-	revertedContent: string | null;
+	unavailable?: boolean;
 }
 
 /**
- * What deleting a single tool_use block would roll back.
- *
- * Narrower than {@link RevertScopePreviews}: a block is one recorded call, so there
- * is no scope to choose between. `available: false` means the change cannot be
- * reversed safely. Only history-only deletion is permitted; legacy tool inputs
- * are not evidence that authorizes writing files.
- */
-export interface BlockDeletePreview {
-	available: boolean;
-	reason?: ScopedRevertUnavailableReason | "not_a_tool_use";
-	files: RevertPreviewFileWithContent[];
-	/** Paths another actor changed in the same regions; deletion would be refused. */
-	conflicts: string[];
-	subagentWarning?: { changeCount: number; sampleFiles: string[] };
-}
-
-/**
- * Both rollback scopes for one window, so the dialog can compare them.
- *
- * Scope metadata remains optional for older preview responses. Missing metadata
- * is unverified, not permission to replay `affectedFiles` or proof of no changes.
- * `scope` is only a recommendation; workspace rollback always needs an explicit
- * user choice and an available, complete preview.
+ * A fixed narrator plan, with optional metadata for read-only legacy previews.
+ * Missing plan metadata never authorizes replay or implies no file changes.
  */
 export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreviewFile> {
 	/** Present only for the new action-preview + paged-files flow. */
@@ -510,7 +568,6 @@ export interface BrokenModelNarrator {
 	title: string | null;
 	model: string;
 	status: string;
-	chapterId: string | null;
 	hasBrokenPendingRestore: boolean;
 }
 
@@ -562,19 +619,121 @@ export interface NarratorCustomTraits {
 	availableTools: { name: string; description: string; category: string }[];
 }
 
+export type NarratorSlashMenuResponse = {
+	commands: Array<{
+		name: string;
+		prompt: string;
+		description?: string;
+		source: string;
+		runBashFirst?: boolean;
+		bashCommand?: string;
+		params?: Array<{
+			name: string;
+			description?: string;
+			required?: boolean;
+			defaultValue?: string;
+		}>;
+	}>;
+	skills: Array<{
+		name: string;
+		description: string;
+		source: string;
+		blocked?: boolean;
+	}>;
+	tools: Array<{
+		id: string;
+		toolName: string;
+		descriptionEn: string;
+		descriptionZh: string;
+	}>;
+	allSkillsBlocked?: boolean;
+};
+
+/** Delete whole blocks by id, history only (§5.5). */
+function deleteBlocksById(narratorId: string, blockIds: string[]) {
+	return request<{
+		ok: boolean;
+		deleted: number;
+		failed?: number;
+		results: Array<{ blockId: string; messageId: string; messageDeleted: boolean }>;
+		/** A deletion's file outcome when the server reports one. */
+		revertResult?: FileChangeRevertApplyResponse;
+	}>(`/narrators/${narratorId}/blocks`, {
+		method: "DELETE",
+		body: JSON.stringify({ blockIds, skipRevert: true }),
+	});
+}
+
 export const narratorsApi = {
+	getRequestRecordingDetail: (narratorId: string, requestId: string, signal?: AbortSignal) =>
+		request<RequestRecordingDetail>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/requests/${encodeURIComponent(requestId)}`,
+			{ signal },
+		),
+	saveSpecificRequestRecording: (narratorId: string, requestId: string, signal?: AbortSignal) =>
+		request<SavedRecording>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/requests/${encodeURIComponent(requestId)}`,
+			{ method: "POST", signal },
+		),
+	startModelTrace: (narratorId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace`, {
+			method: "POST",
+		}),
+	retryModelTrace: (narratorId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
+			method: "POST",
+		}),
+	/** 该模型是否已经有 ModelTrace 舱；没有跑过时为 null。 */
+	getModelTraceNarrator: (model: string) =>
+		request<{ narratorId: string | null }>(
+			`/narrators/modeltrace/lookup?model=${encodeURIComponent(model)}`,
+		),
+	saveRequestRecording: (narratorId: string, signal?: AbortSignal) =>
+		request<SavedRecording>(`/narrators/${encodeURIComponent(narratorId)}/request-recordings`, {
+			method: "POST",
+			signal,
+		}),
+	listRequestRecordings: (narratorId: string, cursor?: string, signal?: AbortSignal) => {
+		const params = new URLSearchParams({ limit: "50" });
+		if (cursor) params.set("cursor", cursor);
+		return request<{ items: SavedRecording[]; nextCursor: string | null }>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings?${params}`,
+			{ signal },
+		);
+	},
+	deleteRequestRecording: (narratorId: string, saveId: string) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/${encodeURIComponent(saveId)}`,
+			{ method: "DELETE" },
+		),
+	async downloadRequestRecording(
+		narratorId: string,
+		saveId: string,
+		signal?: AbortSignal,
+	): Promise<{ blob: Blob; fileName: string | null }> {
+		const res = await authorizedFetch(
+			`${apiBase()}/narrators/${encodeURIComponent(narratorId)}/request-recordings/${encodeURIComponent(saveId)}/download`,
+			{ signal },
+		);
+		if (!res.ok) {
+			const error = await readFetchError(res, `HTTP ${res.status}`);
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return {
+			blob: await res.blob(),
+			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
+		};
+	},
 	getTextDocumentRange,
 	ensureWriteDocumentSource,
 	readTextDocumentRange,
 	listNarrators: (opts?: {
-		chapterId?: string;
 		standalone?: boolean;
 		status?: string;
 		sortBy?: string;
 		sortOrder?: string;
 	}) => {
 		const params = new URLSearchParams();
-		if (opts?.chapterId) params.set("chapterId", opts.chapterId);
 		if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
@@ -584,9 +743,7 @@ export const narratorsApi = {
 	},
 	listNarratorsPaginated: (opts?: {
 		projectId?: string;
-		standalone?: boolean | "all";
 		status?: string;
-		filter?: string;
 		sortBy?: string;
 		sortOrder?: string;
 		limit?: number;
@@ -598,10 +755,7 @@ export const narratorsApi = {
 	}) => {
 		const params = new URLSearchParams();
 		if (opts?.projectId) params.set("projectId", opts.projectId);
-		if (opts?.standalone === "all") params.set("standalone", "all");
-		else if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
-		if (opts?.filter) params.set("filter", opts.filter);
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
 		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
 		if (opts?.limit) params.set("limit", String(opts.limit));
@@ -613,8 +767,30 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
-	getNarrator: (id: string, signal?: AbortSignal) =>
-		request<ApiEntity>(`/narrators/${id}`, { signal }),
+	getNarrator: async (id: string, signal?: AbortSignal) => {
+		const token = narratorLoadingMetrics.current(id);
+		if (token) narratorLoadingMetrics.mark(token, "detail-start");
+		const detail = await request<NarratorDetail>(`/narrators/${id}`, { signal });
+		if (token) narratorLoadingMetrics.mark(token, "detail-ready");
+		return detail;
+	},
+	getNarratorPanelState,
+	getNarratorGitSummary: async (
+		id: string,
+		signal?: AbortSignal,
+	): Promise<GitWorkspaceSummary | null> => {
+		// Generic request() treats JSON null as malformed; null is an explicit valid summary here.
+		const response = await authorizedFetch(
+			`${apiBase()}/narrators/${encodeURIComponent(id)}/git/summary`,
+			{ signal },
+		);
+		if (!response.ok) {
+			await clearTokenOnSessionFailure(response.clone());
+			const error = await readFetchError(response, "Git summary read failed");
+			throw new ApiError(error.message, response.status, error.data);
+		}
+		return response.json() as Promise<GitWorkspaceSummary | null>;
+	},
 
 	/**
 	 * Upload a custom bitmap avatar for a narrator, replacing any previous one.
@@ -636,22 +812,23 @@ export const narratorsApi = {
 	/** Drop the custom avatar, falling back to the procedural identicon. */
 	deleteNarratorAvatar: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/avatar`, { method: "DELETE" }),
-	getNarratorDraft: (id: string) =>
+	getNarratorDraft: (id: string, signal?: AbortSignal) =>
 		request<{
 			hasDraft: boolean;
 			text: string;
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
 			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
-		}>(`/narrators/${id}/draft`),
+		}>(`/narrators/${id}/draft`, { signal }),
 	updateNarratorDraft: (
 		id: string,
 		text: string,
-		baseRevision: number,
 		sourceId?: string,
 		fileReferences?: FileReference[],
+		composerDocument?: ComposerDocument,
 	) =>
 		request<{
 			ok: boolean;
@@ -659,13 +836,30 @@ export const narratorsApi = {
 			hasDraft: boolean;
 			text: string;
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
 			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
 		}>(`/narrators/${id}/draft`, {
 			method: "PUT",
-			body: JSON.stringify({ text, baseRevision, sourceId, fileReferences }),
+			body: JSON.stringify({ text, sourceId, fileReferences, composerDocument }),
+		}),
+	/** Swap the draft with the server's undo slot (the version the last write replaced). */
+	restoreNarratorDraftPrevious: (id: string, sourceId?: string) =>
+		request<{
+			ok: boolean;
+			hasDraft: boolean;
+			text: string;
+			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
+			revision: number;
+			updatedAt: string | null;
+			updatedBy: string | null;
+			sourceId: string | null;
+		}>(`/narrators/${id}/draft/restore`, {
+			method: "POST",
+			body: JSON.stringify({ sourceId }),
 		}),
 	getNarratorUsageStats: (id: string, opts?: { includeSubagents?: boolean }) => {
 		const params = new URLSearchParams();
@@ -676,35 +870,12 @@ export const narratorsApi = {
 		return request<UsageHistoryStats>(`/narrators/${id}/usage-stats${qs ? `?${qs}` : ""}`);
 	},
 	getNarratorCommands: (id: string) =>
-		request<{
-			commands: Array<{
-				name: string;
-				prompt: string;
-				description?: string;
-				source: string;
-				runBashFirst?: boolean;
-				bashCommand?: string;
-				params?: Array<{
-					name: string;
-					description?: string;
-					required?: boolean;
-					defaultValue?: string;
-				}>;
-			}>;
-			skills: Array<{
-				name: string;
-				description: string;
-				source: string;
-				blocked?: boolean;
-			}>;
-			tools: Array<{
-				id: string;
-				toolName: string;
-				descriptionEn: string;
-				descriptionZh: string;
-			}>;
-			allSkillsBlocked?: boolean;
-		}>(`/narrators/${id}/commands`),
+		request<NarratorSlashMenuResponse>(`/narrators/${id}/commands`),
+	/** Slash menu for the session-less dashboard composer, resolved from `cwd`. */
+	getDraftComposerCommands: (cwd: string | null) =>
+		request<NarratorSlashMenuResponse>(
+			`/narrators/draft-composer/commands${cwd ? `?cwd=${encodeURIComponent(cwd)}` : ""}`,
+		),
 	getNarratorSkills: (id: string, opts?: { refresh?: boolean }) => {
 		const params = new URLSearchParams();
 		if (opts?.refresh) params.set("refresh", "true");
@@ -736,7 +907,7 @@ export const narratorsApi = {
 		}>(`/narrators/${id}/skills${qs ? `?${qs}` : ""}`);
 	},
 	createNarrator: (data: {
-		chapterId?: string | null;
+		contextProjectId?: string;
 		type?: string;
 		model?: string;
 		systemPrompt?: string;
@@ -751,9 +922,10 @@ export const narratorsApi = {
 		behaviorFenceIntervalOverride?: number | null;
 		behaviorFenceAttachOverride?: "inherit" | "on" | "off";
 		cwd?: string;
+		title?: string;
 		makeNamed?: boolean;
 		handle?: string;
-		kind?: "knowledge" | "setup";
+		kind?: "knowledge" | "setup" | "bot";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	/**
 	 * Spawn a Setup Assistant narrator that installs the missing system
@@ -821,15 +993,12 @@ export const narratorsApi = {
 		if (opts?.beforeSeq != null) params.set("beforeSeq", String(opts.beforeSeq));
 		if (opts?.limit != null) params.set("limit", String(opts.limit));
 		if (opts?.messageVersion != null) params.set("messageVersion", String(opts.messageVersion));
-		const qs = params.toString();
-		return request<PretextDocumentPageResult>(
-			`/narrators/${id}/pretext-document${qs ? `?${qs}` : ""}`,
-			{
-				signal: opts?.signal,
-				maxResponseBytes: opts?.maxResponseBytes,
-				onResponseBytes: opts?.onResponseBytes,
-			},
-		);
+		// The page is envelopes + blocks (§8.1), decoded into rows.
+		return request<PretextDocumentPageResult>(`/narrators/${id}/pretext-document?${params}`, {
+			signal: opts?.signal,
+			maxResponseBytes: opts?.maxResponseBytes,
+			onResponseBytes: opts?.onResponseBytes,
+		}).then(decodeBlockPage);
 	},
 	// Resolve a message id to its top-level seq coordinate (jump-to-message).
 	getMessageLocation: (id: string, messageId: string, signal?: AbortSignal) =>
@@ -985,7 +1154,22 @@ export const narratorsApi = {
 		}),
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
-	getBufferedMessages: (id: string) => request<BufferMessageSummary[]>(`/narrators/${id}/buffer`),
+	getMessageComposerDocument: (narratorId: string, messageId: string, signal?: AbortSignal) =>
+		request<ComposerDocumentDetail>(
+			`/narrators/${encodeURIComponent(narratorId)}/messages/${encodeURIComponent(messageId)}/composer-document`,
+			{ signal },
+		),
+	getBufferedMessageComposerDocument: (
+		narratorId: string,
+		messageId: string,
+		signal?: AbortSignal,
+	) =>
+		request<ComposerDocumentDetail>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/composer-document`,
+			{ signal },
+		),
+	getBufferedMessages: (id: string, signal?: AbortSignal) =>
+		request<BufferMessageSummary[]>(`/narrators/${id}/buffer`, { signal }),
 	/**
 	 * Edit a queued message's text and/or its attachments.
 	 *
@@ -999,33 +1183,50 @@ export const narratorsApi = {
 		text: string,
 		opts?: {
 			keepImageIds?: string[];
+			keepMediaIds?: string[];
+			newMedia?: File[];
 			keepTextFiles?: { index: number; filename: string }[];
 			newImages?: File[];
 			newTextFiles?: File[];
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
 		},
 	) => {
+		const uploadError = mediaUploadError({
+			media: opts?.newMedia,
+			otherFiles: [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])],
+			text,
+			keptMediaCount: opts?.keepMediaIds?.length,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
-		if (!opts?.newImages?.length && !opts?.newTextFiles?.length) {
+		if (!opts?.newImages?.length && !opts?.newTextFiles?.length && !opts?.newMedia?.length) {
 			return request<{ ok: boolean }>(path, {
 				method: "PATCH",
 				body: JSON.stringify({
 					text,
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+					...(opts?.keepMediaIds ? { keepMediaIds: opts.keepMediaIds } : {}),
 					...(opts?.keepTextFiles ? { keepTextFiles: opts.keepTextFiles } : {}),
 					fileReferences: opts?.fileReferences,
+					composerDocument: opts?.composerDocument,
 				}),
 			});
 		}
 		const formData = new FormData();
 		formData.append("text", text);
 		if (opts.keepImageIds) formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
+		if (opts.keepMediaIds) formData.append("keepMediaIds", JSON.stringify(opts.keepMediaIds));
 		if (opts.keepTextFiles) formData.append("keepTextFiles", JSON.stringify(opts.keepTextFiles));
 		if (opts.fileReferences !== undefined) {
 			formData.append("fileReferences", JSON.stringify(opts.fileReferences));
 		}
+		if (opts.composerDocument !== undefined) {
+			formData.append("composerDocument", JSON.stringify(opts.composerDocument));
+		}
 		for (const img of opts.newImages ?? []) formData.append("images", img);
 		for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
+		for (const media of opts.newMedia ?? []) formData.append("media", media);
 		// Content-Type is left unset so the browser adds the multipart boundary.
 		const res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
 		if (!res.ok) {
@@ -1054,6 +1255,21 @@ export const narratorsApi = {
 		}),
 	clearBufferedMessages: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer`, { method: "DELETE" }),
+	getPendingAgentMessages: (narratorId: string, signal?: AbortSignal) =>
+		request<PendingAgentMessagesPage>(
+			`/narrators/${encodeURIComponent(narratorId)}/inbox/agent-messages`,
+			{ signal },
+		),
+	resumeAgentInbox: (narratorId: string) =>
+		request<{ ok: true; resumed: boolean }>(
+			`/narrators/${encodeURIComponent(narratorId)}/inbox/resume`,
+			{ method: "POST" },
+		),
+	discardPendingAgentMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/inbox/agent-messages/${encodeURIComponent(messageId)}`,
+			{ method: "DELETE" },
+		),
 	reorderBufferedMessages: (narratorId: string, orderedIds: string[]) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/reorder`, {
 			method: "PUT",
@@ -1070,7 +1286,8 @@ export const narratorsApi = {
 		request<HumanAttentionDetail>(`/narrators/human-attention/${encodeURIComponent(id)}`, {
 			signal,
 		}),
-	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
+	getPendingPermissions: (id: string, signal?: AbortSignal) =>
+		request<PendingPermission[]>(`/narrators/${id}/permissions`, { signal }),
 	// Async AskUserQuestion inbox — separate from permissions because nothing is
 	// suspended waiting for these (see the AsyncQuestion type).
 	//
@@ -1078,7 +1295,7 @@ export const narratorsApi = {
 	// per-narrator one structurally cannot.
 	getAllAsyncQuestions: () =>
 		request<{
-			items: (AsyncQuestion & { narratorTitle: string | null; chapterId: string | null })[];
+			items: (AsyncQuestion & { narratorTitle: string | null })[];
 			openCount: number;
 			awaitedCount: number;
 		}>("/narrators/questions/all"),
@@ -1123,7 +1340,6 @@ export const narratorsApi = {
 		return request<{
 			items: (AsyncQuestion & {
 				narratorTitle: string | null;
-				chapterId: string | null;
 				canAct?: boolean;
 			})[];
 			nextCursor: string | null;
@@ -1317,6 +1533,22 @@ export const narratorsApi = {
 				body: JSON.stringify({ deviceId }),
 			},
 		),
+
+	// === Git commit identity pick ===
+	// Which of MY identities this narrator commits under, plus my identities to
+	// choose from. Keyed by (user × narrator), so another user's pick is never
+	// returned here and cannot be changed through these calls.
+
+	getNarratorGitIdentity: (id: string) =>
+		request<{ identities: GitIdentity[]; selectedId: string | null }>(
+			`/narrators/${id}/git-identity`,
+		),
+	setNarratorGitIdentity: (id: string, identityId: string | null) =>
+		request<{ ok: boolean }>(`/narrators/${id}/git-identity`, {
+			method: "PUT",
+			body: JSON.stringify({ identityId }),
+		}),
+
 	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",
@@ -1494,7 +1726,15 @@ export const narratorsApi = {
 		fileReferences?: FileReference[],
 		interrupt?: boolean,
 		queueMode?: "turn" | "tool" | "interrupt",
+		options?: { composerDocument?: ComposerDocument },
+		media?: File[],
 	) => {
+		const uploadError = mediaUploadError({
+			media,
+			otherFiles: [...(images ?? []), ...(textFiles ?? [])],
+			text: message,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		if (queueMode !== undefined) {
 			priority = queueMode !== "turn";
 			interrupt = queueMode === "interrupt";
@@ -1507,7 +1747,7 @@ export const narratorsApi = {
 
 		const url = `${apiBase()}/narrators/${narratorId}/messages`;
 		let res: Response;
-		if (images?.length || textFiles?.length) {
+		if (images?.length || textFiles?.length || media?.length) {
 			const formData = new FormData();
 			formData.append("message", message);
 			if (images) {
@@ -1516,11 +1756,15 @@ export const narratorsApi = {
 			if (textFiles) {
 				for (const tf of textFiles) formData.append("textFiles", tf);
 			}
+			for (const file of media ?? []) formData.append("media", file);
 			if (priority) formData.append("priority", "true");
 			if (interrupt) formData.append("interrupt", "true");
 			if (queueMode !== undefined) formData.append("queueMode", queueMode);
 			if (fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(fileReferences));
+			}
+			if (options?.composerDocument !== undefined) {
+				formData.append("composerDocument", JSON.stringify(options.composerDocument));
 			}
 			// Use XHR-backed upload so we can surface real upload progress to the UI.
 			res = await postFormDataWithProgress(url, formData, {
@@ -1539,13 +1783,11 @@ export const narratorsApi = {
 					...(interrupt ? { interrupt: true } : {}),
 					...(queueMode !== undefined ? { queueMode } : {}),
 					fileReferences,
+					composerDocument: options?.composerDocument,
 				}),
 				signal,
 			});
 		}
-		// The XHR upload branch cannot go through authorizedFetch, so absorption
-		// stays explicit here — with the token this request used, for the CAS.
-		absorbRenewedToken(res, token);
 		if (res.status === 401) {
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
@@ -1591,12 +1833,28 @@ export const narratorsApi = {
 			recoveryMode?: "snapshot";
 		},
 		signal?: AbortSignal,
-	) =>
-		request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
+	) => {
+		// A rollback or a tool block deletion is planned for the whole block (§5.5).
+		const { blockId, ...indexBody } = body;
+		if (body.action === "rollback_to_block" || body.action === "delete_tool_block") {
+			if (!blockId) return Promise.reject(new Error(`${body.action} needs the block's id`));
+			return request<RevertActionPreview>(`/narrators/${narratorId}/blocks/revert-action-preview`, {
+				method: "POST",
+				body: JSON.stringify({
+					action: body.action,
+					blockIds: [blockId],
+					idempotencyKey: body.idempotencyKey,
+					...(body.recoveryMode ? { recoveryMode: body.recoveryMode } : {}),
+				}),
+				signal,
+			});
+		}
+		return request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
 			method: "POST",
-			body: JSON.stringify(body),
+			body: JSON.stringify(indexBody),
 			signal,
-		}),
+		});
+	},
 	getRevertPlanFiles: (
 		narratorId: string,
 		planId: string,
@@ -1622,18 +1880,18 @@ export const narratorsApi = {
 				}),
 			},
 		),
+	/** Keep the whole block the element belongs to (§5.5) and delete what follows it. */
 	rollbackToBlock: (
 		narratorId: string,
-		messageId: string,
-		blockIndex: number,
+		{ blockId }: BlockTarget,
 		opts?: { skipRevert?: boolean; scope?: RevertScope },
 	) =>
 		request<{ ok: boolean; warnings?: RevertWarning[] }>(
-			`/narrators/${narratorId}/rollback/${messageId}`,
+			`/narrators/${narratorId}/blocks/rollback`,
 			{
 				method: "POST",
 				body: JSON.stringify({
-					blockIndex,
+					blockIds: [blockId],
 					skipRevert: opts?.skipRevert === true,
 					...(opts?.scope ? { scope: opts.scope } : {}),
 				}),
@@ -1653,38 +1911,58 @@ export const narratorsApi = {
 		opts?: {
 			skipRevert?: boolean;
 			scope?: RevertScope;
+			revertPlan?: RevertPlanConfirmation;
 			keepImageIds?: string[];
+			keepMediaIds?: string[];
+			newMedia?: File[];
 			newImages?: File[];
 			keepTextFilePaths?: string[];
 			newTextFiles?: File[];
 			fileReferences?: FileReference[];
+			composerDocument?: ComposerDocument;
+			/** The message's input block when the server named it; the message route otherwise. */
+			inputBlockId?: string;
 		},
 	) => {
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
+		const inputBlockId = opts?.inputBlockId;
 
+		const uploadError = mediaUploadError({
+			media: opts?.newMedia,
+			otherFiles: [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])],
+			text: content,
+			keptMediaCount: opts?.keepMediaIds?.length,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		let body: BodyInit;
 		// Use multipart whenever new files (images or text files) are uploaded;
 		// kept-subset ids/paths ride along so the server drops removed attachments.
-		if (opts?.newImages?.length || opts?.newTextFiles?.length) {
+		if (opts?.newImages?.length || opts?.newTextFiles?.length || opts?.newMedia?.length) {
 			const formData = new FormData();
 			formData.append("content", content);
 			if (opts.skipRevert !== undefined) {
 				formData.append("skipRevert", opts.skipRevert ? "true" : "false");
 			}
 			if (opts.scope) formData.append("scope", opts.scope);
+			if (opts.revertPlan) formData.append("revertPlan", JSON.stringify(opts.revertPlan));
 			if (opts.keepImageIds) {
 				formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
 			}
+			if (opts.keepMediaIds) formData.append("keepMediaIds", JSON.stringify(opts.keepMediaIds));
 			if (opts.keepTextFilePaths) {
 				formData.append("keepTextFilePaths", JSON.stringify(opts.keepTextFilePaths));
 			}
 			if (opts.fileReferences !== undefined) {
 				formData.append("fileReferences", JSON.stringify(opts.fileReferences));
 			}
+			if (opts.composerDocument !== undefined) {
+				formData.append("composerDocument", JSON.stringify(opts.composerDocument));
+			}
 			for (const img of opts.newImages ?? []) formData.append("images", img);
 			for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
+			for (const media of opts.newMedia ?? []) formData.append("media", media);
 			body = formData;
 		} else {
 			headers["Content-Type"] = "application/json";
@@ -1692,21 +1970,25 @@ export const narratorsApi = {
 				content,
 				...(opts?.skipRevert !== undefined ? { skipRevert: opts.skipRevert } : {}),
 				...(opts?.scope ? { scope: opts.scope } : {}),
+				...(opts?.revertPlan ? { revertPlan: opts.revertPlan } : {}),
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+				...(opts?.keepMediaIds ? { keepMediaIds: opts.keepMediaIds } : {}),
 				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
 				fileReferences: opts?.fileReferences,
+				composerDocument: opts?.composerDocument,
 			});
 		}
 
 		const res = await fetch(
-			`${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,
+			inputBlockId
+				? `${apiBase()}/narrators/${narratorId}/blocks/${encodeURIComponent(inputBlockId)}/edit-and-regenerate`
+				: `${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,
 			{
 				method: "POST",
 				headers,
 				body,
 			},
 		);
-		absorbRenewedToken(res, token);
 		if (res.status === 401) {
 			const error = await readFetchError(res, "Unauthorized");
 			throw new ApiError(error.message, 401, error.data);
@@ -1715,10 +1997,15 @@ export const narratorsApi = {
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
-		const result = (await res.json()) as { ok?: unknown; warnings?: RevertWarning[] };
+		const result = (await res.json()) as {
+			ok?: unknown;
+			warnings?: RevertWarning[];
+			revertResult?: FileChangeRevertApplyResponse;
+		};
 		return {
 			ok: result.ok === true,
 			...(result.warnings?.length ? { warnings: result.warnings } : {}),
+			...(result.revertResult ? { revertResult: result.revertResult } : {}),
 		};
 	},
 	editAssistantMessage: (narratorId: string, messageId: string, content: string) =>
@@ -1756,44 +2043,19 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "DELETE",
 		}),
-	deleteMessage: (
-		narratorId: string,
-		messageId: string,
-		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) => {
-		const query = new URLSearchParams();
-		if (opts?.skipRevert) query.set("skipRevert", "1");
-		// A narrator-scoped revert can refuse on conflict; widening the scope is the
-		// remedy the error suggests, so it has to be reachable from the client.
-		if (opts?.scope) query.set("scope", opts.scope);
-		const suffix = query.size > 0 ? `?${query}` : "";
-		return request<{ ok: boolean; deletedCount: number }>(
-			`/narrators/${narratorId}/messages/${messageId}${suffix}`,
+	/** History-only: file restores go through a reviewed revert plan instead. */
+	deleteMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedCount: number }>(
+			`/narrators/${narratorId}/messages/${messageId}?skipRevert=1`,
 			{
 				method: "DELETE",
 			},
-		);
-	},
+		),
 	dismissSpecCarryoverMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/spec-carryover-messages/${messageId}`,
 			{
 				method: "DELETE",
-			},
-		),
-	/**
-	 * Start a turn for a review conclusion the narrator already holds.
-	 *
-	 * Writes no message: the conclusion row IS the user message and has been in the
-	 * history since the review concluded. `started: false` is a normal outcome (the
-	 * narrator is busy, or the row was already handled), not an error — either way the
-	 * findings are in the history the next request rebuilds.
-	 */
-	applyReviewFeedback: (narratorId: string, messageId: string) =>
-		request<{ ok: boolean; started: boolean; reason: string }>(
-			`/narrators/${narratorId}/review-feedback/${messageId}/apply`,
-			{
-				method: "POST",
 			},
 		),
 	dismissCwdRecoveryMessage: (narratorId: string, messageId: string) =>
@@ -1817,42 +2079,41 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
-	/** What deleting one tool_use block would roll back, for the confirm dialog. */
-	blockDeletePreview: (narratorId: string, messageId: string, blockIndex: number) =>
-		request<BlockDeletePreview>(
-			`/narrators/${narratorId}/block-delete-preview?messageId=${encodeURIComponent(
-				messageId,
-			)}&blockIndex=${blockIndex}`,
-		),
-	deleteMessageBlock: (
-		narratorId: string,
-		messageId: string,
-		blockIndex: number,
-		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) => {
-		const params = new URLSearchParams();
-		if (opts?.skipRevert) params.set("skipRevert", "1");
-		if (opts?.scope) params.set("scope", opts.scope);
-		const query = params.toString();
-		return request<{ ok: boolean; messageDeleted: boolean }>(
-			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}${
-				query ? `?${query}` : ""
-			}`,
-			{ method: "DELETE" },
-		);
-	},
-	deleteMessageBlocks: (
-		narratorId: string,
-		blocks: Array<{ messageId: string; blockIndex: number }>,
-		opts?: { skipRevert?: boolean },
-	) =>
-		request<{ ok: boolean; deleted: number; failed: number }>(
-			`/narrators/${narratorId}/messages/batch-blocks`,
+	/**
+	 * Close the post-error subagent recovery card without restarting anything.
+	 * Neither resumes nor records a selection: the offer is simply withdrawn, and
+	 * the server's per-subagent watermark keeps it from being offered again.
+	 */
+	dismissSubagentRecoveryMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; deletedMessageIds: string[] }>(
+			`/narrators/${narratorId}/subagent-recovery-messages/${messageId}`,
 			{
 				method: "DELETE",
-				body: JSON.stringify({ blocks, skipRevert: opts?.skipRevert === true }),
 			},
 		),
+	/** History-only: deleting a tool block with its files uses `applyRevertPlan`. */
+	deleteMessageBlock: async (narratorId: string, { blockId }: BlockTarget) => {
+		// The whole block the element belongs to (§5.5).
+		const result = await deleteBlocksById(narratorId, [blockId]);
+		return {
+			ok: result.ok,
+			messageDeleted: result.results.some((item) => item.messageDeleted),
+		};
+	},
+	/** History-only: a multi-block selection has no previewable file restore plan. */
+	deleteMessageBlocks: async (
+		narratorId: string,
+		targets: readonly BlockTarget[],
+	): Promise<{
+		ok: boolean;
+		deleted: number;
+		failed: number;
+		revertResult?: FileChangeRevertApplyResponse;
+	}> => {
+		const ids = [...new Set(targets.map((target) => target.blockId))];
+		const { ok, deleted, failed, revertResult } = await deleteBlocksById(narratorId, ids);
+		return { ok, deleted, failed: failed ?? 0, ...(revertResult ? { revertResult } : {}) };
+	},
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "PATCH",
@@ -1873,10 +2134,6 @@ export const narratorsApi = {
 		}),
 	getSegmentCompactSummary: (narratorId: string, messageId: string) =>
 		request<{ summary: string }>(`/narrators/${narratorId}/segment-compact/${messageId}`),
-	getSegmentCompactMessages: (narratorId: string, messageId: string) =>
-		request<{ messages: unknown[] }>(
-			`/narrators/${narratorId}/segment-compact/${messageId}/messages`,
-		),
 	deleteSegmentCompact: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact/${messageId}`, {
 			method: "DELETE",
@@ -1887,42 +2144,22 @@ export const narratorsApi = {
 			body: JSON.stringify({ summary }),
 		}),
 
-	// File tree — current uncommitted Git line counts, relative to this narrator's cwd.
+	// File tree — current Git changes relative to this narrator's cwd; legacy line counts are optional.
 	getFileTreeStatus: (narratorId: string) =>
 		request<{
 			isGitRepo: boolean;
-			files: Array<{ path: string; linesAdded: number; linesRemoved: number }>;
+			files: Array<{
+				path: string;
+				status?: string;
+				oldPath?: string;
+				linesAdded?: number;
+				linesRemoved?: number;
+			}>;
 			totalFiles: number;
+			totalFilesExact?: boolean;
 			truncated: boolean;
 		}>(`/narrators/${narratorId}/file-tree-status`),
 
-	// File rollback previews
-	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) =>
-		request<
-			RevertScopePreviews<RevertPreviewFile> & {
-				toolCallCount: number;
-				deletedBlockCount: number;
-				deletedMessageCount: number;
-			}
-		>(
-			`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}&blockIndex=${blockIndex}`,
-		),
-	/**
-	 * What editing this user message and regenerating would roll back.
-	 *
-	 * Same endpoint as the rollback preview, with no `blockIndex`: editing keeps the
-	 * whole user turn and truncates what follows, which is exactly the window the
-	 * server computes when no index is given. Sharing it is what keeps the dialog's
-	 * promise identical to the rollback that runs.
-	 */
-	getEditRegeneratePreview: (narratorId: string, messageId: string) =>
-		request<
-			RevertScopePreviews<RevertPreviewFile> & {
-				toolCallCount: number;
-				deletedBlockCount: number;
-				deletedMessageCount: number;
-			}
-		>(`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}`),
 	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>
 		request<{
 			deviceId: string;
@@ -1945,7 +2182,7 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
 		),
 
-	// Ordinary conversation fork (standalone output, including legacy chapter sources).
+	// Ordinary conversation fork (standalone output).
 	// The fork point is identified by the local narrator message id: only
 	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
 	// from a user message.
@@ -1963,30 +2200,32 @@ export const narratorsApi = {
 		narratorId: string,
 		opts: { sourceMessageId: string; sourceMessageUuid?: string },
 	) =>
-		request<{ messageId: string; message?: TreeMessage }>(
+		request<{ messageId: string; message?: unknown }>(
 			`/narrators/${narratorId}/ask-in-passing/start`,
 			{
 				method: "POST",
 				body: JSON.stringify(opts),
 			},
-		),
+		).then(decodeBlockMessage),
 	askInPassing: (
 		narratorId: string,
 		opts: {
 			question: string;
 			pendingMessageId: string;
+			/** Selected excerpt; the fork receives it as a quote block ahead of the question. */
+			quote?: { label: string; text: string; anchor?: string };
 		},
 	) =>
-		request<ApiEntity & { message?: TreeMessage }>(`/narrators/${narratorId}/ask-in-passing`, {
+		request<ApiEntity & { message?: unknown }>(`/narrators/${narratorId}/ask-in-passing`, {
 			method: "POST",
 			body: JSON.stringify(opts),
-		}),
+		}).then((response) => decodeBlockMessage(response) as ApiEntity & { message?: TreeMessage }),
 	cancelAskInPassing: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/ask-in-passing/${messageId}`, {
 			method: "DELETE",
 		}),
 	promoteNarrator: (narratorId: string) =>
-		request<{ type: "unlocked" | "forked"; narratorId: string; narrator?: ApiEntity }>(
+		request<{ type: "unlocked"; narratorId: string; narrator?: ApiEntity }>(
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
 		),
@@ -2090,21 +2329,6 @@ export const narratorsApi = {
 			if (!res.ok) throw new Error(`interact failed: ${res.status}`);
 			return res.blob();
 		}),
-	/**
-	 * Fetch the raw SSE request/response dump for a leaked-tool-call diagnostic.
-	 * Narrator-scoped so non-admin users can download the data while debugging.
-	 */
-	getLeakedToolDump: (narratorId: string, apiRequestId: string) =>
-		request<{
-			id: string;
-			narratorId: string;
-			provider: string;
-			model: string;
-			createdAt: string;
-			errorMessage: string | null;
-			rawDump: unknown;
-		}>(`/narrators/${narratorId}/leaked-tool-dump/${apiRequestId}`),
-
 	// ── Access control (sharing) ───────────────────────────────────────────────
 
 	getNarratorAccess: (narratorId: string) =>
@@ -2146,6 +2370,28 @@ export const narratorsApi = {
 
 	// ── Prompt optimization ────────────────────────────────────────────────────
 
+	/**
+	 * Optimize prompt text that has no narrator yet (the "new session" dialog's
+	 * project-prompt box). Same styles and model as the composer's button, but there is
+	 * no session to authorize against or read conversation context from.
+	 */
+	optimizeDraftPrompt: (
+		text: string,
+		style: "clarify" | "concise" | "structured" | "translate_en",
+		options?: { signal?: AbortSignal },
+	) =>
+		request<{ text: string; model: string; reasoningSummary?: string }>(
+			// NOT under `/narrators`: that router resolves a `:id` for every sub-path it
+			// serves, so a narrator-less call there is read as a narrator id and answered
+			// with "Narrator not found". The draft route is its own group.
+			"/prompt-optimize/draft",
+			{
+				method: "POST",
+				body: JSON.stringify({ text, style }),
+				signal: options?.signal,
+			},
+		),
+
 	optimizePrompt: (
 		narratorId: string,
 		text: string,
@@ -2156,14 +2402,17 @@ export const narratorsApi = {
 			signal?: AbortSignal;
 		},
 	) =>
-		request<{ text: string; model: string }>(`/narrators/${narratorId}/optimize-prompt`, {
-			method: "POST",
-			body: JSON.stringify({
-				text,
-				style,
-				withContext: options?.withContext,
-				messageId: options?.messageId,
-			}),
-			signal: options?.signal,
-		}),
+		request<{ text: string; model: string; reasoningSummary?: string }>(
+			`/narrators/${narratorId}/optimize-prompt`,
+			{
+				method: "POST",
+				body: JSON.stringify({
+					text,
+					style,
+					withContext: options?.withContext,
+					messageId: options?.messageId,
+				}),
+				signal: options?.signal,
+			},
+		),
 };

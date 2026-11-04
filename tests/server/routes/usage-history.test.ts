@@ -1,16 +1,23 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
-import {
-	REQUEST_DUMP_SPILL_DIR,
-	REQUEST_DUMP_SPILL_POINTER_SCHEMA,
-} from "@server/lib/api-request-dump-store";
-import { getNarraforkPath } from "@server/lib/narrafork-home";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { buildAppErrorResponse } from "@server/lib/app-error-response";
 import {
 	createUsageHistoryRoutes,
 	type UsageHistoryRouteService,
 } from "@server/routes/usage-history";
+import type { AuthSessionStore } from "@server/services/auth/session-store";
+import { authMfaStore, authSessionStore, setAuthStores } from "@server/services/auth/store";
+import type { TokenRecalculationJob, TokenRecalculationRange } from "@shared/token-recalculation";
 import { Hono } from "hono";
+
+/**
+ * The "real admin middleware" cases below use the default `requireAdmin`, which authorizes
+ * against the LIVE role read through the session store, never the token's `role` claim. The
+ * injected `requireAuth` only sets `c.get("user")`, so this seam makes the store report each
+ * acting user's role (admin → allowed, user → 403). Without it the lookup would hit the real
+ * (empty) database and 401 USER_GONE instead of 403.
+ */
+const ADMIN_ACTOR_IDS = new Set(["administrator"]);
+const SEEN_ACTOR_IDS = [...ADMIN_ACTOR_IDS, "ordinary"];
 
 const listUsageHistoryCursor = mock(async () => ({
 	records: [],
@@ -24,8 +31,6 @@ const unexpectedServiceCall = async (): Promise<never> => {
 	throw new Error("Unexpected usage history service call");
 };
 
-const getRawDumpSource = mock(unexpectedServiceCall);
-
 const service: UsageHistoryRouteService = {
 	listUsageHistoryCursor,
 	listUsageHistory,
@@ -33,7 +38,6 @@ const service: UsageHistoryRouteService = {
 	getUsageStats: unexpectedServiceCall,
 	getUsageTimeSeries: unexpectedServiceCall,
 	getUsageRecord: unexpectedServiceCall,
-	getRawDumpSource,
 	getUsageBreakdown: unexpectedServiceCall,
 	getUsageTimeSeriesStacked: unexpectedServiceCall,
 };
@@ -56,8 +60,21 @@ app.onError((error, c) => {
 app.route("/", usageHistoryRoutes);
 
 beforeEach(() => {
+	const store: AuthSessionStore = {
+		...authSessionStore,
+		findSessionState: async (id) => ({
+			id,
+			role: ADMIN_ACTOR_IDS.has(id) ? "admin" : "user",
+			tokenVersion: 0,
+		}),
+	};
+	setAuthStores({ session: store, mfa: authMfaStore });
 	listUsageHistoryCursor.mockClear();
 	listUsageHistory.mockClear();
+});
+
+afterEach(() => {
+	setAuthStores(undefined);
 });
 
 function encodeRawCursor(createdAt: string): string {
@@ -149,7 +166,7 @@ describe("usage history user filters and authorization", () => {
 		expect(calls[3].options).toMatchObject({ dimension: "user" });
 	});
 
-	test("real admin middleware blocks ordinary users from all usage and dump routes", async () => {
+	test("real admin middleware blocks ordinary users from all usage routes", async () => {
 		const guarded = new Hono();
 		guarded.onError((error, c) =>
 			c.json(
@@ -176,7 +193,6 @@ describe("usage history user filters and authorization", () => {
 			"/timeseries-stacked?dimension=user&metric=cost",
 			"/providers",
 			"/request-id",
-			"/request-id/raw-dump",
 		]) {
 			expect((await guarded.request(path)).status).toBe(403);
 		}
@@ -189,7 +205,7 @@ describe("usage history user filters and authorization", () => {
 		guarded.onError((_error, c) => c.json({ error: "unauthorized" }, 401));
 		guarded.route("/", createUsageHistoryRoutes({ service }));
 		expect((await guarded.request("/?userId=alice-id")).status).toBe(401);
-		expect((await guarded.request("/request-id/raw-dump")).status).toBe(401);
+		expect((await guarded.request("/request-id")).status).toBe(401);
 	});
 
 	test("real admin middleware permits administrator queries", async () => {
@@ -201,6 +217,163 @@ describe("usage history user filters and authorization", () => {
 			service,
 		});
 		expect((await guarded.request("/?pagination=cursor&userId=alice-id")).status).toBe(200);
+	});
+});
+
+describe("token recalculation routes", () => {
+	function fixture(actor: "administrator" | "ordinary" | null = "administrator") {
+		const job: TokenRecalculationJob = {
+			id: "recalculation-job",
+			status: "running",
+			startedAt: "2026-10-26T00:00:00.000Z",
+			finishedAt: null,
+			scanned: 10,
+			processed: 8,
+			changed: 6,
+			skipped: 2,
+			fallback: 1,
+			error: null,
+		};
+		const recalculationService = {
+			get: mock((): TokenRecalculationJob | null => job),
+			start: mock((range: TokenRecalculationRange) => ({ ...job, ...range })),
+			cancel: mock((id: string) => ({ ...job, id })),
+		};
+		const getUsageRecord = mock(unexpectedServiceCall);
+		const guarded = new Hono();
+		// Mirror production error serialization instead of masking every thrown error as 400.
+		guarded.onError(
+			(error, c) => buildAppErrorResponse(error, c) ?? c.json({ error: "Internal error" }, 500),
+		);
+		guarded.route(
+			"/",
+			createUsageHistoryRoutes({
+				requireAuth: actor
+					? async (c, next) => {
+							// A claimed admin role must not bypass the live ordinary-user role.
+							c.set("user", { sub: actor, role: "admin", iat: 0, exp: 4_102_444_800 });
+							await next();
+						}
+					: undefined,
+				service: { ...service, getUsageRecord },
+				recalculationService,
+			}),
+		);
+		return { guarded, recalculationService, getUsageRecord, job };
+	}
+
+	test.each([
+		["ordinary", 403],
+		[null, 401],
+	] as const)("%s cannot inspect, start, or cancel jobs", async (actor, status) => {
+		const { guarded, recalculationService, getUsageRecord } = fixture(actor);
+		for (const [path, method] of [
+			["/token-recalculation", "GET"],
+			["/token-recalculation", "POST"],
+			["/token-recalculation/recalculation-job/cancel", "POST"],
+		]) {
+			const response = await guarded.request(path, {
+				method,
+				...(method === "POST"
+					? { headers: { "Content-Type": "application/json" }, body: "{}" }
+					: {}),
+			});
+			expect(response.status).toBe(status);
+		}
+		expect(recalculationService.get).not.toHaveBeenCalled();
+		expect(recalculationService.start).not.toHaveBeenCalled();
+		expect(recalculationService.cancel).not.toHaveBeenCalled();
+		expect(getUsageRecord).not.toHaveBeenCalled();
+	});
+
+	test("administrator reads status and cancels the exact job without hitting /:id", async () => {
+		const { guarded, recalculationService, getUsageRecord, job } = fixture();
+		const response = await guarded.request("/token-recalculation");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ job });
+		expect(recalculationService.get).toHaveBeenCalledTimes(1);
+		recalculationService.get.mockReturnValueOnce(null);
+		expect(await (await guarded.request("/token-recalculation")).json()).toEqual({ job: null });
+		const cancelled = await guarded.request("/token-recalculation/exact-job-id/cancel", {
+			method: "POST",
+		});
+		expect(cancelled.status).toBe(200);
+		expect(await cancelled.json()).toEqual({ job: { ...job, id: "exact-job-id" } });
+		expect(recalculationService.cancel).toHaveBeenCalledWith("exact-job-id");
+		expect(getUsageRecord).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		{},
+		{ startDate: "2026-10-01" },
+		{ endDate: "2026-10-26" },
+		{ startDate: "2026-10-01", endDate: "2026-10-26" },
+		{ startDate: "2024-02-29", endDate: "2024-02-29" },
+	])("administrator starts a valid range with 202: %j", async (range) => {
+		const { guarded, recalculationService, getUsageRecord, job } = fixture();
+		const response = await guarded.request("/token-recalculation", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(range),
+		});
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({ job: { ...job, ...range } });
+		expect(recalculationService.start).toHaveBeenCalledWith(range);
+		expect(recalculationService.start).toHaveBeenCalledTimes(1);
+		expect(getUsageRecord).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		{ startDate: "not-a-date" },
+		{ endDate: "2026-02-30" },
+		{ startDate: "2026-02-29" },
+		{ startDate: "2026-10-01T00:00:00Z" },
+		{ startDate: "2026-10-27", endDate: "2026-10-26" },
+		{ startDate: "2026-10-01", unknown: true },
+		{ startDate: 123 },
+		null,
+		[],
+	])("rejects an invalid range before starting work: %j", async (range) => {
+		const { guarded, recalculationService } = fixture();
+		const response = await guarded.request("/token-recalculation", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(range),
+		});
+		expect(response.status).toBe(400);
+		expect(recalculationService.start).not.toHaveBeenCalled();
+	});
+
+	test("rejects malformed JSON before starting work", async () => {
+		const { guarded, recalculationService } = fixture();
+		const response = await guarded.request("/token-recalculation", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: "{",
+		});
+		expect(response.status).toBe(400);
+		expect(recalculationService.start).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		false,
+		true,
+	])("enforces the 1024-byte boundary with Content-Length=%s", async (contentLength) => {
+		const { guarded, recalculationService } = fixture();
+		for (const size of [1024, 1025]) {
+			recalculationService.start.mockClear();
+			const headers = new Headers({ "Content-Type": "application/json" });
+			if (contentLength) headers.set("Content-Length", String(size));
+			const response = await guarded.request("/token-recalculation", {
+				method: "POST",
+				headers,
+				// Whitespace is valid JSON padding, so rejection can only be the body limit.
+				body: `{${" ".repeat(size - 2)}}`,
+			});
+			expect(response.status).toBe(size === 1024 ? 202 : 413);
+			if (size === 1024) expect(recalculationService.start).toHaveBeenCalledWith({});
+			else expect(recalculationService.start).not.toHaveBeenCalled();
+		}
 	});
 });
 
@@ -259,192 +432,5 @@ describe("usage history pagination route", () => {
 			pageSize: 2,
 			totalPages: 2,
 		});
-	});
-});
-
-/**
- * The download route's whole purpose is that a user who opens a dump gets ALL of it. Each
- * test here pins one way that promise could quietly break: serving the row when a file
- * exists, 404ing when the file was pruned, or following a path outside the dump directories.
- */
-describe("usage history raw dump download", () => {
-	const baseRecord = {
-		id: "req-1",
-		narratorId: "n-1",
-		narratorTitle: "Diagnose the rejection",
-		chapterId: "ch-1",
-		chapterTitle: "request dumps",
-		projectId: "proj-1",
-		kind: "narrator",
-		provider: "nug2",
-		credentialId: null,
-		credentialName: "work@example.invalid",
-		model: "nug2:anthropic:claude-opus-5",
-		errorMessage: "Improperly formed request.",
-		createdAt: "2026-08-19T10:47:10.832Z",
-	};
-
-	beforeEach(() => {
-		getRawDumpSource.mockReset();
-	});
-
-	test("404s when the record has no dump at all", async () => {
-		getRawDumpSource.mockResolvedValueOnce({ ...baseRecord, rawDumpJson: null } as never);
-		const response = await app.request("/req-1/raw-dump");
-		expect(response.status).toBe(404);
-	});
-
-	/**
-	 * Both download paths must hand back ONE shape. This test previously asserted that the
-	 * response equalled the row string byte for byte, which froze the opposite into a
-	 * contract: the response shape depended on whether the dump happened to exceed a row
-	 * budget, and the inline path silently dropped the request identity that the old
-	 * client-side export attached (narrator/chapter/project/credential names). A dump gets
-	 * forwarded to whoever is helping diagnose it, so that identity has to travel with it.
-	 */
-	test("wraps the row's dump in the same envelope a spill file carries", async () => {
-		const inline = JSON.stringify({ request: { body: { hello: "world" } } });
-		getRawDumpSource.mockResolvedValueOnce({ ...baseRecord, rawDumpJson: inline } as never);
-
-		const response = await app.request("/req-1/raw-dump");
-		expect(response.status).toBe(200);
-		const body = JSON.parse(await response.text()) as Record<string, unknown>;
-
-		expect(body.schema).toBe("narrafork.api-request-dump.v1");
-		expect(body.requestId).toBe("req-1");
-		expect(body.createdAt).toBe(baseRecord.createdAt);
-		expect(body.dump).toEqual({ request: { body: { hello: "world" } } });
-		// The metadata the previous client-side export provided and the bare-row response lost.
-		expect(body.narratorTitle).toBe("Diagnose the rejection");
-		expect(body.chapterId).toBe("ch-1");
-		expect(body.chapterTitle).toBe("request dumps");
-		expect(body.projectId).toBe("proj-1");
-		expect(body.credentialName).toBe("work@example.invalid");
-		expect(body.provider).toBe("nug2");
-		expect(body.errorMessage).toBe("Improperly formed request.");
-
-		expect(response.headers.get("content-disposition")).toContain("attachment");
-		// Never application/json: attacker-influenced text on a same-origin URL.
-		expect(response.headers.get("content-type")).toBe("application/octet-stream");
-		expect(response.headers.get("cache-control")).toBe("no-store");
-	});
-
-	test("serves the complete file, not the truncated row, when the dump spilled", async () => {
-		const spillPath = getNarraforkPath(REQUEST_DUMP_SPILL_DIR, "download-test.json");
-		const complete = JSON.stringify({
-			schema: "narrafork.api-request-dump.v1",
-			dump: { request: { body: { pad: "F".repeat(50_000) } } },
-		});
-		await mkdir(dirname(spillPath), { recursive: true });
-		await writeFile(spillPath, complete, "utf8");
-
-		// The row holds only a head plus the pointer — exactly the shape that used to be
-		// downloaded and mistaken for the whole dump.
-		getRawDumpSource.mockResolvedValueOnce({
-			...baseRecord,
-			rawDumpJson: JSON.stringify({
-				request: { bodyTextTruncated: true, bodyText: "FFF" },
-				spill: {
-					schema: REQUEST_DUMP_SPILL_POINTER_SCHEMA,
-					filePath: spillPath,
-					bytes: complete.length,
-					inlineTruncated: true,
-					note: "full dump on disk",
-				},
-			}),
-		} as never);
-
-		const response = await app.request("/req-1/raw-dump");
-		expect(response.status).toBe(200);
-		const text = await response.text();
-		expect(text).toBe(complete);
-		expect(text).not.toContain("bodyTextTruncated");
-
-		await rm(spillPath, { force: true });
-	});
-
-	test("falls back to the inline head when the spilled file was pruned", async () => {
-		// Pruning outlives the row, so a missing file must still yield what survived rather
-		// than a 404 that hides the head the row still has.
-		const inline = JSON.stringify({
-			request: { bodyTextTruncated: true, bodyText: "head only" },
-			spill: {
-				schema: REQUEST_DUMP_SPILL_POINTER_SCHEMA,
-				filePath: getNarraforkPath(REQUEST_DUMP_SPILL_DIR, "already-pruned.json"),
-				bytes: 999,
-				inlineTruncated: true,
-				note: "full dump on disk",
-			},
-		});
-		getRawDumpSource.mockResolvedValueOnce({ ...baseRecord, rawDumpJson: inline } as never);
-
-		const response = await app.request("/req-1/raw-dump");
-		expect(response.status).toBe(200);
-		const body = JSON.parse(await response.text()) as {
-			dump?: {
-				request?: { bodyText?: string };
-				spill?: { fileName?: string; filePath?: string; note?: string };
-			};
-		};
-		// What survived is still delivered, including the pointer's explanation of what is not.
-		expect(body.dump?.request?.bodyText).toBe("head only");
-		expect(body.dump?.spill?.note).toBe("full dump on disk");
-		// But not the server's path: a downloaded dump gets forwarded to whoever is helping
-		// diagnose it, and the path names the host's OS account. The file name is kept because
-		// it is what correlates the download with the server log line.
-		expect(body.dump?.spill?.filePath).toBeUndefined();
-		expect(body.dump?.spill?.fileName).toBe("already-pruned.json");
-	});
-
-	test("an unparseable row keeps its text verbatim inside the envelope", async () => {
-		// Re-encoding would destroy the malformed text someone is trying to read, so it is
-		// preserved exactly — but still enveloped, because a bare response for precisely the
-		// rows that need explaining is the shape inconsistency this route just removed.
-		const broken = '{ "request": truncated mid-write';
-		getRawDumpSource.mockResolvedValueOnce({ ...baseRecord, rawDumpJson: broken } as never);
-
-		const response = await app.request("/req-1/raw-dump");
-		expect(response.status).toBe(200);
-		const body = JSON.parse(await response.text()) as {
-			schema?: string;
-			requestId?: string;
-			dumpText?: string;
-			dumpParseError?: string;
-		};
-		expect(body.schema).toBe("narrafork.api-request-dump.v1");
-		expect(body.requestId).toBe("req-1");
-		expect(body.dumpText).toBe(broken);
-		expect(body.dumpParseError).toBeTruthy();
-	});
-
-	test("ignores a pointer aiming outside the dump directories", async () => {
-		// Defense in depth: the path comes from our own row, but a tampered or corrupted one
-		// must not turn this route into an arbitrary-file reader.
-		const inline = JSON.stringify({
-			request: { bodyText: "head" },
-			spill: {
-				schema: REQUEST_DUMP_SPILL_POINTER_SCHEMA,
-				filePath: getNarraforkPath("settings.json"),
-				bytes: 10,
-				inlineTruncated: true,
-				note: "tampered",
-			},
-		});
-		getRawDumpSource.mockResolvedValueOnce({ ...baseRecord, rawDumpJson: inline } as never);
-
-		const response = await app.request("/req-1/raw-dump");
-		expect(response.status).toBe(200);
-		const body = JSON.parse(await response.text()) as {
-			dump?: {
-				request?: { bodyText?: string };
-				spill?: { filePath?: string; fileName?: string };
-			};
-		};
-		// The row is served (not the file it pointed at), and the tampered path is not echoed
-		// back either — this branch would have leaked it if redaction were tied to the
-		// pruned-file case alone.
-		expect(body.dump?.request?.bodyText).toBe("head");
-		expect(body.dump?.spill?.filePath).toBeUndefined();
-		expect(body.dump?.spill?.fileName).toBe("settings.json");
 	});
 });

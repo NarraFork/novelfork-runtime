@@ -6,6 +6,7 @@ package rpc
 import (
 	"encoding/json"
 
+	"github.com/narrafork/remote-executor/internal/handlers"
 	"github.com/narrafork/remote-executor/internal/wire"
 )
 
@@ -32,8 +33,18 @@ const FeatureGlobBoundedV1 = "glob.bounded.v1"
 // bounded chunks and revalidates canonical identity and file size before returning.
 const FeatureFsReadBoundedV1 = "fs.read.bounded.v1"
 
+// Positional bounded reads; callers must negotiate this before sending offset.
+const FeatureFsReadOffsetV1 = "fs.read.offset.v1"
+
 // Executor-serialized check-and-replace; not an OS-level CAS against external writers.
 const FeatureFsConditionalWriteV1 = "fs.write.conditional.v1"
+
+// Atomic final-directory mkdir and exclusive initial file creation.
+const FeatureFsMkdirExclusiveV1 = "fs.mkdir.exclusive.v1"
+
+// Stronger additive capability: exclusive mkdir/write bind canonical parent
+// directory handles, rather than re-traversing a checked full pathname.
+const FeatureFsCreateBoundParentV1 = "fs.create.bound-parent.v1"
 
 // FeatureGitWorkspaceV1 covers structured, bounded, cancellable full Git management.
 const FeatureGitWorkspaceV1 = "git.workspace.v1"
@@ -41,12 +52,36 @@ const FeatureGitWorkspaceV1 = "git.workspace.v1"
 // FeatureGitWorkspaceWatchV1 adds bounded metadata-only workspace fingerprints.
 const FeatureGitWorkspaceWatchV1 = "git.workspace.watch.v1"
 
+// FeatureGitWorkspaceStatusV1 guarantees status-only scanning, no line statistics,
+// and early termination at the byte budget or 10000 complete logical records.
+const FeatureGitWorkspaceStatusV1 = "git.workspace.status.v1"
+
+// FeatureGitLineStatsV1 adds the independent, bounded lineStats read operation.
+const FeatureGitLineStatsV1 = "git.workspace.line-stats.v1"
+
 // FeatureGitCommitPreviewV1 adds read-only git.workspace operations commitDetail
 // and commitDiff. They read only the object database, never the working tree.
 // Preview maxBytes includes metadata and JSON escaping. CommitDiff reports
 // outputs.fileStatus=ok/not_found/too_large/invalid; outputs.found=0 is reserved
 // for missing commits. Historical file names must be UTF-8.
 const FeatureGitCommitPreviewV1 = "git.workspace.commit-preview.v1"
+
+// FeatureGitBranchesV1 adds the read-only `branches` operation. It returns the raw
+// for-each-ref and worktree listings in outputs under the keys the server's parser
+// already knows, so a server that predates branch management simply never asks.
+// Older executors lack it and are refused per operation, not per workspace.
+const FeatureGitBranchesV1 = "git.workspace.branches.v1"
+
+// FeatureGitBranchSwitchV1 adds the `checkout` write operation: switch to a local
+// branch, create one from a start point, or check out a remote branch with
+// --track. It runs under the same repository write lock as the other mutations.
+const FeatureGitBranchSwitchV1 = "git.workspace.branch-switch.v1"
+
+// FeatureGitRemoteSyncV1 adds the `push` and `fetch` write operations. Both talk to
+// a configured remote, so an executor started with --disable-shell refuses them:
+// credential helpers and pre-push hooks are external programs. There is no force
+// variant — a non-fast-forward is reported to the user, never overridden.
+const FeatureGitRemoteSyncV1 = "git.workspace.remote-sync.v1"
 
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
@@ -110,10 +145,18 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureFsWriteAtomicResolvedPathV1,
 		FeatureGlobBoundedV1,
 		FeatureFsReadBoundedV1,
+		FeatureFsReadOffsetV1,
 		FeatureFsConditionalWriteV1,
+		FeatureFsMkdirExclusiveV1,
 		FeatureGitWorkspaceV1,
 		FeatureGitWorkspaceWatchV1,
+		FeatureGitWorkspaceStatusV1,
+		FeatureGitLineStatsV1,
 		FeatureGitCommitPreviewV1,
+		FeatureGitBranchesV1,
+		FeatureGitBranchSwitchV1,
+		FeatureGitRemoteSyncV1,
+		FeatureEditorRawReadV1,
 	} {
 		seen := false
 		for _, feature := range features {
@@ -125,6 +168,17 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		if !seen {
 			features = append(features, required)
 		}
+	}
+	// Never let an arbitrary Features entry advertise unsupported os.Root semantics.
+	filtered := features[:0]
+	for _, feature := range features {
+		if feature != FeatureFsCreateBoundParentV1 {
+			filtered = append(filtered, feature)
+		}
+	}
+	features = filtered
+	if handlers.BoundParentCreationSupported() {
+		features = append(features, FeatureFsCreateBoundParentV1)
 	}
 	return json.Marshal(struct {
 		Git      bool     `json:"git"`

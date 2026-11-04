@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import { getTestDb } from "../../../tests/setup";
 import * as schema from "../../db/schema";
@@ -75,7 +76,9 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	}
 
 	mock.module("../../db", () => ({
+		activeDatabaseBackend: "sqlite",
 		sqlite,
+		databaseMaintenance: createSqliteMaintenance(() => sqlite),
 		db: new Proxy(fixtureDb, {
 			get(target, key, receiver) {
 				if (key === "query")
@@ -141,7 +144,6 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				substatus: [],
 				title: "Existing title",
 				cwd: import.meta.dir,
-				chapterId: null,
 			}),
 			persistUserMessage: async (id: string, text: string, blocks: unknown[]) =>
 				saveMessage(id, text, blocks),
@@ -219,32 +221,26 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 		},
 	}));
 	const session = await import("../narrator-session");
-	const subagent = await import("../subagent-executor");
-	const { toBufferSummary } = await import("../narrator-buffer");
-	const resumedInputs: Array<import("../subagent-runner").ContinueSubagentInput> = [];
-	const realRunner = { ...(await import("../subagent-runner")) };
-	mock.module("../subagent-runner", () => ({
-		...realRunner,
-		startContinuedSubagent: async (input: import("../subagent-runner").ContinueSubagentInput) => {
-			resumedInputs.push(input);
-			const userMessage =
-				input.persistPrompt !== false
-					? saveMessage(
-							input.subagentId,
-							input.prompt ?? "",
-							[...(input.fileReferences ?? []), { type: "text", text: input.prompt ?? "" }],
-							input.toolUseId,
-						)
-					: undefined;
-			return {
-				userMessage,
-				runId: "fixture-run",
-				completion: Promise.resolve("done"),
-				terminalCompletion: Promise.resolve("done"),
-			};
-		},
+	const buffer = await import("../narrator-buffer");
+	// The model boundary: these cases test send/save/edit persistence, never a run.
+	const runModule = await import("../agent-runtime/run");
+	const idleRun = Promise.resolve({
+		started: true,
+		output: "",
+		finalText: "",
+		hasError: false,
+		interrupted: false,
+		timedOut: false,
+	});
+	mock.module("../agent-runtime/run", () => ({
+		...runModule,
+		startNarratorRun: async () => ({
+			started: true,
+			foreground: idleRun,
+			terminal: idleRun,
+			completion: idleRun,
+		}),
 	}));
-	const { resumeSubagent } = await import("../subagent-resume");
 
 	function snapshot(): FileReferenceSnapshot {
 		return {
@@ -288,13 +284,12 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	beforeEach(() => {
 		sqlite.exec("DELETE FROM saved_messages");
 		state.activeNarrators.clear();
-		subagent.clearSubagentBufferedMessages("child");
+		buffer.clearBufferedMessages("child");
 		frames.length = 0;
 		failPersist = false;
 		suppressLoop = false;
 		includeTrailingSys = false;
 		currentTarget = "";
-		resumedInputs.length = 0;
 		settings.anthropicProviders = [
 			{
 				id: "refs",
@@ -309,7 +304,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	});
 	afterAll(() => {
 		state.activeNarrators.clear();
-		subagent.clearSubagentBufferedMessages("child");
+		buffer.clearBufferedMessages("child");
 		sqlite.close();
 	});
 
@@ -376,8 +371,9 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				expect(saved.contentText).toBe(text);
 				expect(getFileReferenceSnapshots(saved.contentJson)).toEqual([snapshot()]);
 				expectMetadataOnlyFrames();
-				const recovered = session.resolvePoppedTrailingUserText([saved]);
-				expect(recovered).toContain(snapshot().snapshotText);
+				// The saved row carries its frozen bytes into the model history.
+				const [projected] = projectFileReferencesForModel([saved as DbMessage]);
+				expect(projected.contentText).toContain(snapshot().snapshotText);
 			}
 		});
 
@@ -423,159 +419,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 		});
 	});
 
-	describe("subagent continuation and retry", () => {
-		test("official retry before trailing sys carries the saved material only in current input", async () => {
-			includeTrailingSys = true;
-			settings.anthropicProviders = (settings.anthropicProviders ?? []).map((provider) => ({
-				...provider,
-				officialApi: true,
-			}));
-			saveMessage("resume-official", "", [snapshot()], "origin");
-			const result = await resumeSubagent({
-				subagentId: "resume-official",
-				intent: "retry_last_input",
-				actor: "user",
-				locale: "en",
-				skipConclusionDelivery: true,
-				retryRevertFiles: false,
-			});
-			await result.terminalCompletion;
-			const current = resumedInputs[0];
-			expect(JSON.stringify(current.initialHistory)).not.toContain(snapshot().snapshotText);
-			expect(current.prompt).toContain(snapshot().snapshotText);
-			expect(current.initialHistory).toContainEqual({
-				role: "system",
-				content: "standing reminder",
-			});
-			expect(getFileReferenceSnapshots(allMessages()[0].contentJson)).toEqual([snapshot()]);
-		});
-
-		test("a reference-only retry uses accepted bytes from the saved message", async () => {
-			saveMessage("resume-child", "", [snapshot()], "origin");
-			const result = await resumeSubagent({
-				subagentId: "resume-child",
-				intent: "retry_last_input",
-				actor: "user",
-				locale: "en",
-				skipConclusionDelivery: true,
-				retryRevertFiles: false,
-			});
-			await result.terminalCompletion;
-			expect(resumedInputs[0].persistPrompt).toBe(false);
-			expect(resumedInputs[0].prompt).toContain(snapshot().snapshotText);
-			expect(allMessages()).toHaveLength(1);
-		});
-
-		test("a reference-only follow-up passes snapshots to continuation without pre-projecting stored text", async () => {
-			const refs = [snapshot()];
-			const resuming = resumeSubagent({
-				subagentId: "resume-followup",
-				intent: "follow_up",
-				actor: "user",
-				locale: "en",
-				skipConclusionDelivery: true,
-				prompt: "",
-				fileReferences: refs,
-			});
-			refs[0].snapshotText = "caller changed while resume waited";
-			const result = await resuming;
-			await result.terminalCompletion;
-			expect(resumedInputs[0].prompt).toBe("");
-			expect(resumedInputs[0].fileReferences).toEqual([snapshot()]);
-			expect(getFileReferenceSnapshots(result.userMessage?.contentJson)).toEqual([snapshot()]);
-			expectMetadataOnlyFrames();
-		});
-	});
-
-	describe("subagent's existing queue", () => {
-		test("official queue consumption before sys includes accepted bytes exactly once", async () => {
-			includeTrailingSys = true;
-			settings.anthropicProviders = (settings.anthropicProviders ?? []).map((provider) => ({
-				...provider,
-				officialApi: true,
-			}));
-			await subagent.pushSubagentBufferedMessage("child", "inspect", {
-				fileReferences: [snapshot()],
-			});
-			const consumed = await subagent.consumeNextBufferedSubagentMessage({
-				narratorId: "child",
-				parentNarratorId: "n",
-				toolUseId: "origin",
-				model: "model",
-				provider: "refs",
-				cwd: import.meta.dir,
-			});
-			expect(JSON.stringify(consumed?.history)).not.toContain(snapshot().snapshotText);
-			expect(consumed?.prompt.split(snapshot().snapshotText)).toHaveLength(2);
-			expect(consumed?.history).toContainEqual({ role: "system", content: "standing reminder" });
-			expect(getFileReferenceSnapshots(allMessages()[0].contentJson)).toEqual([snapshot()]);
-		});
-
-		test("concurrent drains cannot dispatch one accepted snapshot twice", async () => {
-			await subagent.pushSubagentBufferedMessage("child", "", { fileReferences: [snapshot()] });
-			const options = {
-				narratorId: "child",
-				parentNarratorId: "n",
-				toolUseId: "origin",
-				model: "model",
-				provider: "refs",
-				cwd: import.meta.dir,
-			};
-			const consumed = await Promise.all([
-				subagent.consumeNextBufferedSubagentMessage(options),
-				subagent.consumeNextBufferedSubagentMessage(options),
-			]);
-			expect(consumed.filter(Boolean)).toHaveLength(1);
-			expect(allMessages()).toHaveLength(1);
-		});
-
-		test("priority edits retain immutable snapshots and consume projects them once", async () => {
-			const input = snapshot();
-			const pushed = await subagent.bufferSubagentUserMessage("child", "inspect", {
-				priority: true,
-				fileReferences: [input],
-			});
-			input.reference.path = "/changed";
-			input.snapshotText = "changed";
-			await subagent.updateSubagentBufferedMessage("child", pushed.id, "edited text");
-			const before = subagent.getSubagentBufferedMessages("child");
-			expect(before[0].fileReferences).toEqual([snapshot()]);
-			expect(toBufferSummary(before)[0].fileReferences).toEqual([snapshot().reference]);
-			expect(subagent.canDeliverBufferedMessageInPass(before[0], null)).toBe(false);
-			const consumed = await subagent.consumeNextBufferedSubagentMessage({
-				narratorId: "child",
-				parentNarratorId: "n",
-				toolUseId: "origin",
-				model: "model",
-				provider: "refs",
-				cwd: import.meta.dir,
-			});
-			expect(consumed?.prompt.split(snapshot().snapshotText).length).toBe(2);
-			expect(allMessages()[0].contentText).toBe("edited text");
-			expect(getFileReferenceSnapshots(allMessages()[0].contentJson)).toEqual([snapshot()]);
-			expectMetadataOnlyFrames();
-			expect(subagent.getSubagentBufferedMessages("child")).toEqual([]);
-		});
-
-		test("failed consume keeps accepted snapshots queued for the retry", async () => {
-			await subagent.pushSubagentBufferedMessage("child", "", { fileReferences: [snapshot()] });
-			failPersist = true;
-			const options = {
-				narratorId: "child",
-				parentNarratorId: "n",
-				toolUseId: "origin",
-				model: "model",
-				provider: "refs",
-				cwd: import.meta.dir,
-			};
-			await expect(subagent.consumeNextBufferedSubagentMessage(options)).rejects.toThrow(
-				"fixture persistence failed",
-			);
-			expect(subagent.getSubagentBufferedMessages("child")[0].fileReferences).toEqual([snapshot()]);
-			failPersist = false;
-			expect((await subagent.consumeNextBufferedSubagentMessage(options))?.prompt).toContain(
-				snapshot().snapshotText,
-			);
-		});
-	});
+	// Delegated sessions use these same send/retry paths; a reference-only retry of a
+	// delegated session runs against the real store in narrator-top-level-rule.test.ts
+	// (this fixture's private message table cannot drive the real retry reader).
 }

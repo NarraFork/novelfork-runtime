@@ -6,6 +6,7 @@ import react from "@vitejs/plugin-react";
 import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+import { resolveBuildGitHubRepository } from "../scripts/lib/build-repository";
 import { injectSpaBaseHref } from "../server/lib/spa-base-href";
 import {
 	assertAppShellJavaScriptIsPrecached,
@@ -14,6 +15,7 @@ import {
 	extractEmittedHtml,
 	filterAppShellManifest,
 } from "./build/app-shell-precache";
+import { editorCodecBuffer } from "./build/editor-codec-buffer";
 import {
 	buildPluginUiRuntime,
 	isMainApplicationBuild as isMainPluginRuntimeBuild,
@@ -512,9 +514,12 @@ export default defineConfig(({ mode, command }) => {
 			format: "es",
 			// Worker graphs have their own plugins: never inline Shiki's entire grammar registry.
 			// Editor-only workers do not import Shiki and need no substitution.
-			plugins: () => [shikiLanguageAliases(false)],
+			plugins: () => [shikiLanguageAliases(false), editorCodecBuffer()],
 		},
 		define: {
+			__NARRAFORK_BUILD_REPOSITORY__: JSON.stringify(
+				resolveBuildGitHubRepository({ root: resolve(__dirname, "..") }),
+			),
 			// Inject dev ports whenever running the dev server (regardless of mode)
 			// so that WS URL rewriting works in start:dev (production mode + vite serve)
 			__DEV_VITE_PORT__: isServe ? JSON.stringify(vitePort) : "undefined",
@@ -522,6 +527,7 @@ export default defineConfig(({ mode, command }) => {
 			__APP_VERSION__: JSON.stringify(appVersion),
 		},
 		plugins: [
+			editorCodecBuffer(),
 			watchSharedDirectory(),
 			devSpaBaseHref(),
 			shikiLanguageAliases(),

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { MeasureElement } from "@shared/pretext-layout/layout-pipeline";
 import type { NarratorMsg, PendingPermission } from "../narrator-panel-types";
 import { measureInlinePermission } from "./measure/measure-permission";
@@ -66,31 +67,34 @@ function fixture({
 	const id = `permission-resize-${++documentId}`;
 	const requests = Array.from({ length: count }, (_, i) => request(`${id}-t${i}`));
 	const byTool = new Map(requests.map((permission) => [permission.toolUseId, permission]));
-	const tools: TreeMessage = {
-		id: `${id}-assistant`,
-		narratorId: id,
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: requests.map((permission) => ({
+	const tools: TreeMessage = rowWithElements(
+		{
+			id: `${id}-assistant`,
+			narratorId: id,
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			createdAt: "2026-08-01T00:00:00.000Z",
+			seq: 0,
+		},
+		requests.map((permission) => ({
 			type: "tool_use",
 			id: permission.toolUseId ?? "",
 			name: "Bash",
 			input: { command: "pwd" },
 			status: "pending",
 		})),
-		contentText: null,
-		toolCalls: [],
-		createdAt: "2026-08-01T00:00:00.000Z",
-		children: [],
-		seq: 0,
-	};
-	const tail: TreeMessage = {
-		...tools,
-		id: `${id}-user`,
-		role: "user",
-		contentJson: [{ type: "text", text: "Following message keeps the segment gap observable." }],
-		seq: 1,
-	};
+	);
+	const tail: TreeMessage = rowWithElements(
+		{
+			...tools,
+			id: `${id}-user`,
+			role: "user",
+			seq: 1,
+		},
+		[{ type: "text", text: "Following message keeps the segment gap observable." }],
+	);
 	const built = buildPretextDocumentLayout([tools, tail] as NarratorMsg[], {
 		layoutRevision: id,
 		documentRevision: id,
@@ -289,6 +293,9 @@ describe("permission forms reflow through real card measurements", () => {
 			inputJson: input,
 			outputJson: output,
 			detailPayload: { items: input, card: output },
+			durationMs: 150,
+			execDurationMs: 100,
+			fileChangeTiming: { waitMs: 80, executionMs: 20, totalMs: 100 },
 		};
 		const result = reflowPermissionForms(data, 420, base.resolve) as typeof data;
 		expect(result.inputJson).toBe(input);
@@ -297,7 +304,7 @@ describe("permission forms reflow through real card measurements", () => {
 		expect(reads).toBe(0);
 		expect(data.permissionForm?.height).toBe(900);
 		expect(result.permissionForm?.height).toBeUndefined();
-		measureToolCall(result, 420);
+		expect(measureToolCall(result, 420).displayDurationMs).toBe(20);
 		expect(reads).toBe(0);
 	});
 

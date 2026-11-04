@@ -73,11 +73,9 @@
  *   - generated code (`server/generated/`) — build output. `embedded-changelog.ts` embeds
  *     release notes that literally quote "bun:sqlite" in prose, which is a pure false positive.
  *
- * The PROJECT DATABASE is exempt by a different mechanism: it stays SQLite permanently, so its
- * files are registered like any other, with `sqliteOnly: true` (see `SQLITE_ONLY_MODULES`).
- * That is a claim the guard checks rather than a hole in the scan — and the distinction is
- * load-bearing: `<gitPath>/.narrafork/project.db` is a portable artifact users copy between
- * machines, so it is not migrating anywhere regardless of what the main database does.
+ * Modules that stay SQLite permanently are exempt by a different mechanism: they are
+ * registered like any other and additionally listed in `SQLITE_ONLY_MODULES`. That is a
+ * claim the guard checks rather than a hole in the scan.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -301,11 +299,11 @@ const CAPABILITIES: readonly Capability[] = [
 	},
 	{
 		id: "sessionFn",
-		what: "connection-scoped counter (`total_changes()`, `last_insert_rowid()`)",
+		what: "connection-scoped counter (`changes()`, `total_changes()`, `last_insert_rowid()`)",
 		why: "per-connection state; with a pooled/networked client the value belongs to whichever session served the call",
-		// These back the revert stack's mutation-detection fingerprints, so the semantics
-		// (counts my connection's changes) are load-bearing, not cosmetic.
-		pattern: /\b(?:total_changes|last_insert_rowid)\s*\(\s*\)/i,
+		// The generic name changes() also occurs in ordinary TypeScript helpers. Anchor that
+		// branch to the SELECT form used by affected-row queries, rather than matching helpers.
+		pattern: /\b(?:total_changes|last_insert_rowid)\s*\(\s*\)|\bSELECT\s+changes\s*\(\s*\)/i,
 	},
 	{
 		id: "errorCode",
@@ -357,44 +355,23 @@ const CAPABILITY_IDS: ReadonlySet<string> = new Set(CAPABILITIES.map((c) => c.id
  *
  * THE TEST FOR MEMBERSHIP: does a second backend REPLACE this file, or never call it at all?
  * ------------------------------------------------------------------------------------------
- * Three shapes are registered here, and they are not the same shape as a port adapter:
+ Two shapes are registered here, and they are not the same shape as a port adapter:
  *
- *   1. the PORTABLE ARCHIVE — `<gitPath>/.narrafork/project.db` and everything that opens it.
- *      Portability is the feature, so the file is SQLite regardless of what the main database
- *      becomes. A second backend still reads and writes these archives, through this same code.
- *   2. the SQLITE ENGINE ITSELF — the connection, migration replay, column patching, FTS5
+ *   1. the SQLITE ENGINE ITSELF — the connection, migration replay, column patching, FTS5
  *      setup, WAL/`.recover` repair, and the lifecycle/maintenance adapters that orchestrate
  *      them. A server-managed engine has no local file to `.recover`, no `application_id` to
  *      stamp and no `VACUUM`, so it answers `notApplicable` (see `backend/capability.ts`)
  *      rather than reimplementing any of it.
- *   3. LEGACY SQLITE DATA REPAIR — statements that exist only because SQLite files written by
+ *   2. LEGACY SQLITE DATA REPAIR — statements that exist only because SQLite files written by
  *      older builds are still in the field.
  *
  * What is deliberately NOT here: a MAIN-DATABASE adapter behind a port
- * (`services/search/sqlite-store.ts`, `services/project-archive/sqlite-main-store.ts`). Those
- * are registered like any other pending work, because a second backend supplies its own
+ * (`services/search/sqlite-store.ts`). Those are registered like any other pending work, because a second backend supplies its own
  * implementation of the same contract and the SQLite one stops being the answer. Marking them
  * as "staying" would say the port has nothing left to do, which is the opposite of true. The
  * last-but-one test in this file pins both directions of that distinction by name.
  */
 const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
-	[
-		"server/lib/project-db.ts",
-		"per-project `<gitPath>/.narrafork/project.db` — a portable file users copy between machines",
-	],
-	["server/services/project-db-sync.ts", "writes the per-project SQLite file"],
-	[
-		"server/services/project-archive/archive-file.ts",
-		"opens a portable `project.db` archive read-only; the archive is SQLite whatever the main database is",
-	],
-	[
-		"server/services/project-archive/archive-writer.ts",
-		"prepares the `INSERT OR REPLACE` statements that write into a portable archive file",
-	],
-	[
-		"server/services/project-archive/export-rows.ts",
-		"drives the archive-side (SQLite) writer while reading the main database through the port",
-	],
 	[
 		"server/db/connection.ts",
 		"the SQLite connection chokepoint itself (PRAGMA set + real-database test guard)",
@@ -408,6 +385,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 		"the SQLite maintenance adapter: `PRAGMA wal_checkpoint`/`optimize`, freelist pages, `VACUUM`, `SQLITE_BUSY` classification — none of which a server-managed engine exposes",
 	],
 	["server/db/run-migrations.ts", "applies the SQLite migration SQL in `drizzle/`"],
+	[
+		"server/db/legacy-request-storage.ts",
+		"finishes SQLite migration 0207's deferred column drops and clears its retained dumps",
+	],
 	["server/db/migrate.ts", "the `bun run db:migrate` entry point: opens the file and applies SQL"],
 	["server/db/ensure-columns.ts", "patches columns on SQLite databases from older versions"],
 	[
@@ -418,18 +399,35 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/db/migrate-narrator-drafts.ts", "one-time SQLite data migration"],
 	["server/db/integrity-probe-worker.ts", "read-only `PRAGMA integrity_check` subprocess"],
 	[
+		"server/db/snapshot-builder-worker.ts",
+		"固定表清单的快照构建子进程：ATTACH 源库后逐表 `INSERT … SELECT` 拷贝，再 `VACUUM` 压实；两者都是 SQLite 专属且 O(数据量) 的同步操作",
+	],
+	[
 		"server/db/integrity-check.ts",
 		"orchestrates the SQLite integrity probe and the `sqlite3 .recover` fallback",
 	],
 	["server/lib/db-resilience.ts", "WAL recovery and `sqlite3 .recover` CLI fallback"],
 	["server/lib/db-worker/worker-entry.ts", "read-only SQLite worker connection"],
-	["server/lib/db-worker/search-query.ts", "bounded read-only SQLite search worker execution"],
+	["server/lib/db-worker/select-rows.ts", "bounded read-only SQLite SELECT worker execution"],
+	["server/db/worker-read.ts", "routes Drizzle SQLite selects to the read-only worker"],
 	["server/lib/db-worker/storage-scan-runner.ts", "SQLite storage scan budgets"],
 	["server/services/storage-scan-queries.ts", "`dbstat`/page-level SQLite storage accounting"],
 	["server/services/database-cleanup-service.ts", "SQLite VACUUM / page accounting maintenance"],
 	[
+		"server/services/token-recalculation-sqlite.ts",
+		"SQLite batch adapter; PostgreSQL uses token-recalculation-postgres.ts instead",
+	],
+	[
+		"server/services/token-recalculation-worker.ts",
+		"SQLite-only background writer and short busy timeout; PostgreSQL uses its async client",
+	],
+	[
 		"server/services/file-change-physical-audit-worker.ts",
 		"SQLite-side physical audit in a worker",
+	],
+	[
+		"server/services/data-portability.ts",
+		"固定表清单的导出与导入：子进程逐表复制后再压实，ATTACH 之后靠 `sqlite_master` 与 `rowid` 按列交集拷贝；PostgreSQL 侧要走 `pg_dump`/`COPY` 的另一套实现",
 	],
 ]);
 
@@ -464,11 +462,27 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// `getDbPath` (the PG branch acquires the same instance lock at the same path — the lock
 	// guards local resources, not the database file). Neither opens a SQLite connection.
 	"server/db/index.ts": ["drizzleDialect", "driver", "connectionModule"],
+	"server/db/resource-protection-index.ts": ["driver"],
+	"server/services/resource-protection-index.ts": ["driver", "handle"],
 	"server/db/integrity-check.ts": ["connectionModule", "sqliteCli"],
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
 	"server/db/migrate.ts": ["connectionModule"],
-	"server/db/run-migrations.ts": ["driver", "pragma", "pragmaFn", "sqliteCatalog", "insertOr"],
+	// Deferred half of SQLite migration 0207; rowid batches clear dumps in one ordered pass.
+	"server/db/legacy-request-storage.ts": ["driver", "pragma", "sqliteCatalog", "rowid"],
+	"server/db/run-migrations.ts": [
+		"driver",
+		"pragma",
+		"pragmaFn",
+		"sqliteCatalog",
+		"insertOr",
+		// Bound the migration proof to the published trigger namespace; other triggers remain valid.
+		"glob",
+		// The `user_git_identities` backfill generates ids inside its INSERT…SELECT, the same
+		// way `narrator-service.ts` does for forked transcripts, rather than round-tripping
+		// every user row through JS during startup.
+		"blobFn",
+	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
 	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
 	// the raw-handle access path for its non-search reads.
@@ -476,23 +490,60 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
-	"server/lib/db-worker/search-query.ts": ["driver"],
+	"server/lib/db-worker/select-rows.ts": ["driver"],
+	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
-	"server/lib/project-db.ts": ["driver", "pragma"],
+	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
+	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
+	// （复制后压实），ATTACH + 按列交集拷贝回库，`INSERT OR IGNORE` 跳过已存在的行，
+	// `SQLITE_BUSY` 之类的错误码决定重试；源库与目标库都按文件路径打开。
+	"server/services/data-portability.ts": [
+		"connectionModule",
+		"driver",
+		"handle",
+		"pragma",
+		"sqliteCatalog",
+		"rowid",
+		"insertOr",
+		"errorCode",
+	],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
+	// History/display ports also have PG implementations. Register the SQLite branches
+	// and Database types without claiming these main-database modules are SQLite-only.
+	"server/services/agent-runtime/model-history-revision.ts": ["driver", "sqliteCatalog"],
+	// The trigger renderer emits both dialects; these are its SQLite branch (tool-block phase
+	// and sync-queue triggers). The PG branch spells them `::jsonb` and `ON CONFLICT`.
+	"server/services/agent-runtime/model-history-revision-sql.ts": ["json1", "insertOr"],
+	"server/services/agent-runtime/model-history-source.ts": ["driver"],
+	"server/services/agent-runtime/model-history-query.ts": ["driver"],
+	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
+	// Dual-backend snapshot worker: these capabilities belong to its SQLite branch.
+	"server/services/narrator-prefix-snapshots-worker.ts": [
+		"driver",
+		"connectionModule",
+		"pragma",
+		"errorCode",
+	],
+	// 固定表清单的构建同样放在独立进程：`INSERT … SELECT` 与 `VACUUM` 都是 O(数据量) 的同步操作。
+	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
+	"server/services/narrator-display-page-reader.ts": ["driver"],
+	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
+	// The injected occupancy source currently uses the SQLite builder; the maintained
+	// graph is backend-neutral, so this is not a permanently SQLite-only module.
+	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
 	// `pragma` and `errorCode` left this file for `backend/sqlite-maintenance.ts`. `vacuum` stays
 	// because the admin operation is still exposed from here (through the port), and the chain-
 	// end test below depends on that remaining true.
-	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "json1", "vacuum"],
+	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
-	"server/services/file-change-evidence.ts": ["nativeClient"],
+	"server/services/file-change-evidence.ts": ["driver", "nativeClient", "drizzleDialect"],
 	"server/services/file-change-physical-audit-worker.ts": [
 		"driver",
 		"pragma",
@@ -512,50 +563,81 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"glob",
 		"collate",
 	],
-	"server/services/file-state-rebuild.ts": ["json1"],
 	"server/services/git-current-diff-view.ts": ["rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode"],
-	"server/services/narrator-messages.ts": ["json1", "glob"],
-	"server/services/narrator-persistence.ts": ["handle", "json1"],
+	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
+	"server/services/narrator-panel-state.ts": ["json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
+	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
+	// The broken-call flag of a tool result is read in SQL so the result itself is not.
+	"server/services/narrator-block-sync.ts": [
+		"handle",
+		"sqliteCatalog",
+		"insertOr",
+		"rowid",
+		"json1",
+	],
+	// The block index job is SQLite-only like block storage: worker reads, rowid writes.
+	"server/services/narrator-block-index.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+	],
+	"server/services/narrator-epochs.ts": ["handle", "json1"],
+	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
+	"server/services/narrator-block-backfill.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+		"insertOr",
+		"indexHint",
+	],
+	// Its reindex reads which blocks the block index already has, by rowid.
+	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid", "sqliteCatalog", "fts5"],
+	// Operations addressed by block id resolve to element ranges from block rows.
+	"server/services/narrator-block-targets.ts": ["handle", "json1"],
+	// Message protocol v2 (§8): a page's envelopes read their block rows' layouts.
+	"server/services/narrator-block-page.ts": ["handle", "json1"],
+	// Scans that find envelopes through block rows (SQLite-only, like block storage).
+	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
+	// Main-thread Drizzle readers' bodies from block rows (SQLite-only, like block storage).
+	"server/services/narrator-body-reads.ts": ["handle", "json1"],
+	// The central body reader: selects block-format bodies and assembles them from rows.
+	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
+	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
+	// storage): exports, the session interchange, and the body length they measure in SQL.
+	"server/lib/narrator-body-length.ts": ["json1"],
+	"server/services/narrator-export.ts": ["handle"],
+	"server/services/session-interchange/export.ts": ["handle"],
+	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
-	"server/services/narrator-scoped-revert.ts": ["json1"],
 	"server/services/narrator-service.ts": ["blobFn"],
-	"server/services/narrator-session.ts": ["handle"],
+	"server/services/narrator-session.ts": ["handle", "rowid"],
 	"server/services/narrator-subagent-recovery.ts": ["handle"],
+	"server/services/notification-center-maintenance.ts": ["sessionFn"],
+	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
+	// The SQLite side of `outline/store/read-port.ts`: FTS5 search, and cached raw statements for
+	// the reads on every page read's path. The PostgreSQL store answers the same port (search
+	// from its pg_trgm shadow table).
+	"server/services/outline/store/sqlite-read.ts": ["handle", "rowid", "fts5"],
+	// The open-task read names the partial index's own predicate (`json_extract` of the task
+	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
+	"server/services/outline/store/sqlite-store.ts": ["json1"],
 	"server/services/parent-injection-queue.ts": ["json1"],
-	// The archive seam. Three files below are SQLite-only (the portable FILE), one is not:
-	// `sqlite-main-store.ts` is the MAIN database behind `ProjectArchiveMainStore`, so a second
-	// backend replaces it. `store.ts` — the module that picks the implementation — has no
-	// capability of its own and correctly does not appear here.
-	"server/services/project-archive/archive-file.ts": ["driver", "pragma"],
-	"server/services/project-archive/archive-writer.ts": ["driver", "pragma", "insertOr"],
-	"server/services/project-archive/export-rows.ts": ["driver"],
-	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
-	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
-	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
-	// PRAGMA work on the portable file stay.
-	"server/services/project-db-sync.ts": ["driver", "pragma", "json1"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",
 		"drizzleDialect",
 		"pragma",
 		"pragmaFn",
-		"sqliteCatalog",
 		"rowid",
 		"indexHint",
-		"fts5",
-		"insertOr",
 		"sessionFn",
 	],
-	"server/services/revert-mutation-journal.ts": [
-		"driver",
-		"nativeClient",
-		"drizzleDialect",
-		"pragma",
-		"json1",
-	],
+	"server/services/revert-mutation-journal.ts": ["driver", "nativeClient", "drizzleDialect"],
 	"server/services/revert-plan-service.ts": [
 		"driver",
 		"nativeClient",
@@ -563,17 +645,14 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 		"json1",
 	],
-	"server/services/revert-planner-local-access.ts": ["json1"],
-	"server/services/revert-planner-service.ts": ["nativeClient", "pragma", "sessionFn"],
+	"server/services/revert-planner-service.ts": ["nativeClient"],
 	"server/services/revert-selection-service.ts": [
 		"driver",
 		"nativeClient",
-		"pragma",
 		"rowid",
 		"indexHint",
-		"sessionFn",
+		"json1",
 	],
-	"server/services/revert-transaction-service.ts": ["nativeClient", "pragma", "sessionFn"],
 	"server/services/routine-service.ts": ["handle"],
 	// The whole search surface, in one file behind `services/search/port.ts`. NOT SQLite-only: a
 	// second backend implements the same `SearchStore` contract and this file stops being the
@@ -590,12 +669,30 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"fts5",
 		"errorCode",
 	],
+	"server/services/narrator-timeline.ts": ["json1"],
 	"server/services/subagent-activity.ts": ["json1"],
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
+	"server/services/token-recalculation-sqlite.ts": ["driver"],
+	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
-	"server/services/workspace-modification-view.ts": ["rowid"],
-	"server/services/workspace-write-coordinator.ts": ["drizzleDialect", "pragma"],
+	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
+	// New main-database read/write surfaces remain migration inventory, NOT permanent
+	// SQLite-only exemptions.
+	"server/lib/disk-safety.ts": ["driver", "errorCode"],
+	"server/services/context-composition-history.ts": ["driver"],
+	"server/services/file-change-diagnostics.ts": ["errorCode"],
+	"server/services/narrator-context-composition.ts": ["driver", "handle"],
+	"server/services/narrator-permission.ts": ["json1"],
+	"server/services/narrator-question-history.ts": [
+		"driver",
+		"drizzleDialect",
+		"rowid",
+		"indexHint",
+	],
+	"server/services/narrator-question-service.ts": ["rowid", "json1"],
+	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
+	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
 
@@ -898,20 +995,79 @@ describe("SQLite dialect inventory guard", () => {
 		}
 	});
 
-	it("self-check: every capability has at least one live user", () => {
-		// A pattern that matches nothing is indistinguishable from a broken one. Any capability
-		// listed in the ledger must therefore be observed by the scan somewhere.
-		//
-		// The exception is deliberate and named: `handle`'s namespace-import branch (case 4 in
-		// HANDLE_PATTERN) has no call site today and is covered by the detection self-check
-		// below instead. That is an over-approximating branch of an already-live capability,
-		// not a capability of its own, so it is not listed here.
-		const live = new Set(
-			[...scanRepository().values()].flatMap((findings) => findings.map((f) => f.capability.id)),
-		);
+	it("self-check: every capability detects source usage and rejects a near miss", () => {
+		// A detector must remain effective after its last production caller is removed. Pin
+		// both directions with fixtures instead of forcing the application to retain usage.
+		// Exact key coverage makes adding a capability without a detector test fail explicitly.
+		const fixtures: Readonly<Record<string, readonly [usage: string, nearMiss: string]>> = {
+			driver: [
+				'import { Database } from "bun:sqlite";',
+				'import { DatabaseSync } from "node:sqlite";',
+			],
+			handle: ['import { sqlite } from "../db";', 'import { db } from "../db";'],
+			nativeClient: ["db.$client.query(sql);", "const id = db.$clientId;"],
+			connectionModule: [
+				'import { openDatabase } from "../db/connection";',
+				'import { getDbDir } from "../db/connection";',
+			],
+			drizzleDialect: [
+				'import { drizzle } from "drizzle-orm/bun-sqlite";',
+				'import { drizzle } from "drizzle-orm/bun-sql";',
+			],
+			sqliteCli: ['const cmd = `sqlite3 "db" ".recover"`;', 'const extension = "sqlite3";'],
+			pragma: ['q("PRAGMA busy_timeout");', "const pragmaTimeout = 250;"],
+			pragmaFn: ['q("SELECT * FROM pragma_table_info(?)");', "pragmaTableInfo();"],
+			sqliteCatalog: ['q("SELECT name FROM sqlite_schema");', "const sqliteSchema = {};"],
+			dbstat: ['q("SELECT pgsize FROM dbstat");', 'const scanMode = "dbstat";'],
+			rowid: ['q("SELECT rowid FROM records");', "const rowId = record.id;"],
+			indexHint: ['q("SELECT id FROM records INDEXED BY records_id");', "const INDEXED_BY = true;"],
+			json1: ['q("SELECT json_valid(?)");', "const value = JSON.parse(raw);"],
+			fts5: [
+				'q("SELECT * FROM messages_fts WHERE messages_fts MATCH ?");',
+				"const messageFts = [];",
+			],
+			insertOr: [
+				'q("INSERT OR IGNORE INTO records (id) VALUES (?)");',
+				'q("INSERT INTO records (id) VALUES (?) ON CONFLICT DO NOTHING");',
+			],
+			glob: ['q("SELECT id FROM records WHERE name GLOB ?");', "const GLOBAL_SCOPE = {};"],
+			blobFn: ['q("SELECT randomblob(16)");', "const randomBlobSize = 16;"],
+			timeFn: ['q("SELECT unixepoch()");', "const time = unixEpochMillis();"],
+			sessionFn: ['q("SELECT total_changes()");', "const count = changes();"],
+			errorCode: ['const code = "SQLITE_BUSY";', 'const note = "SQLITE_BACKUP_NOTE";'],
+			collate: ['q("SELECT name COLLATE NOCASE FROM records");', "collateResults(rows);"],
+			vacuum: ["await vacuumDatabase();", "const vacuuming = false;"],
+		};
+		expect(Object.keys(fixtures).sort()).toEqual([...CAPABILITY_IDS].sort());
 		for (const capability of CAPABILITIES) {
-			expect(live.has(capability.id), `capability "${capability.id}" matches nothing`).toBe(true);
+			const [usage, nearMiss] = fixtures[capability.id];
+			const detect = (source: string) => scanSource(source).map((finding) => finding.capability.id);
+			expect(detect(usage), `${capability.id} must detect its source fixture`).toContain(
+				capability.id,
+			);
+			expect(detect(nearMiss), `${capability.id} must reject a near miss`).not.toContain(
+				capability.id,
+			);
+			expect(detect(`// ${usage}`), `${capability.id} must ignore commented-out usage`).toEqual([]);
 		}
+	});
+
+	it("self-check: removed session counters still require registration when reintroduced", () => {
+		const file = "fake/session-counter.ts";
+		const removed = liveFromSources({ [file]: "export const count = 0;" });
+		expect(diffAgainstLedger(removed, {})).toEqual({
+			unregistered: [],
+			vanishedFiles: [],
+			vanishedCapabilities: [],
+		});
+		for (const counter of ["changes()", "total_changes()", "last_insert_rowid()"] as const) {
+			const reintroduced = liveFromSources({ [file]: `q("SELECT ${counter}");` });
+			const diff = diffAgainstLedger(reintroduced, {});
+			expect(diff.unregistered.map(({ finding }) => finding.capability.id)).toEqual(["sessionFn"]);
+			expect(diff.unregistered[0]?.file).toBe(file);
+			expect(diffAgainstLedger(reintroduced, { [file]: ["sessionFn"] }).unregistered).toEqual([]);
+		}
+		expect(diffAgainstLedger(removed, { [file]: ["sessionFn"] }).vanishedFiles).toEqual([file]);
 	});
 
 	it("self-check: detects each capability in live code and ignores prose", () => {
@@ -1057,9 +1213,12 @@ describe("SQLite dialect inventory guard", () => {
 		expect(detect("q(\"SELECT strftime('%s', 'now')\");")).toContain("timeFn");
 		expect(detect("const julian = calendarDay(1);")).toEqual([]);
 
+		expect(detect('q("SELECT changes() AS value");')).toContain("sessionFn");
 		expect(detect('q("SELECT total_changes() AS value");')).toContain("sessionFn");
 		expect(detect('q("SELECT last_insert_rowid()");')).toContain("sessionFn");
 		expect(detect("const n = countTotalChanges();")).toEqual([]);
+		expect(detect("const n = changes();")).toEqual([]);
+		expect(detect("const n = state.changes();")).toEqual([]);
 
 		// biome-ignore lint/suspicious/noTemplateCurlyInString: intentional fixture, not a template
 		expect(detect("`WHERE ${column} COLLATE BINARY = ?`")).toContain("collate");
@@ -1155,19 +1314,6 @@ describe("SQLite dialect inventory guard", () => {
 			expect(registered).toContain(file);
 		}
 
-		// The portable archive is permanently SQLite — a file users copy between machines. Its
-		// modules must be marked as such rather than read as pending work. A second backend
-		// still reads and writes these archives through this same code.
-		for (const file of [
-			"server/lib/project-db.ts",
-			"server/services/project-db-sync.ts",
-			"server/services/project-archive/archive-file.ts",
-			"server/services/project-archive/archive-writer.ts",
-			"server/services/project-archive/export-rows.ts",
-		]) {
-			expect(SQLITE_ONLY_MODULES.has(file), `${file} writes/reads the portable archive`).toBe(true);
-		}
-
 		// The SQLite engine adapters behind `server/db/backend/`. A server-managed engine has no
 		// local file to `.recover` and no `VACUUM`; it answers `notApplicable` rather than
 		// inheriting a stub, so these are the floor and not migration work.
@@ -1176,20 +1322,15 @@ describe("SQLite dialect inventory guard", () => {
 	});
 
 	it("main-database port adapters are pending work, not the SQLite floor", () => {
-		// The other half of the distinction above, and the one that decays silently. These two
+		// The other half of the distinction above, and the one that decays silently. These
 		// files are SQLite implementations of a port whose whole purpose is that a second backend
 		// supplies a DIFFERENT implementation of the same contract. Marking them SQLite-only
-		// would read as "the port has nothing left to do", which is exactly backwards — and the
-		// mistake is easy to make, because they sit in the same directories as files that ARE the
-		// floor (`sqlite-main-store.ts` next to `archive-file.ts`).
+		// would read as "the port has nothing left to do", which is exactly backwards.
 		//
 		// The test is on the SQLITE_ONLY_MODULES membership rather than on the capability lists,
 		// because the capabilities will legitimately change as the port matures while the
 		// classification must not.
-		for (const file of [
-			"server/services/search/sqlite-store.ts",
-			"server/services/project-archive/sqlite-main-store.ts",
-		]) {
+		for (const file of ["server/services/search/sqlite-store.ts"]) {
 			expect(DIALECT_INVENTORY[file], `${file} must be registered`).toBeDefined();
 			expect(
 				SQLITE_ONLY_MODULES.has(file),

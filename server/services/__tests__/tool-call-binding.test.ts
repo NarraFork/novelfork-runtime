@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	fileChangeOperations,
 	narratorMessageRefs,
@@ -13,9 +13,9 @@ import {
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { AgentConfig, ToolCallBinding, ToolContext } from "../../lib/agent/types";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const realProvider = { ...(await import("../../lib/agent/provider")) };
 let providerTurn = 0;
 let scenario: "eager" | "write" | "streaming" = "eager";
@@ -25,7 +25,7 @@ const order: string[] = [];
 const executed: ToolContext[] = [];
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -54,9 +54,6 @@ const provider: ProviderAdapter = {
 		}
 		yield { text: "after tool" };
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -221,7 +218,8 @@ async function untilPending(id: string) {
 	}
 	throw new Error("permission did not become pending");
 }
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	executed.length = 0;
 	order.length = 0;
@@ -236,15 +234,14 @@ afterEach(async () => {
 	sqlite.run("DROP TRIGGER IF EXISTS reject_permission_update");
 	sqlite.run("DROP TRIGGER IF EXISTS reject_start_update");
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	toolRegistry.unregister("TestBoundRead");
 	toolRegistry.unregister("TestBoundAsk");
 	toolRegistry.unregister("Write");
 	if (originalWrite) toolRegistry.register(originalWrite);
 	mock.module("../../lib/agent/provider", () => realProvider);
-	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
 });
 
 describe("真实工具行执行绑定", () => {
@@ -309,9 +306,9 @@ describe("真实工具行执行绑定", () => {
 			ctx.toolCallIdsMap.set("call_0", "stale");
 			const cfg = config();
 			await executeAgentLoop(
-				{ config: cfg, userText: "run", history: [], eventContext: ctx },
+				{ config: cfg, userText: "run", history: { rows: [] }, eventContext: ctx },
 				{
-					eventSource: agentLoop(cfg, "run", []),
+					eventSource: agentLoop(cfg, "run", { rows: [] }),
 					processEventFn: async (event, ec, hooks) => {
 						const result = await processEvent(event, ec, hooks);
 						if (event.type === "block_complete" && event.block.type === "tool_use")
@@ -346,7 +343,7 @@ describe("真实工具行执行绑定", () => {
 			executeAgentLoop({
 				config: config(),
 				userText: "write",
-				history: [],
+				history: { rows: [] },
 				eventContext: context(),
 			}),
 		).rejects.toThrow("persistence barrier");
@@ -654,7 +651,7 @@ describe("真实工具行执行绑定", () => {
 		ctx.toolCallIdsMap.set("call_0", binding.toolCallId);
 		await expect(
 			executeAgentLoop(
-				{ config: config(), userText: "", history: [], eventContext: ctx },
+				{ config: config(), userText: "", history: { rows: [] }, eventContext: ctx },
 				{
 					eventSource: (async function* () {
 						yield {
@@ -732,6 +729,18 @@ describe("真实工具行执行绑定", () => {
 		const child = await narratorService.createSubagent(input);
 		expect(child.originToolCallId).toBe("source");
 		expect(child.subagentOriginKind).toBe("tool");
+		await db
+			.update(narrators)
+			.set({
+				runtimeRegistrationJson: {
+					version: 1,
+					run: {
+						logicalRunId: "conclusion-run",
+						deliverTo: { narratorId: "n", toolUseId: "call_0", toolCallId: "source", attempt: 1 },
+					},
+				},
+			})
+			.where(eq(narrators.id, child.id));
 		expect(
 			await narratorPersistence.resolveSubagentConclusionReference(child.id, "n", "call_0"),
 		).toMatchObject({ toolCallId: "source", messageId: "message", originToolCallId: "source" });
@@ -740,7 +749,7 @@ describe("真实工具行执行绑定", () => {
 		).rejects.toThrow("parent's executing Agent row");
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference(child.id, "other", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
+		).rejects.toThrow("registered delivery tool-call");
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference(
 				child.id,
@@ -768,19 +777,28 @@ describe("真实工具行执行绑定", () => {
 			cwd: testHome,
 			originToolCallId: "source",
 		});
-		const { registerConclusionWatcher, getConclusionWatcher, removeConclusionWatcher } =
-			await import("../subagent-manual-override");
-		registerConclusionWatcher(child.id, "n", "call_0", child.originToolCallId ?? undefined);
+		await db
+			.update(narrators)
+			.set({
+				runtimeRegistrationJson: {
+					version: 1,
+					run: {
+						logicalRunId: "conclusion-run",
+						deliverTo: { narratorId: "n", toolUseId: "call_0", toolCallId: "source", attempt: 1 },
+					},
+				},
+			})
+			.where(eq(narrators.id, child.id));
 		await db
 			.insert(narratorMessageRefs)
 			.values({ id: "fork-ref", narratorId: "fork", messageId: "shared", seq: 1 });
 		const privateMessageId = await narratorPersistence.copyOnWriteMessage("n", "shared");
-		const watcher = getConclusionWatcher(child.id);
+		// The exact registered destination remains authoritative after parent COW.
 		const target = await narratorPersistence.resolveSubagentConclusionReference(
 			child.id,
 			"n",
 			"call_0",
-			watcher?.originToolCallId,
+			child.originToolCallId ?? undefined,
 		);
 		expect(target.messageId).toBe(privateMessageId);
 		expect(target.toolCallId).not.toBe("source");
@@ -800,12 +818,17 @@ describe("真实工具行执行绑定", () => {
 			.where(eq(narrators.id, "other"));
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference("other", "n", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
-		await db.update(narrators).set({ originToolCallId: null }).where(eq(narrators.id, child.id));
+		).rejects.toThrow("registered delivery tool-call");
+		await db
+			.update(narrators)
+			.set({
+				originToolCallId: null,
+				runtimeRegistrationJson: { version: 1 },
+			})
+			.where(eq(narrators.id, child.id));
 		await expect(
 			narratorPersistence.resolveSubagentConclusionReference(child.id, "n", "call_0"),
-		).rejects.toThrow("trusted parent tool-call origin");
-		removeConclusionWatcher(child.id);
+		).rejects.toThrow("registered delivery tool-call");
 	});
 
 	test("实际Agent工具经runner创建子代理时保留ctx主键", async () => {
@@ -864,7 +887,12 @@ describe("真实工具行执行绑定", () => {
 		const ctx = context("child");
 		const cfg = config("child");
 		scenario = "eager";
-		await executeAgentLoop({ config: cfg, userText: "child", history: [], eventContext: ctx });
+		await executeAgentLoop({
+			config: cfg,
+			userText: "child",
+			history: { rows: [] },
+			eventContext: ctx,
+		});
 		const binding = requiredBinding(executed[0]);
 		expect(binding.toolCallId).not.toBe("parent-row");
 		const persisted = await db.query.narratorToolCalls.findFirst({

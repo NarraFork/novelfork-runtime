@@ -18,6 +18,7 @@
 
 import type { FileSelection } from "@shared/file-reference";
 import { localFileDirectory } from "@shared/markdown-file-path";
+import type { OutlinePanelState } from "../../../lib/outline-panel";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-edit-reference";
@@ -31,12 +32,15 @@ import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-e
  * - `userchat` — the human discussion room beside this narrator (people talking to
  *   each other; its content never enters the narrator's context unless someone
  *   forwards it explicitly).
+ * - `timeline` — per-turn horizontal timeline of this agent and its subagents.
  * - `appearance` — live typography controls for this transcript (font size / letter
  *   spacing / block spacing), so the reader can adjust while watching the effect.
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `filetree` — a singleton browser of the narrator's cwd, which opens `file` panels.
  * - `webview`  — a standalone webview (workspace only).
+ * - `outline`  — a multi-instance outline page (or a space's pages, or the outline home):
+ *   the router-free outline view, navigated inside the panel.
  * - `mock`     — TEMPORARY streaming harness (see `../mock/README-REMOVAL.md`).
  */
 export type PanelKind =
@@ -50,10 +54,12 @@ export type PanelKind =
 	| "search"
 	| "userchat"
 	| "appearance"
+	| "timeline"
 	| "filetree"
 	| "subagent"
 	| "file"
 	| "knowledge"
+	| "outline"
 	| "webview"
 	| "plugin"
 	| "mock";
@@ -67,7 +73,7 @@ export type PanelKind =
  */
 export type ResourcePanelKind = Exclude<
 	PanelKind,
-	"chat" | "subagent" | "file" | "knowledge" | "webview" | "plugin"
+	"chat" | "subagent" | "file" | "knowledge" | "outline" | "webview" | "plugin"
 >;
 
 /**
@@ -78,8 +84,6 @@ export type ResourcePanelKind = Exclude<
 export interface NarratorBoundPanelParams {
 	panelType: Exclude<PanelKind, "subagent" | "webview">;
 	narratorId: string;
-	/** Chapter id — required by the git panel; optional elsewhere. */
-	chapterId?: string | null;
 }
 
 /** Params carried by a multi-instance subagent session panel. */
@@ -125,7 +129,7 @@ export function nextHighlightRequestId(): string {
  * Params carried by a read-only file viewer panel (multi-instance: one panel per
  * path). Like `subagent`, the resource identity (`filePath`) MUST survive
  * serialization — `stripIdentityFromLayout` only removes host identity
- * (narratorId / chapterId).
+ * (narratorId).
  */
 /** Navigation is transient; file authority, device/path and toolEdit are resource identity. */
 export interface FileOpenOptions {
@@ -144,6 +148,8 @@ export interface FileOpenOptions {
 
 export interface FilePanelParams extends FileOpenOptions {
 	panelType: "file";
+	/** Panel-local loading consent; never part of the resource/deduplication identity. */
+	largeFileConfirmed?: boolean;
 	/** Absolute path of the file being viewed. */
 	filePath: string;
 	/** Optional display-name override (defaults to the path's basename). */
@@ -238,6 +244,19 @@ export interface KnowledgePanelParams {
 	hostNarratorId?: string;
 }
 
+/**
+ * Params carried by an outline panel (multi-instance). Like `knowledge`, the resource identity
+ * — the space and the page, plus what the panel shows of it (focus, view, time) — lives in the
+ * params and survives serialization, so a reload restores the same focus, view and time.
+ * `stripIdentityFromLayout` only removes host identity. See `lib/outline-panel.ts` for the
+ * fields and for which panel a request opens in.
+ */
+export interface OutlinePanelParams extends OutlinePanelState {
+	panelType: "outline";
+	/** Owning root narrator cluster (workspace resources; absent for workspace members). */
+	hostNarratorId?: string;
+}
+
 /** Params carried by a standalone terminal panel (workspace). */
 export interface StandaloneTerminalPanelParams {
 	panelType: "terminal";
@@ -261,6 +280,7 @@ export type AnyPanelParams =
 	| SubagentPanelParams
 	| FilePanelParams
 	| KnowledgePanelParams
+	| OutlinePanelParams
 	| StandaloneTerminalPanelParams
 	| StandaloneWebviewPanelParams
 	| PluginDockPanelParams;
@@ -284,10 +304,12 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	search: "search",
 	userchat: "userchat",
 	appearance: "appearance",
+	timeline: "timeline",
 	filetree: "filetree",
 	subagent: "subagent",
 	file: "file",
 	knowledge: "knowledge",
+	outline: "outline",
 	webview: "webview",
 	plugin: "plugin",
 	mock: "mock",
@@ -311,10 +333,12 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	search: "Search",
 	userchat: "Discussion",
 	appearance: "Appearance",
+	timeline: "Timeline",
 	filetree: "Files",
 	subagent: "Subagent",
 	file: "File",
 	knowledge: "Knowledge",
+	outline: "Outline",
 	webview: "Webview",
 	plugin: "Plugin",
 	mock: "Mock stream",

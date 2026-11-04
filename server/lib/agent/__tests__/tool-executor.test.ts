@@ -2,15 +2,26 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { resolveRuntimePolicy } from "../../../services/agent-runtime/policy";
+import { db } from "../../../db";
+import { narratorMessages, narrators, narratorToolCalls, users } from "../../../db/schema";
 import {
+	compileDelegationPolicy,
+	resolveRuntimePolicy,
+} from "../../../services/agent-runtime/policy";
+import {
+	classifyDanger,
 	extractToolPaths,
 	MAX_PLAN_FILE_BYTES,
 	resolveExitPlanModeInput,
 	resolvePermissionDecision,
 } from "../../../services/narrator-permission";
 import { activeNarrators } from "../../../services/narrator-session-state";
+import {
+	registerRecoverySource,
+	resetRecoveryHandoffForTests,
+} from "../../../services/recovery-handoff";
 import {
 	SUBAGENT_ALIAS_TRAIT_PREFIX,
 	subagentMatchesSelector,
@@ -26,8 +37,9 @@ import {
 	waitForOrdinaryToolDrain,
 	waitForUpdateCheckpointFence,
 } from "../../../services/update-coordinator";
-import { getToolMessage, getToolMessageWithParams } from "../../i18n";
+import { getToolMessage } from "../../i18n";
 import { settings } from "../../settings";
+import { sideCarBodyWithText } from "../../sidecar-templates";
 import type { ExecutionBackend } from "../execution/backend";
 import { posixPathSemantics } from "../execution/path-semantics";
 import { setRemoteBackendResolver } from "../execution/registry";
@@ -53,6 +65,7 @@ import { askUserQuestionTool } from "../tools/ask-user-question";
 import { browserTool } from "../tools/browser";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 import { EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME } from "../tools/exit-plan-reflection";
+import { knowledgeCreateTool } from "../tools/knowledge-edit";
 import {
 	type AgentConfig,
 	type AgentToolUse,
@@ -67,6 +80,7 @@ const TEST_TOOL_NAME = "__ExecutorGuardTest";
 const ADMISSION_TOOL_NAME = "__AdmissionOrdinaryTest";
 const DISABLED_ADMISSION_TOOL_NAME = "__AdmissionDisabledTest";
 const originalUpsertContinuation = toolContinuationService.upsert;
+const originalCheckpointContinuation = toolContinuationService.checkpoint;
 
 const originalPlanReflectionAutoApprove = settings.agent.planReflectionAutoApprove;
 const originalPlanReflectionAllowAutoCompact = settings.agent.planReflectionAllowAutoCompact;
@@ -87,7 +101,9 @@ afterEach(() => {
 	toolRegistry.unregister("Await");
 	toolRegistry.unregister("Bash");
 	toolContinuationService.upsert = originalUpsertContinuation;
+	toolContinuationService.checkpoint = originalCheckpointContinuation;
 	resetUpdateCoordinationForTests();
+	resetRecoveryHandoffForTests();
 	setRemoteBackendResolver(null);
 	setPlanReflectionOverrideLoaderForTests(null);
 	settings.agent.planReflectionAutoApprove = originalPlanReflectionAutoApprove;
@@ -136,6 +152,76 @@ function stubAdmissionPersistence(records: Array<Record<string, unknown>>): void
 		return input as never;
 	}) as typeof toolContinuationService.upsert;
 }
+
+describe("admin tool execution role gate", () => {
+	test("keeps a declared admin tool but blocks a non-admin before approval", async () => {
+		const original = toolRegistry.get("NarraForkAdmin");
+		const permission = mock(async () => ({ behavior: "allow" as const }));
+		const now = new Date().toISOString();
+		const ids = ["exec-admin-user", "exec-regular-user"];
+		try {
+			toolRegistry.register({
+				name: "NarraForkAdmin",
+				description: "already declared",
+				parameters: z.object({}),
+				execute: async () => ({ output: "must not run for ordinary user" }),
+			});
+			await db.insert(users).values([
+				{ id: ids[0], username: ids[0], role: "admin", passwordHash: "test", createdAt: now },
+				{ id: ids[1], username: ids[1], role: "user", passwordHash: "test", createdAt: now },
+			]);
+			const call = { toolUseId: "admin-role-gate", name: "NarraForkAdmin", input: {} };
+			const denied = await executeTool(call, { ...makeConfig(permission), userId: ids[1] });
+			expect(denied.isError).toBe(true);
+			expect(denied.output).toContain("restricted to administrators");
+			expect(permission).not.toHaveBeenCalled();
+			const allowed = await executeTool(call, { ...makeConfig(permission), userId: ids[0] });
+			expect(allowed.output).toBe("must not run for ordinary user");
+			expect(permission).toHaveBeenCalledTimes(1);
+		} finally {
+			for (const id of ids) await db.delete(users).where(eq(users.id, id));
+			if (original) toolRegistry.register(original);
+			else toolRegistry.unregister("NarraForkAdmin");
+		}
+	});
+});
+
+describe("knowledge tool internal permission feedback", () => {
+	test("preserves the internal denial after outer approval and keeps both approval inputs intact", async () => {
+		const previous = toolRegistry.get("KnowledgeCreate");
+		toolRegistry.register(knowledgeCreateTool);
+		const input = {
+			title: "Knowledge approval regression",
+			collectionId: "test-collection",
+			content: "The complete proposed body",
+			keywords: ["permission-regression"],
+			tags: ["docs"],
+			direct: true,
+		};
+		const reason = "Danger reflection rejected this body; revise it before publishing.";
+		const calls: Array<{ toolName: string; input: Record<string, unknown>; toolUseId: string }> =
+			[];
+		const config = makeConfig(async (toolName, approvalInput, toolUseId) => {
+			calls.push({ toolName, input: approvalInput, toolUseId });
+			return calls.length === 1 ? { behavior: "allow" } : { behavior: "deny", message: reason };
+		});
+		try {
+			const result = await executeTool(
+				{ toolUseId: "knowledge-denial", name: "KnowledgeCreate", input },
+				config,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toBe(reason);
+			expect(calls).toEqual([
+				{ toolName: "KnowledgeCreate", input, toolUseId: "knowledge-denial" },
+				{ toolName: "KnowledgeCreate", input, toolUseId: "knowledge-denial" },
+			]);
+		} finally {
+			if (previous) toolRegistry.register(previous);
+			else toolRegistry.unregister("KnowledgeCreate");
+		}
+	});
+});
 
 describe("reflection tool early rejection", () => {
 	for (const locale of ["en", "zh-CN"] as const) {
@@ -293,9 +379,11 @@ describe("broken tool input attribution", () => {
 		expect(placeholder).not.toContain("过长");
 		expect(placeholder).not.toContain("truncated");
 		expect(placeholder).not.toContain("截断");
-		const reminder = getToolMessageWithParams("brokenToolCallReminder", locale, {
-			toolNames: "Write",
-		});
+		const reminder = sideCarBodyWithText(
+			"broken_call",
+			{ kind: "notice", params: { toolNames: "Write" } },
+			locale,
+		).content;
 		expect(reminder).toContain(locale === "en" ? "does not establish" : "无法认定");
 		expect(reminder).toContain(locale === "en" ? "valid JSON" : "有效的 JSON");
 	});
@@ -303,12 +391,13 @@ describe("broken tool input attribution", () => {
 
 describe("executeTool trusted runtime policy", () => {
 	test("passes the exact server policy to ToolContext and cannot be overwritten by tool input", async () => {
-		const policy = resolveRuntimePolicy({
-			variant: "subagent",
-			subagentType: "custom",
-			customDefinition: { toolAccess: "custom", customTools: ["Read"] },
-		});
-		const forgedPolicy = resolveRuntimePolicy({ variant: "primary" });
+		const policy = resolveRuntimePolicy([
+			compileDelegationPolicy({
+				template: "custom",
+				customDefinition: { toolAccess: "custom", customTools: ["Read"] },
+			}),
+		]);
+		const forgedPolicy = resolveRuntimePolicy([]);
 		let receivedPolicy: unknown;
 		let receivedInput: unknown;
 		toolRegistry.register({
@@ -341,11 +430,12 @@ describe("executeTool trusted runtime policy", () => {
 		try {
 			const config = makeConfig(async () => ({ behavior: "allow" }));
 			config.parentNarratorId = "trusted-parent";
-			config.runtimePolicy = resolveRuntimePolicy({
-				variant: "subagent",
-				subagentType: "custom",
-				customDefinition: { toolAccess: "custom", customTools: ["Read", "Await"] },
-			});
+			config.runtimePolicy = resolveRuntimePolicy([
+				compileDelegationPolicy({
+					template: "custom",
+					customDefinition: { toolAccess: "custom", customTools: ["Read", "Await"] },
+				}),
+			]);
 			const result = await executeTool(
 				{
 					toolUseId: "policy-ask-denied",
@@ -353,7 +443,7 @@ describe("executeTool trusted runtime policy", () => {
 					input: {
 						async: true,
 						questions: [{ question: "direction", header: "Which direction?", options: [] }],
-						runtimePolicy: resolveRuntimePolicy({ variant: "primary" }),
+						runtimePolicy: resolveRuntimePolicy([]),
 					},
 				},
 				config,
@@ -371,7 +461,9 @@ describe("executeTool trusted runtime policy", () => {
 		toolRegistry.register(askUserQuestionTool);
 		try {
 			const config = makeConfig(async () => ({ behavior: "allow" }));
-			config.runtimePolicy = resolveRuntimePolicy({ variant: "subagent", subagentType: "general" });
+			config.runtimePolicy = resolveRuntimePolicy([
+				compileDelegationPolicy({ template: "general" }),
+			]);
 			const result = await executeTool(
 				{
 					toolUseId: "policy-sync-denied",
@@ -425,14 +517,34 @@ describe("executeTool update admission gate", () => {
 			classifyToolUpdateExecution({
 				toolUseId: "classify-send-await",
 				name: "Send",
+				// A legacy await flag no longer makes Send wait.
 				input: { await: true, message: "wait for reply" },
 			}),
-		).toBe("resumable");
+		).toBe("ordinary");
 		expect(
 			classifyToolUpdateExecution({
 				toolUseId: "classify-send-ordinary",
 				name: "Send",
 				input: { message: "fire and forget" },
+			}),
+		).toBe("ordinary");
+	});
+
+	test("Stop and historical Agent stop remain ordinary bounded control operations", () => {
+		for (const type of ["bash", "agent"]) {
+			expect(
+				classifyToolUpdateExecution({
+					toolUseId: `classify-stop-${type}`,
+					name: "Stop",
+					input: { type, id: "worker" },
+				}),
+			).toBe("ordinary");
+		}
+		expect(
+			classifyToolUpdateExecution({
+				toolUseId: "legacy-stop",
+				name: "Agent",
+				input: { stop: "worker" },
 			}),
 		).toBe("ordinary");
 	});
@@ -523,6 +635,124 @@ describe("executeTool update admission gate", () => {
 		expect(result.output).toBe("executed");
 		expect(permissionCalls).toBe(1);
 		expect(executions).toBe(1);
+	});
+
+	test.each([
+		"mounted",
+		"checkpoint-in-flight",
+		"fresh-late-write",
+	])("a real gate preserves old claims and cleans only new rows when cancelled at %s", async (cancelAt) => {
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: "carry-owner", createdAt: now, updatedAt: now });
+		await db.insert(narratorMessages).values({
+			id: "carry-message",
+			narratorId: "carry-owner",
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: "row-carry-tool",
+			narratorId: "carry-owner",
+			messageId: "carry-message",
+			toolUseId: "carry-tool",
+			toolName: ADMISSION_TOOL_NAME,
+			status: "pending",
+			executionAttempt: 1,
+			createdAt: now,
+		});
+		let executions = 0;
+		let permissions = 0;
+		toolRegistry.register({
+			name: ADMISSION_TOOL_NAME,
+			description: "carryover gate fixture",
+			parameters: z.object({}),
+			execute: async () => {
+				executions++;
+				return { output: "once" };
+			},
+		});
+		try {
+			if (cancelAt !== "fresh-late-write") {
+				await toolContinuationService.create({
+					toolCallId: "row-carry-tool",
+					narratorId: "carry-owner",
+					updateEpoch: "old-recovery",
+					kind: "pending_permission",
+					state: "waiting",
+					payloadJson: { permissionGranted: false },
+				});
+				await toolContinuationService.claim("row-carry-tool", {
+					claimToken: "original-owner",
+					deadlineAt: "2099-01-01T00:00:00.000Z",
+				});
+				registerRecoverySource({
+					updateEpoch: "old-recovery",
+					kind: "planned",
+					capturedAt: now,
+					narrators: [{ narratorId: "carry-owner", locale: "en" }],
+					pendingNarratorIds: ["carry-owner"],
+				});
+			}
+			const original = await toolContinuationService.getByToolCallId("row-carry-tool");
+			const scheduled = scheduleUpdate("test-version", undefined, {
+				supportedRecoveryManifestVersions: [1, 2, 3],
+			});
+			beginQuiescingTools();
+			const config = makeConfig(async () => {
+				permissions++;
+				return { behavior: "allow" };
+			});
+			config.narratorId = "carry-owner";
+			let checkpointEntered = false;
+			let releaseCheckpoint = () => {};
+			if (cancelAt !== "mounted") {
+				const blocked = new Promise<void>((resolve) => {
+					releaseCheckpoint = resolve;
+				});
+				toolContinuationService.checkpoint = async (input) => {
+					checkpointEntered = true;
+					await blocked;
+					return originalCheckpointContinuation.call(toolContinuationService, input);
+				};
+			}
+			const result = executeTool(
+				{ toolUseId: "carry-tool", name: ADMISSION_TOOL_NAME, input: {} },
+				config,
+			);
+			await waitForCondition(() =>
+				cancelAt !== "mounted"
+					? checkpointEntered
+					: getUpdateCoordinationStatus().pausedToolCount === 1,
+			);
+			expect(executions).toBe(0);
+			expect(permissions).toBe(0);
+			expect(await toolContinuationService.getByToolCallId("row-carry-tool")).toEqual(original);
+			failScheduledUpdate("cancel second prepare");
+			if (!scheduled.updateEpoch) throw new Error("Missing scheduled fixture epoch");
+			await toolContinuationService.cancelEpoch(scheduled.updateEpoch);
+			releaseCheckpoint();
+			await expect(result).resolves.toMatchObject({ output: "once" });
+			expect(executions).toBe(1);
+			expect(permissions).toBe(1);
+			if (cancelAt === "fresh-late-write") {
+				expect(await toolContinuationService.getByToolCallId("row-carry-tool")).toMatchObject({
+					updateEpoch: scheduled.updateEpoch,
+					state: "cancelled",
+				});
+			} else {
+				expect(await toolContinuationService.getByToolCallId("row-carry-tool")).toEqual(original);
+				expect(
+					await toolContinuationService.markResultWritten("row-carry-tool", {
+						claimToken: "original-owner",
+					}),
+				).not.toBeNull();
+			}
+		} finally {
+			await db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, "row-carry-tool"));
+			await db.delete(narratorMessages).where(eq(narratorMessages.id, "carry-message"));
+			await db.delete(narrators).where(eq(narrators.id, "carry-owner"));
+		}
 	});
 
 	test("phase 2 continuation metadata stays below the database limit for large tool input", async () => {
@@ -962,6 +1192,54 @@ describe("executeTool permission guard", () => {
 				cwd: "/tmp/project",
 			}),
 		).toBe("deny");
+	});
+
+	test("outline reads are reads; OutlineEdit needs no approval in any mode", () => {
+		for (const toolName of ["OutlineRead", "OutlineSearch"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName,
+					input: { address: "Q17" },
+					permMode: "readOnly",
+					cwd: "/tmp/project",
+				}),
+			).toBe("allow");
+		}
+		// Where it may write (the session's own space only, in read-only and strict plan mode)
+		// is the tool's decision: it resolves the addresses.
+		const edit = { edits: [{ add: "/", markdown: "- note" }] };
+		for (const permMode of ["default", "acceptEdits", "readOnly", "dontAsk", "bypassPermissions"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "OutlineEdit",
+					input: edit,
+					permMode,
+					cwd: "/tmp/project",
+				}),
+			).toBe("allow");
+		}
+		expect(
+			resolvePermissionDecision({
+				toolName: "OutlineEdit",
+				input: edit,
+				permMode: "default",
+				cwd: "/tmp/project",
+				planMode: true,
+			}),
+		).toBe("allow");
+	});
+
+	test("under bypass, outline deletes and moves are a medium danger, other edits low", () => {
+		const add = classifyDanger("OutlineEdit", { edits: [{ add: "/", markdown: "- x" }] }, "/tmp");
+		expect(add?.severity).toBe("low");
+		const restructure = classifyDanger(
+			"OutlineEdit",
+			{ edits: [{ delete: "Ab3dEf9Q" }, { move: "Q1", to: "Q2" }] },
+			"/tmp",
+		);
+		expect(restructure?.severity).toBe("medium");
+		expect(restructure?.summary).toContain("2 outline block(s)");
+		expect(classifyDanger("OutlineRead", { address: "Q1" }, "/tmp")).toBeNull();
 	});
 
 	test("does not execute unresolved dangerReflection permission results", async () => {

@@ -1,6 +1,7 @@
 import { PERSISTED_NARRATOR_TOOLBAR_IDS } from "@shared/narrator-toolbar";
 import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
 import { TYPOGRAPHY_RANGE } from "@shared/pretext-layout/typography";
+import { proxyOverrideSchema } from "@shared/proxy-settings";
 import {
 	RECENT_TABS_LIVE_LIMIT,
 	RECENT_TABS_PAGE_SIZE,
@@ -31,57 +32,6 @@ export const diskSafetySettingsSchema = z
 export const defaultNarratorVisibilitySchema = z.enum(["auto", "private", "public"]);
 export const defaultNarratorWriteAudienceSchema = z.enum(["auto", "owner", "project", "public"]);
 
-/**
- * One model card delta, as persisted in `agent.modelCards`.
- *
- * Every field except `modelKey` is optional, because a stored entry is the
- * DIFFERENCE from the builtin card, not a whole card: absence means "inherit".
- *
- * `effortLevels` excludes `none` at the schema level rather than silently
- * dropping it later. `none` means "reasoning off", and storing it would make it
- * a clamp target — a requested `low` on a model whose lowest real tier is
- * `medium` could then clamp to thinking being switched off, with nothing said.
- * Rejecting it tells the caller instead of quietly changing behaviour.
- *
- * Prices are capped well above any published rate: the bound exists to reject
- * a stray unit error (a per-1k price typed into a per-1M field), not to predict
- * vendor pricing.
- */
-const modelCardPricingSchema = z.object({
-	input: z.number().min(0).max(100_000).optional(),
-	output: z.number().min(0).max(100_000).optional(),
-	cacheRead: z.number().min(0).max(100_000).optional(),
-	cacheWrite: z.number().min(0).max(100_000).optional(),
-});
-
-export const modelCardSchema = z.object({
-	modelKey: z.string().min(1).max(200),
-	displayName: z.string().max(200).optional(),
-	family: z.string().max(100).optional(),
-	notes: z.string().max(2000).optional(),
-	aliases: z.array(z.string().min(1).max(200)).max(50).optional(),
-	matchPrefixes: z.array(z.string().min(1).max(200)).max(50).optional(),
-	// 0 is accepted and means "not set" — the card editor's default for a field
-	// the user is not filling in.
-	contextWindow: z.number().int().min(0).max(100_000_000).optional(),
-	maxCompletionTokens: z.number().int().min(0).max(100_000_000).optional(),
-	effortLevels: z
-		.array(z.enum(["low", "medium", "high", "xhigh", "max"]))
-		.max(10)
-		.optional(),
-	officialPricing: modelCardPricingSchema.optional(),
-	/** Tombstone marking a builtin card the user deleted. */
-	deleted: z.boolean().optional(),
-});
-
-/** Per-location proxy override: default (inherit global) / direct / system / custom. */
-const proxyOverrideSchema = z
-	.object({
-		mode: z.enum(["default", "direct", "system", "custom"]),
-		url: z.string().max(500).optional(),
-	})
-	.optional();
-
 // === Gateway per-user configuration ===
 
 const gatewayPlatformConfigSchema = z.object({
@@ -96,8 +46,8 @@ const gatewayPlatformConfigSchema = z.object({
 	// Feishu / QQ Bot
 	appId: z.string().max(200).optional(),
 	appSecret: z.string().max(500).optional(),
-	// Webhook
-	secret: z.string().max(500).optional(),
+	// Webhook — must be non-empty when present (empty secret = unauthenticated HMAC).
+	secret: z.string().min(1).max(500).optional(),
 	// Weixin
 	accountId: z.string().max(200).optional(),
 	baseUrl: z.string().max(500).optional(),
@@ -122,7 +72,6 @@ const gatewayPlatformConfigSchema = z.object({
 const gatewayConfigSchema = z.object({
 	enabled: z.boolean().optional(),
 	defaultProjectId: z.string().max(50).optional(),
-	defaultChapterId: z.string().max(50).optional(),
 	defaultPermissionMode: legacyPermissionModeSchema.optional(),
 	sessionIdleMinutes: z.number().int().min(0).max(43200).optional(),
 	rateLimitPerMinute: z.number().int().min(0).max(1000).optional(),
@@ -251,12 +200,24 @@ export const updateUserPreferencesSchema = z.object({
 	navLayout: navLayoutSchema.optional(),
 	// Narrator header toolbar layout: order = priority, position vs divider = surfaced or tucked
 	narratorToolbarLayout: narratorToolbarLayoutSchema.optional(),
+	// 提交身份入口的显示位置。跟账号走，不是浏览器本地偏好；默认关，叙述者详情里始终能选身份。
+	gitIdentityContextMenu: z.boolean().optional(),
+	gitIdentityCreateModal: z.boolean().optional(),
+});
+
+/**
+ * 写入某个叙述者的大纲标签排布。数组设上限，避免偏好字段被当作无界存储。
+ */
+export const specTabLayoutPatchSchema = z.object({
+	narratorId: z.string().min(1).max(64),
+	order: z.array(z.string().min(1).max(256)).max(100),
+	pinned: z.array(z.string().min(1).max(256)).max(100),
 });
 
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 
 export const recentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "project", "workspace", "subagent", "group"]),
+	type: z.enum(["narrator", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	parentNarratorId: z.string().min(1).max(50).optional(),
@@ -315,8 +276,14 @@ export const batchUpsertRecentTabsSchema = z.object({
 });
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent", "group"]),
+	type: z.enum(["narrator", "session", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
+	/**
+	 * Entity-teardown cleanup (project deleted, narrator archived). When set, no undo
+	 * token is minted — a cascade must not overwrite the user's pending undo slot with
+	 * a snapshot that points at entities that are already gone.
+	 */
+	cascade: z.boolean().optional(),
 });
 
 export const moveRecentTabSchema = z

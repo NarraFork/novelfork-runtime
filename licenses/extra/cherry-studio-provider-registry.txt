@@ -1,0 +1,126 @@
+Cherry Studio provider registry data
+
+Component: @cherrystudio/provider-registry 0.0.1-alpha.1
+Author / attribution: Cherry Studio
+Upstream repository: https://github.com/CherryHQ/cherry-studio
+Fixed commit: 4edb3b85630469e1a784577ec47540cb646d9781
+Data source: packages/provider-registry/data/providers.json
+License declaration source: packages/provider-registry/package.json
+Source URL: https://github.com/CherryHQ/cherry-studio/blob/4edb3b85630469e1a784577ec47540cb646d9781/packages/provider-registry/data/providers.json
+Declaration URL: https://github.com/CherryHQ/cherry-studio/blob/4edb3b85630469e1a784577ec47540cb646d9781/packages/provider-registry/package.json
+
+The upstream subpackage declares "license": "MIT" and "author": "Cherry Studio".
+It provides a package declaration, not a separate MIT license text. The text below
+is a standard MIT template, NOT a verbatim license file supplied by Cherry Studio.
+Its permission and disclaimer paragraphs were copied verbatim from the installed
+node_modules/normalize-path/LICENSE. The copyright holder is attributed using the
+upstream package author; no copyright year is inferred.
+The upstream repository root uses AGPL; this reuse is limited to the MIT-declared
+provider-registry subpackage data. No upstream main src implementation is copied.
+
+Data mapping (frontend/components/providers/provider-presets.ts):
+- Keep only provider id, name, compatible API base URLs and default chat protocol.
+- anthropic-messages maps to anthropic-messages; openai-responses maps to
+  openai-responses; openai-chat-completions maps to completions-compatible;
+  google-generate-content maps to gemini-compatible.
+- Keep concrete URLs for adapter families anthropic, openai-compatible, openai,
+  open-responses and google. The ordinary API-key compatible families deepseek,
+  openrouter, groq, togetherai, xai, xai-responses and cerebras are mapped onto
+  the corresponding generic protocols, without copying their adapter code.
+- Remove trailing slashes. Anthropic bases end in /v1; Gemini bases end in
+  /v1beta. OpenAI bases receive /v1 unless they already contain a versioned
+  path segment (for example /api/v3, /api/paas/v4, /v3/openai or /api/v1).
+  NarraFork appends /messages, /responses, /chat/completions or /models/...;
+  therefore these URLs do not depend on SDK-specific prefix handling.
+- Keep the upstream default when included; otherwise use the first compatible
+  endpoint. Ollama is an explicit local compatibility override: only its
+  OpenAI-compatible http://localhost:11434/v1 is exposed, not native /api/chat.
+  A second local compatibility override adds OpenAI Chat Completions at
+  https://api.openai.com/v1; upstream lists only Responses for this provider,
+  and Responses remains the default.
+- Add NarraFork-authored Chinese search aliases (for example SiliconFlow,
+  ZhiPu, DeepSeek, Bailian, Doubao, Moonshot and StepFun Chinese names) and
+  common English aliases. These aliases are local usability metadata, not
+  copied upstream fields; original provider ids and raw names are retained.
+- Add local providerNames.<id> translation keys and English/Chinese display-name
+  mappings in NarraFork settings locales. These localized names are local UI
+  metadata, not modifications to the upstream registry data or API URLs.
+- Exclude Azure, Bedrock, Vertex AI, Copilot, OpenAI Codex, Claude Code, Grok CLI,
+  native Ollama, ComfyUI, missing URLs, and unapproved specialized adapter
+  families (cherryin, aihubmix, dmxapi, newapi, mistral, perplexity, voyage,
+  gateway). NUG and the custom option are UI actions, not registry records.
+- Do not carry model data, website metadata, referral links or promotion URLs.
+
+Local connection selection (provider-connection-presets.ts), not upstream data:
+- NarraFork-authored region/billing mapping contains factual API addresses only;
+  no vendor code or documentation excerpts are copied. Registry data above and
+  its attribution/license text below remain unchanged.
+- KIMI payg: China api.moonshot.cn, international api.moonshot.ai; C/R /v1,
+  A /anthropic/v1. Code: api.kimi.com (China), api.kimi.ai (international),
+  A/C/R /coding/v1. Code keys and payg keys are independent.
+  Sources: https://platform.kimi.com/docs/api/messages
+  https://platform.kimi.ai/docs/api/messages
+  https://www.kimi.ai/resources/codex-api
+  https://www.kimi.com/code/docs/en/third-party-tools/codex.html
+  https://www.kimi.com/code/docs/en/
+- MiniMax China api.minimax.cn, international api.minimax.io, both billing
+  modes: A /anthropic/v1, C /v1. Subscription keys are NOT payg keys;
+  sharing a hostname does not mean falling back to payg. Responses is omitted
+  because these sources do not confirm it.
+  Sources: https://platform.minimaxi.com/docs/coding-plan/quickstart.md
+  https://platform.minimax.io/docs/coding-plan/quickstart.md
+  https://platform.minimaxi.com/docs/api-reference/text-openai-api.md
+  https://platform.minimax.io/docs/api-reference/text-openai-api.md
+  https://platform.minimax.io/docs/token-plan/other-tools.md
+- MiMo payg (both regions): api.xiaomimimo.com, A /anthropic/v1, C/R /v1.
+  Token Plan: token-plan-{cn,sgp,ams}.xiaomimimo.com, A /anthropic/v1, C /v1;
+  R /v1 is confirmed for cn. The international SGP/AMS selection must match
+  subscription management. No regional Responses examples were found for
+  SGP/AMS, so those selections expose A/C only, not inferred Responses.
+  Payg sk- keys and Token Plan tp- keys are independent; no key is copied to
+  extra headers. These addresses are documentation-derived, not live-tested.
+  Official XiaomiMiMo/awesome-mimo-agent commit:
+  9b84a73ac88ca2bbe5fc560d073a7767abb87dc8
+  Sources: https://github.com/XiaomiMiMo/awesome-mimo-agent/blob/9b84a73ac88ca2bbe5fc560d073a7767abb87dc8/docs/codex.md
+  https://github.com/XiaomiMiMo/awesome-mimo-agent/blob/9b84a73ac88ca2bbe5fc560d073a7767abb87dc8/docs/claude_code.md
+  https://github.com/XiaomiMiMo/awesome-mimo-agent/blob/9b84a73ac88ca2bbe5fc560d073a7767abb87dc8/docs/cline.md
+- Zhipu China open.bigmodel.cn; international api.z.ai: A /api/anthropic/v1,
+  payg C /api/paas/v4, Token Plan C /api/coding/paas/v4. Token Plan R
+  /api/v1 for both regions. Ordinary China R /api/v1 is separately confirmed
+  by the Response API compatibility guide. Ordinary international R is omitted
+  because Z.ai's ordinary API index does not document its availability.
+  Sources: https://docs.bigmodel.cn/cn/coding-plan/quick-start
+  https://docs.bigmodel.cn/cn/guide/develop/responses/introduction.md
+  https://docs.z.ai/devpack/quick-start.md
+  https://docs.z.ai/devpack/tool/codex.md
+  https://docs.z.ai/llms.txt
+- A means Anthropic Messages, C means Chat Completions, R means Responses.
+  A bases include /v1 for NarraFork's direct /messages append; vendor SDK
+  examples omit that version because their SDK adds it automatically.
+- Token Plan mappings select NarraFork's real User-Agent, never impersonate
+  Claude Code/Codex or promise that NarraFork is an approved client. Keys and
+  provider tool/usage restrictions must be respected; no automatic fallback.
+
+Standard MIT license template (attribution adjusted as explained above):
+
+The MIT License (MIT)
+
+Copyright (c) Cherry Studio
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

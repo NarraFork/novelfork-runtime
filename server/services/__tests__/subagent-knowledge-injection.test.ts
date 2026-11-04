@@ -22,23 +22,33 @@
  * the keyword matcher all exercised for real). No `mock.module`: the seams used here are
  * ordinary arguments, and Bun's module mocks are process-wide.
  */
-import { beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
+import { historyStrings, sentHistory } from "../../../tests/fixtures/model-input";
 import { db } from "../../db";
-import { aclGrants, knowledgeTags, narrators, users } from "../../db/schema";
+import {
+	aclGrants,
+	knowledgeTags,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
+import { projectSenderText } from "../../lib/agent/sender-projection";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
+import { getExecutionOwner } from "../agent-runtime/ownership";
+import { startNarratorRun } from "../agent-runtime/run";
+import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
-import type { ExecuteLoopOptions } from "../narrator-executor";
+import { clearBufferedMessages, enqueueBufferedMessage } from "../narrator-buffer";
 import * as narratorExecutor from "../narrator-executor";
+import { closePrefixSnapshotStore } from "../narrator-prefix-snapshots";
 import { narratorService } from "../narrator-service";
+import { resumeBufferedMessagesIfIdle } from "../narrator-session";
 import { activeNarrators } from "../narrator-session-state";
-import {
-	clearSubagentBufferedMessages,
-	consumeNextBufferedSubagentMessage,
-	executeSubagent,
-	pushSubagentBufferedMessage,
-} from "../subagent-executor";
 import {
 	getSubagentKnowledgeCycle,
 	resolveInjectionUserId,
@@ -144,6 +154,10 @@ beforeAll(async () => {
 		keywords: [PUBLIC_KW],
 	});
 	publicEntryId = open.id;
+});
+
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 });
 
 /** Run one scan with a fresh cycle, so de-dup never hides a result under test. */
@@ -342,6 +356,31 @@ describe("agent-to-agent messages are scanned under the acting human's permissio
 });
 
 describe("compact-cycle de-dup", () => {
+	test("personal scope survives the subagent body and durable ledger payload", async () => {
+		const keyword = `subpersonal${TAG}`;
+		const draft = await knowledgeBranchService.createStandalone(
+			{ userId: clearedUserId, role: "user" },
+			{ title: "Private", content: "secret personal content", keywords: [keyword] },
+		);
+		const result = await scanSubagentTextForKnowledge({
+			narratorId: subagentId,
+			parentNarratorId,
+			text: keyword,
+			source: "team_message",
+			turnUserId: clearedUserId,
+			cycle: { seq: -1, ids: new Set() },
+			locale: "en",
+		});
+		expect(result?.record.hits).toContainEqual(
+			expect.objectContaining({ scope: "personal", entryId: draft.id }),
+		);
+		expect(result?.body).toMatchObject({
+			kind: "knowledge",
+			hits: [{ scope: "personal", entryId: draft.id }],
+		});
+		expect(result?.content).toContain(JSON.stringify({ personalEntryId: draft.id }));
+	});
+
 	test("an entry already in the cycle set is not injected again", async () => {
 		const cycle = { seq: -1, ids: new Set<string>() };
 		const first = await scanSubagentTextForKnowledge({
@@ -356,7 +395,7 @@ describe("compact-cycle de-dup", () => {
 		});
 		expect(first?.record.hits.map((h) => h.entryId)).toContain(publicEntryId);
 		// The scan records its own hits, so a second message in the same cycle is quiet.
-		expect(cycle.ids.has(publicEntryId)).toBe(true);
+		expect(cycle.ids.has(`global:${publicEntryId}`)).toBe(true);
 
 		const second = await scanSubagentTextForKnowledge({
 			narratorId: subagentId,
@@ -391,6 +430,7 @@ describe("nothing to say produces no row", () => {
 });
 
 describe("buffered knowledge hint reaches the resumed executor input", () => {
+	let deliverySeq = 0;
 	async function resumeBufferedMessage(
 		officialApi: boolean,
 		keyword: string,
@@ -412,93 +452,141 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 		];
 		const narratorId = generateId();
 		const toolUseId = generateId();
+		const toolCallId = generateId();
+		const messageId = generateId();
+		// A delegated run must have a real persisted delivery slot, including its exact row id.
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId: parentNarratorId,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: toolUseId, name: "Agent", input: {} }],
+			createdAt: nowIso(),
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: generateId(),
+			narratorId: parentNarratorId,
+			messageId,
+			seq: ++deliverySeq,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: toolCallId,
+			narratorId: parentNarratorId,
+			messageId,
+			toolUseId,
+			toolName: "Agent",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			status: "success",
+			outputJson: "Previous run result",
+			createdAt: nowIso(),
+		});
 		await db.insert(narrators).values({
 			id: narratorId,
 			type: "subagent",
 			variant: "subagent:general",
 			parentNarratorId,
 			traits: ["standalone"],
+			status: "idle",
 			model,
+			cwd: process.env.HOME,
 			autoContinuationOverride: "off",
+			// A delegated session: its run delivers to the creating call.
+			runtimeRegistrationJson: {
+				version: 1,
+				run: {
+					logicalRunId: `knowledge-${narratorId}`,
+					deliverTo: { narratorId: parentNarratorId, toolUseId, toolCallId },
+				},
+			},
 			createdAt: nowIso(),
 			updatedAt: nowIso(),
 		});
 		const text = `BUFFERED_REQUEST_MARKER inspect ${keyword}`;
 		const userId = authorized ? clearedUserId : unclearedUserId;
-		await pushSubagentBufferedMessage(narratorId, text, { createdBy: userId });
-		const requests: Pick<ExecuteLoopOptions, "userText" | "history" | "trailingToolResults">[] = [];
+		const creator = await db.query.users.findFirst({ where: eq(users.id, userId) });
+		const modelText = projectSenderText(text, {
+			kind: "human",
+			id: userId,
+			name: creator?.username,
+		});
+		await enqueueBufferedMessage(narratorId, text, undefined, null, userId);
+		// What the model is sent: the host-built history (not the rows it was built from).
+		const requests: Array<{ userText: string; history: unknown }> = [];
 		const executor = spyOn(narratorExecutor, "executeAgentLoop").mockImplementation(
 			async (input) => {
 				requests.push({
 					userText: input.userText,
-					history: structuredClone(input.history),
-					trailingToolResults: structuredClone(input.trailingToolResults),
+					history: structuredClone(sentHistory(input.history)),
 				});
 				return { finalText: "done", hasError: false, shouldUpdateTitle: false };
 			},
 		);
 		try {
 			expect(process.env.NARRAFORK_TEST).toBe("1");
-			// This is the real drain used by the executor AND runner restart/takeover paths.
-			// It scans with real ACL, persists a sys row, and rebuilds real provider history.
-			const consumed = drainInExecutor
-				? { prompt: "initial dispatch", history: [], trailingToolResults: [], userId: null }
-				: await consumeNextBufferedSubagentMessage({
-						narratorId,
-						parentNarratorId,
-						toolUseId,
-						model,
-						provider: prefix,
-						cwd: process.env.HOME as string,
-						locale: "en",
-					});
-			if (!consumed) throw new Error("expected the queued message to be consumed");
-			await executeSubagent({
-				narratorId,
-				parentNarratorId,
-				toolUseId,
-				subagentType: "general",
-				prompt: consumed.prompt,
-				initialHistory: consumed.history,
-				initialTrailingToolResults: consumed.trailingToolResults,
-				userId: consumed.userId,
-				cwd: process.env.HOME as string,
-				model,
-				provider: prefix,
-				locale: "en",
-				signal: new AbortController().signal,
-				systemPrompt: "Test subagent",
-			});
+			// The one input consumer scans with real ACL, persists a sys row, and rebuilds
+			// real provider history — whether the queued input wakes an idle session or is
+			// adopted at the end of a running pass.
+			if (drainInExecutor) {
+				const handle = await startNarratorRun({
+					narratorId,
+					locale: "en",
+					text: "initial dispatch",
+					principal: null,
+				});
+				expect(handle.started).toBe(true);
+				await handle.terminal;
+			} else {
+				expect((await resumeBufferedMessagesIfIdle(narratorId, "en")).resumed).toBe(true);
+			}
+			const deadline = Date.now() + 5_000;
+			while (requests.length < (drainInExecutor ? 2 : 1) || getExecutionOwner(narratorId)) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for the queued input run");
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			}
 			expect(requests).toHaveLength(drainInExecutor ? 2 : 1);
 			const request = requests[requests.length - 1];
+			// The queued message and its hint are persisted rows: the history carries both.
+			expect(request.userText).toBe("");
+			const historyText = historyStrings(request.history);
 			const rows = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			expect(rows.find((row) => row.role === "user")?.contentText).toBe(text);
-			const hint = rows.find((row) => row.role === "sys");
+			// Prefix context updates are also sys rows; identify the knowledge hint by its block.
+			const hints = rows.filter(
+				(row) =>
+					row.role === "sys" &&
+					(row.contentJson as Array<{ type: string }> | null)?.some(
+						(block) => block.type === "knowledge_hint",
+					),
+			);
+			expect(hints).toHaveLength(authorized ? 1 : 0);
+			const hint = hints[0];
 			if (authorized) {
 				expect(hint?.contentText).toContain(secretEntryId);
 				expect(hint?.parentToolUseId).toBe(toolUseId);
-				if (officialApi) {
-					expect(request.userText).toBe(text);
-					expect(request.history).toContainEqual({ role: "system", content: hint?.contentText });
-				} else {
-					expect(request.userText).toBe(`${hint?.contentText}\n\n${text}`);
-					expect(JSON.stringify(request.history)).not.toContain(secretEntryId);
-					expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
-				}
+				expect(hint?.contentText).not.toContain("<sender");
+				expect(historyText).toContain(modelText);
+				expect(historyText).toContain(hint?.contentText ?? "");
+				expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
+				// Official endpoints take the hint as a system message; compatible ones as input.
+				const hintMessage = (request.history as Array<{ role: string }>).find((message) =>
+					JSON.stringify(message).includes(secretEntryId),
+				);
+				expect(hintMessage?.role).toBe(officialApi ? "system" : "user");
 				expect(JSON.stringify(request).match(/Relevant knowledge-base entries/g)).toHaveLength(1);
 			} else {
-				// A denied/no-hit scan must not invent current-turn text or replay old input.
+				// A denied/no-hit scan must not invent input or replay old input.
 				expect(hint).toBeUndefined();
-				expect(request.userText).toBe(text);
+				expect(historyText).toContain(modelText);
+				expect(JSON.stringify(request).match(/BUFFERED_REQUEST_MARKER/g)).toHaveLength(1);
 				expect(JSON.stringify(request)).not.toContain(secretEntryId);
 			}
 		} finally {
 			executor.mockRestore();
-			clearSubagentBufferedMessages(narratorId);
+			clearBufferedMessages(narratorId);
 		}
 	}
 
-	test("compatible Anthropic carries the new sys hint and buffered message into the current turn", () =>
+	test("compatible Anthropic carries the new sys hint and buffered message as the latest input", () =>
 		resumeBufferedMessage(false, SECRET_KW, true));
 
 	test("the executor's own pass-restart drain also carries the extracted hint", () =>

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -8,10 +9,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import { useToolCallDetail } from "../../../hooks/useNarrator";
 import { toolCallDetailQueryKey } from "../../../lib/api/narrators";
+import en from "../../../locales/en/narrator.json";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { TraceRowInteraction } from "../trace/TraceRowInteraction";
 import { ToolCallInspector } from "./ToolCallInspector";
+import { openHostedToolCallInspector, useToolCallInspectorHost } from "./tool-call-inspector-host";
 
 const { VListRowInteraction } = await import("../vlist/VListRowInteraction");
 const { adaptSegment, adaptActivityUnit } = await import("../vlist/segment-adapter");
@@ -172,6 +175,95 @@ async function render(props: Props | Props[]) {
 	await flush();
 }
 
+describe("ToolCallInspector timing", () => {
+	test("separates streaming, pre-execution wait and measured file operation", async () => {
+		i18n.addResourceBundle(
+			"en",
+			"narrator",
+			{
+				toolCallInspector: {
+					timing: {
+						streaming: "STREAM {{duration}}",
+						wait: "WAIT {{duration}}",
+						execution: "OPERATION {{duration}}",
+						executionSpan: "SPAN {{duration}}",
+						total: "TOTAL {{duration}}",
+					},
+				},
+			},
+			true,
+			true,
+		);
+		const detail = {
+			toolName: "Edit",
+			streamStartedAt: 35_417,
+			streamCompletedAt: 40_192,
+			executionStartedAt: 40_259,
+			completedAt: 48_625,
+			durationMs: 13_209,
+			outputJson: { _metadata: { execDurationMs: 8_366 } },
+		};
+		await render({ ...base, detail });
+		expect(document.body.textContent).toContain("STREAM 4.8s");
+		expect(document.body.textContent).toContain("WAIT 67ms");
+		expect(document.body.textContent).toContain("SPAN 8.4s");
+		expect(document.body.textContent).toContain("TOTAL 13s");
+		await render({
+			...base,
+			detail: {
+				...detail,
+				outputJson: {
+					_metadata: {
+						execDurationMs: 8_366,
+						fileChangeTiming: { waitMs: 8_000, executionMs: 300, totalMs: 8_300 },
+					},
+				},
+			},
+		});
+		expect(document.body.textContent).toContain("WAIT 8.1s");
+		expect(document.body.textContent).toContain("OPERATION 366ms");
+		expect(document.body.textContent).not.toContain("SPAN 8.4s");
+	});
+});
+
+describe("ToolCallInspector file history advisory", () => {
+	for (const source of ["persisted", "live"] as const) {
+		test.each([
+			["applied", "unavailable", true],
+			["not_applied", "unavailable", false],
+			["unknown", "unavailable", false],
+			["conflict", "unavailable", false],
+			[undefined, "unavailable", false],
+			["applied", "complete", false],
+			["applied", undefined, false],
+		] as const)(`${source} %s/%s warns only for confirmed disk writes with missing history`, async (diskOutcome, historyStatus, warned) => {
+			i18n.addResource(
+				"en",
+				"narrator",
+				"revertPlanHistoryUnavailable",
+				en.revertPlanHistoryUnavailable,
+			);
+			const metadata = {
+				...(diskOutcome === undefined ? {} : { diskOutcome }),
+				...(historyStatus === undefined ? {} : { historyStatus }),
+			};
+			await render({
+				...base,
+				detail: {
+					toolName: "Write",
+					status: "completed",
+					...(source === "persisted"
+						? { outputJson: { _text: "result", _metadata: metadata } }
+						: { outputJson: "result", _metadata: metadata }),
+				},
+			});
+			expect(document.body.textContent?.includes(en.revertPlanHistoryUnavailable)).toBe(warned);
+			expect(document.body.textContent).toContain("completed");
+			expect(calls).toHaveLength(0);
+		});
+	}
+});
+
 describe("ToolCallInspector exact refs", () => {
 	test("simultaneous identical provider IDs each render their own initial row's full payload", async () => {
 		await render([
@@ -305,24 +397,27 @@ const rowRefs = [1, 2].map((index) => ({
 }));
 
 function toolItems() {
-	const messages = rowRefs.map((ref) => ({
-		id: ref.messageId,
-		role: "assistant",
-		contentJson: [
+	const messages = rowRefs.map((ref) =>
+		rowWithElements(
 			{
-				type: "tool_use",
-				id: ref.toolUseId,
-				tcId: ref.toolCallId,
-				executionAttempt: ref.executionAttempt,
-				name: "Bash",
-				status: "success",
-				inputJson: { command: "same content" },
-				outputJson: "same content",
+				id: ref.messageId,
+				role: "assistant",
+				toolCalls: [],
 			},
-		],
-		toolCalls: [],
-		children: [],
-	})) as unknown as NarratorMsg[];
+			[
+				{
+					type: "tool_use",
+					id: ref.toolUseId,
+					tcId: ref.toolCallId,
+					executionAttempt: ref.executionAttempt,
+					name: "Bash",
+					status: "success",
+					inputJson: { command: "same content" },
+					outputJson: "same content",
+				},
+			],
+		),
+	) as unknown as NarratorMsg[];
 	const segment = segmentMessages(messages)[0];
 	if (segment?.kind !== "tool-run") throw new Error("expected tool segment");
 	return segment.items as unknown as import("../vlist/segment-adapter").AdapterToolItem[];
@@ -385,6 +480,81 @@ function assertOwnRequests() {
 }
 
 describe("row menu click → real Inspector fetch", () => {
+	test("the list host keeps the inspector after its row unmounts", async () => {
+		function Harness({ showRow }: { showRow: boolean }) {
+			const modal = useToolCallInspectorHost("n1");
+			return (
+				<>
+					{showRow ? (
+						<VListRowInteraction
+							blockId="tc-hosted-tool"
+							messageId="wrong-selection-message"
+							blockIndex={0}
+							actions={{ messageId: "wrong-selection-message" }}
+							narratorId="n1"
+							toolUseId="hosted-tool"
+							toolDetailRef={{ toolCallId: "row-1", messageId: "message-1" }}
+						>
+							<div data-test-tool-row="0">tool</div>
+						</VListRowInteraction>
+					) : null}
+					{modal}
+				</>
+			);
+		}
+		await renderRowNodes(<Harness showRow />);
+		await inspectRow(0);
+		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+		expect(document.body.textContent).toContain("input:");
+		const fetched = calls.length;
+		await renderRowNodes(<Harness showRow={false} />);
+		expect(document.querySelector("[data-test-tool-row]")).toBeNull();
+		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+		expect(document.body.textContent).toContain("input:");
+		expect(calls).toHaveLength(fetched);
+	});
+
+	test("unmounting one list keeps the other list's inspector host", async () => {
+		function Pane({ label }: { label: string }) {
+			const modal = useToolCallInspectorHost("n1");
+			return (
+				<div data-pane={label}>
+					<button
+						type="button"
+						data-open={label}
+						onClick={() =>
+							openHostedToolCallInspector({
+								narratorId: "n1",
+								toolUseId: "hosted-tool",
+								toolCallId: "row-1",
+								messageId: "message-1",
+							})
+						}
+					>
+						open
+					</button>
+					{modal}
+				</div>
+			);
+		}
+		function Panes({ second }: { second: boolean }) {
+			return (
+				<>
+					<Pane label="a" />
+					{second ? <Pane label="b" /> : null}
+				</>
+			);
+		}
+		await renderRowNodes(<Panes second />);
+		await renderRowNodes(<Panes second={false} />);
+		expect(document.querySelector("[data-pane='b']")).toBeNull();
+		await rowAct(() => {
+			document.querySelector<HTMLButtonElement>("[data-open='a']")?.click();
+		});
+		expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+		expect(document.body.textContent).toContain("input:");
+	});
+
 	test("standalone repeated tools use card-owned refs, not the selection message or suffixed key", async () => {
 		const specs = adaptSegment(
 			{ kind: "tool-run", items: toolItems(), sourceMessages: [] },

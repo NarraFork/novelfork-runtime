@@ -74,6 +74,7 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 	};
 	return {
 		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+		...(typeof data.blockId === "string" ? { blockId: data.blockId } : {}),
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
 			typeof data.createdAt === "string" || typeof data.createdAt === "number"
@@ -250,35 +251,6 @@ function eventDiagnosticMessage(data: Record<string, unknown>, fallback = "Unkno
 	return fallback;
 }
 
-export interface CommitSyncErrorEvent {
-	chapterId: string;
-	code?: string;
-	reason?: string;
-	error?: string;
-	message?: string;
-	fallback?: boolean;
-	fatal?: boolean;
-	backgroundSync?: boolean;
-	[key: string]: unknown;
-}
-
-export function coerceCommitSyncErrorEvent(
-	data: Record<string, unknown>,
-): CommitSyncErrorEvent | null {
-	if (typeof data.chapterId !== "string" || !data.chapterId) return null;
-	return {
-		...data,
-		chapterId: data.chapterId,
-		code: typeof data.code === "string" ? data.code : undefined,
-		reason: typeof data.reason === "string" ? data.reason : undefined,
-		error: typeof data.error === "string" ? data.error : undefined,
-		message: typeof data.message === "string" ? data.message : undefined,
-		fallback: typeof data.fallback === "boolean" ? data.fallback : undefined,
-		fatal: typeof data.fatal === "boolean" ? data.fatal : undefined,
-		backgroundSync: typeof data.backgroundSync === "boolean" ? data.backgroundSync : undefined,
-	};
-}
-
 /** Identity aliases attached to a COW compact replacement event. */
 export interface MessageReplacementAliases {
 	oldMessageId?: string;
@@ -317,6 +289,11 @@ export interface CompactProgressEvent extends ProgressSnapshot {
 	retryCount: number;
 	/** Error that triggered the current retry, when retryCount > 0. */
 	retryError?: string;
+	/**
+	 * Provenance of the summary model's context window. `fallback` means packing
+	 * used the tier default because nothing user/catalog/provider configured one.
+	 */
+	contextWindowSource?: string;
 }
 
 export function coerceCompactProgressEvent(
@@ -343,6 +320,9 @@ export function coerceCompactProgressEvent(
 		// Older servers never broadcast retry state, which normalizes to "not
 		// retrying" — exactly their pre-existing behaviour.
 		retryCount,
+		...(typeof data.contextWindowSource === "string" && data.contextWindowSource
+			? { contextWindowSource: data.contextWindowSource }
+			: {}),
 		...(retryCount > 0 && typeof data.retryError === "string" && data.retryError
 			? { retryError: data.retryError }
 			: {}),
@@ -373,6 +353,8 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
+	blockId?: string | null;
 	toolName?: string | null;
 	createdAt?: string | number | null;
 	timing?: SubagentToolCallTiming | null;
@@ -402,6 +384,15 @@ export function coercePermissionRoutingFields(
 			typeof data.subagentNarratorId === "string" ? data.subagentNarratorId : undefined,
 		ownerNarratorId: typeof data.ownerNarratorId === "string" ? data.ownerNarratorId : undefined,
 	};
+}
+
+export interface NarratorWarningInfo {
+	message: string;
+	warningCode?: "native_media_fallback";
+	retryCount?: number;
+	maxRetries?: number;
+	delayMs?: number;
+	diagnostics?: Record<string, unknown>;
 }
 
 export interface NarratorWSCallbacks {
@@ -609,12 +600,14 @@ export interface NarratorWSCallbacks {
 	/**
 	 * A running Await-agent call learned which child narrator it is waiting on.
 	 * Lets the card offer "open session" before the wait returns (the id is not in
-	 * the persisted row until then).
+	 * the persisted row until then). `subagentTitle` is the session's display
+	 * name when the server had the narrator row in hand.
 	 */
 	onAwaitAgentResolved?: (
 		toolUseId: string,
 		subagentNarratorId: string,
 		parentToolUseId?: string,
+		subagentTitle?: string,
 	) => void;
 	/** Accepted Send receipts; their reserved message IDs may still be queued. */
 	onSendDeliveryResolved?: (
@@ -637,6 +630,7 @@ export interface NarratorWSCallbacks {
 		hasDraft: boolean;
 		text: string;
 		fileReferences?: import("@shared/file-reference").FileReference[];
+		hasComposerDocument?: boolean;
 		revision: number;
 		updatedAt: string | null;
 		updatedBy: string | null;
@@ -674,13 +668,7 @@ export interface NarratorWSCallbacks {
 		compactStart?: number,
 		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
-	onGitStatus?: (data: {
-		chapterId: string;
-		commitsAhead: number;
-		baseBranch: string;
-		linesAdded: number;
-		linesRemoved: number;
-	}) => void;
+	onGitStatus?: (data: { linesAdded?: number; linesRemoved?: number }) => void;
 	/**
 	 * Individual worktree paths changed, so a file tree can patch the affected
 	 * directories instead of refetching.
@@ -693,7 +681,6 @@ export interface NarratorWSCallbacks {
 	 * rather than the whole set — invalidate broadly instead of applying it literally.
 	 */
 	onWorkspacePathsChanged?: (data: {
-		chapterId: string;
 		changes: { path: string; kind: "added" | "updated" | "deleted" }[];
 		truncated: boolean;
 	}) => void;
@@ -708,7 +695,7 @@ export interface NarratorWSCallbacks {
 	}) => void;
 	/**
 	 * The narrator is parked on a self-recovering block: a NUG model to recover
-	 * (credential pool exhausted), or a Kimi quota window to reset.
+	 * (credential pool exhausted), or a Kimi / OpenCode Go quota window to reset.
 	 */
 	onModelUnavailableWaiting?: (info: {
 		message: string;
@@ -717,6 +704,8 @@ export interface NarratorWSCallbacks {
 		providerPrefix?: string;
 		nugModelId?: string;
 		waitKind?: "credentials" | "quota";
+		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+		quotaProvider?: "kimi" | "opencode";
 		/** Epoch ms the quota window resets at (`quota` waits only). */
 		resumeAt?: number;
 	}) => void;
@@ -728,6 +717,8 @@ export interface NarratorWSCallbacks {
 		model: string;
 		nugModelId?: string;
 		waitKind?: "credentials" | "quota";
+		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
+		quotaProvider?: "kimi" | "opencode";
 	}) => void;
 	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
@@ -755,19 +746,13 @@ export interface NarratorWSCallbacks {
 		errorCode?: string,
 		diagnostics?: Record<string, unknown>,
 	) => void;
-	onNarratorWarning?: (info: {
-		message: string;
-		retryCount?: number;
-		maxRetries?: number;
-		delayMs?: number;
-		/** Structured cause of the retry. The server always sends this; dropping it
-		 *  here is what forced retry toasts to show raw English provider text. */
-		diagnostics?: Record<string, unknown>;
-	}) => void;
+	onNarratorWarning?: (info: NarratorWarningInfo) => void;
 	/** Leaked XML tool-call diagnostic. Not persisted. */
 	onLeakedToolCall?: (info: {
 		phase: "stream_captured" | "recovered" | "unrecovered";
 		apiRequestId: string;
+		/** Recorder attempt id; the leak path pins it so the evidence outlives the window. */
+		recordingRequestId?: string;
 		toolUseIds?: string[];
 		toolNames?: string[];
 		snippet?: string;
@@ -791,8 +776,6 @@ export interface NarratorWSCallbacks {
 	onSubscribeDenied?: () => void;
 	/** Sharing settings changed; anything showing access state should re-read it. */
 	onAccessChanged?: (reason: string) => void;
-	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
-	onCommitSyncError?: (event: CommitSyncErrorEvent) => void;
 	onBackgroundTaskStarted?: (
 		taskNarratorId: string,
 		toolUseId: string,
@@ -824,15 +807,7 @@ export interface NarratorWSCallbacks {
 		toolUseId?: string;
 		takenOver: boolean;
 	}) => void;
-	onSubagentWarning?: (
-		subagentNarratorId: string,
-		info: {
-			message: string;
-			retryCount?: number;
-			maxRetries?: number;
-			delayMs?: number;
-		},
-	) => void;
+	onSubagentWarning?: (subagentNarratorId: string, info: NarratorWarningInfo) => void;
 	onSubagentConclusionUpdated?: (
 		subagentNarratorId: string,
 		toolUseId: string,
@@ -1307,6 +1282,7 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.subagentNarratorId as string,
 							data.parentToolUseId as string | undefined,
+							data.subagentTitle as string | undefined,
 						);
 						break;
 					case "send_delivery_resolved":
@@ -1361,6 +1337,7 @@ export function useNarratorWS(
 					case "draft_changed":
 						callbackOwner.callbacks.onDraftChanged?.({
 							hasDraft: !!data.hasDraft,
+							...(data.hasComposerDocument ? { hasComposerDocument: true } : {}),
 							text: typeof data.text === "string" ? data.text : "",
 							fileReferences: Array.isArray(data.fileReferences)
 								? (data.fileReferences as import("@shared/file-reference").FileReference[])
@@ -1440,15 +1417,10 @@ export function useNarratorWS(
 						}
 						break;
 					case "git_status":
-						if (data.chapterId) {
-							callbackOwner.callbacks.onGitStatus?.({
-								chapterId: data.chapterId as string,
-								commitsAhead: (data.commitsAhead as number) ?? 0,
-								baseBranch: (data.baseBranch as string) ?? "",
-								linesAdded: (data.linesAdded as number) ?? 0,
-								linesRemoved: (data.linesRemoved as number) ?? 0,
-							});
-						}
+						callbackOwner.callbacks.onGitStatus?.({
+							linesAdded: isFileChangeCount(data.linesAdded) ? data.linesAdded : undefined,
+							linesRemoved: isFileChangeCount(data.linesRemoved) ? data.linesRemoved : undefined,
+						});
 						break;
 					case "workspace_paths_changed": {
 						// An empty `changes` with `truncated` set is meaningful (everything is
@@ -1461,7 +1433,6 @@ export function useNarratorWS(
 							return [{ path: item.path, kind } as const];
 						});
 						callbackOwner.callbacks.onWorkspacePathsChanged?.({
-							chapterId: (data.chapterId as string) ?? "",
 							changes,
 							truncated: data.truncated === true,
 						});
@@ -1503,6 +1474,7 @@ export function useNarratorWS(
 							providerPrefix: data.providerPrefix as string | undefined,
 							nugModelId: data.nugModelId as string | undefined,
 							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 							resumeAt: data.resumeAt as number | undefined,
 						});
 						break;
@@ -1511,6 +1483,7 @@ export function useNarratorWS(
 							model: data.model as string,
 							nugModelId: data.nugModelId as string | undefined,
 							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 						});
 						break;
 					case "queue_status":
@@ -1558,6 +1531,8 @@ export function useNarratorWS(
 					case "warning":
 						callbackOwner.callbacks.onNarratorWarning?.({
 							message: data.message as string,
+							warningCode:
+								data.warningCode === "native_media_fallback" ? data.warningCode : undefined,
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
@@ -1573,6 +1548,8 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onLeakedToolCall?.({
 							phase: data.phase as "stream_captured" | "recovered" | "unrecovered",
 							apiRequestId: data.apiRequestId as string,
+							recordingRequestId:
+								typeof data.recordingRequestId === "string" ? data.recordingRequestId : undefined,
 							toolUseIds: data.toolUseIds as string[] | undefined,
 							toolNames: data.toolNames as string[] | undefined,
 							snippet: data.snippet as string | undefined,
@@ -1668,19 +1645,6 @@ export function useNarratorWS(
 							);
 						}
 						break;
-					case "commits_updated":
-						if (data.chapterId) {
-							callbackOwner.callbacks.onCommitsUpdated?.(
-								data.chapterId as string,
-								(data.newCount as number) ?? 0,
-							);
-						}
-						break;
-					case "commit_sync_error": {
-						const event = coerceCommitSyncErrorEvent(data);
-						if (event) callbackOwner.callbacks.onCommitSyncError?.(event);
-						break;
-					}
 					case "background_task_started":
 						callbackOwner.callbacks.onBackgroundTaskStarted?.(
 							data.taskNarratorId as string,
@@ -1720,6 +1684,8 @@ export function useNarratorWS(
 					case "subagent_warning":
 						callbackOwner.callbacks.onSubagentWarning?.(data.subagentNarratorId as string, {
 							message: data.message as string,
+							warningCode:
+								data.warningCode === "native_media_fallback" ? data.warningCode : undefined,
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
@@ -1774,6 +1740,8 @@ export function useNarratorWS(
 								listEpoch: data.listEpoch as string,
 								version: data.version as number,
 								activeCount: data.activeCount as number,
+								activeWorkCount: data.activeWorkCount as number | undefined,
+								activeServiceCount: data.activeServiceCount as number | undefined,
 								upsert: data.upsert as BackgroundTaskListDelta["upsert"],
 								removeIds: data.removeIds as string[] | undefined,
 								invalidate: data.invalidate as boolean | undefined,
@@ -1960,7 +1928,6 @@ export interface NarratorListWSEvent {
 		| "presence"
 		| "terminalCount"
 		| "backgroundTaskCount"
-		| "containerStatus"
 		| "draft"
 		/**
 		 * An agent started or stopped BLOCKING on an async question (`Await`).
@@ -1977,6 +1944,13 @@ export interface NarratorListWSEvent {
 	substatus?: string[];
 	/** Execution generation for the current/last turn — used to dedup notifications per turn. */
 	turnStartedAt?: string;
+	/**
+	 * `status` only, done-transition (idle + unread): non-service background work
+	 * is still running. The narrator still renders unread and the favicon still
+	 * alerts, but the sound/PWA notification is suppressed — the wake-up turn
+	 * after the last background task completes notifies normally.
+	 */
+	backgroundWorkActive?: boolean;
 	title?: string;
 	permissionMode?: string;
 	viewers?: Array<{
@@ -1987,7 +1961,8 @@ export interface NarratorListWSEvent {
 	}>;
 	activeTerminalCount?: number;
 	activeBackgroundTaskCount?: number;
-	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
+	activeBackgroundWorkCount?: number;
+	activeBackgroundServiceCount?: number;
 	hasDraft?: boolean;
 	/** `awaitedQuestion` only: true when an agent just started blocking on a question. */
 	awaited?: boolean;
@@ -2061,6 +2036,7 @@ export function useNarratorsListWS(
 							type: "status",
 							status: data.status as string,
 							substatus: data.substatus as string[] | undefined,
+							...(data.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 						});
 				} else if (data.type === "substatus_change") {
 					if (nId)

@@ -72,7 +72,9 @@ mock.module("../narrator-service", () => ({
 	},
 }));
 
+const { knowledgeCreateTool } = await import("../../lib/agent/tools/knowledge-edit");
 const {
+	cancelDangerReflection,
 	classifyDanger,
 	confirmDangerReflection,
 	createDangerFingerprint,
@@ -381,6 +383,93 @@ describe("confirmDangerReflection ordering", () => {
 	});
 });
 
+describe("KnowledgeCreate approval payload identity", () => {
+	for (const scenario of ["full", "minimal", "changed-content"] as const) {
+		test(`${scenario}: internal approval respects the confirmed payload fingerprint`, async () => {
+			const id = `knowledge-payload-${scenario}`;
+			const callId = `${id}-call`;
+			const useId = `${id}-use`;
+			const input =
+				scenario === "minimal"
+					? { title: "Personal note", content: "approved body" }
+					: {
+							title: "Global note",
+							content: "approved body",
+							collectionId: "knowledge-collection",
+							direct: true,
+							fallbackToPersonal: false,
+							tags: ["docs"],
+							keywords: ["approval-payload"],
+							changeNote: "Initial entry",
+						};
+			await seedPermissionRequest({
+				narratorId: id,
+				messageId: `${id}-message`,
+				toolCallId: callId,
+				toolUseId: useId,
+				toolName: "KnowledgeCreate",
+				input,
+				permissionMode: "bypassPermissions",
+			});
+			await db
+				.update(narrators)
+				.set({ dangerReflectionOverride: "standard" })
+				.where(eq(narrators.id, id));
+			const signal = new AbortController().signal;
+			const outer = await handlePermission(
+				id,
+				signal,
+				"KnowledgeCreate",
+				input,
+				useId,
+				"/workspace",
+				"en",
+			);
+			expect(outer.behavior).toBe("dangerReflection");
+			if (outer.behavior !== "dangerReflection") throw new Error("Expected outer reflection");
+			expect(await confirmDangerReflection(callId, "Verified the complete payload")).toBe(true);
+			expect((await outer.decision).behavior).toBe("allow");
+
+			const actualInput =
+				scenario === "changed-content" ? { ...input, content: "unapproved body" } : input;
+			let internalBehavior: PermissionResult["behavior"] | undefined;
+			const reason = "Stop after approval inspection without creating knowledge.";
+			const result = await knowledgeCreateTool.execute(actualInput, {
+				narratorId: id,
+				cwd: "/workspace",
+				signal,
+				locale: "en",
+				currentToolUseId: useId,
+				requestPermission: async (toolName, approvalInput, approvalUseId) => {
+					const decision = await handlePermission(
+						id,
+						signal,
+						toolName,
+						approvalInput,
+						approvalUseId,
+						"/workspace",
+						"en",
+					);
+					internalBehavior = decision.behavior;
+					if (decision.behavior === "dangerReflection") {
+						await cancelDangerReflection(decision.requestId, reason);
+						return decision.decision;
+					}
+					// This test probes the real gate, not knowledge persistence.
+					return { behavior: "deny", message: reason };
+				},
+			});
+			expect(internalBehavior).toBe(scenario === "changed-content" ? "dangerReflection" : "allow");
+			expect(result.isError).toBe(true);
+			expect(result.output).toBe(reason);
+			expect(
+				(await db.query.narratorToolCalls.findFirst({ where: eq(narratorToolCalls.id, callId) }))
+					?.inputJson,
+			).toEqual(actualInput);
+		});
+	}
+});
+
 describe("working-directory switch danger reflection", () => {
 	const input = {
 		expectedRevision: 1,
@@ -465,6 +554,59 @@ describe("working-directory switch danger reflection", () => {
 			expect(await result.decision).toMatchObject({ behavior: "allow" });
 		});
 	}
+});
+
+describe(".git internal review routing", () => {
+	const input = { file_path: "/workspace/.git/refs/heads/main", content: "0".repeat(40) };
+
+	test.each([
+		"light",
+		"standard",
+		"strict",
+		"off",
+	] as const)("bypassPermissions sends review-tier .git writes to %s reflection or a human", async (level) => {
+		const id = `git-review-${level}`;
+		const callId = `${id}-call`;
+		const useId = `${id}-use`;
+		await seedPermissionRequest({
+			narratorId: id,
+			messageId: `${id}-message`,
+			toolCallId: callId,
+			toolUseId: useId,
+			toolName: "Write",
+			input,
+			permissionMode: "bypassPermissions",
+		});
+		await db.update(narrators).set({ dangerReflectionOverride: level }).where(eq(narrators.id, id));
+		const permissionPromise = handlePermission(
+			id,
+			new AbortController().signal,
+			"Write",
+			input,
+			useId,
+			"/workspace",
+			"en",
+			undefined,
+			{
+				executionBackend: localBackend,
+				executionTarget: frozenTarget(localBackend, { cwd: "/workspace", path: input.file_path }),
+			},
+		);
+		if (level === "off") {
+			// No reflection to answer the review: it must reach a human, never auto-allow.
+			await waitFor(() => pendingPermissions.has(callId));
+			expect(pendingDangerReflections.has(callId)).toBe(false);
+			expect(await resolvePermission(callId, "deny")).toBe(true);
+			expect(await permissionPromise).toMatchObject({ behavior: "deny" });
+			return;
+		}
+		const result = await permissionPromise;
+		expect(result.behavior).toBe("dangerReflection");
+		if (result.behavior !== "dangerReflection") throw new Error("Expected reflection pause");
+		expect(result.danger.details?.join("\n")).toContain(".git/refs/heads/main");
+		expect(await confirmDangerReflection(callId, "Verified the ref update")).toBe(true);
+		expect(await result.decision).toMatchObject({ behavior: "allow" });
+	});
 });
 
 describe("danger fingerprint execution identity", () => {
@@ -1171,6 +1313,7 @@ describe("OAuth remote runtime permission constraints", () => {
 		label: string;
 		toolName:
 			| "Bash"
+			| "Stop"
 			| "Write"
 			| "Edit"
 			| "KnowledgeSearch"
@@ -1295,6 +1438,33 @@ describe("OAuth remote runtime permission constraints", () => {
 		});
 		expect(probes).toBe(0);
 	});
+	test("Stop rejects unknown OAuth tasks and review without remote path probes", async () => {
+		let probes = 0;
+		const backend: ExecutionBackend = {
+			...makeRemoteRuntimeBackend(),
+			resolvePathIdentity: async () => {
+				probes++;
+				throw new Error("metadata unavailable");
+			},
+		};
+		for (const type of ["bash", "agent"]) {
+			for (const reviewReadOnlyBash of [false, true]) {
+				const result = await evaluate({
+					label: `stop-${type}-review-${reviewReadOnlyBash}`,
+					toolName: "Stop",
+					toolInput: { type, id: "owned-task" },
+					backend,
+					directoryRules: ["/restricted"],
+					reviewReadOnlyBash,
+				});
+				expect(result.behavior).toBe("deny");
+				if (result.behavior === "deny")
+					expect(result.message).toContain(reviewReadOnlyBash ? "Review mode" : "does not exist");
+			}
+		}
+		expect(probes).toBe(0);
+	});
+
 	test("real Bash analysis deduplicates repeated operands and bounds large remote batches", async () => {
 		for (const repeated of [true, false]) {
 			const base = makeRemoteRuntimeBackend();

@@ -206,6 +206,134 @@ describe("SQL-derived physical column order", () => {
 		expect(result.problems.length).toBeGreaterThan(0);
 	});
 
+	test("reviewed procedural statements are admitted only by exact text", () => {
+		const folder = join(import.meta.dir, "../../drizzle-postgres");
+		const sql = readBounded(join(folder, "0012_narrator_model_history_revision.sql"), 1024 * 1024);
+		const statements = sql
+			.split("--> statement-breakpoint")
+			.map((part) => part.trim())
+			.filter((part) => /^(CREATE (FUNCTION|TRIGGER)|INSERT INTO)/.test(part));
+		// The real reviewed statements pass on their own (no table needed for these).
+		expect(statements).toHaveLength(11);
+		for (const statement of statements) expect(run(statement, {}).problems).toEqual([]);
+		const fn = statements.find((statement) => statement.startsWith("CREATE FUNCTION"));
+		if (!fn) throw new Error("fixture");
+		// One character inside the opaque body, or a dynamic-DDL payload, is a new statement.
+		for (const tampered of [
+			fn.replace("RETURN NEW;", "RETURN NEW; "),
+			fn.replace("BEGIN", "BEGIN EXECUTE 'ALTER TABLE narrators ADD COLUMN x text';"),
+			fn.replace("model_history_v1_", "model_history_v2_"),
+		]) {
+			expect(tampered).not.toBe(fn);
+			expect(run(tampered, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+		}
+	});
+
+	test("context stats copy is admitted only by exact text", () => {
+		const folder = join(import.meta.dir, "../../drizzle-postgres");
+		const sql = readBounded(join(folder, "0022_context_numeric_stats.sql"), 1024 * 1024);
+		const statements = sql
+			.split("--> statement-breakpoint")
+			.map((part) => part.trim())
+			.filter((part) => /^(CREATE (FUNCTION|TRIGGER)|INSERT INTO)/.test(part));
+		expect(statements).toHaveLength(4);
+		for (const statement of statements) expect(run(statement, {}).problems).toEqual([]);
+		const fn = statements.find((statement) => statement.startsWith("CREATE FUNCTION"));
+		if (!fn) throw new Error("fixture");
+		const tampered = fn.replace("RETURN NEW;", "RETURN NULL;");
+		expect(run(tampered, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+	});
+
+	test("0047 models the reviewed conditional column and rejects altered DO bodies", () => {
+		const sql = readBounded(
+			join(import.meta.dir, "../../drizzle-postgres/0048_native_media.sql"),
+			1024 * 1024,
+		);
+		const [media, compensation, modeltraceCompensation] = sql.split("--> statement-breakpoint");
+		expect(run(modeltraceCompensation, {}).problems.join("\n")).toContain(
+			"Unknown SQL table narrators",
+		);
+		good(
+			[
+				"CREATE TABLE narrators(id text, hidden_from_lists boolean, modeltrace_key text);",
+				modeltraceCompensation,
+			],
+			{ narrators: ["id", "hidden_from_lists", "modeltrace_key"] },
+		);
+		for (const changed of [
+			modeltraceCompensation.replace("AND NOT EXISTS", "AND EXISTS"),
+			modeltraceCompensation.replace(
+				"f2ecf4303ae75d856f1fe37c88ca9419e21131b8e34edbbef2d982a812945728",
+				"unrelated",
+			),
+			modeltraceCompensation.replace("WHERE hash IN", "WHERE hash NOT IN"),
+		]) {
+			expect(run(changed, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+		}
+		const table = "CREATE TABLE narrator_buffered_messages(id text, existing text);";
+		const order = good([table, media], {
+			narrator_buffered_messages: ["id", "existing", "media_json"],
+		});
+		expect(order.get("narrator_buffered_messages")).toEqual(["id", "existing", "media_json"]);
+		const existing = good(
+			["CREATE TABLE narrator_buffered_messages(id text, media_json text, existing text);", media],
+			{ narrator_buffered_messages: ["id", "existing", "media_json"] },
+		);
+		expect(existing.get("narrator_buffered_messages")).toEqual(["id", "media_json", "existing"]);
+		for (const changed of [
+			media.replace("ADD COLUMN IF NOT EXISTS", "ADD COLUMN"),
+			media.replace("END IF;", "END IF; EXECUTE 'DROP TABLE narrator_buffered_messages';"),
+			compensation.replace("AND NOT EXISTS", "AND EXISTS"),
+			compensation.replace('"in_process_epoch" integer', '"other_epoch" integer'),
+		]) {
+			expect(run(changed, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+		}
+		// The conditional compensation is not a no-op unless upstream 0046's layout exists.
+		expect(run(compensation, {}).problems.join("\n")).toContain(
+			"Unknown SQL table outline_task_claims",
+		);
+		const upstream = readBounded(
+			join(import.meta.dir, "../../drizzle-postgres/0046_outline_task_claims.sql"),
+			1024 * 1024,
+		);
+		const base = "CREATE TABLE outline_blocks(id text); CREATE TABLE outline_spaces(id text);";
+		const expected = {
+			outline_blocks: ["id", "in_process"],
+			outline_spaces: ["id", "in_process_ready", "in_process_epoch"],
+			outline_task_claims: [
+				"task_block_id",
+				"holder_narrator_id",
+				"holder_user_id",
+				"epoch",
+				"task_version_at_claim",
+				"claimed_at",
+				"expires_at",
+				"last_holder_narrator_id",
+				"last_holder_user_id",
+			],
+		};
+		const before = good([base, upstream], expected);
+		const after = good([base, upstream, compensation], expected);
+		expect(after).toEqual(before);
+		const partial = upstream.replace(
+			'ALTER TABLE "outline_spaces" ADD COLUMN "in_process_epoch" integer DEFAULT 0 NOT NULL;',
+			"",
+		);
+		expect(run([base, partial, compensation], expected).problems.join("\n")).toContain(
+			"0047 compensation baseline missing outline_spaces.in_process_epoch",
+		);
+	});
+
+	test("row level security toggles do not change column order", () => {
+		const order = good(
+			`CREATE TABLE t(a text);
+			ALTER TABLE t DISABLE ROW LEVEL SECURITY;
+			ALTER TABLE t ENABLE ROW LEVEL SECURITY;`,
+			{ t: ["a"] },
+		);
+		expect(order.get("t")).toEqual(["a"]);
+	});
+
 	test.each([
 		"CREATE TABLE t(a text,a text);",
 		"CREATE TABLE t(a text); CREATE TABLE t(b text);",
@@ -268,6 +396,7 @@ describe("SQL-derived physical column order", () => {
 			columns: structuredClone(expected.columns),
 			foreignKeys: [],
 			indexes: [],
+			primaryKeys: [],
 			uniques: [],
 			checks: [],
 			generated: [],
@@ -336,18 +465,47 @@ describe("bounds, real committed assets, and source AST guard", () => {
 		const sqls = metadata.journal.entries.map((entry) =>
 			readBounded(join(folder, `${entry.tag}.sql`), 1024 * 1024),
 		);
-		const result = physicalColumnOrderFromSql(sqls, metadata.snapshot as unknown as Snapshot);
+		const currentSnapshot = metadata.snapshot as unknown as Snapshot;
+		const result = physicalColumnOrderFromSql(sqls, currentSnapshot);
 		expect(result.problems).toEqual([]);
-		expect(result.order.size).toBe(
-			Object.keys((metadata.snapshot as unknown as Snapshot).tables).length,
-		);
+		expect(result.order.size).toBe(Object.keys(currentSnapshot.tables).length);
+		for (const table of Object.values(currentSnapshot.tables)) {
+			const physicalColumns = result.order.get(table.name);
+			expect(physicalColumns, `${table.name} has a complete SQL-derived order`).toBeDefined();
+			expect(physicalColumns?.length).toBe(Object.keys(table.columns).length);
+			expect([...(physicalColumns ?? [])].sort()).toEqual(
+				Object.values(table.columns)
+					.map((column) => column.name)
+					.sort(),
+			);
+		}
 		const narrators = result.order.get("narrators");
-		expect(narrators?.slice(-2)).toEqual([
+		// 0010 appends stop reason after both context columns, then 0012 appends the model-history
+		// revision; schema declaration order cannot substitute for physical order reconstructed
+		// from the full journal.
+		const historicalStart = narrators?.indexOf("context_char_cache_json") ?? -1;
+		expect(historicalStart).toBeGreaterThanOrEqual(0);
+		expect(narrators?.slice(historicalStart, historicalStart + 4)).toEqual([
 			"context_char_cache_json",
 			"context_usage_snapshot_json",
+			"last_stop_reason",
+			"model_history_revision",
+		]);
+		// 0047 追加 ModelTrace 舱的两列，0048 追加大纲任务后端，0051 追加回复上下文。
+		expect(narrators?.slice(-6)).toEqual([
+			"runtime_registration_json",
+			"policy_source_narrator_id",
+			"hidden_from_lists",
+			"modeltrace_key",
+			"task_backend",
+			"reply_context",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
-		expect(result.order.get("background_tasks")?.at(-1)).toBe("insert_seq");
+		// The main-branch 0010 migration appends background_kind after insert_seq.
+		expect(result.order.get("background_tasks")?.slice(-2)).toEqual([
+			"insert_seq",
+			"background_kind",
+		]);
 	});
 
 	test("AST pins a pure SQL helper with no catalog access or snapshot-order writes", () => {

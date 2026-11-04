@@ -1,3 +1,5 @@
+import type { PreparedUpdateIdentity } from "@shared/update-identity";
+
 export type UpdateCoordinationPhase =
 	| "idle"
 	| "draining"
@@ -72,6 +74,7 @@ export interface UpdateInstructions {
  */
 export interface PreparedUpdateStatus {
 	ready: boolean;
+	preparedIdentity?: PreparedUpdateIdentity;
 	updateFile?: string;
 	canAutoRestart: boolean;
 	newBinaryPath?: string;
@@ -87,6 +90,8 @@ export interface PreparedUpdateStatus {
 	resumableExecutionCount?: number;
 	pausedToolCount?: number;
 	cancelRequested?: boolean;
+	/** The current attempt still owns recovery state and its failed cleanup can be retried. */
+	cleanupRetryPending?: boolean;
 	blockers?: UpdateWaitBlocker[];
 	error?: string;
 	errorKind?: "failed" | "cancelled";
@@ -169,6 +174,8 @@ export function resolveUpdateStatusPollInterval(input: UpdateStatusPollInput): n
 	const { status, dataUpdatedAt, errorSinceMs = null, assumeScheduled = false } = input;
 	const statusErrorIsCurrent =
 		!!status?.error && (errorSinceMs === null || dataUpdatedAt >= errorSinceMs);
+	// Cleanup failure is not a terminal cancellation: keep observing the held attempt.
+	if (status?.cleanupRetryPending) return UPDATE_STATUS_ACTIVE_POLL_MS;
 	if (statusErrorIsCurrent && !status?.scheduled && !assumeScheduled) return false;
 	return assumeScheduled || status?.scheduled === true
 		? UPDATE_STATUS_ACTIVE_POLL_MS
@@ -177,7 +184,7 @@ export function resolveUpdateStatusPollInterval(input: UpdateStatusPollInput): n
 
 /** Whether a scheduled update exists, so ambient UI must stay mounted and polling. */
 export function hasActiveUpdateSchedule(status: PreparedUpdateStatus | undefined): boolean {
-	return status?.scheduled === true;
+	return status?.scheduled === true || status?.cleanupRetryPending === true;
 }
 
 export interface ScheduledUpdatePill {

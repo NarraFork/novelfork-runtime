@@ -6,6 +6,7 @@ export {
 	adminCreateUserSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
+	createGitIdentitySchema,
 	loginSchema,
 	mfaToggleSchema,
 	mfaVerifySchema,
@@ -19,23 +20,9 @@ export {
 	registerSchema,
 	totpActivateSchema,
 	totpDisableSchema,
+	updateGitIdentitySchema,
 	updateProfileSchema,
 } from "./auth";
-export {
-	batchCleanupSchema,
-	batchMergeSchema,
-	containerConfigSchema,
-	createChapterSchema,
-	createReviewSchema,
-	forkChapterSchema,
-	mergeChapterSchema,
-	mergeCheckSchema,
-	splitChapterSchema,
-	updateChapterDetachedPanelsSchema,
-	updateChapterDockLayoutSchema,
-	updateChapterSchema,
-	updateGraphPositionsSchema,
-} from "./chapters";
 export {
 	chatDirectoryQuerySchema,
 	chatMessagesQuerySchema,
@@ -59,12 +46,6 @@ export {
 	whitelistDirEntrySchema,
 } from "./common";
 export {
-	applyVolumeSnapshotSchema,
-	containerRemoveSchema,
-	createVolumeSnapshotSchema,
-	updateVolumeSnapshotSchema,
-} from "./containers";
-export {
 	buildPathRulesConfigSnippet,
 	createRemoteDeviceSchema,
 	deviceBrowseQuerySchema,
@@ -76,19 +57,20 @@ export {
 	updateDevicePathRulesSchema,
 	updateRemoteDeviceSchema,
 } from "./devices";
-export {
-	createExplorationGroupSchema,
-	updateExplorationGroupSchema,
-} from "./explorations";
 export { type FsWriteInput, fsWriteSchema } from "./fs";
 export {
+	gitBranchNameSchema,
+	gitCheckoutSchema,
 	gitCommitDiffQuerySchema,
 	gitCommitSchema,
 	gitCommitShaSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
+	gitFetchSchema,
 	gitLogQuerySchema,
 	gitModificationsQuerySchema,
+	gitPushSchema,
+	gitRemoteNameSchema,
 	gitResetSchema,
 	gitStageSchema,
 	gitStashSchema,
@@ -112,6 +94,7 @@ export {
 	knowledgeSearchQuerySchema,
 	listDraftSubmissionsQuerySchema,
 	listKnowledgeAclEventsQuerySchema,
+	listKnowledgeEntriesQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
 	rebaseKnowledgeDraftQuerySchema,
@@ -138,18 +121,22 @@ export {
 	updateKnowledgePackSchema,
 } from "./knowledge-packs";
 export {
+	narratorTimelineQuerySchema,
+	narratorTimelineTurnsQuerySchema,
+} from "./narrator-timeline";
+export {
 	askInPassingSchema,
 	askInPassingStartSchema,
 	asyncQuestionAnswerSchema,
 	asyncQuestionDetailQuerySchema,
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
-	batchDeleteBlocksSchema,
 	browserInteractSchema,
 	bufferQueueModeSchema,
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
+	codexUpdateCredentialSchema,
 	codexUseImageGenerationSchema,
 	codexUseWebSearchSchema,
 	codexUseWebSocketSchema,
@@ -175,12 +162,14 @@ export {
 	narratorWriteAudienceSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
+	restoreNarratorDraftSchema,
 	retryFailedCompactSchema,
 	revertFilesSchema,
 	revertScopeSchema,
 	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	setNarratorGitIdentitySchema,
 	subagentRecoverySchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
@@ -211,22 +200,23 @@ export {
 	updateProjectSchema,
 } from "./projects";
 export {
-	rulerAbandonSchema,
-	rulerMergeSchema,
-	rulerRebaseResolveSchema,
-	rulerRebaseSchema,
-	updateRulerPositionsSchema,
-} from "./ruler";
-export {
 	createScheduledTaskSchema,
 	toggleScheduledTaskSchema,
 	updateScheduledTaskSchema,
 } from "./scheduled-tasks";
 export {
+	type SessionLocationInput,
+	sessionExportDownloadQuerySchema,
+	sessionExportToSchema,
+	sessionImportFromPathSchema,
+	sessionImportUploadFieldsSchema,
+	sessionInterchangeFormatSchema,
+	sessionScanQuerySchema,
+} from "./session-interchange";
+export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
-	modelCardSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabSchema,
@@ -236,6 +226,7 @@ export {
 	reorderFavoriteDirectoriesSchema,
 	restoreRecentTabsSchema,
 	setRecentTabDirectoryOrderSchema,
+	specTabLayoutPatchSchema,
 	updateFavoriteDirectorySchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,

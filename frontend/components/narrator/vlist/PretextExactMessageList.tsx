@@ -35,6 +35,7 @@ import {
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
@@ -78,11 +79,13 @@ import { useRenderLod } from "../lod/RenderLodCtx";
 import { type MessageSelectionResolver, useMessageSelection } from "../message/MessageSelectionCtx";
 import { resolveEditorInitialText } from "../message/message-edit-text";
 import type { MessageListHandle, MessageListTailMeta } from "../message/message-list-handle";
+import { isForeignSubagentRow } from "../message/nested-rows";
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
+import { useToolCallInspectorHost } from "../tool-call/tool-call-inspector-host";
 import {
 	getCategory,
 	getCategoryColor,
@@ -290,10 +293,6 @@ import {
 } from "./vlist-reload-policy";
 import { indexWithHeightOverrides } from "./vlist-resize-preview";
 import {
-	resolveReviewFeedbackActions,
-	useReviewFeedbackActions,
-} from "./vlist-review-feedback-actions";
-import {
 	buildRowCtxActions,
 	buildRowToolActions,
 	rowActionHandlerDependencies,
@@ -319,8 +318,10 @@ import {
 } from "./vlist-spec-carryover-actions";
 import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-live";
 import { nextStreamAnimEpoch } from "./vlist-stream-anim-extra";
+import { useSubagentRecoveryDismiss } from "./vlist-subagent-recovery-dismiss";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
+import { installVListTextDragGuard } from "./vlist-text-drag";
 import { buildToolMetaIndex } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
 import {
@@ -411,8 +412,6 @@ type PretextExactMessageListProps = {
 	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
-	/** Narrator is bound to a chapter (git) → user-edit offers the rollback option. */
-	hasChapter?: boolean;
 	/**
 	 * Deep-link / search target: jump to this message once and flash it.
 	 *
@@ -424,6 +423,8 @@ type PretextExactMessageListProps = {
 	highlightMessageId?: string;
 	/** A new request repeats the jump while retaining this list's loaded window. */
 	highlightRequestId?: string;
+	/** Text that picks which row of a multi-row message the jump lands on. */
+	highlightNeedle?: string;
 	tailFooter?: ReactNode;
 	/**
 	 * Pluggable data boundary for surfaces rendering the same document through a
@@ -507,6 +508,14 @@ function isStreamingRowKey(key: string): boolean {
 	return key.startsWith(STREAMING_PLACEHOLDER_ID);
 }
 
+// Cached document readers outlive the pane. Keeping this transport at module
+// scope prevents its closure from retaining React's shared render Context (and
+// therefore setViewportNode, the old Fiber tree and the whole Dockview surface).
+const ensureNarratorWriteSource: WriteDocumentSourceEnsurer = (owner, toolUseId, pin, signal) => {
+	if (!isExactWriteDocumentPin(pin))
+		return Promise.reject(new Error("Exact Write document source identity is missing"));
+	return narratorsApi.ensureWriteDocumentSource(owner, toolUseId, pin, signal);
+};
 export const PretextExactMessageList = memo(
 	forwardRef<MessageListHandle, PretextExactMessageListProps>(
 		function PretextExactMessageList(props, ref) {
@@ -524,9 +533,9 @@ export const PretextExactMessageList = memo(
 				onSelectionResolverChange,
 				rowHandlers,
 				permCb,
-				hasChapter,
 				highlightMessageId,
 				highlightRequestId,
+				highlightNeedle,
 				tailFooter,
 				dataSource,
 				selectedMessageIds: messageSelectedIds,
@@ -664,6 +673,7 @@ export const PretextExactMessageList = memo(
 			const [layoutCompactUsageLines, setLayoutCompactUsageLines] = useState(isMobileViewport);
 			const committedCompactUsageLinesRef = useRef(isMobileViewport);
 			const [contentWidth, setContentWidth] = useState(0);
+			const [layoutGeometryNode, setLayoutGeometryNode] = useState<HTMLDivElement | null>(null);
 			const [widthCommitEpoch, setWidthCommitEpoch] = useState(0);
 			// Exact viewport height can change live; only the finished height reaches the full build.
 			const [layoutHeight, setLayoutHeight] = useState(0);
@@ -871,6 +881,9 @@ export const PretextExactMessageList = memo(
 			} | null>(null);
 			/** Message whose pre-edit original text the (single) shell modal reveals. */
 			const [originalModalMessageId, setOriginalModalMessageId] = useState<string | null>(null);
+			// One inspector for the list. Rows only request it; mounting the dialog on
+			// the row unmounts it whenever that row leaves the overscan window.
+			const toolCallInspector = useToolCallInspectorHost(narratorId);
 			// Per-key real-pixel height overrides for rows whose content cannot be
 			// predicted arithmetically (mermaid / katex / unknown images, the live
 			// permission form, and the inline editor). A row reports its settled height via
@@ -985,6 +998,12 @@ export const PretextExactMessageList = memo(
 			// Edit/Read rows showed just the tool name while their expanded detail (which
 			// fetches the full payload) looked fine.
 			const { t, i18n } = useTranslation("narrator");
+			// Every localized string the vlist paints comes from one place (the vlist
+			// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
+			// the pure adapter's measured card / trace text and exact tool summaries;
+			// `renderLabels` supplies each RenderXxx's chrome. Reuse the memoized labels
+			// without translating every historical tool again on each streaming frame.
+			const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
 			const resolveExactToolSummary = useCallback(
 				(tc: unknown) => {
 					const call = (tc ?? {}) as {
@@ -1022,35 +1041,26 @@ export const PretextExactMessageList = memo(
 										: {}),
 								}
 							: undefined;
+					// The running Await's session title also lives on the call record
+					// (`_awaitAgentTitle`, server-resolved): lift it so the header can name
+					// the session before the tool's own metadata exists.
+					const awaitTitle = (call as { _awaitAgentTitle?: unknown })._awaitAgentTitle;
+					const summaryInputMetadata =
+						typeof awaitTitle === "string" && awaitTitle
+							? { ...baseMetadata, _awaitAgentTitle: awaitTitle }
+							: baseMetadata;
 					const summaryMetadata =
 						call.toolName === "Send"
 							? {
-									...baseMetadata,
+									...summaryInputMetadata,
 									status: call.status,
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: baseMetadata;
-					return getSummary(call.toolName, call.inputJson, summaryMetadata, {
-						communicationRunning: t("communicationRunning"),
-						communicationNoRecipients: t("communicationNoRecipients"),
-						communicationSuccess: t("communicationSuccess"),
-						communicationReceived: t("communicationReceived"),
-						communicationWaiting: t("communicationWaiting"),
-						communicationReplyReceived: t("communicationReplyReceived"),
-						communicationTimeout: t("communicationTimeout"),
-						communicationCancelled: t("communicationCancelled"),
-						communicationError: t("communicationError"),
-						contextAskOutputChars: t("contextAskOutputChars", { count: "{count}" }),
-						contextAskQuestions: t("contextAskQuestions", { count: "{count}" }),
-						contextAskStatusSummary: t("contextAskStatusSummary"),
-						workspaceCreate: t("workspaceCreate"),
-						workspaceList: t("workspaceList"),
-						workspaceSwitch: t("workspaceSwitch"),
-						workspaceDevice: t("workspaceDevice"),
-					});
+							: summaryInputMetadata;
+					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
-				[t],
+				[vlistLabels],
 			);
 			// A subagent recent-call row's label detail. Same shared helper the chunked
 			// `SubagentActivityRow` calls, so one child call is worded identically in both
@@ -1594,6 +1604,10 @@ export const PretextExactMessageList = memo(
 				},
 				[],
 			);
+			// Closing the recovery card is the third answer — "leave them stopped". It
+			// deletes the display row server-side, so identity stability matters here for
+			// the same reason as above: every mounted row receives this callback.
+			const dismissSubagentRecovery = useSubagentRecoveryDismiss(narratorId);
 
 			// Dynamic Spec notice cards: "View tasks" opens the Spec task board. The panel
 			// owns that panel, and the chunked card reaches it by bubbling a DOM
@@ -1603,11 +1617,6 @@ export const PretextExactMessageList = memo(
 				viewportRef.current?.dispatchEvent(new CustomEvent("spec-open-tasks", { bubbles: true }));
 			}, []);
 			const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
-
-			// Review feedback cards: the button hands the conclusion to this narrator as a user
-			// turn. A concluded review does not wake an idle narrator by design, so this is how
-			// the findings get acted on.
-			const resolveReviewActions = useReviewFeedbackActions(narratorId);
 
 			// Error notice cards: "mark as retryable" opens the shared rule dialog, the
 			// close button deletes the notice. The dialog is one shell-level instance
@@ -1627,11 +1636,6 @@ export const PretextExactMessageList = memo(
 			// content fixed while the reserved space changes off-screen above it.
 			const [olderHeaderHeight, setOlderHeaderHeight] = useState(0);
 			const { t: tCommon } = useTranslation("common");
-			// Every localized string the vlist paints comes from one place (the vlist
-			// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
-			// the pure adapter's measured card / trace text; `renderLabels` supplies each
-			// RenderXxx's chrome (buttons, badges, section titles, placeholders).
-			const { adapterLabels: vlistLabels, renderLabels } = useVListLabels();
 			// Tooltip / aria label for a clickable text-file attachment. Height-neutral
 			// chrome, so it does NOT participate in the measurement cache key.
 			const openAttachmentLabel = t("contextMenu_openFilePanel");
@@ -1648,7 +1652,6 @@ export const PretextExactMessageList = memo(
 					narrator: t("openFullSubagentSession"),
 					knowledge: t("injectionTarget.openKnowledge"),
 					spec: t("injectionTarget.openSpecFile"),
-					chapter: t("injectionTarget.openChapter"),
 				}),
 				[t],
 			);
@@ -1891,14 +1894,7 @@ export const PretextExactMessageList = memo(
 			}>({ narratorId, requests: [] });
 			const rawTextDocumentRangeReader =
 				dataSource?.fetchTextDocumentRange ?? narratorsApi.readTextDocumentRange;
-			const ensureNarratorWriteSource = useCallback<WriteDocumentSourceEnsurer>(
-				(owner, toolUseId, pin, signal) => {
-					if (!isExactWriteDocumentPin(pin))
-						return Promise.reject(new Error("Exact Write document source identity is missing"));
-					return narratorsApi.ensureWriteDocumentSource(owner, toolUseId, pin, signal);
-				},
-				[],
-			);
+
 			const ensureWriteSource =
 				dataSource?.ensureWriteDocumentSource ??
 				(dataSource?.fetchToolDetail ? undefined : ensureNarratorWriteSource);
@@ -2092,6 +2088,7 @@ export const PretextExactMessageList = memo(
 				[dataSource?.fetchPage, dataSource?.locateMessage],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
 				keepEmptyReasoningLive: isActive,
 				labels: vlistLabels,
@@ -2273,6 +2270,12 @@ export const PretextExactMessageList = memo(
 			// their existing exact insert fast path.
 			const upsertOrReload = useCallback(
 				(message: TreeMessage | undefined) => {
+					// A subagent's row is dual-broadcast here too, but it is never a row of
+					// THIS document (see `isForeignSubagentRow`). Applying it always fails and
+					// yet the revision bump below still counted it, so every subagent message
+					// inflated the "new messages" badge of a parent panel that nothing was
+					// arriving in. Its card is maintained by the live-patch channel instead.
+					if (isForeignSubagentRow(message, !!isSubagent)) return;
 					if (message && upsertMessageRef.current(message)) {
 						appliedMessageRevisionRef.current += 1;
 					} else if (message && askInPassingBlock(message)) {
@@ -2287,7 +2290,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
 			);
 
 			// A deletion is applied to the loaded window IN PLACE for the same reason an
@@ -2333,6 +2336,10 @@ export const PretextExactMessageList = memo(
 						replacementMessageId?: string;
 					},
 				) => {
+					// Same reasoning as `upsertOrReload`: a subagent row's update is not this
+					// document's business, and every one of them used to leave the applied
+					// revision behind the structural one.
+					if (isForeignSubagentRow(message, !!isSubagent)) return;
 					// Same-id updates (including queued → claimed/materialized/failed and
 					// canonical user edits) use the id+seq upsert path. Alias-bearing COW
 					// replacements still use the legacy replacement guard below.
@@ -2358,7 +2365,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
 			);
 
 			// The exact shell is stable-state only. Subscribe to the existing message
@@ -2434,6 +2441,7 @@ export const PretextExactMessageList = memo(
 					thinkingChars,
 					outputChars,
 					retryCount,
+					contextWindowSource,
 				}) => {
 					if (!messageId) return;
 					const segment = !!isSegment;
@@ -2442,6 +2450,7 @@ export const PretextExactMessageList = memo(
 						thinkingChars,
 						outputChars,
 						retryCount,
+						...(contextWindowSource ? { contextWindowSource } : {}),
 					});
 					compactProgressKeysRef.current.set(messageId, segment);
 				},
@@ -3954,15 +3963,32 @@ export const PretextExactMessageList = memo(
 			useLayoutEffect(() => {
 				const node = viewportNode;
 				if (!node) return;
+				// Before the pointer tracker. A text-selection dragstart is cancelled here,
+				// and the tracker must observe that cancellation instead of latching a
+				// native-drag slot that dragend will never clear.
+				const stopTextDrag = installVListTextDragGuard(node);
 				const pointerTracker = createPointerDragTracker(() => controller.release());
+				const canMeasure = () => {
+					return (
+						panelVisible &&
+						visibleViewportRef.current.isVisible(node) &&
+						Number.isFinite(node.clientWidth) &&
+						node.clientWidth > PAGE_PADDING * 2
+					);
+				};
 				const controller = createVListResizeController({
 					previewPolicy: "freeze",
-					readSize: () => ({
-						width: resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn),
-						boxWidth: node.offsetWidth,
-						height: node.clientHeight,
-						presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
-					}),
+					readSize: () => {
+						const ready = canMeasure();
+						return {
+							width: ready
+								? resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn)
+								: 0,
+							boxWidth: ready ? node.offsetWidth : 0,
+							height: ready ? node.clientHeight : 0,
+							presentationKey: mobileViewportRef.current ? "mobile" : "desktop",
+						};
+					},
 					getCommittedWidth: () => committedContentWidthRef.current,
 					getCommittedPresentationKey: () =>
 						committedCompactUsageLinesRef.current ? "mobile" : "desktop",
@@ -3992,7 +4018,11 @@ export const PretextExactMessageList = memo(
 					morphScrollOrigin.invalidate();
 					// The stable chat temporarily parks off-layout while a dock slot mounts.
 					// Do not commit a one-pixel reading width or zero plan-detail cap.
-					if (!visibleViewportRef.current.isVisible(node)) return;
+					if (!canMeasure()) {
+						setLayoutGeometryNode(null);
+						return;
+					}
+					setLayoutGeometryNode(node);
 					// Replay hidden anchored commits before the resize coordinator reads
 					// the restored viewport, even when its width/height did not change.
 					visibleViewportRef.current.resume(node, pinnedToBottomRef.current, writeScrollTop);
@@ -4009,11 +4039,19 @@ export const PretextExactMessageList = memo(
 				observer?.observe(node);
 				return () => {
 					observer?.disconnect();
+					stopTextDrag();
 					pointerTracker.dispose();
 					controller.dispose();
 					if (resizeControllerRef.current === controller) resizeControllerRef.current = null;
 				};
-			}, [viewportNode, centeredColumn, readViewportView, writeScrollTop, morphScrollOrigin]);
+			}, [
+				viewportNode,
+				centeredColumn,
+				panelVisible,
+				readViewportView,
+				writeScrollTop,
+				morphScrollOrigin,
+			]);
 			// A capped column may keep the same width across a viewport breakpoint.
 			// Notify the controller explicitly rather than relying on ResizeObserver.
 			useLayoutEffect(() => {
@@ -4518,10 +4556,12 @@ export const PretextExactMessageList = memo(
 					domIds,
 					targetIds,
 					highlightId,
+					needle,
 				}: {
 					domIds: string[];
 					targetIds: string[];
 					highlightId?: string;
+					needle?: string;
 				}) => {
 					// One jump at a time. A second jump (another search hit clicked while the
 					// first is still paging through history) invalidates the first, which must
@@ -4539,7 +4579,7 @@ export const PretextExactMessageList = memo(
 					const revealMounted = () => {
 						const node = viewportRef.current;
 						if (!node) return false;
-						const element = mountedJumpTarget(node, domIds, targetIds);
+						const element = mountedJumpTarget(node, domIds, targetIds, { needle });
 						if (!element) return false;
 						interactionAdmissionRef.current?.markHistoryIntent();
 						pinnedToBottomRef.current = false;
@@ -4562,22 +4602,31 @@ export const PretextExactMessageList = memo(
 							if (!index || !node) return false;
 							const itemIndex = jumpTargetItemIndex(index, messageId);
 							if (itemIndex == null) continue;
-							const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
-							interactionAdmissionRef.current?.markHistoryIntent();
-							pinnedToBottomRef.current = false;
-							visibleViewportRef.current.setPinned(false);
-							setPinnedToBottom(false);
-							writeScrollTop(targetTop);
-							await waitAnimationFrame();
-							if (cancelled()) return false;
+							// Already mounted: reveal in place, no intermediate scroll write.
+							const itemKey = index.manifest.items[itemIndex]?.itemKey;
+							const mounted =
+								itemKey &&
+								node.querySelector(`[data-nf-row-key="${CSS.escape(itemKey)}"]`) !== null;
+							if (!mounted) {
+								const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+								interactionAdmissionRef.current?.markHistoryIntent();
+								pinnedToBottomRef.current = false;
+								visibleViewportRef.current.setPinned(false);
+								setPinnedToBottom(false);
+								writeScrollTop(targetTop);
+								await waitAnimationFrame();
+								if (cancelled()) return false;
+							}
 							if (revealMounted()) return true;
 						}
 						return false;
 					};
-					if (revealMounted()) return true;
+					// Layout first: it knows which of the message's rows is its prose even
+					// when only an earlier thinking / tool row of it is mounted.
 					const localIds = targetIds.map(messageIdFromTarget);
 					if (await revealByLayout(localIds)) return true;
 					if (cancelled()) return false;
+					if (revealMounted()) return true;
 
 					// Not in the loaded window.
 					//
@@ -4694,6 +4743,7 @@ export const PretextExactMessageList = memo(
 					detachFromBottom,
 					scrollToMessageTarget,
 					prepareLodChange,
+					messageOf: (messageId) => messagesByIdRef.current.get(messageId),
 				}),
 				[
 					detachFromBottom,
@@ -4716,7 +4766,12 @@ export const PretextExactMessageList = memo(
 					return;
 				}
 				if (!documentReady) return;
-				const key = JSON.stringify([narratorId, highlightMessageId, highlightRequestId]);
+				const key = JSON.stringify([
+					narratorId,
+					highlightMessageId,
+					highlightRequestId,
+					highlightNeedle,
+				]);
 				if (jumpedHighlightRef.current === key) return;
 				// Latch BEFORE awaiting: a failed deep-link jump has already told the reader
 				// why (the notice inside scrollToMessageTarget), and re-running it on the next
@@ -4726,11 +4781,13 @@ export const PretextExactMessageList = memo(
 					domIds: [`msg-${highlightMessageId}`],
 					targetIds: [highlightMessageId],
 					highlightId: highlightMessageId,
+					needle: highlightNeedle,
 				});
 			}, [
 				documentReady,
 				highlightMessageId,
 				highlightRequestId,
+				highlightNeedle,
 				narratorId,
 				scrollToMessageTarget,
 			]);
@@ -4822,7 +4879,7 @@ export const PretextExactMessageList = memo(
 			}, [semanticItems]);
 
 			// Full messages by id — the inline editor and the original-content modal need
-			// the raw payload (contentJson / creator / narratorId / editedAt), which the
+			// the raw payload (blocks / creator / narratorId / editedAt), which the
 			// measured layout spec deliberately drops.
 			const messagesById = useMemo(() => {
 				const map = new Map<string, TreeMessage>();
@@ -4862,7 +4919,7 @@ export const PretextExactMessageList = memo(
 				(key: string, messageId: string, role: VListEditRole) => {
 					const msg = messagesByIdRef.current.get(messageId);
 					if (!msg) return;
-					const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+					const blocks = messageBody(msg);
 					const preview = resolveEditorInitialText(blocks, role);
 					if (preview.truncated) {
 						notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
@@ -4925,7 +4982,9 @@ export const PretextExactMessageList = memo(
 					if (!item) continue;
 					const manifestItem = manifestByKey.get(item.spec.key);
 					const sourceIds = manifestItem?.sourceMessageIds ?? [];
-					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds);
+					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds, (id) =>
+						messagesById.get(id),
+					);
 					if (!target) continue;
 					const entry = selectionIndex.byBlockId.get(target.blockId);
 					// Authoritative message id / block index come from the selection entry
@@ -4948,7 +5007,7 @@ export const PretextExactMessageList = memo(
 						{
 							canEditUser,
 							canEditAssistant,
-							hasEditableText: hasEditableTextBlock(msg?.contentJson),
+							hasEditableText: hasEditableTextBlock(messageBody(msg)),
 						},
 					);
 					const specKey = item.spec.key;
@@ -5146,11 +5205,10 @@ export const PretextExactMessageList = memo(
 								narratorId={narratorId}
 								messageId={row.messageId}
 								imageNarratorId={msg.narratorId ?? narratorId}
-								blocks={Array.isArray(msg.contentJson) ? msg.contentJson : []}
+								blocks={messageBody(msg)}
 								creator={msg.creator ?? null}
 								initialText={row.initialText}
 								isLastUserMessage={row.messageId === tailMeta.lastUserMessageId}
-								hasChapter={hasChapter}
 								onEditAndRegenerate={handlers.onEditAndRegenerate}
 								onEditAssistantMessage={handlers.onEditAssistantMessage}
 								onClose={closeEditor}
@@ -5158,14 +5216,7 @@ export const PretextExactMessageList = memo(
 						</Suspense>
 					);
 				},
-				[
-					messagesById,
-					rowHandlers,
-					narratorId,
-					tailMeta.lastUserMessageId,
-					hasChapter,
-					closeEditor,
-				],
+				[messagesById, rowHandlers, narratorId, tailMeta.lastUserMessageId, closeEditor],
 			);
 
 			const originalModalMessage = originalModalMessageId
@@ -5190,14 +5241,12 @@ export const PretextExactMessageList = memo(
 					onOpenNarrator: rowHandlers?.onViewSubagentSession,
 					onOpenKnowledge: rowHandlers?.onOpenKnowledgeEntry,
 					onOpenSpec: rowHandlers?.onOpenSpecFile,
-					onOpenChapter: rowHandlers?.onOpenChapter,
 					labels: injectionTargetLabels,
 				}),
 				[
 					rowHandlers?.onViewSubagentSession,
 					rowHandlers?.onOpenKnowledgeEntry,
 					rowHandlers?.onOpenSpecFile,
-					rowHandlers?.onOpenChapter,
 					injectionTargetLabels,
 				],
 			);
@@ -5274,17 +5323,13 @@ export const PretextExactMessageList = memo(
 							? getUnknownHeightReporter(item.spec.key, item.contentWidth ?? contentWidth)
 							: undefined,
 						onResumeSubagentRecovery: handleResumeSubagentRecovery,
+						onDismissSubagentRecovery: dismissSubagentRecovery,
 						specCarryoverActions: resolveSpecCarryoverActions(item, sourceIds, resolveSpecActions),
 						errorNoticeActions: resolveErrorNoticeActions(item, sourceIds, errorNotice.resolve),
 						injectionGuardActions: resolveInterruptGuardActions(
 							item,
 							sourceIds,
 							resolveGuardActions,
-						),
-						reviewFeedbackActions: resolveReviewFeedbackActions(
-							item,
-							sourceIds,
-							resolveReviewActions,
 						),
 						compactActions: compact.byKey.get(item.spec.key),
 						compactCancelTitle: compact.cancelTitle,
@@ -5541,6 +5586,7 @@ export const PretextExactMessageList = memo(
 					{/* Fullscreen content viewer — ONE instance for the whole list, mounted only
 			    while a body is open. Rows (and their action bars) only report which
 			    target to show, so a scrolling list never builds a modal per body. */}
+					{toolCallInspector}
 					{contentView.openTarget ? (
 						<VListContentViewModal
 							target={contentView.openTarget}

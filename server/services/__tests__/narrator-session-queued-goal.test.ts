@@ -1,7 +1,52 @@
 import { describe, expect, test } from "bun:test";
-import { parseQueuedGoalCommand } from "../narrator-session";
+import {
+	parseQueuedGoalCommand,
+	parseQueuedNewCommand,
+	shouldSendQueuedNewInitialMessage,
+} from "../narrator-session";
+import type { BufferedMessage } from "../narrator-session-state";
+
+describe("queued /new initial message", () => {
+	test("only media adds a new attachment-only trigger", () => {
+		const buffered: BufferedMessage = {
+			id: "queued",
+			text: "/new",
+			bufferedAt: "2026-01-01",
+			images: [{ imageId: "image", filename: "image.png", mediaType: "image/png" }],
+			textFiles: [new File(["text"], "note.txt")],
+		};
+		expect(shouldSendQueuedNewInitialMessage("", buffered)).toBe(false);
+		expect(shouldSendQueuedNewInitialMessage("hello", buffered)).toBe(true);
+		expect(
+			shouldSendQueuedNewInitialMessage("", {
+				...buffered,
+				media: [{ mediaId: "audio", filename: "audio.wav", mediaType: "audio/wav", size: 5 }],
+			}),
+		).toBe(true);
+	});
+});
 
 describe("parseQueuedGoalCommand", () => {
+	test("mixed semantic documents never become /new or /goal controls after queuing", () => {
+		const document = {
+			version: 1 as const,
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment" as const, id: "node", assetId: "asset" },
+						{ type: "text" as const, text: "/goal ordinary wording" },
+					],
+				},
+			],
+			assets: [
+				{ id: "asset", kind: "image" as const, name: "x.png", size: 9, mimeType: "image/png" },
+			],
+		};
+		expect(parseQueuedGoalCommand("/goal ordinary wording", undefined, document)).toBeNull();
+		expect(
+			parseQueuedNewCommand("/new ordinary wording", "/new ordinary wording", document),
+		).toBeNull();
+	});
 	test("parses a /goal command carried in commandText", () => {
 		const parsed = parseQueuedGoalCommand("/goal ship the release", "/goal ship the release");
 		expect(parsed).toEqual({ rawCommand: "/goal ship the release", objective: "ship the release" });

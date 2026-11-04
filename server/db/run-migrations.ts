@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -12,6 +13,20 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
+import {
+	MODEL_HISTORY_REVISION_CONTRACT,
+	MODEL_HISTORY_REVISION_CONTRACT_V1,
+	MODEL_HISTORY_REVISION_CONTRACT_V2,
+	renderModelHistoryRevisionSql,
+	renderModelHistoryRevisionSqlV1,
+	renderModelHistoryRevisionSqlV2,
+} from "../services/agent-runtime/model-history-revision-sql";
+import {
+	completeDeferredLegacyRequestRetirement,
+	hasRetainedLegacyRequestDump,
+	LEGACY_REQUEST_RETIREMENT_RECEIPT_PREFIX,
+	retireLegacyRequestStorage,
+} from "./legacy-request-storage";
 
 const FILESYSTEM_MIGRATIONS_FOLDER = resolve(import.meta.dir, "../../drizzle");
 
@@ -242,6 +257,88 @@ function isAlreadyExistsError(err: unknown): boolean {
 	// DrizzleError wraps the original SQLiteError in `cause`
 	if (err instanceof Error && err.cause && check(String(err.cause))) return true;
 	return false;
+}
+
+// These checks apply only to the exact native-media and ModelTrace migration programs.
+// Generic historical duplicate-DDL handling must retain its existing behavior.
+function nativeUpgradeKind(sql: string[]): "media" | "modeltrace" | null {
+	const program = sql.map((s) => s.trim().replace(/\s+/g, " ").toLowerCase()).filter(Boolean);
+	const media = [
+		"pragma foreign_keys=off;",
+		"alter table `narrator_buffered_messages` add `media_json` text;",
+		"pragma foreign_keys=on;",
+	];
+	const modeltrace = [
+		"pragma foreign_keys=off;",
+		"alter table `narrators` add `hidden_from_lists` integer default false not null;",
+		"alter table `narrators` add `modeltrace_key` text;",
+		"create unique index `idx_narrators_modeltrace_key` on `narrators` (`modeltrace_key`);",
+		"pragma foreign_keys=on;",
+	];
+	const matches = (expected: string[]) =>
+		program.length === expected.length && program.every((s, i) => s === expected[i]);
+	return matches(media) ? "media" : matches(modeltrace) ? "modeltrace" : null;
+}
+
+function assertNativeUpgradeInstalled(sqlite: Database, kind: "media" | "modeltrace"): void {
+	const table = kind === "media" ? "narrator_buffered_messages" : "narrators";
+	const columns = sqlite.query(`PRAGMA table_xinfo('${table}')`).all() as Array<{
+		name: string;
+		type: string;
+		notnull: number;
+		dflt_value: string | null;
+		pk: number;
+		hidden: number;
+	}>;
+	const columnMatches = (name: string, type: string, notNull: number, defaults: string[]) => {
+		const c = columns.find((column) => rebuildIdentifierKey(column.name) === name);
+		return (
+			c &&
+			c.type.toLowerCase() === type &&
+			c.notnull === notNull &&
+			c.pk === 0 &&
+			c.hidden === 0 &&
+			(defaults.length === 0
+				? c.dflt_value === null
+				: c.dflt_value !== null &&
+					defaults.includes(c.dflt_value.toLowerCase().replace(/[()\s]/g, "")))
+		);
+	};
+	let valid =
+		kind === "media"
+			? columnMatches("media_json", "text", 0, [])
+			: columnMatches("hidden_from_lists", "integer", 1, ["false", "0"]) &&
+				columnMatches("modeltrace_key", "text", 0, []);
+	if (kind === "modeltrace") {
+		const indexes = sqlite.query("PRAGMA index_list('narrators')").all() as Array<{
+			name: string;
+			unique: number;
+			partial: number;
+			origin: string;
+		}>;
+		const index = indexes.find(
+			(item) => rebuildIdentifierKey(item.name) === "idx_narrators_modeltrace_key",
+		);
+		const keys = sqlite.query("PRAGMA index_xinfo('idx_narrators_modeltrace_key')").all() as Array<{
+			name: string | null;
+			key: number;
+			desc: number;
+			coll: string;
+		}>;
+		const indexed = keys.filter((key) => key.key === 1);
+		valid =
+			valid &&
+			!!index &&
+			index.unique === 1 &&
+			index.partial === 0 &&
+			index.origin === "c" &&
+			indexed.length === 1 &&
+			indexed[0].name !== null &&
+			rebuildIdentifierKey(indexed[0].name) === "modeltrace_key" &&
+			indexed[0].desc === 0 &&
+			indexed[0].coll.toUpperCase() === "BINARY";
+	}
+	if (!valid) throw new Error(`Incompatible SQLite ${kind} migration schema`);
 }
 
 /** Whether a table with the given name currently exists. */
@@ -810,6 +907,195 @@ function isRetiredIndexCreateError(
 	});
 }
 
+// Only outer whitespace and SQLite's omitted final semicolon are interchangeable. In
+// particular, never normalize whitespace/case inside a trigger body or a SQL literal.
+// CRLF is the one exception: it only reflects the checkout the migration file was read from.
+function normalizeMigrationSql(sql: string): string {
+	return sql.replace(/\r\n/g, "\n").trim().replace(/;$/, "").trimEnd();
+}
+
+// The official SQLite v1 schema prelude, followed by the generator's pure trigger SQL.
+// A filename, timestamp, marker or trigger count alone cannot establish this milestone.
+const MODEL_HISTORY_MIGRATION_SQL = [
+	"PRAGMA foreign_keys=OFF;",
+	"CREATE TABLE `model_history_revision_contracts` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`installed_version` text NOT NULL\n);",
+	"ALTER TABLE `narrator_messages` ADD `body_revision` integer DEFAULT 0 NOT NULL;",
+	"ALTER TABLE `narrator_tool_calls` ADD `model_revision` integer DEFAULT 0 NOT NULL;",
+	"ALTER TABLE `narrators` ADD `model_history_revision` integer DEFAULT 0 NOT NULL;",
+	"PRAGMA foreign_keys=ON;",
+	...renderModelHistoryRevisionSqlV1("sqlite").split("--> statement-breakpoint"),
+].map(normalizeMigrationSql);
+function canonicalTriggers(statements: readonly string[]) {
+	return statements.map((sql) => {
+		const match =
+			/^CREATE TRIGGER (\w+) (?:BEFORE|AFTER) (?:INSERT|UPDATE(?: OF [\w, ]+)?|DELETE) ON (\w+)\b/.exec(
+				sql,
+			);
+		if (!match) throw new Error("Invalid canonical model-history SQLite trigger");
+		return { name: match[1], table: match[2], sql };
+	});
+}
+const MODEL_HISTORY_TRIGGERS = canonicalTriggers(MODEL_HISTORY_MIGRATION_SQL.slice(6, -1));
+const contractTriggers = (sql: string) =>
+	canonicalTriggers(
+		sql
+			.split("--> statement-breakpoint")
+			.map(normalizeMigrationSql)
+			.filter((statement) => statement.startsWith("CREATE TRIGGER")),
+	);
+/** The v2 (block storage) and current v3 contracts' triggers: each supersedes the ones before. */
+const MODEL_HISTORY_V2_TRIGGERS = contractTriggers(renderModelHistoryRevisionSqlV2("sqlite"));
+const MODEL_HISTORY_V3_TRIGGERS = contractTriggers(renderModelHistoryRevisionSql("sqlite"));
+
+function isOfficialModelHistoryMigration(statements: readonly string[]): boolean {
+	return (
+		statements.length === MODEL_HISTORY_MIGRATION_SQL.length &&
+		statements.every(
+			(statement, index) => normalizeMigrationSql(statement) === MODEL_HISTORY_MIGRATION_SQL[index],
+		)
+	);
+}
+
+/**
+ * Bounded catalog proof only; this never installs or repairs live DDL. A database whose
+ * v1 contract was later reinstalled as v2 (block storage) or v3 (state writes) has the v1
+ * migration's effect too.
+ */
+function isModelHistoryRevisionInstalled(sqlite: Database): boolean {
+	return (
+		isModelHistoryContractInstalled(
+			sqlite,
+			MODEL_HISTORY_REVISION_CONTRACT_V1,
+			MODEL_HISTORY_TRIGGERS,
+		) ||
+		isModelHistoryContractInstalled(
+			sqlite,
+			MODEL_HISTORY_REVISION_CONTRACT_V2,
+			MODEL_HISTORY_V2_TRIGGERS,
+		) ||
+		isModelHistoryContractInstalled(
+			sqlite,
+			MODEL_HISTORY_REVISION_CONTRACT,
+			MODEL_HISTORY_V3_TRIGGERS,
+		)
+	);
+}
+
+function isModelHistoryContractInstalled(
+	sqlite: Database,
+	contract: string,
+	triggers: ReadonlyArray<{ name: string; table: string; sql: string }>,
+): boolean {
+	const catalogSql = sqlite.prepare(
+		"SELECT sql FROM sqlite_schema WHERE type = ? AND name = ? AND tbl_name = ? AND length(sql) <= ? LIMIT 1",
+	);
+	const matchesCatalogSql = (type: string, name: string, table: string, expected: string) => {
+		// Room for a CRLF form: one extra byte per line.
+		const maxLength = expected.length + expected.split("\n").length;
+		const row = catalogSql.get(type, name, table, maxLength) as { sql: string } | null;
+		return row !== null && normalizeMigrationSql(row.sql) === expected;
+	};
+	if (
+		!matchesCatalogSql(
+			"table",
+			"model_history_revision_contracts",
+			"model_history_revision_contracts",
+			MODEL_HISTORY_MIGRATION_SQL[1],
+		)
+	) {
+		return false;
+	}
+	const columnShape = sqlite.prepare(
+		`SELECT 1 FROM pragma_table_xinfo(?) WHERE name = ? AND type = ?
+		 AND "notnull" = 1 AND dflt_value IS ? AND pk = ? AND hidden = 0 LIMIT 1`,
+	);
+	for (const [table, column, type, defaultSql, primaryKey] of [
+		["model_history_revision_contracts", "id", "TEXT", null, 1],
+		["model_history_revision_contracts", "installed_version", "TEXT", null, 0],
+		["narrator_messages", "body_revision", "INTEGER", "0", 0],
+		["narrator_tool_calls", "model_revision", "INTEGER", "0", 0],
+		["narrators", "model_history_revision", "INTEGER", "0", 0],
+	] as const) {
+		if (!columnShape.get(table, column, type, defaultSql, primaryKey)) return false;
+	}
+	if (
+		!sqlite
+			.prepare(
+				"SELECT 1 FROM model_history_revision_contracts WHERE id = 'model-history' AND installed_version = ? LIMIT 1",
+			)
+			.get(contract)
+	) {
+		return false;
+	}
+	for (const trigger of triggers) {
+		if (!matchesCatalogSql("trigger", trigger.name, trigger.table, trigger.sql)) return false;
+	}
+	// Other business triggers are unrelated, but an unknown model-history trigger is not.
+	return (
+		sqlite
+			.prepare(
+				`SELECT 1 FROM sqlite_schema WHERE type = 'trigger' AND name GLOB 'model_history_v*'
+				 AND name NOT IN (${triggers.map(() => "?").join(",")}) LIMIT 1`,
+			)
+			.get(...triggers.map((trigger) => trigger.name)) === null
+	);
+}
+
+/**
+ * Whether the ledger already records this migration, under either line-ending form.
+ *
+ * Drizzle hashes the raw file text, so the same migration read from a CRLF checkout (Windows
+ * git with `core.autocrlf`, or a binary built from one) is recorded under a different hash than
+ * its LF copy. Without this, a database migrated by one form looks entirely unmigrated to the
+ * other: every migration is replayed from the start, and the high-water mark that protects
+ * already-applied destructive rebuilds is lost.
+ */
+function isRecordedMigration(
+	appliedHashes: ReadonlySet<string>,
+	migration: { sql: string[]; hash: string },
+): boolean {
+	if (appliedHashes.has(migration.hash)) return true;
+	const retirementReceipt = legacyRequestRetirementReceipt(migration.sql);
+	if (retirementReceipt && appliedHashes.has(retirementReceipt)) return true;
+	const lf = migration.sql.join("--> statement-breakpoint").replace(/\r\n/g, "\n");
+	const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+	return appliedHashes.has(sha256(lf)) || appliedHashes.has(sha256(lf.replace(/\n/g, "\r\n")));
+}
+
+// The complete published 0207 program, not a filename/timestamp/column-name heuristic.
+// Keep the asset unchanged. When request dumps are retained, only its column drops wait; see
+// legacy-request-storage.ts for the deferred half and how it is completed.
+const LEGACY_REQUEST_DUMP_DROP_SQL = [
+	"PRAGMA foreign_keys=OFF;",
+	"DROP TABLE `usage_token_repair_candidates`;",
+	"DROP TABLE `usage_token_repair_jobs`;",
+	"DROP INDEX `idx_api_requests_token_repair_pending`;",
+	"DROP INDEX `idx_api_requests_token_repair_reviewed`;",
+	"ALTER TABLE `api_requests` DROP COLUMN `token_accounting_version`;",
+	"ALTER TABLE `api_requests` DROP COLUMN `token_accounting_review_version`;",
+	"ALTER TABLE `api_requests` DROP COLUMN `raw_dump_json`;",
+	"PRAGMA foreign_keys=ON;",
+].map(normalizeMigrationSql);
+
+/** Identify only the complete published program, never a filename or schema heuristic. */
+function legacyRequestRetirementReceipt(statements: readonly string[]): string | null {
+	// Cheap length gate first: this runs for every unrecorded migration on every startup.
+	let nonBlank = 0;
+	for (const statement of statements) if (statement.trim()) nonBlank++;
+	if (nonBlank !== LEGACY_REQUEST_DUMP_DROP_SQL.length) return null;
+	const normalized = statements.map(normalizeMigrationSql).filter(Boolean);
+	if (
+		normalized.length !== LEGACY_REQUEST_DUMP_DROP_SQL.length ||
+		!normalized.every((statement, index) => statement === LEGACY_REQUEST_DUMP_DROP_SQL[index])
+	) {
+		return null;
+	}
+	// A separate receipt, NOT the original migration hash: the column drops have NOT run.
+	// Normalized content binds the receipt to this exact program across LF/CRLF builds.
+	const digest = createHash("sha256").update(normalized.join("\n")).digest("hex");
+	return `${LEGACY_REQUEST_RETIREMENT_RECEIPT_PREFIX}${digest}`;
+}
+
 /**
  * Apply pending migrations by hash-membership instead of Drizzle's `MAX(created_at)`
  * high-water mark. This replaces `migrate()` on the main path because the built-in SQLite
@@ -821,9 +1107,13 @@ function isRetiredIndexCreateError(
  *
  * Behavior:
  * - A migration whose hash is already recorded is skipped (idempotent no-op).
- * - A destructive migration (drops a real table) whose target table already exists is treated
- *   as "already effective but unstamped": its SQL is NOT re-run, only its hash is recorded.
- *   This protects live data on a dirty database from a needless DROP/rebuild.
+ * - Exact 0207 while request dumps are retained drops its tables and indexes but defers the
+ *   column drops, recording a versioned receipt instead of its original hash. Subsequent starts
+ *   recognize that receipt, and `runMigrations` finishes the drops once the dumps are cleared.
+ * - A destructive migration in a hole below the applied journal high-water mark, whose
+ *   dropped tables all exist, is "already effective but unstamped": only record its hash.
+ * - The exact official model-history v1 migration, proven fully installed in this transaction,
+ *   also establishes an in-memory high-water mark and is stamped without replaying its SQL.
  * - Every other pending migration is executed statement-by-statement, tolerating
  *   "already exists"/"duplicate column" (safe re-create) and a `DROP TABLE` of a table this
  *   database never had. "no such table" from any other statement is fatal.
@@ -835,6 +1125,107 @@ function isRetiredIndexCreateError(
  * Exported for tests so the statement-level error tolerance can be exercised against purpose-
  * built migration folders instead of only the committed journal.
  */
+/**
+ * Fork layer: carry chapter ownership into the explicit project before the migration that
+ * retires `chapters` (upstream 0218_retire_narrative_line) runs. Upstream resolves a narrator's
+ * project from `context_project_id`, then from the cwd project index; NovelFork book narrators
+ * and their subagents were scoped only through their chapter, so without this carry they lose
+ * their book binding on upgrade. Runs inside the apply transaction, keeps migration files byte
+ * identical to upstream, and is a no-op once `chapters` or `narrators.chapter_id` is gone.
+ */
+function carryChapterProjectsBeforeRetirement(sqlite: Database, statements: readonly string[]): number {
+	if (!migrationDropsRealTables(statements).some((table) => sameObjectName(table, "chapters"))) {
+		return 0;
+	}
+	if (!tableExists(sqlite, "chapters") || !tableExists(sqlite, "narrators")) return 0;
+	if (
+		!columnExists(sqlite, "narrators", "chapter_id") ||
+		!columnExists(sqlite, "narrators", "context_project_id") ||
+		!columnExists(sqlite, "chapters", "project_id")
+	) {
+		return 0;
+	}
+	const result = sqlite.run(`UPDATE narrators SET context_project_id = (
+		SELECT c.project_id FROM chapters c INNER JOIN projects p ON p.id = c.project_id
+		WHERE c.id = narrators.chapter_id
+	)
+	WHERE context_project_id IS NULL
+		AND chapter_id IS NOT NULL
+		AND EXISTS (
+			SELECT 1 FROM chapters c INNER JOIN projects p ON p.id = c.project_id
+			WHERE c.id = narrators.chapter_id
+		)`);
+	return Number(result.changes);
+}
+
+/**
+ * Fork layer: inside an already-effective historical hole only additive DDL is replayed, so
+ * missing indexes/tables/triggers can be recreated while data statements (backfills, copies,
+ * probes) and drops never run again against live rows.
+ */
+function isAdditiveDdlStatement(statement: string): boolean {
+	const trimmed = maskSqlLiteralsAndComments(statement).trim();
+	return (
+		/^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(trimmed) ||
+		/^CREATE\s+(?:TEMP(?:ORARY)?\s+)?(?:TABLE|TRIGGER|VIEW)\b/i.test(trimmed) ||
+		/^CREATE\s+VIRTUAL\s+TABLE\b/i.test(trimmed) ||
+		new RegExp(String.raw`^ALTER\s+TABLE\s+${SQLITE_TABLE_REF}\s+ADD\b`, "i").test(trimmed)
+	);
+}
+
+/**
+ * Fork layer: a historical-hole `CREATE INDEX` whose column a LATER migration retired. The
+ * evidence must be in the journal: a later canonical rebuild of the table whose copy list
+ * omits the column, or a later `ALTER TABLE ... DROP COLUMN` of it. The live table must exist
+ * and lack the column; anything else still fails loudly.
+ */
+function isLaterRetiredColumnIndexError(
+	sqlite: Database,
+	err: unknown,
+	stmt: string,
+	laterMigrations: ReadonlyArray<{ sql: string[] }>,
+): boolean {
+	const missingColumn = missingColumnFromError(err);
+	if (missingColumn === null) return false;
+	const match = new RegExp(
+		String.raw`^\s*CREATE\s+(?:UNIQUE\s+)?INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:${SQLITE_IDENTIFIER})\s+ON\s+(${SQLITE_IDENTIFIER})\s*\(\s*(${SQLITE_IDENTIFIER_LIST})\s*\)[\s\S]*$`,
+		"i",
+	).exec(maskSqlLiteralsAndComments(stmt));
+	if (!match) return false;
+	const table = normalizeObjectName(match[1]);
+	const columns = (match[2].match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? []).map(normalizeObjectName);
+	if (!columns.some((column) => sameObjectName(column, missingColumn))) return false;
+	if (!tableExists(sqlite, table) || columnExists(sqlite, table, missingColumn)) return false;
+	const dropColumn = new RegExp(
+		String.raw`^\s*ALTER\s+TABLE\s+(${SQLITE_IDENTIFIER})\s+DROP\s+(?:COLUMN\s+)?(${SQLITE_IDENTIFIER})\s*;?\s*$`,
+		"i",
+	);
+	return laterMigrations.some((migration) =>
+		migration.sql.some((statement) => {
+			const dropped = dropColumn.exec(statement);
+			if (dropped) {
+				return (
+					sameObjectName(normalizeObjectName(dropped[1]), table) &&
+					sameObjectName(normalizeObjectName(dropped[2]), missingColumn)
+				);
+			}
+			const copy = CANONICAL_REBUILD_COPY.exec(statement);
+			if (
+				!copy ||
+				!sameObjectName(normalizeObjectName(copy[1]), `__new_${table}`) ||
+				!sameObjectName(normalizeObjectName(copy[4]), table)
+			)
+				return false;
+			return [copy[2], copy[3]].every(
+				(list) =>
+					!(list.match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? []).some((identifier) =>
+						sameObjectName(normalizeObjectName(identifier), missingColumn),
+					),
+			);
+		}),
+	);
+}
+
 function statementReferencesDroppedTable(
 	statement: string,
 	droppedTables: readonly string[],
@@ -877,15 +1268,23 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	// past that journal position (normal incremental upgrades only ever leave a trailing
 	// suffix pending). A destructive migration in a hole must not be re-run: its rebuild
 	// already happened, so replaying the DROP would destroy live data.
+	const applied = migrations.map((migration) => isRecordedMigration(appliedHashes, migration));
 	let lastAppliedIndex = -1;
 	for (let i = 0; i < migrations.length; i++) {
-		if (appliedHashes.has(migrations[i].hash)) lastAppliedIndex = i;
+		if (applied[i]) lastAppliedIndex = i;
 	}
 
 	const pending = migrations
 		.map((migration, index) => ({ migration, index }))
-		.filter(({ migration }) => !appliedHashes.has(migration.hash));
-	if (pending.length === 0) return;
+		.filter(({ index }) => !applied[index]);
+	// Recorded hashes do not prove that the corresponding live schema is still intact.
+	const recordedNativeKinds = new Set(
+		migrations.flatMap((migration, index) => {
+			const kind = applied[index] ? nativeUpgradeKind(migration.sql) : null;
+			return kind ? [kind] : [];
+		}),
+	);
+	if (pending.length === 0 && recordedNativeKinds.size === 0) return;
 
 	const obsoletedTablesByIndex = new Map<number, Set<string>>();
 	for (const { index } of pending) {
@@ -906,10 +1305,40 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = OFF");
 
 	let stampedWithoutRun = 0;
+	let activeMigration:
+		| { migrationIndex: number; folderMillis: number; executionStatementIndex?: number }
+		| undefined;
+	logger.info("Applying pending SQLite migrations", { pending: pending.length });
 	try {
 		const apply = sqlite.transaction(() => {
+			for (const kind of recordedNativeKinds) assertNativeUpgradeInstalled(sqlite, kind);
+			// Source-built databases can have a fully installed v1 contract but no matching
+			// journal hashes. Prove that exact supplied migration in this transaction before
+			// treating preceding destructive migrations as holes. No ledger row is pre-written.
+			const modelHistoryCandidate = pending.find(({ migration }) =>
+				isOfficialModelHistoryMigration(migration.sql),
+			);
+			const installedModelHistoryIndex =
+				modelHistoryCandidate && isModelHistoryRevisionInstalled(sqlite)
+					? modelHistoryCandidate.index
+					: -1;
+			const effectiveLastAppliedIndex = Math.max(lastAppliedIndex, installedModelHistoryIndex);
 			for (const { migration, index } of pending) {
 				const statements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
+				const retirementReceipt = legacyRequestRetirementReceipt(statements);
+				const deferPhysicalCleanup =
+					retirementReceipt !== null && hasRetainedLegacyRequestDump(sqlite);
+				let recordedHash = migration.hash;
+				const migrationStarted = performance.now();
+				activeMigration = { migrationIndex: index, folderMillis: migration.folderMillis };
+				// Hundreds of fast migrations run on a cold database. Keep routine progress
+				// out of default stdout so bounded startup consumers still see readiness.
+				const logStart = deferPhysicalCleanup ? logger.info : logger.debug;
+				logStart("Starting SQLite migration", {
+					...activeMigration,
+					statementCount: statements.length,
+					legacyRequestPhysicalCleanupDeferred: deferPhysicalCleanup,
+				});
 				const droppedTables = migrationDropsRealTables(statements);
 				const isDestructive = droppedTables.length > 0;
 				// A destructive migration is only skipped when the database already advanced past
@@ -918,73 +1347,140 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 				// migration at or above the high-water mark is a normal forward step and must run
 				// (e.g. a fresh database applying the whole journal, where the target table was
 				// created by an earlier migration in the very same run).
-				const isUnstampedHole = index < lastAppliedIndex;
+				const isUnstampedHole = index < effectiveLastAppliedIndex;
+				// Exact 0207 has its own proven empty/populated strategy. A historical hole
+				// must not masquerade as physical completion while leaving empty legacy tables.
 				const alreadyEffective =
+					retirementReceipt === null &&
 					isDestructive &&
 					isUnstampedHole &&
 					droppedTables.every((table) => tableExists(sqlite, table));
 
-				if (alreadyEffective) {
-					// The destructive rebuild already happened on a prior run; the hash just never
-					// got stamped. Skip only statements that reference the rebuilt table so missing
-					// additive objects from the same migration can still be recreated.
-					stampedWithoutRun++;
-					logger.warn("Skipping already-effective destructive rebuild statements", {
+				const carriedChapterNarrators = carryChapterProjectsBeforeRetirement(sqlite, statements);
+				if (carriedChapterNarrators > 0) {
+					logger.info("Carried chapter projects into narrator context before chapter retirement", {
 						folderMillis: migration.folderMillis,
-						droppedTables,
+						narrators: carriedChapterNarrators,
 					});
 				}
-
-				for (const rawStmt of statements) {
-					if (alreadyEffective && statementReferencesDroppedTable(rawStmt, droppedTables)) {
-						continue;
+				if (deferPhysicalCleanup && retirementReceipt) {
+					// Cheap drops now, even in a historical hole; the column rewrites wait for the
+					// dumps to be cleared rather than copying them during the upgrade.
+					retireLegacyRequestStorage(sqlite);
+					recordedHash = retirementReceipt;
+					logger.info("Legacy request storage logically retired; physical cleanup deferred", {
+						folderMillis: migration.folderMillis,
+						receiptVersion: 1,
+						dataRetained: true,
+						awaitingBatchCommit: true,
+					});
+				} else if (index === installedModelHistoryIndex) {
+					// Earlier pending SQL must not invalidate the proof. Both this check and
+					// the stamp share the apply transaction, including any later failure.
+					if (!isModelHistoryRevisionInstalled(sqlite)) {
+						throw new Error("Installed model-history migration proof changed during replay");
 					}
-					const stmt = rewriteQualifiedNewTableChecks(rawStmt);
-					// Validate before SQLite can accept missing DQS names as literals. Neither
-					// compatibility failures nor repaired-copy failures are tolerable DDL errors.
-					const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
-					if (copyStatement !== stmt) {
-						if (copyStatement !== null) sqlite.run(copyStatement);
-						continue;
+					stampedWithoutRun++;
+					logger.warn("Stamping exactly proven installed model-history migration", {
+						folderMillis: migration.folderMillis,
+					});
+				} else {
+					if (alreadyEffective) {
+						// The destructive rebuild already happened on a prior run; the hash just never
+						// got stamped. Skip statements that reference the rebuilt table and every
+						// non-additive statement, so only missing additive objects are recreated.
+						stampedWithoutRun++;
+						logger.warn("Skipping already-effective destructive rebuild statements", {
+							folderMillis: migration.folderMillis,
+							droppedTables,
+						});
 					}
-					try {
-						sqlite.run(stmt);
-					} catch (err) {
-						if (isAlreadyExistsError(err)) continue;
-						// An index/column drop whose target is already gone: the statement's
-						// own goal is satisfied, verified against the live catalog.
-						if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
-						if (isRetiredIndexCreateError(sqlite, err, stmt, migrations.slice(index + 1))) {
-							logger.info("Skipped retired historical index DDL", {
-								folderMillis: migration.folderMillis,
-							});
-							continue;
-						}
-						// Scoped to the failing statement, not the whole migration: only a
-						// `DROP TABLE` whose own target is the table SQLite reports missing is
-						// harmless. Anything else failing with "no such table" means the
-						// migration's assumptions are broken, and continuing through the rest of
-						// a rebuild sequence would drop live rows into an empty replacement.
-						if (isDestructive && isMissingDropTargetError(err, stmt, droppedTables)) {
-							continue;
-						}
+					for (const [executionStatementIndex, rawStmt] of statements.entries()) {
 						if (
-							isUnstampedHole &&
-							isObsoletedTableError(err, stmt, obsoletedTablesByIndex.get(index) ?? new Set())
+							alreadyEffective &&
+							(statementReferencesDroppedTable(rawStmt, droppedTables) ||
+								!isAdditiveDdlStatement(rawStmt))
 						) {
 							continue;
 						}
-						throw err;
+						activeMigration.executionStatementIndex = executionStatementIndex;
+						const statementStarted = performance.now();
+						// Ordinals only: migration SQL can contain literals and must not enter logs.
+						logger.debug("Starting SQLite migration statement", { ...activeMigration });
+						try {
+							const stmt = rewriteQualifiedNewTableChecks(rawStmt);
+							// Validate before SQLite can accept missing DQS names as literals. Neither
+							// compatibility failures nor repaired-copy failures are tolerable DDL errors.
+							const copyStatement = compatibleRebuildCopyStatement(sqlite, stmt);
+							if (copyStatement !== stmt) {
+								if (copyStatement !== null) sqlite.run(copyStatement);
+								continue;
+							}
+							try {
+								sqlite.run(stmt);
+							} catch (err) {
+								if (isAlreadyExistsError(err)) continue;
+								// An index/column drop whose target is already gone: the statement's
+								// own goal is satisfied, verified against the live catalog.
+								if (isAlreadySatisfiedDropError(sqlite, err, stmt)) continue;
+								if (isRetiredIndexCreateError(sqlite, err, stmt, migrations.slice(index + 1))) {
+									logger.info("Skipped retired historical index DDL", {
+										folderMillis: migration.folderMillis,
+									});
+									continue;
+								}
+								// Scoped to the failing statement, not the whole migration: only a
+								// DROP TABLE whose own target is reported missing is harmless. Other
+								// missing tables must abort, or a rebuild could destroy live rows.
+								if (isDestructive && isMissingDropTargetError(err, stmt, droppedTables)) {
+									continue;
+								}
+								// A historical-hole index whose column a later migration retired.
+								if (
+									isUnstampedHole &&
+									isLaterRetiredColumnIndexError(sqlite, err, stmt, migrations.slice(index + 1))
+								) {
+									logger.info("Skipped historical index on a later-retired column", {
+										folderMillis: migration.folderMillis,
+									});
+									continue;
+								}
+								// A historical-hole DDL whose table a later migration explicitly drops.
+								if (
+									isUnstampedHole &&
+									isObsoletedTableError(err, stmt, obsoletedTablesByIndex.get(index) ?? new Set())
+								) {
+									continue;
+								}
+								throw err;
+							}
+						} finally {
+							const durationMs = Math.round(performance.now() - statementStarted);
+							if (durationMs >= 1_000) {
+								logger.warn("Slow SQLite migration statement", { ...activeMigration, durationMs });
+							}
+						}
 					}
 				}
 
+				const nativeKind = nativeUpgradeKind(migration.sql);
+				if (nativeKind) assertNativeUpgradeInstalled(sqlite, nativeKind);
+				delete activeMigration.executionStatementIndex;
 				sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
-					migration.hash,
+					recordedHash,
 					migration.folderMillis,
 				]);
+				// This is progress, not a durability claim: a later failure rolls it back.
+				logger.debug("SQLite migration executed; awaiting batch commit", {
+					...activeMigration,
+					durationMs: Math.round(performance.now() - migrationStarted),
+				});
 			}
 		});
 		apply();
+	} catch (error) {
+		logger.error("SQLite migration batch failed; rolled back", { ...activeMigration });
+		throw error;
 	} finally {
 		if (foreignKeysWereEnabled) sqlite.run("PRAGMA foreign_keys = ON");
 	}
@@ -1721,6 +2217,7 @@ export async function runMigrations(sqlite: Database): Promise<{
 		"inherit_project_gate",
 	);
 	const hadAclGrantsTable = tableExists(sqlite, "acl_grants");
+	const hadUserGitIdentitiesTable = tableExists(sqlite, "user_git_identities");
 
 	const resolved = await resolveMigrationsFolder();
 	try {
@@ -1728,6 +2225,9 @@ export async function runMigrations(sqlite: Database): Promise<{
 		// so a database whose `__drizzle_migrations` was polluted by a branch/version with
 		// larger migration timestamps still gets every unapplied migration (issue #5769).
 		applyPendingMigrationsByHash(sqlite, resolved.folder);
+		if (completeDeferredLegacyRequestRetirement(sqlite)) {
+			logger.info("Completed deferred legacy request storage cleanup");
+		}
 		repairMissingSpecTables(sqlite);
 		// Run one-time data backfills gated on the pre-migration snapshot. Safe to
 		// run from both the standalone `db:migrate` process and server startup —
@@ -1755,6 +2255,9 @@ export async function runMigrations(sqlite: Database): Promise<{
 		backfillSubagentAclRoot(sqlite);
 		if (!hadAclGrantsTable) {
 			migrateGrantsToUnifiedAcl(sqlite);
+		}
+		if (!hadUserGitIdentitiesTable) {
+			backfillUserGitIdentities(sqlite);
 		}
 		return { source: resolved.source, folder: resolved.folder };
 	} finally {
@@ -2163,6 +2666,41 @@ function migrateGrantsToUnifiedAcl(sqlite: Database): void {
 		// the legacy tables authoritative, and the domain layers still read them until
 		// their own cut-over step. Logged loudly because it needs attention.
 		logger.error("unified ACL grant migration failed (non-fatal)", { error: String(err) });
+	}
+}
+
+/**
+ * Move the legacy single git identity (`users.git_username`/`git_email`) into the
+ * multi-identity table, as each user's first and therefore default identity.
+ *
+ * Runs only on the upgrade that introduces `user_git_identities` (gated on the
+ * pre-migration snapshot), and is idempotent besides: the `NOT EXISTS` guard
+ * means a user who already has an identity keeps it, so a second run cannot
+ * duplicate or overwrite anything. The legacy columns stay put — they are simply
+ * no longer read as an identity source — which keeps this additive.
+ */
+function backfillUserGitIdentities(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare(
+				`INSERT INTO user_git_identities (id, user_id, name, email, is_default, created_at)
+				 SELECT lower(hex(randomblob(16))), u.id, trim(u.git_username), trim(u.git_email), 1, ?
+				 FROM users u
+				 WHERE u.git_username IS NOT NULL AND trim(u.git_username) <> ''
+				   AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
+				   AND instr(u.git_username, '<') = 0 AND instr(u.git_username, '>') = 0
+				   AND instr(u.git_email, '<') = 0 AND instr(u.git_email, '>') = 0
+				   AND NOT EXISTS (SELECT 1 FROM user_git_identities i WHERE i.user_id = u.id)`,
+			)
+			.run(new Date().toISOString());
+		if (result.changes > 0) {
+			logger.info("Backfilled git identities from the legacy profile columns", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("git identity backfill failed (non-fatal)", { error: String(err) });
 	}
 }
 

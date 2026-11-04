@@ -1,229 +1,27 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { FORK_WORKTREE_SOURCES } from "@shared/chapter-fork";
+import {
+	applyMcpLoadingPatch,
+	hasMcpLoadingConflict,
+	normalizeMcpLoadingConfig,
+	resolveMcpLoadingMode,
+} from "@shared/mcp-loading-mode";
 import { Hono } from "hono";
 import { z } from "zod";
-import { gitAvailable, recheckGit } from "../lib/git-status";
 import { generateShortId } from "../lib/id";
 import { mcpManager, projectMcpServerConfig } from "../lib/mcp/manager";
 import { syncMcpTools } from "../lib/mcp/tool-bridge";
 import { type McpServerConfig, saveSettings, settings } from "../lib/settings";
 import { requireAdmin } from "../middleware/auth";
-import { chapterFork } from "../services/chapter-fork";
-import { chapterMerge } from "../services/chapter-merge";
-import { chapterService } from "../services/chapter-service";
 import { narratorContext } from "../services/narrator-context";
-import {
-	countNarratorMessageRefs,
-	countNarratorMessageRefsBatch,
-} from "../services/narrator-message-count";
+import { countNarratorMessageRefs } from "../services/narrator-message-count";
 import { narratorService } from "../services/narrator-service";
-
-function assertGitAvailableForMcp(): void {
-	if (gitAvailable || recheckGit()) return;
-	throw new Error(
-		"GIT_NOT_INSTALLED: Git is not installed. Please install git and retry this Git-dependent action.",
-	);
-}
 
 function createMcpServer(userId?: string | null): McpServer {
 	const server = new McpServer({
 		name: "narrafork",
 		version: "0.1.0",
 	});
-
-	server.tool(
-		"narrafork_list_chapters",
-		"List chapters in a project",
-		{ projectId: z.string().describe("Project ID") },
-		async ({ projectId }) => {
-			try {
-				const chapters = await chapterService.listByProject(projectId);
-				return {
-					content: [
-						{
-							type: "text",
-							text: JSON.stringify(
-								chapters.map((ch) => ({
-									id: ch.id,
-									title: ch.title,
-									status: ch.status,
-									branch: ch.branch,
-								})),
-								null,
-								2,
-							),
-						},
-					],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-
-	server.tool(
-		"narrafork_fork_chapter",
-		"Fork a chapter, independently choosing conversation inheritance and filesystem source",
-		{
-			chapterId: z.string().describe("Source chapter ID to fork from"),
-			title: z.string().describe("Title for the new chapter"),
-			inheritMode: z
-				.enum(["full", "compressed", "fresh"])
-				.optional()
-				.describe("Conversation inheritance only; does not choose which files are forked"),
-			worktreeSource: z
-				.enum(FORK_WORKTREE_SOURCES)
-				.optional()
-				.describe(
-					'Filesystem source: "workspace" includes current uncommitted files; "commit" uses committed history only. Legacy omission remains supported.',
-				),
-			commitSha: z
-				.string()
-				.min(1)
-				.optional()
-				.describe(
-					'Optional commit in the parent branch history. Maps to startCommitSha and requires worktreeSource="commit".',
-				),
-		},
-		async ({ chapterId, title, inheritMode, worktreeSource, commitSha }) => {
-			try {
-				assertGitAvailableForMcp();
-				const chapter = await chapterFork.fork(chapterId, {
-					title,
-					inheritMode,
-					worktreeSource,
-					startCommitSha: commitSha,
-				});
-				return {
-					content: [{ type: "text", text: JSON.stringify(chapter, null, 2) }],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-
-	server.tool(
-		"narrafork_merge_chapter",
-		"Merge a chapter into a target chapter",
-		{
-			chapterId: z.string().describe("Source chapter ID to merge"),
-			targetChapterId: z.string().describe("Target chapter ID to merge into"),
-			strategy: z.enum(["merge", "squash", "cherry-pick"]).optional().describe("Merge strategy"),
-		},
-		async ({ chapterId, targetChapterId, strategy }) => {
-			try {
-				assertGitAvailableForMcp();
-				const result = await chapterMerge.merge(chapterId, { targetChapterId, strategy });
-				return {
-					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-
-	server.tool(
-		"narrafork_check_conflicts",
-		"Check for merge conflicts between two chapters",
-		{
-			chapterId: z.string().describe("Source chapter ID"),
-			targetChapterId: z.string().describe("Target chapter ID"),
-		},
-		async ({ chapterId, targetChapterId }) => {
-			try {
-				assertGitAvailableForMcp();
-				const result = await chapterMerge.checkConflicts(chapterId, targetChapterId);
-				return {
-					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-
-	server.tool(
-		"narrafork_abandon_chapter",
-		"Abandon a chapter (mark as abandoned and clean up)",
-		{ chapterId: z.string().describe("Chapter ID to abandon") },
-		async ({ chapterId }) => {
-			try {
-				await chapterService.update(chapterId, { status: "abandoned" });
-				return {
-					content: [{ type: "text", text: `Chapter ${chapterId} abandoned` }],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-
-	server.tool(
-		"narrafork_list_narrators",
-		"List narrators for a chapter",
-		{ chapterId: z.string().describe("Chapter ID") },
-		async ({ chapterId }) => {
-			try {
-				const list = await narratorService.listByChapter(chapterId);
-				// The stored column is an insert-only upper bound; count for real so an
-				// agent reading this tool's output is not told a stale number.
-				const messageCounts = await countNarratorMessageRefsBatch(list.map((n) => n.id));
-				return {
-					content: [
-						{
-							type: "text",
-							text: JSON.stringify(
-								list.map((n) => ({
-									id: n.id,
-									type: n.type,
-									status: n.status,
-									model: n.model,
-									messageCount: messageCounts.get(n.id) ?? 0,
-								})),
-								null,
-								2,
-							),
-						},
-					],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
 
 	server.tool(
 		"narrafork_get_context_summary",
@@ -303,7 +101,8 @@ const mcpServerCreateSchema = z.object({
 	env: mcpSecretMapSchema.optional(),
 	url: z.string().url().max(2000).optional(),
 	headers: mcpSecretMapSchema.optional(),
-	enabled: z.boolean().optional().default(true),
+	mode: z.enum(["disabled", "auto", "resident"]).optional(),
+	enabled: z.boolean().optional(),
 	defaultBehavior: mcpBehaviorSchema.optional(),
 	toolPermissions: z.array(mcpToolPermissionInputSchema).optional(),
 });
@@ -319,6 +118,7 @@ const mcpServerPatchSchema = z.object({
 	url: z.string().url().max(2000).optional(),
 	headers: mcpSecretMapSchema.optional(),
 	headerPatch: mcpSecretMapPatchSchema.optional(),
+	mode: z.enum(["disabled", "auto", "resident"]).optional(),
 	enabled: z.boolean().optional(),
 	// null explicitly clears the server-level override; undefined leaves it unchanged.
 	defaultBehavior: mcpBehaviorSchema.nullable().optional(),
@@ -341,7 +141,7 @@ function applyMcpServerPatch(
 	patch: z.infer<typeof mcpServerPatchSchema>,
 ): McpServerConfig {
 	const { defaultBehavior, toolPermissionPatch, envPatch, headerPatch, ...rest } = patch;
-	const updated: McpServerConfig = { ...server, ...rest };
+	const updated: McpServerConfig = { ...server, ...rest, ...applyMcpLoadingPatch(server, patch) };
 	if (envPatch) {
 		const env = applyMcpSecretMapPatch(updated.env, envPatch);
 		if (env) updated.env = env;
@@ -402,10 +202,12 @@ mcpRoutes.post("/servers", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
-	const config: McpServerConfig = {
+	if (hasMcpLoadingConflict(parsed.data))
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
+	const config: McpServerConfig = normalizeMcpLoadingConfig({
 		id: generateShortId(),
 		...parsed.data,
-	};
+	});
 
 	const servers = [...(Array.isArray(settings.mcpServers) ? settings.mcpServers : []), config];
 	settings.mcpServers = servers;
@@ -431,6 +233,8 @@ mcpRoutes.patch("/servers/:id", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
+	if (hasMcpLoadingConflict(parsed.data))
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
 	const updated = applyMcpServerPatch(servers[idx], parsed.data);
 	servers[idx] = updated;
 	settings.mcpServers = servers;
@@ -476,11 +280,9 @@ mcpRoutes.post("/servers/:id/connect", requireAdmin, async (c) => {
 	const config = servers.find((s) => s.id === id);
 	if (!config) return c.json({ error: "Not found" }, 404);
 
-	if (!config.enabled) {
-		config.enabled = true;
-		settings.mcpServers = servers;
-		saveSettings(settings);
-	}
+	Object.assign(config, applyMcpLoadingPatch(config, { enabled: true }));
+	settings.mcpServers = servers;
+	saveSettings(settings);
 
 	// A failed connection is deliberately NOT rolled back to enabled=false: the
 	// user asked for this server to be up, and the failure is already reported
@@ -503,8 +305,8 @@ mcpRoutes.post("/servers/:id/disconnect", requireAdmin, async (c) => {
 	// off, which now also means "wrote a config change" — worth failing loudly.
 	if (!config) return c.json({ error: "Not found" }, 404);
 
-	if (config.enabled) {
-		config.enabled = false;
+	if (resolveMcpLoadingMode(config) !== "disabled" || config.enabled !== false) {
+		Object.assign(config, applyMcpLoadingPatch(config, { mode: "disabled" }));
 		settings.mcpServers = servers;
 		saveSettings(settings);
 	}
@@ -577,10 +379,14 @@ mcpRoutes.post("/servers/:id/test", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
+	if (hasMcpLoadingConflict(parsed.data)) {
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
+	}
 
 	const config: McpServerConfig = {
 		...applyMcpServerPatch(existing, parsed.data),
 		id: `test-${id}`,
+		mode: "auto",
 		enabled: true,
 	};
 	return c.json(await mcpManager.testConnection(config));
@@ -593,9 +399,13 @@ mcpRoutes.post("/servers/test", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
+	if (hasMcpLoadingConflict(parsed.data)) {
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
+	}
 	const config: McpServerConfig = {
 		id: "test",
 		...parsed.data,
+		mode: "auto",
 		enabled: true,
 	};
 
@@ -683,11 +493,20 @@ mcpRoutes.post("/servers/import", requireAdmin, async (c) => {
 			headers = filtered.length > 0 ? Object.fromEntries(filtered) : undefined;
 		}
 
+		const loading = z
+			.object({
+				mode: z.enum(["disabled", "auto", "resident"]).optional(),
+				enabled: z.boolean().optional(),
+			})
+			.safeParse({ mode: cfg.mode, enabled: cfg.disabled === true ? false : cfg.enabled });
+		if (!loading.success || hasMcpLoadingConflict(loading.data)) {
+			return c.json({ error: `Invalid MCP loading policy for ${name}` }, 400);
+		}
 		const config: McpServerConfig = {
 			id: generateShortId(),
 			name,
 			transport,
-			enabled: cfg.disabled !== true && cfg.enabled !== false,
+			...normalizeMcpLoadingConfig(loading.data),
 			command: cfg.command,
 			args: Array.isArray(cfg.args) ? cfg.args : undefined,
 			cwd: cfg.cwd,

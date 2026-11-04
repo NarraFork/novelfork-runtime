@@ -25,7 +25,6 @@ import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import {
-	chapters,
 	fileAttributions,
 	fileChangeEffects,
 	fileChangeScopes,
@@ -39,18 +38,17 @@ import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext } from "../lib/agent/types";
-import type { JwtPayload } from "../lib/auth";
+import type { SessionPayload } from "../lib/auth";
 import { generateId } from "../lib/id";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
-import { gitRoutes } from "../routes/git";
+import { narratorGitRoutes } from "../routes/git";
 import { recordAttribution } from "./file-attribution-service";
 import { fileChangeLocalIo } from "./file-change-local-io";
 import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
 import { gitCurrentBaselineReader } from "./git-current-baseline";
 import { getGitCurrentDiffView } from "./git-current-diff-view";
 import { getWorkspaceModificationView } from "./workspace-modification-view";
-import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 
 let root: string;
 let workspace: string;
@@ -65,7 +63,6 @@ beforeAll(() => {
 	runtime = new LocalFileChangeRuntime({
 		db,
 		privateRoot: getNarraforkHome(),
-		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
 	});
 });
@@ -176,7 +173,7 @@ async function aiWrite(content: string, path = join(workspace, "a.txt"), cwd = w
 	);
 	expect(result.isError).not.toBe(true);
 	expect(result.metadata?.fileChangeEvidence).toMatchObject({
-		version: 2,
+		version: 3,
 		grade: "measured",
 		settlement: "settled",
 		outcome: "changed",
@@ -215,7 +212,7 @@ async function view() {
 	return getGitCurrentDiffView(workspace, { filePaths: ["a.txt"] });
 }
 
-describe("current Git targets matched against actual v2 writes", () => {
+describe("current Git targets matched against recorded writes", () => {
 	test("real AI Write and editor another hunk name only the latest matching after, not all contributors", async () => {
 		await aiWrite(initial.replace("first: initial", "first: AI"));
 		const ai = await view();
@@ -334,7 +331,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		});
 	});
 
-	test("recreated workspace at the same path and remote device never inherit local evidence", async () => {
+	test("recreated paths remain usable while remote devices keep separate evidence", async () => {
 		await aiWrite("matching bytes\n");
 		expect((await view()).scope).not.toBeNull();
 		await rename(workspace, join(root, "old-workspace"));
@@ -342,8 +339,10 @@ describe("current Git targets matched against actual v2 writes", () => {
 		await git("init", "--initial-branch=main");
 		await writeFile(join(workspace, "a.txt"), "matching bytes\n");
 		const replaced = await view();
-		expect(replaced.scope).toBeNull();
-		expect(replaced.byFile[0]?.worktree.reason).toBe("scope_unknown");
+		expect(replaced.scope).not.toBeNull();
+		expect(replaced.byFile[0]?.worktree.continuity).toBe("unverified");
+		await aiWrite("fresh write in replacement directory\n");
+		expect((await view()).byFile[0]?.worktree.status).toBe("matching_evidence");
 		const snapshot = spyOn(gitCurrentBaselineReader, "snapshot");
 		const remote = await getGitCurrentDiffView(workspace, {
 			deviceId: "not-local",
@@ -354,40 +353,74 @@ describe("current Git targets matched against actual v2 writes", () => {
 		snapshot.mockRestore();
 	});
 
-	test("missing raw/receipt and over-budget file can never become a matching actor", async () => {
+	// Each gate gets its own real write/store/snapshot fixture and only two view queries.
+	// Combining all gates made their worker queries share one default 5000ms test budget.
+	async function matchingRawFixture() {
 		await aiWrite("raw evidence\n");
-		const match = (await view()).byFile[0]?.worktree.effectId;
+		const current = (await view()).byFile[0]?.worktree;
+		expect(current).toMatchObject({
+			status: "matching_evidence",
+			actor: { narratorId, kind: "primary" },
+		});
+		const match = current?.effectId;
 		expect(match).not.toBeNull();
+		if (!match) throw new Error("missing matched effect identity");
 		const effect = await db
 			.select()
 			.from(fileChangeEffects)
-			.where(eq(fileChangeEffects.id, match as string))
+			.where(eq(fileChangeEffects.id, match))
 			.get();
 		if (!effect) throw new Error("missing actual effect");
-		await db
-			.update(fileChangeEffects)
-			.set({ executionReceiptJson: null })
-			.where(eq(fileChangeEffects.id, effect.id));
-		expect((await view()).byFile[0]?.worktree.status).toBe("unknown");
-		await db
-			.update(fileChangeEffects)
-			.set({ executionReceiptJson: effect.executionReceiptJson })
-			.where(eq(fileChangeEffects.id, effect.id));
 		const { store } = await runtime.initialize();
 		const observed = effect.observedAfterStateJson;
 		if (observed.kind !== "regular") throw new Error("expected regular after");
+		expect(await store.readBytes(observed.blob)).toBeDefined();
+		return { effect, store, observed };
+	}
+
+	test("missing execution result can never become a matching actor", async () => {
+		const { effect } = await matchingRawFixture();
+		await db
+			.update(fileChangeEffects)
+			.set({ executionReceiptJson: null, diskOutcome: null })
+			.where(eq(fileChangeEffects.id, effect.id));
+		try {
+			expect((await view()).byFile[0]?.worktree).toMatchObject({
+				status: "unknown",
+				actor: null,
+			});
+		} finally {
+			await db
+				.update(fileChangeEffects)
+				.set({ executionReceiptJson: effect.executionReceiptJson, diskOutcome: effect.diskOutcome })
+				.where(eq(fileChangeEffects.id, effect.id));
+		}
+	});
+
+	test("missing raw catalog metadata can never become a matching actor", async () => {
+		const { store, observed } = await matchingRawFixture();
 		// Mark the exact raw object missing; metadata alone cannot satisfy the read gate.
 		const catalog = await import("../db/schema");
 		await db
 			.update(catalog.fileChangeBlobs)
 			.set({ status: "missing" })
 			.where(eq(catalog.fileChangeBlobs.digest, observed.blob.digest));
-		expect((await view()).byFile[0]?.worktree.status).toBe("unknown");
-		await db
-			.update(catalog.fileChangeBlobs)
-			.set({ status: "ready" })
-			.where(eq(catalog.fileChangeBlobs.digest, observed.blob.digest));
+		try {
+			expect((await view()).byFile[0]?.worktree).toMatchObject({
+				status: "unknown",
+				actor: null,
+			});
+		} finally {
+			await db
+				.update(catalog.fileChangeBlobs)
+				.set({ status: "ready" })
+				.where(eq(catalog.fileChangeBlobs.digest, observed.blob.digest));
+		}
 		expect(await store.readBytes(observed.blob)).toBeDefined();
+	});
+
+	test("missing physical raw object is unknown rather than a matching actor", async () => {
+		const { observed } = await matchingRawFixture();
 		const rawPath = join(
 			getNarraforkHome(),
 			"file-change-blobs",
@@ -397,17 +430,29 @@ describe("current Git targets matched against actual v2 writes", () => {
 		);
 		await rename(rawPath, `${rawPath}.test-held`);
 		try {
-			expect((await view()).byFile[0]?.worktree.reason).toBe("missing_raw");
+			expect((await view()).byFile[0]?.worktree).toMatchObject({
+				status: "unknown",
+				reason: "missing_raw",
+				actor: null,
+			});
 		} finally {
 			await rename(`${rawPath}.test-held`, rawPath);
 		}
+	});
+
+	test("a real 5MiB file exceeding the source budget can never name a matching actor", async () => {
+		await matchingRawFixture();
 		const file = await open(join(workspace, "a.txt"), "r+");
 		try {
 			await file.truncate(5 * 1024 * 1024);
 		} finally {
 			await file.close();
 		}
-		expect((await view()).byFile[0]?.worktree.reason).toBe("budget_exceeded");
+		expect((await view()).byFile[0]?.worktree).toMatchObject({
+			status: "unknown",
+			reason: "budget_exceeded",
+			actor: null,
+		});
 	});
 
 	test("an effect beyond the bounded sample remains unknown rather than silently complete", async () => {
@@ -477,7 +522,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		expect(current.byFile[0]?.worktree.reason).toBe("cancelled");
 	});
 
-	test("a real applying Write never falls back to earlier measured evidence", async () => {
+	test("a pending write preserves evidence for unchanged indexed bytes", async () => {
 		await aiWrite("previous evidence\n");
 		await git("add", "a.txt");
 		let release!: () => void;
@@ -491,7 +536,6 @@ describe("current Git targets matched against actual v2 writes", () => {
 		const pendingRuntime = new LocalFileChangeRuntime({
 			db,
 			privateRoot: getNarraforkHome(),
-			coordinatorState: createWorkspaceWriteCoordinatorState(),
 			blobStoreOptions: { minimumFreeBytes: 0 },
 			io: {
 				...fileChangeLocalIo,
@@ -510,7 +554,10 @@ describe("current Git targets matched against actual v2 writes", () => {
 		try {
 			await entered;
 			const current = await view();
-			expect(current.byFile[0]?.index).toMatchObject({ status: "unknown", actor: null });
+			expect(current.byFile[0]?.index).toMatchObject({
+				status: "matching_evidence",
+				actor: { narratorId },
+			});
 		} finally {
 			release();
 			await pending;
@@ -562,7 +609,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		expect((await view()).byFile[0]?.worktree.reason).toBe("legacy_or_external");
 	});
 
-	test("repeated effect scope revisions are unknown rather than sorted by nanoid", async () => {
+	test("repeated journal sequences are unknown rather than sorted by nanoid", async () => {
 		await aiWrite("revision one\n");
 		const first = (await view()).byFile[0]?.worktree.effectId;
 		await human("revision two\n");
@@ -575,7 +622,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		if (!row || !next) throw new Error("missing real effects");
 		await db
 			.update(fileChangeEffects)
-			.set({ scopeRevision: row.scopeRevision })
+			.set({ journalSeq: row.journalSeq })
 			.where(eq(fileChangeEffects.id, next));
 		expect((await view()).byFile[0]?.worktree).toMatchObject({
 			status: "unknown",
@@ -583,7 +630,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 		});
 	});
 
-	test("a second-pass index or scope revision change invalidates all candidate actors", async () => {
+	test("physical index changes invalidate a view while legacy scope metadata does not", async () => {
 		await aiWrite("initial evidence\n");
 		for (const change of ["index", "scope"] as const) {
 			let calls = 0;
@@ -605,7 +652,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 				}
 				return originalSnapshot(...args);
 			};
-			expect((await view()).baselineStatus).toBe("stale");
+			expect((await view()).baselineStatus).toBe(change === "index" ? "stale" : "stable");
 			gitCurrentBaselineReader.snapshot = originalSnapshot;
 		}
 	});
@@ -656,7 +703,7 @@ describe("current Git targets matched against actual v2 writes", () => {
 			.set({ changedAt: "2026-01-01T00:00:00.000Z" })
 			.where(eq(fileAttributions.workspacePath, workspace));
 		const projectId = generateId();
-		const chapterId = generateId();
+		const sessionId = generateId();
 		const now = new Date().toISOString();
 		await db.insert(projects).values({
 			id: projectId,
@@ -666,23 +713,23 @@ describe("current Git targets matched against actual v2 writes", () => {
 			createdAt: now,
 			updatedAt: now,
 		});
-		await db.insert(chapters).values({
-			id: chapterId,
-			projectId,
+		await db.insert(narrators).values({
+			id: sessionId,
 			title: "current api",
-			branch: "main",
-			baseBranch: "main",
-			worktreePath: workspace,
+			cwd: workspace,
+			contextProjectId: projectId,
+			ownerUserId: userId,
+			traits: ["standalone"],
 			createdAt: now,
 			updatedAt: now,
 		});
-		const app = new Hono<{ Variables: { user: JwtPayload } }>();
+		const app = new Hono<{ Variables: { user: SessionPayload } }>();
 		app.use("*", async (c, next) => {
 			c.set("user", { sub: userId, role: "admin", iat: 0, exp: 2_147_483_647 });
 			await next();
 		});
-		app.route("/chapters", gitRoutes);
-		const route = `http://localhost/chapters/${chapterId}/git/modifications`;
+		app.route("/narrators", narratorGitRoutes);
+		const route = `http://localhost/narrators/${sessionId}/git/modifications`;
 		const response = await app.request(`${route}?scope=uncommitted&projection=byFile`);
 		expect(response.status).toBe(200);
 		const combined = await response.json();

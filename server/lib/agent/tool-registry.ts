@@ -1,3 +1,4 @@
+import { generateId } from "@server/lib/id";
 import { z } from "zod/v4";
 import { canonicalizeToolName } from "./tool-name";
 import type { ToolDefinition } from "./types";
@@ -21,6 +22,14 @@ export interface ToolProvider {
  * Registry for agent tools.
  */
 export class ToolRegistry {
+	private readonly instanceId = generateId();
+	private generation = 0;
+
+	/** Catalog invalidation only: registration/restart changes neither prefix epoch nor authority. */
+	get revision(): string {
+		return `${this.instanceId}:${this.generation}`;
+	}
+
 	/** Tools registered individually (not via a provider). */
 	private directTools = new Map<string, ToolDefinition>();
 	private providers = new Map<string, ToolProvider>();
@@ -41,11 +50,13 @@ export class ToolRegistry {
 	register(tool: ToolDefinition): void {
 		this.directTools.set(tool.name, tool);
 		this.materialized = null;
+		this.generation++;
 	}
 
 	unregister(name: string): void {
 		this.directTools.delete(name);
 		this.materialized = null;
+		this.generation++;
 	}
 
 	private ensureMaterialized(): Map<string, ToolDefinition> {
@@ -87,6 +98,7 @@ export class ToolRegistry {
 		provider.initialize?.();
 		// Do NOT call provider.tools() here — see `materialized` doc comment.
 		this.materialized = null;
+		this.generation++;
 	}
 
 	unregisterProvider(name: string): void {
@@ -95,6 +107,7 @@ export class ToolRegistry {
 		provider.dispose?.();
 		this.providers.delete(name);
 		this.materialized = null;
+		this.generation++;
 	}
 }
 
@@ -119,6 +132,15 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const def = (schema as any)._zod?.def;
 	const typeName: string | undefined = def?.typeName;
+
+	// A preprocess wraps its input schema in a transform -> schema pipe. Other
+	// pipes describe their accepted input on the left, not their transformed output.
+	if (schema instanceof z.ZodPipe) {
+		const inner = schema.in instanceof z.ZodTransform ? schema.out : schema.in;
+		const converted = convertNode(inner as z.ZodType);
+		if (schema.description && !converted.description) converted.description = schema.description;
+		return converted;
+	}
 
 	// Unwrap optionals and defaults, preserving description from wrapper
 	if (typeName === "ZodOptional" || schema instanceof z.ZodOptional) {
@@ -168,8 +190,9 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 			additionalProperties: convertNode(def.valueType),
 		};
 	} else if (schema instanceof z.ZodAny || schema instanceof z.ZodUnknown) {
-		// z.any() / z.unknown() — emit a permissive type so providers don't reject
-		result = { type: "string" };
+		// An empty schema accepts any JSON value; narrowing this to string corrupts
+		// structured arguments such as record values and arbitrary array items.
+		result = {};
 	} else if (schema instanceof z.ZodNullable) {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const inner = convertNode((schema as any).unwrap());

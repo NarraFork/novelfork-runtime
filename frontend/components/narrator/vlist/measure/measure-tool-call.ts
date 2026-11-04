@@ -125,7 +125,7 @@ import {
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
 import { BARE_ROW_GAP, BARE_ROW_ICON } from "@shared/pretext-layout/row-metrics";
 import { letterSpacingPxFor, scaleFontSize } from "@shared/pretext-layout/typography";
-import { resolveToolDisplayDurationMs } from "@shared/tool-display-duration";
+import { type FileChangeTiming, resolveToolDisplayDurationMs } from "@shared/tool-display-duration";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
@@ -178,10 +178,10 @@ import {
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tool category — a LOCAL copy of ToolCallCard.tsx's ToolCategory union. We do
-// NOT import from ToolCallCard.tsx: it is a heavy React/Mantine module and the
-// measure layer must stay pure/arithmetic (mirrors measure-web-search.ts not
-// importing i18n). The dispatch/registry layer maps a live tool call to this.
+// Tool category — a LOCAL copy of `ToolCategory` in tool-call/tool-display.ts.
+// Not imported from there: that module pulls the detail classifier, and this
+// file must stay pure arithmetic. tool-category-parity.test.tsx fails tsgo when
+// the two unions drift. The registry casts a live category string onto this.
 // ─────────────────────────────────────────────────────────────────────────────
 export type ToolCategory =
 	| "read"
@@ -196,6 +196,7 @@ export type ToolCategory =
 	| "taskOutput"
 	| "agent"
 	| "await"
+	| "stop"
 	| "send"
 	| "ask"
 	| "plan"
@@ -207,6 +208,8 @@ export type ToolCategory =
 	| "skill"
 	| "browser"
 	| "knowledge"
+	| "outline"
+	| "schedule"
 	| "contextAsk"
 	| "workspace"
 	| "generic";
@@ -618,8 +621,9 @@ export interface ToolCallData {
 	 * in the vlist card.
 	 */
 	durationMs?: number | null;
-	/** Pure execution time (bash `_metadata.execDurationMs`), preferred when set. */
+	/** Tool execution span (`_metadata.execDurationMs`), fallback when lifecycle stamps are absent. */
 	execDurationMs?: number | null;
+	fileChangeTiming?: FileChangeTiming | null;
 	/** Start epoch (ms) for the live elapsed timer. */
 	startedAt?: number | null;
 	/** Effective timeout (ms) shown after the duration. */
@@ -690,6 +694,8 @@ export interface ToolCallData {
  * HEIGHT-NEUTRAL — the popover is portaled.
  */
 export interface ToolTimingStamps {
+	execDurationMs?: number | null;
+	fileChangeTiming?: FileChangeTiming | null;
 	startedAt: number | null;
 	streamStartedAt: number | null;
 	streamCompletedAt?: number | null;
@@ -713,6 +719,8 @@ function stampOf(value: unknown): number | null {
  * under a different type) can reuse it without a cast at every call site.
  */
 export function resolveToolTimingStamps(source: {
+	execDurationMs?: number | null;
+	fileChangeTiming?: FileChangeTiming | null;
 	startedAt?: number | null;
 	streamStartedAt?: number | null;
 	streamCompletedAt?: number | null;
@@ -723,6 +731,8 @@ export function resolveToolTimingStamps(source: {
 	durationMs?: number | null;
 }): ToolTimingStamps {
 	return {
+		...(source.execDurationMs != null ? { execDurationMs: stampOf(source.execDurationMs) } : {}),
+		...(source.fileChangeTiming != null ? { fileChangeTiming: source.fileChangeTiming } : {}),
 		startedAt: stampOf(source.startedAt),
 		streamStartedAt: stampOf(source.streamStartedAt),
 		streamCompletedAt: stampOf(source.streamCompletedAt),
@@ -1473,6 +1483,15 @@ function metaRowBlocks(row: ToolMetaRow, marginTop: number): PreparedBlock[] {
 		);
 		nextMargin = META_ROW_GAP;
 	}
+	// An identity line (Await's resolved child session) reserves the SAME fixed
+	// row the badge row used: bounded monospace content + the open-session button,
+	// none of it ever reaching the text measurer.
+	if (row.identity) {
+		out.push(
+			makeFixed(META_BADGE_ROW, "detail-meta-identity", nextMargin, { identity: row.identity }),
+		);
+		nextMargin = META_ROW_GAP;
+	}
 	if ((row.badges?.length ?? 0) > 0) {
 		out.push(makeFixed(META_BADGE_ROW, "detail-meta-badges", nextMargin, { badges: row.badges }));
 		nextMargin = META_ROW_GAP;
@@ -1741,6 +1760,15 @@ export function measureToolBody(
 	viewportHeight?: number,
 ): MeasuredToolBody {
 	switch (detail.kind) {
+		case "gen-ui":
+			// Inline UI reserves the height its declared size maps to; the file card and
+			// the kit prompt are three fixed text rows. Neither is ever measured.
+			return finishRegion(
+				detail,
+				[makeFixed(detail.contentPx ?? 88, "gen-ui", 0)],
+				innerWidth,
+				null,
+			);
 		case "meta-rows": {
 			const rows = detail.rows.slice(0, META_ROWS_MAX);
 			const blocks: PreparedBlock[] = [];
@@ -2094,11 +2122,9 @@ export function measureToolCall(
 		diffStats: data.diffStats ?? null,
 		isRemoteTarget: data.isRemoteTarget === true,
 		isTakenOver: data.isTakenOver === true,
-		// Bash prefers pure execution time. The rule lives in
-		// `@shared/tool-display-duration` so the folded trace row applies the SAME one —
-		// it used to paint raw `durationMs`, and one call reported 1s as a card and 20s
-		// as a row.
-		displayDurationMs: resolveToolDisplayDurationMs(data),
+		// The adapter already projects the small timing fields. Do not let the shared
+		// legacy metadata fallback inspect arbitrary output payloads during measurement.
+		displayDurationMs: resolveToolDisplayDurationMs(resolveToolTimingStamps(data)),
 		startedAt: data.startedAt ?? null,
 		timeoutMs: data.timeoutMs ?? null,
 		timing: resolveToolTimingStamps(data),

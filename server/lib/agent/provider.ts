@@ -12,7 +12,12 @@ import type {
 	WebSearchAction,
 } from "@shared/agent-protocol/types";
 import type { ContextInputCharacters } from "@shared/context-usage";
+import type { NativeMediaInput } from "@shared/media-attachments";
+import type { ProviderReadiness } from "@shared/provider-readiness";
+import { getCodexManager } from "../codex-manager";
+import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
+import { logger } from "../logger";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
@@ -21,17 +26,28 @@ import {
 	getOpenaiProviderConfig,
 	parseModelId,
 	resolveEffectiveModel,
+	resolveModelProtocol,
 	resolveProvider,
 	settings,
 } from "../settings";
+import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
+import { buildCommandCodeProvider } from "./commandcode-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
+import {
+	connectionForProtocolSwitch,
+	type ProtocolConnectionFields,
+	protocolMatchesConnection,
+} from "./protocol-override";
+import { type ProviderSource, ProviderSourceRegistry } from "./provider-source-registry";
 import type { ApiRequestDumpCollector } from "./request-dump";
+import type { StreamProgress } from "./stream-progress";
+import { TokenDanceProvider } from "./tokendance-provider";
 
 // === Provider stream protocol types ===
 //
@@ -69,16 +85,25 @@ export interface ChatParams extends ProtocolChatParams {
 	 * For narrator loops this is narratorId.
 	 */
 	stickySessionKey?: string;
+	/** Local transport isolation only; does not change wire session IDs or credential affinity. */
+	transportSessionKey?: string;
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Optional output ceiling; effective model metadata may lower, never raise it. */
 	maxOutputTokens?: number;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
+	/** How tool loads in `history` were rendered; decides the Anthropic tool-change beta. */
+	toolLoadingStrategy?: import("./tool-loading").ToolLoadingStrategy;
 	/** Metadata to include in the request body (e.g. user_id for Anthropic) */
 	metadata?: { user_id: string };
 	/** Optional collector for persisting raw provider request/response dumps. */
 	requestDump?: ApiRequestDumpCollector;
+	/**
+	 * Optional transport-progress tracker (headers, body bytes, SSE heartbeats) for the
+	 * HTTP attempt. Diagnostic only: it never counts as provider activity.
+	 */
+	streamProgress?: StreamProgress;
 	/**
 	 * Reset any reusable upstream transport state before this request. Used when the
 	 * agent loop rebuilt history (e.g. after compact) so WebSocket/previous-response
@@ -95,6 +120,41 @@ export interface ChatParams extends ProtocolChatParams {
 	/** Complete final input counts; await bounded numeric preparation before sending/consuming output. */
 	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }
+
+/**
+ * A JSON-Schema constraint on the model's output channel.
+ *
+ * Only the JSON-Schema form is modelled because that is the one shape every
+ * adapters' native mechanism can express: OpenAI's `response_format`,
+ * Anthropic's forced tool `input_schema`, and Gemini's `responseSchema` are all
+ * JSON Schema. There is deliberately no `text`/freeform variant — callers that
+ * do not need structure simply leave `responseFormat` unset.
+ */
+export interface ResponseFormatJsonSchema {
+	type: "json_schema";
+	/** Stable schema name. OpenAI requires one; other adapters ignore or echo it. */
+	name: string;
+	/** JSON Schema object the model's output must satisfy. */
+	schema: Record<string, unknown>;
+	/**
+	 * Ask for strict enforcement where the adapter supports it (OpenAI does).
+	 * Strict mode requires every property to be listed in `required` and
+	 * `additionalProperties: false` on every object in the schema.
+	 */
+	strict?: boolean;
+	/**
+	 * Optional name of a string field in `schema` carrying a short, user-facing
+	 * rationale. When set, adapters lift it into
+	 * {@link GenerateMetaResult.reasoningSummary} so a caller does not have to
+	 * know the schema's field names.
+	 *
+	 * It stays in `schema` (and in `required`, for strict mode) and is never
+	 * merged into the payload body.
+	 */
+	summaryField?: string;
+}
+
+export type ResponseFormat = ResponseFormatJsonSchema;
 
 export interface GenerateOptions {
 	/** Optional reasoning/thinking effort for lightweight generation helpers. */
@@ -121,6 +181,18 @@ export interface GenerateOptions {
 	 * contract as `onTextDelta`: deltas only, keep it lightweight.
 	 */
 	onReasoningDelta?: (delta: string) => void | Promise<void>;
+	/** Actual model output outside text/reasoning (e.g. tool arguments), never transport heartbeats. */
+	onGenerationProgress?: () => void | Promise<void>;
+	/**
+	 * Constrain the output channel to a JSON Schema.
+	 *
+	 * Adapters that can express this natively (OpenAI, Anthropic, Gemini) map it
+	 * to their own mechanism and return the parsed payload as
+	 * `GenerateMetaResult.structured`. Adapters that cannot MUST report
+	 * `responseFormatDegraded` instead of silently ignoring the field, so a
+	 * caller can never mistake unconstrained prose for schema-valid output.
+	 */
+	responseFormat?: ResponseFormat;
 }
 
 export interface GenerateMetaResult {
@@ -132,11 +204,39 @@ export interface GenerateMetaResult {
 	credentialId?: string;
 	meterUsage?: number;
 	meterUnit?: string;
+	/**
+	 * Parsed JSON payload when `responseFormat` was requested AND the adapter got
+	 * schema-shaped output back. Absent when no format was requested, or when the
+	 * response could not be parsed — always inspect this together with
+	 * {@link responseFormatDegraded} before trusting `text`.
+	 */
+	structured?: unknown;
+	/**
+	 * Short, user-facing rationale lifted from the field named by
+	 * {@link ResponseFormat.summaryField}. Absent when no format was requested,
+	 * when the field was missing/blank, or when the response degraded to text —
+	 * it is never synthesized from the body text.
+	 */
+	reasoningSummary?: string;
+	/**
+	 * Why a requested `responseFormat` could not be honoured (adapter has no
+	 * native mechanism, the upstream rejected the parameter, or the model
+	 * answered with something that is not the requested JSON shape).
+	 *
+	 * This is a *reported* degradation, not a silent one: callers are expected to
+	 * switch to their text-parsing fallback rather than assume structure.
+	 */
+	responseFormatDegraded?: string;
 }
 
 // === The adapter interface ===
 
 export interface ProviderAdapter {
+	/** Native wire capability, intersected with effective model input metadata. */
+	supportsNativeMediaInput?(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean;
 	/** Convert ToolDefinition[] to provider-specific tool format */
 	formatTools(tools: import("./types").ResolvedToolDefinition[]): unknown[];
 
@@ -150,6 +250,13 @@ export interface ProviderAdapter {
 
 	/** Convert DB messages to provider history + trailing tool results */
 	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory>;
+
+	/**
+	 * The wire protocol this adapter speaks for `model`, used to pick a prefix-preserving
+	 * tool loading strategy (see `tool-loading.ts`). Absent means tools are always
+	 * re-declared in full.
+	 */
+	toolLoadingTarget?(model: string): import("./tool-loading").ToolLoadingTarget | undefined;
 
 	/**
 	 * Stable identity ("provider:channel") of the upstream this provider is
@@ -172,61 +279,6 @@ export interface ProviderAdapter {
 
 	/** Stream a chat completion, yielding parsed events */
 	chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent>;
-
-	/** Format a single tool result for the provider protocol */
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		/** Real tool name for protocols (e.g. Gemini Interactions) that echo it with results. */
-		toolName?: string,
-	): unknown;
-
-	/** Append a user turn to history (mutates in place) */
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void;
-
-	/** Append an assistant turn to history (mutates in place) */
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		/** Provider-native content block index for the text block (for interleaved ordering). */
-		textOutputIndex?: number,
-		/** Anthropic redacted thinking blocks to preserve during a tool-use trajectory. */
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		/** Authoritative encounter order; reasoning entries contain whole native items, not checkpoints. */
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */
 	generate(text: string, model: string): Promise<string>;
@@ -275,42 +327,177 @@ export function createGeminiProvider(
 		: new GeminiProvider(config);
 }
 
-function createProviderByName(provider: string): ProviderAdapter | null {
-	// Keep the retired prefix reserved: old sessions must fail locally, never be
-	// claimed by a configured provider or plugin and sent to a billable upstream.
-	if (provider === "tutorial") {
-		throw catalogError("TUTORIAL_REMOVED");
-	}
+const builtinProviderSources = new ProviderSourceRegistry();
+const externalProviderSources = new ProviderSourceRegistry();
 
-	if (provider === "codex") {
-		return new CodexProvider({
-			useWebSocket: settings.codex?.useWebSocket ?? true,
-			useWebSearch: settings.codex?.useWebSearch ?? true,
-			useImageGeneration: settings.codex?.useImageGeneration ?? true,
-		});
-	}
+function hasTokenDancePrefixConflict(): boolean {
+	return [
+		...(settings.customApiProviders ?? []),
+		...(settings.openaiProviders ?? []),
+		...(settings.anthropicProviders ?? []),
+		...(settings.geminiProviders ?? []),
+		...(settings.nugProviders ?? []),
+	].some((entry) => entry.prefix === "tokendance");
+}
 
-	const anthropicConfig = getAnthropicProviderConfig(provider);
-	if (anthropicConfig) {
-		return new AnthropicProvider(anthropicConfig);
-	}
+builtinProviderSources.register("tokendance", {
+	resolve: (provider) => {
+		if (provider !== "tokendance" || !getTokenDanceRuntimeConfig()) return null;
+		if (hasTokenDancePrefixConflict()) {
+			throw new Error(
+				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
+			);
+		}
+		return new TokenDanceProvider();
+	},
+	listReadiness: () => {
+		const config = getTokenDanceRuntimeConfig();
+		return [
+			{
+				id: "builtin:tokendance",
+				prefix: "tokendance",
+				name: "TokenDance",
+				ready: !!config && !config.disabled,
+			},
+		];
+	},
+});
 
-	const nugConfig = getNugProviderConfig(provider);
-	if (nugConfig) {
-		return new NugProvider(nugConfig);
-	}
+builtinProviderSources.register("codex", {
+	resolve: (provider) =>
+		provider === "codex"
+			? new CodexProvider({
+					useWebSocket: settings.codex?.useWebSocket ?? true,
+					useWebSearch: settings.codex?.useWebSearch ?? true,
+					useImageGeneration: settings.codex?.useImageGeneration ?? true,
+				})
+			: null,
+	listReadiness: () => [
+		{
+			id: "builtin:codex",
+			prefix: "codex",
+			name: "Codex",
+			ready: getCodexManager().hasAvailableCredentials,
+		},
+	],
+});
 
-	const openaiConfig = getOpenaiProviderConfig(provider);
-	if (openaiConfig) {
-		return new OpenAIProvider(openaiConfig);
-	}
+builtinProviderSources.register("CommandCode", {
+	resolve: (provider, model) =>
+		provider === "CommandCode" ? buildCommandCodeProvider(model, settings.commandCode) : null,
+	listReadiness: () => [
+		{
+			id: "builtin:CommandCode",
+			prefix: "CommandCode",
+			name: "Command Code",
+			ready:
+				!settings.commandCode?.disabled &&
+				!!resolveCommandCodeToken(settings.commandCode?.apiKey).credential,
+		},
+	],
+});
 
-	const geminiConfig = getGeminiProviderConfig(provider);
-	if (geminiConfig) {
-		return createGeminiProvider(geminiConfig);
-	}
+/** API families expose the same instances used to construct their adapters. */
+function registerCredentialProviderSource<
+	T extends {
+		id: string;
+		prefix: string;
+		name: string;
+		apiKey: string;
+		disabled?: boolean;
+	},
+>(
+	kind: string,
+	listConfigs: () => T[],
+	getConfig: (prefix: string) => T | undefined,
+	create: (config: T) => ProviderAdapter,
+	isComplete: (config: T) => boolean = (config) => !!config.apiKey.trim(),
+): void {
+	builtinProviderSources.register(kind, {
+		resolve: (prefix, model) => {
+			const config = getConfig(prefix);
+			if (!config) return null;
+			// 逐模型协议覆盖：协议和这条连接本来的适配器不同时，换一族适配器，但留下代理和指纹。
+			const protocol = resolveModelProtocol(prefix, model);
+			const connection = config as ProtocolConnectionFields;
+			if (protocol && !protocolMatchesConnection(kind, connection, protocol)) {
+				try {
+					const shared = connectionForProtocolSwitch(connection, model);
+					if (protocol === "anthropic-messages") return new AnthropicProvider(shared);
+					if (protocol === "gemini-compatible") return createGeminiProvider(shared);
+					return new OpenAIProvider({
+						...shared,
+						apiMode: protocol === "openai-responses" ? "responses" : "completions",
+					});
+				} catch (error) {
+					logger.warn("Model protocol override fell back to the provider default", {
+						prefix,
+						protocol,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			return create(config);
+		},
+		listReadiness: () =>
+			listConfigs().map((config) => ({
+				id: `api:${config.id}`,
+				prefix: config.prefix,
+				name: config.name,
+				ready: !config.disabled && isComplete(config),
+			})),
+	});
+}
 
-	return null;
+registerCredentialProviderSource(
+	"anthropic",
+	() => settings.anthropicProviders ?? [],
+	getAnthropicProviderConfig,
+	(config) => new AnthropicProvider(config),
+);
+registerCredentialProviderSource(
+	"nug",
+	() => settings.nugProviders ?? [],
+	getNugProviderConfig,
+	(config) => new NugProvider(config),
+	(config) => !!config.apiKey.trim() && !!config.baseUrl.trim(),
+);
+registerCredentialProviderSource(
+	"openai",
+	() => settings.openaiProviders ?? [],
+	getOpenaiProviderConfig,
+	(config) => new OpenAIProvider(config),
+);
+registerCredentialProviderSource(
+	"gemini",
+	() => settings.geminiProviders ?? [],
+	getGeminiProviderConfig,
+	createGeminiProvider,
+);
+
+/** Synchronous routing and asynchronous local readiness share the registered sources. */
+export async function listProviderReadiness(): Promise<ProviderReadiness[]> {
+	const disabled = new Set(settings.agent.disabledProviders ?? []);
+	disabled.add("tutorial");
+	if (getTokenDanceRuntimeConfig() && hasTokenDancePrefixConflict()) disabled.add("tokendance");
+	const builtin = await builtinProviderSources.listReadiness(disabled);
+	const external = await externalProviderSources.listReadiness(disabled);
+	const reserved = new Set([
+		"codex",
+		"tokendance",
+		"tutorial",
+		...builtin.map((entry) => entry.prefix),
+	]);
+	return [...builtin, ...external.filter((entry) => !reserved.has(entry.prefix))];
+}
+
+function createProviderByName(
+	provider: string,
+	model = `${provider}:default`,
+): ProviderAdapter | null {
+	// The retired prefix must never route to a billable upstream or plugin.
+	if (provider === "tutorial") throw catalogError("TUTORIAL_REMOVED");
+	return builtinProviderSources.resolve(provider, model);
 }
 
 function isDefaultSentinel(model: string | undefined): boolean {
@@ -328,6 +515,10 @@ function prefixProviderModel(provider: string, model: string | undefined): strin
 }
 
 function defaultModelForProvider(provider: string): string | null {
+	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
+		const model = getTokenDanceCatalogModels()[0];
+		return model ? `tokendance:${model.id}` : null;
+	}
 	if (provider === "codex") {
 		const custom = settings.agent.customModels ?? [];
 		const codexCustom = custom.find((m) => m.provider === "codex")?.value;
@@ -373,21 +564,11 @@ export interface ProviderResolution {
 	model: string;
 }
 
-export type ExternalProviderResolver = (
-	requestedProvider: string,
-	requestedModel: string,
-) => ProviderAdapter | null | undefined;
+export type ExternalProviderResolver = ProviderSource;
 
-let externalProviderResolver: ExternalProviderResolver | undefined;
-
-/** Register the optional executable-plugin provider bridge without changing builtin resolution. */
-export function registerExternalProviderResolver(
-	resolver: ExternalProviderResolver | undefined,
-): () => void {
-	externalProviderResolver = resolver;
-	return () => {
-		if (externalProviderResolver === resolver) externalProviderResolver = undefined;
-	};
+/** External routing cannot be registered without its readiness projection. */
+export function registerExternalProviderResolver(source: ProviderSource): () => void {
+	return externalProviderSources.register("external", source);
 }
 
 function buildResolution(
@@ -401,7 +582,7 @@ function buildResolution(
 		provider === requestedProvider
 			? requestedModel
 			: (defaultModelForProvider(provider) ?? `${provider}:${bareRequestedModel || "default"}`);
-	if (adapter instanceof NugProvider) {
+	if (adapter instanceof NugProvider || adapter instanceof TokenDanceProvider) {
 		adapter.prepareForModel(model);
 	}
 	return {
@@ -420,7 +601,7 @@ export function resolveProviderAndModel(
 	const requestedModel = resolveEffectiveModel(model, stickyProvider);
 	const requestedProvider = resolveProvider(requestedModel);
 
-	const explicit = createProviderByName(requestedProvider);
+	const explicit = createProviderByName(requestedProvider, requestedModel);
 	if (explicit) {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, explicit);
 	}
@@ -428,7 +609,7 @@ export function resolveProviderAndModel(
 	// Executable-plugin providers are resolved only after every builtin and
 	// compatible-API provider has declined, so a plugin can never shadow a
 	// builtin prefix (anthropic/openai/nug/gemini/codex).
-	const external = externalProviderResolver?.(requestedProvider, requestedModel);
+	const external = externalProviderSources.resolve(requestedProvider, requestedModel);
 	if (external) {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, external);
 	}

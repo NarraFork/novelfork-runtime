@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { logger } from "../lib/logger";
+import { MAX_REPORT_DETAIL_CHARS, MAX_REPORT_FINDINGS } from "./integrity-protocol";
 
 const CLEAN_SHUTDOWN_MARKER = 0x4e465243; // "NFRC" = NarraFork Clean
 
@@ -60,41 +61,172 @@ export function consumeCleanShutdownState(sqlite: Database): { wasClean: boolean
 	return result;
 }
 
-/** Env flag: force the old behavior of unconditionally rebuilding every FTS index after an
- * unclean shutdown (bypasses the cheaper 'integrity-check' probe). Escape hatch for the rare
- * case where the probe misses a corruption that the full rebuild would have fixed. */
+/** Env flag: rebuild every FTS index after an unclean shutdown, before serving. An operator's
+ * explicit choice of a slow startup; without it, startup reads no index (see `ensureFts`). */
 const FORCE_FULL_FTS_REBUILD =
 	process.env.NARRAFORK_DB_FULL_INTEGRITY_CHECK === "1" ||
 	process.env.NARRAFORK_FTS_FULL_REBUILD === "1";
 
+/** The FTS indexes `ensureFts` manages: the ones it rebuilds when a check finds them broken. */
+export const FTS_INDEX_TABLES = [
+	"narrator_blocks_fts",
+	"narrator_messages_fts",
+	"narrators_fts",
+	"knowledge_entries_fts",
+	"knowledge_drafts_fts",
+	"outline_blocks_fts",
+] as const;
+
 /**
- * Probe an external-content FTS5 table for corruption without rebuilding it.
+ * The FTS indexes an integrity report blames, when it blames nothing else.
  *
- * `INSERT INTO <t>(<t>, rank) VALUES('integrity-check', 1)` verifies both the index and
- * its external content. Without rank=1, SQLite only checks the index internally and misses
- * rowid drift after a content-table rebuild. This can scan the content, so it is restricted
- * to startup maintenance after an unclean shutdown, never the clean-start fast path.
- *
- * Returns `"ok"` when the probe passes, `"corrupt"` when it throws (SQLITE_CORRUPT_VTAB or a
- * "database disk image is malformed" style error), signalling the caller to rebuild that table.
- *
- * NOTE (safety trade-off): 'integrity-check' catches the vast majority of index/content
- * inconsistencies but is not a 100% guarantee against every edge-case corruption that could
- * later surface as a "malformed" error on UPDATE. The runtime safety net (recoverWithCli in
- * db-resilience.ts) still recovers such cases if they slip through, and its recovery path
- * recreates the FTS tables. Worst case is a delayed fix, not permanent data loss.
+ * `PRAGMA quick_check` runs FTS5's own index check (SQLite 3.44+) and names the table in each
+ * finding. A report made only of such findings needs those indexes rebuilt, not the database
+ * recovered. Anything else returns null, the database itself being suspect: a finding naming
+ * no managed index, or a report cut at its limit, whose dropped findings could be anything.
  */
-function probeFtsIntegrity(sqlite: Database, table: string): "ok" | "corrupt" {
-	try {
-		sqlite.run(`INSERT INTO ${table}(${table}, rank) VALUES ('integrity-check', 1)`);
-		return "ok";
-	} catch (err) {
-		logger.warn("FTS integrity probe failed — table will be rebuilt", {
-			table,
-			error: String(err),
-		});
-		return "corrupt";
+export function ftsIndexFindings(details: string): string[] | null {
+	const findings = details.split("; ").filter((finding) => finding.length > 0);
+	if (findings.length === 0 || findings.length >= MAX_REPORT_FINDINGS) return null;
+	if (details.length >= MAX_REPORT_DETAIL_CHARS) return null;
+	const tables = new Set<string>();
+	for (const finding of findings) {
+		if (!/fts5/i.test(finding)) return null;
+		const named = FTS_INDEX_TABLES.filter((table) =>
+			new RegExp(`(^|[^A-Za-z0-9_])${table}([^A-Za-z0-9_]|$)`).test(finding),
+		);
+		if (named.length === 0) return null;
+		for (const table of named) tables.add(table);
 	}
+	return [...tables];
+}
+
+/**
+ * Install a trigger whose definition carries a version (docs/BLOCK_STORAGE-DESIGN.md §4.6).
+ * `CREATE TRIGGER IF NOT EXISTS` never replaces an existing definition, so a changed trigger
+ * is recognised by the version comment SQLite keeps in its stored SQL and swapped in one
+ * transaction. The name stays the same, so the missing-trigger repair above does not mistake
+ * an upgrade for a rebuilt content table.
+ */
+function installVersionedTrigger(
+	sqlite: Database,
+	name: string,
+	version: number,
+	sql: (marker: string) => string,
+): void {
+	const marker = `/* narrafork:trigger-version ${version} */`;
+	const installed = sqlite
+		.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+		.get(name) as { sql: string } | undefined;
+	if (installed?.sql.includes(marker)) return;
+	sqlite.transaction(() => {
+		sqlite.run(`DROP TRIGGER IF EXISTS ${name}`);
+		sqlite.run(sql(marker));
+	})();
+}
+
+/** Bump when the envelope FTS update trigger's definition changes. */
+const NARRATOR_MESSAGES_FTS_UPDATE_VERSION = 2;
+
+/** Characters of one block's text the block index keeps (tool results are capped earlier). */
+export const BLOCK_INDEX_MAX_CHARS = 256 * 1024;
+
+/**
+ * Create the block search index (docs/BLOCK_STORAGE-DESIGN.md §4.6, D6): trigram, keyed by the
+ * block row's rowid, contentless — its text is a function of the block and its adopted ledger
+ * result that the store computes when it writes the block, so no copy is stored. Rows are
+ * removed by rowid, which needs `contentless_delete` (SQLite 3.43+); an older system SQLite
+ * gets an ordinary FTS5 table instead, which supports the same statements.
+ *
+ * Returns whether the table was created by this call.
+ */
+function createBlockIndex(sqlite: Database): boolean {
+	const exists = sqlite
+		.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'narrator_blocks_fts'")
+		.get();
+	if (exists) return false;
+	try {
+		sqlite.run(`
+			CREATE VIRTUAL TABLE narrator_blocks_fts USING fts5(
+				text, content='', contentless_delete=1, tokenize='trigram'
+			)
+		`);
+	} catch (error) {
+		logger.info("SQLite lacks contentless_delete; the block index stores its text", {
+			error: String(error),
+		});
+		sqlite.run("CREATE VIRTUAL TABLE narrator_blocks_fts USING fts5(text, tokenize='trigram')");
+	}
+	return true;
+}
+
+/** Connections known to carry the block index; the helpers below are no-ops elsewhere. */
+const blockIndexPresent = new WeakMap<Database, boolean>();
+
+function hasBlockIndex(sqlite: Database): boolean {
+	let present = blockIndexPresent.get(sqlite);
+	if (present === undefined) {
+		present = !!sqlite
+			.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'narrator_blocks_fts'")
+			.get();
+		blockIndexPresent.set(sqlite, present);
+	}
+	return present;
+}
+
+/**
+ * Set the searchable text of one block, replacing what it had; empty text leaves it
+ * unsearchable. Synchronous and transaction-agnostic: the store calls it inside the
+ * transaction that writes the block (a step's seal, a tool's settlement, an edit). A block
+ * that does not exist (yet) is not indexed.
+ */
+export function replaceBlockIndexText(sqlite: Database, blockId: string, text: string): void {
+	if (!hasBlockIndex(sqlite)) return;
+	removeBlockIndexText(sqlite, blockId);
+	if (!text) return;
+	sqlite
+		.query(
+			"INSERT INTO narrator_blocks_fts(rowid, text) SELECT rowid, ? FROM narrator_blocks WHERE id = ?",
+		)
+		.run(text.slice(0, BLOCK_INDEX_MAX_CHARS), blockId);
+}
+
+/**
+ * Set the searchable text of a block by its row's rowid, which the caller has checked (the
+ * reindex job, which also writes in rowid order: FTS5 flushes its pending terms whenever a
+ * write goes back to a lower rowid).
+ */
+export function replaceBlockIndexRow(sqlite: Database, rowid: number, text: string): void {
+	if (!hasBlockIndex(sqlite)) return;
+	sqlite.query("DELETE FROM narrator_blocks_fts WHERE rowid = ?").run(rowid);
+	if (!text) return;
+	sqlite
+		.query("INSERT INTO narrator_blocks_fts(rowid, text) VALUES (?, ?)")
+		.run(rowid, text.slice(0, BLOCK_INDEX_MAX_CHARS));
+}
+
+/**
+ * Make one block unsearchable (it reopened, or it is about to be deleted). Deleting a block
+ * row removes its index text by itself (`narrator_blocks_fts_delete`), cascades included.
+ */
+export function removeBlockIndexText(sqlite: Database, blockId: string): void {
+	if (!hasBlockIndex(sqlite)) return;
+	sqlite
+		.query(
+			"DELETE FROM narrator_blocks_fts WHERE rowid = (SELECT rowid FROM narrator_blocks WHERE id = ?)",
+		)
+		.run(blockId);
+}
+
+/** The block index writer `narrator-block-sync` registers, bound to one connection. */
+export function blockIndexWriter(sqlite: Database): {
+	write(blockId: string, text: string): void;
+	drop(blockId: string): void;
+} {
+	return {
+		write: (blockId, text) => replaceBlockIndexText(sqlite, blockId, text),
+		drop: (blockId) => removeBlockIndexText(sqlite, blockId),
+	};
 }
 
 /** Refill the rowid-bound draft index without relying on FTS5's external-content rebuild command. */
@@ -119,6 +251,172 @@ function repopulateKnowledgeDraftsFts(sqlite: Database, hasKnowledgeEntries: boo
 	refill();
 }
 
+/**
+ * FTS objects of retired features, dropped on startup.
+ *
+ * An upgrade's migration drops the content table (and SQLite drops the table's triggers with
+ * it), but the FTS5 virtual table and its shadow tables are runtime objects this module created
+ * and no migration knows about. Triggers go first so a trigger can never outlive the index it
+ * writes to. A healthy database has none of them: one schema lookup and no writes.
+ */
+const RETIRED_FTS_TRIGGERS = ["chapters_fts_insert", "chapters_fts_update", "chapters_fts_delete"];
+const RETIRED_FTS_TABLES = ["chapters_fts"];
+
+function dropRetiredFtsObjects(sqlite: Database): void {
+	const names = [...RETIRED_FTS_TRIGGERS, ...RETIRED_FTS_TABLES];
+	const present = sqlite
+		.prepare(
+			`SELECT name FROM sqlite_master WHERE type IN ('trigger', 'table') AND name IN (${names
+				.map(() => "?")
+				.join(", ")})`,
+		)
+		.all(...names) as Array<{ name: string }>;
+	if (present.length === 0) return;
+	sqlite.transaction(() => {
+		for (const name of RETIRED_FTS_TRIGGERS) sqlite.run(`DROP TRIGGER IF EXISTS ${name}`);
+		for (const name of RETIRED_FTS_TABLES) sqlite.run(`DROP TABLE IF EXISTS ${name}`);
+	})();
+	logger.info("Dropped retired FTS objects", { objects: present.map((row) => row.name) });
+}
+
+/**
+ * Whether the block index was lost and has been emptied: its delete trigger is gone (a
+ * migration rebuilt `narrator_blocks`, so its rowids may have moved and the index may point
+ * at the wrong blocks), or an integrity check found it corrupt. Its text is computed by the
+ * store, so it cannot be rebuilt here; see {@link restartReindex}.
+ */
+function repairBlockIndex(sqlite: Database, corrupt: boolean): boolean {
+	const deleteTrigger = sqlite
+		.prepare(
+			"SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'narrator_blocks_fts_delete'",
+		)
+		.get();
+	if (!deleteTrigger) {
+		sqlite.run("DELETE FROM narrator_blocks_fts");
+		logger.info("Block FTS index cleared before restoring its missing delete trigger");
+		return true;
+	}
+	if (!corrupt) return false;
+	try {
+		sqlite.run("DROP TABLE narrator_blocks_fts");
+		createBlockIndex(sqlite);
+		logger.warn("Corrupt block FTS index recreated empty");
+		return true;
+	} catch (err) {
+		logger.warn("Block FTS index recreation failed on startup", { error: String(err) });
+		return false;
+	}
+}
+
+function hasBackfillJobs(sqlite: Database): boolean {
+	return !!sqlite
+		.prepare(
+			"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'narrator_block_backfill'",
+		)
+		.get();
+}
+
+/** Start the reindex job over (`narrator-block-backfill.ts`): every block regains its text. */
+function restartReindex(sqlite: Database): void {
+	if (!hasBackfillJobs(sqlite)) return;
+	sqlite
+		.prepare(
+			`INSERT INTO narrator_block_backfill (job, cursor, complete, paused, processed, updated_at)
+			 VALUES ('reindex', 0, 0, 0, 0, ?)
+			 ON CONFLICT (job) DO UPDATE SET cursor = 0, complete = 0, processed = 0,
+				updated_at = excluded.updated_at`,
+		)
+		.run(new Date().toISOString());
+	logger.info("Block reindex restarted; the envelope FTS index stays until it completes");
+}
+
+/** Whether the reindex job has rewritten every block's index text since it last started. */
+function reindexComplete(sqlite: Database): boolean {
+	return (
+		hasBackfillJobs(sqlite) &&
+		!!sqlite
+			.prepare("SELECT 1 FROM narrator_block_backfill WHERE job = 'reindex' AND complete = 1")
+			.get()
+	);
+}
+
+const ENVELOPE_INDEX_OBJECTS = {
+	triggers: [
+		"narrator_messages_fts_insert",
+		"narrator_messages_fts_update",
+		"narrator_messages_fts_delete",
+	],
+	table: "narrator_messages_fts",
+};
+
+/**
+ * Retire the envelope index (P3c): its triggers first, so none outlives the index it writes
+ * to. Nothing to do once retired. An older build that finds it missing recreates it and, its
+ * triggers being missing, rebuilds it from `content_text`.
+ */
+function dropEnvelopeIndex(sqlite: Database): void {
+	const names = [...ENVELOPE_INDEX_OBJECTS.triggers, ENVELOPE_INDEX_OBJECTS.table];
+	const present = sqlite
+		.prepare(
+			`SELECT name FROM sqlite_master WHERE type IN ('trigger', 'table') AND name IN (${names
+				.map(() => "?")
+				.join(", ")})`,
+		)
+		.all(...names) as Array<{ name: string }>;
+	if (present.length === 0) return;
+	sqlite.transaction(() => {
+		for (const name of ENVELOPE_INDEX_OBJECTS.triggers)
+			sqlite.run(`DROP TRIGGER IF EXISTS ${name}`);
+		sqlite.run(`DROP TABLE IF EXISTS ${ENVELOPE_INDEX_OBJECTS.table}`);
+	})();
+	logger.info("Envelope FTS index retired; search reads the block index", {
+		objects: present.map((row) => row.name),
+	});
+}
+
+/** The triggers that keep the envelope index in step with `narrator_messages.content_text`. */
+function installEnvelopeIndexTriggers(sqlite: Database): void {
+	sqlite.run(`
+		CREATE TRIGGER IF NOT EXISTS narrator_messages_fts_insert AFTER INSERT ON narrator_messages BEGIN
+			INSERT INTO narrator_messages_fts(rowid, content_text)
+			VALUES (NEW.rowid, NEW.content_text);
+		END
+	`);
+	// v2: only a changed content_text re-indexes the row. v1 fired on every column, so each
+	// revision bump, usage write or flag flip deleted and re-inserted the row's index.
+	installVersionedTrigger(
+		sqlite,
+		"narrator_messages_fts_update",
+		NARRATOR_MESSAGES_FTS_UPDATE_VERSION,
+		(marker) => `
+		CREATE TRIGGER narrator_messages_fts_update AFTER UPDATE OF content_text ON narrator_messages
+		WHEN OLD.content_text IS NOT NEW.content_text BEGIN
+			${marker}
+			INSERT INTO narrator_messages_fts(narrator_messages_fts, rowid, content_text)
+			VALUES ('delete', OLD.rowid, OLD.content_text);
+			INSERT INTO narrator_messages_fts(rowid, content_text)
+			VALUES (NEW.rowid, NEW.content_text);
+		END
+	`,
+	);
+	sqlite.run(`
+		CREATE TRIGGER IF NOT EXISTS narrator_messages_fts_delete AFTER DELETE ON narrator_messages BEGIN
+			INSERT INTO narrator_messages_fts(narrator_messages_fts, rowid, content_text)
+			VALUES ('delete', OLD.rowid, OLD.content_text);
+		END
+	`);
+}
+
+let envelopeIndexRetired = false;
+
+/**
+ * Whether `ensureFts` retired the envelope index (`narrator_messages_fts`) on this process's
+ * database (docs/BLOCK_STORAGE-DESIGN.md §4.6, P3c): search then reads the block index alone.
+ */
+export function isEnvelopeIndexRetired(): boolean {
+	return envelopeIndexRetired;
+}
+
 export function ensureFts(
 	sqlite: Database,
 	options: {
@@ -128,31 +426,72 @@ export function ensureFts(
 		 *
 		 * MUST be passed by the startup path. `consumeCleanShutdownState` resets `application_id`
 		 * to 0 before this function runs, so re-reading the pragma here would report EVERY startup
-		 * as unclean and pay the probe cost (seconds of blocked main thread) even after a clean
-		 * shutdown. Omitted only by callers with no marker to consult (tests, tooling).
+		 * as unclean, and NARRAFORK_FTS_FULL_REBUILD would rebuild every index on every startup.
+		 * Omitted only by callers with no marker to consult (tests, tooling).
 		 */
 		wasClean?: boolean;
+		/**
+		 * Indexes an earlier background integrity check found corrupt (`ftsIndexFindings`), to
+		 * rebuild now. Startup itself reads no index to find out.
+		 */
+		repairFtsTables?: readonly string[];
 	} = {},
 ): { rebuilt: boolean } {
 	// Guard: skip if base tables don't exist yet (fresh DB before first migration)
 	const hasBaseTables = sqlite
 		.prepare(
-			"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name IN ('chapters','narrators','narrator_messages')",
+			"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name IN ('narrators','narrator_messages')",
 		)
 		.get() as { c: number };
 
-	if (hasBaseTables.c !== 3) {
+	if (hasBaseTables.c !== 2) {
 		return { rebuilt: false };
 	}
 
+	dropRetiredFtsObjects(sqlite);
+
+	// Prefer the caller-supplied marker state. Falling back to the live pragma is only correct for
+	// callers that never consumed the marker; the startup path always passes `wasClean` because it
+	// already reset `application_id` to 0 (see the option docs above).
+	const wasClean =
+		options.wasClean ??
+		((sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
+			?.application_id ?? 0) === CLEAN_SHUTDOWN_MARKER;
+	const uncleanShutdown = !options.skipUncleanShutdownRebuild && !wasClean;
+	const corruptIndexes = new Set(options.repairFtsTables ?? []);
+
+	// The block index exists once block storage does (migration 0213).
+	const hasNarratorBlocks =
+		(
+			sqlite
+				.prepare(
+					"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name='narrator_blocks'",
+				)
+				.get() as { c: number }
+		).c === 1;
+	const blockIndexCreated = hasNarratorBlocks && createBlockIndex(sqlite);
+	if (hasNarratorBlocks) blockIndexPresent.set(sqlite, true);
+	const repairedContentIndexes = new Set<string>();
+	// Its text is computed by the store, so a lost block index cannot be rebuilt here: it is
+	// emptied, the reindex job starts over, and the envelope index stays (or comes back) until
+	// that job has completed.
+	if (
+		hasNarratorBlocks &&
+		!blockIndexCreated &&
+		repairBlockIndex(sqlite, corruptIndexes.has("narrator_blocks_fts"))
+	) {
+		repairedContentIndexes.add("narrator_blocks_fts");
+		restartReindex(sqlite);
+	}
+	// P3c: once every block's index text has been rewritten, search reads the block index alone.
+	const retireEnvelopeIndex = hasNarratorBlocks && reindexComplete(sqlite);
+	envelopeIndexRetired = retireEnvelopeIndex;
+	if (retireEnvelopeIndex) dropEnvelopeIndex(sqlite);
+	const envelopeIndex = retireEnvelopeIndex ? [] : ["narrator_messages_fts"];
+
 	// Detect and drop old non-trigram FTS tables so they get recreated correctly
 	const ftsTablesRecreated: string[] = [];
-	for (const table of [
-		"chapters_fts",
-		"narrator_messages_fts",
-		"narrators_fts",
-		"knowledge_drafts_fts",
-	]) {
+	for (const table of [...envelopeIndex, "narrators_fts", "knowledge_drafts_fts"]) {
 		const info = sqlite
 			.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
 			.get(table) as { sql: string } | undefined;
@@ -163,12 +502,8 @@ export function ensureFts(
 	}
 
 	// --- Virtual tables ---
-	sqlite.run(`
-		CREATE VIRTUAL TABLE IF NOT EXISTS chapters_fts USING fts5(
-			title, description, content='chapters', content_rowid=rowid, tokenize='trigram'
-		)
-	`);
-	sqlite.run(`
+	if (!retireEnvelopeIndex)
+		sqlite.run(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS narrator_messages_fts USING fts5(
 			content_text, content='narrator_messages', content_rowid=rowid, tokenize='trigram'
 		)
@@ -251,27 +586,44 @@ export function ensureFts(
 		`);
 	}
 
+	// outline_blocks_fts indexes the current content of every outline block (deleted ones too:
+	// the search filters on the block row). External content keyed by rowid, like
+	// knowledge_entries_fts; created once the outline migration has run.
+	const hasOutlineBlocks =
+		(
+			sqlite
+				.prepare(
+					"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name='outline_blocks'",
+				)
+				.get() as { c: number }
+		).c === 1;
+	if (hasOutlineBlocks) {
+		sqlite.run(`
+			CREATE VIRTUAL TABLE IF NOT EXISTS outline_blocks_fts USING fts5(
+				content, content='outline_blocks', content_rowid=rowid, tokenize='trigram'
+			)
+		`);
+	}
+
 	// A Drizzle content-table rebuild drops its triggers and can renumber rowids while
 	// leaving the external-content FTS index untouched (for example migration 0170).
 	// Check BEFORE reinstalling triggers, even on a clean startup. Missing triggers are
 	// also a durable retry signal: rebuild must succeed before that signal is removed.
 	// Only inspect the fixed set of schema objects; healthy clean starts scan no content.
-	const repairedContentIndexes = new Set<string>();
 	const contentIndexTriggerSets = [
-		{
-			table: "chapters_fts",
-			rebuild: true,
-			triggers: ["chapters_fts_insert", "chapters_fts_update", "chapters_fts_delete"],
-		},
-		{
-			table: "narrator_messages_fts",
-			rebuild: true,
-			triggers: [
-				"narrator_messages_fts_insert",
-				"narrator_messages_fts_update",
-				"narrator_messages_fts_delete",
-			],
-		},
+		...(retireEnvelopeIndex
+			? []
+			: [
+					{
+						table: "narrator_messages_fts",
+						rebuild: true,
+						triggers: [
+							"narrator_messages_fts_insert",
+							"narrator_messages_fts_update",
+							"narrator_messages_fts_delete",
+						],
+					},
+				]),
 		{
 			table: "narrators_fts",
 			rebuild: true,
@@ -300,6 +652,19 @@ export function ensureFts(
 							"knowledge_drafts_fts_update",
 							"knowledge_drafts_fts_delete",
 							"knowledge_drafts_fts_entry_title",
+						],
+					},
+				]
+			: []),
+		...(hasOutlineBlocks
+			? [
+					{
+						table: "outline_blocks_fts",
+						rebuild: true,
+						triggers: [
+							"outline_blocks_fts_insert",
+							"outline_blocks_fts_update",
+							"outline_blocks_fts_delete",
 						],
 					},
 				]
@@ -346,49 +711,8 @@ export function ensureFts(
 		}
 	}
 
-	// --- Sync triggers: chapters ---
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS chapters_fts_insert AFTER INSERT ON chapters BEGIN
-			INSERT INTO chapters_fts(rowid, title, description)
-			VALUES (NEW.rowid, NEW.title, NEW.description);
-		END
-	`);
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS chapters_fts_update AFTER UPDATE ON chapters BEGIN
-			INSERT INTO chapters_fts(chapters_fts, rowid, title, description)
-			VALUES ('delete', OLD.rowid, OLD.title, OLD.description);
-			INSERT INTO chapters_fts(rowid, title, description)
-			VALUES (NEW.rowid, NEW.title, NEW.description);
-		END
-	`);
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS chapters_fts_delete AFTER DELETE ON chapters BEGIN
-			INSERT INTO chapters_fts(chapters_fts, rowid, title, description)
-			VALUES ('delete', OLD.rowid, OLD.title, OLD.description);
-		END
-	`);
-
-	// --- Sync triggers: narrator_messages ---
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS narrator_messages_fts_insert AFTER INSERT ON narrator_messages BEGIN
-			INSERT INTO narrator_messages_fts(rowid, content_text)
-			VALUES (NEW.rowid, NEW.content_text);
-		END
-	`);
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS narrator_messages_fts_update AFTER UPDATE ON narrator_messages BEGIN
-			INSERT INTO narrator_messages_fts(narrator_messages_fts, rowid, content_text)
-			VALUES ('delete', OLD.rowid, OLD.content_text);
-			INSERT INTO narrator_messages_fts(rowid, content_text)
-			VALUES (NEW.rowid, NEW.content_text);
-		END
-	`);
-	sqlite.run(`
-		CREATE TRIGGER IF NOT EXISTS narrator_messages_fts_delete AFTER DELETE ON narrator_messages BEGIN
-			INSERT INTO narrator_messages_fts(narrator_messages_fts, rowid, content_text)
-			VALUES ('delete', OLD.rowid, OLD.content_text);
-		END
-	`);
+	// --- Sync triggers: narrator_messages (until the envelope index retires) ---
+	if (!retireEnvelopeIndex) installEnvelopeIndexTriggers(sqlite);
 
 	// --- Sync triggers: narrators ---
 	sqlite.run(`
@@ -415,6 +739,17 @@ export function ensureFts(
 			VALUES ('delete', OLD.rowid, OLD.title);
 		END
 	`);
+
+	// --- Sync trigger: narrator_blocks (the store writes the text; deletes clean up here) ---
+	// A deleted block's rowid can be reused by the next insert, so its text must leave the
+	// index with it, including blocks removed by the envelope's ON DELETE CASCADE.
+	if (hasNarratorBlocks) {
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS narrator_blocks_fts_delete AFTER DELETE ON narrator_blocks BEGIN
+				DELETE FROM narrator_blocks_fts WHERE rowid = OLD.rowid;
+			END
+		`);
+	}
 
 	// --- Sync triggers: knowledge_entries (title + current_content + current_keywords) ---
 	if (hasKnowledgeEntries) {
@@ -485,56 +820,68 @@ export function ensureFts(
 		}
 	}
 
-	// --- Rebuild FTS indexes if needed ---
-	// Two independent triggers, handled differently:
-	//   1) Migration (tokenizer change / dropped-and-recreated table): the index is empty or
-	//      built with the wrong tokenizer, so an UNCONDITIONAL full 'rebuild' is mandatory.
-	//   2) Unclean shutdown: trigram indexes *can* silently corrupt on crash and later throw
-	//      "malformed" on UPDATE, but usually they are fine. Instead of unconditionally
-	//      rebuilding every table (the previous behavior — slow: full re-tokenization of the
-	//      whole corpus, ~1 min on large narrator_messages), probe each table cheaply with
-	//      'integrity-check' and rebuild ONLY the tables that actually fail. Set
-	//      NARRAFORK_FTS_FULL_REBUILD=1 (or NARRAFORK_DB_FULL_INTEGRITY_CHECK=1) to force the
-	//      old unconditional-rebuild behavior.
-	// Prefer the caller-supplied marker state. Falling back to the live pragma is only correct for
-	// callers that never consumed the marker; the startup path always passes `wasClean` because it
-	// already reset `application_id` to 0 (see the option docs above).
-	const wasClean =
-		options.wasClean ??
-		((sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
-			?.application_id ?? 0) === CLEAN_SHUTDOWN_MARKER;
-	const migrationForcedRebuild = ftsTablesRecreated.length > 0;
-	const uncleanShutdown = !options.skipUncleanShutdownRebuild && !wasClean;
-	const needsRebuild = migrationForcedRebuild || uncleanShutdown;
+	// --- Sync triggers: outline_blocks (content only) ---
+	// The update trigger fires only when the content changes: moves, page changes and
+	// tombstones rewrite other columns of whole subtrees and must not re-index them.
+	if (hasOutlineBlocks) {
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS outline_blocks_fts_insert AFTER INSERT ON outline_blocks BEGIN
+				INSERT INTO outline_blocks_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
+			END
+		`);
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS outline_blocks_fts_update AFTER UPDATE OF content ON outline_blocks
+			WHEN OLD.content IS NOT NEW.content BEGIN
+				INSERT INTO outline_blocks_fts(outline_blocks_fts, rowid, content)
+				VALUES ('delete', OLD.rowid, OLD.content);
+				INSERT INTO outline_blocks_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
+			END
+		`);
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS outline_blocks_fts_delete AFTER DELETE ON outline_blocks BEGIN
+				INSERT INTO outline_blocks_fts(outline_blocks_fts, rowid, content)
+				VALUES ('delete', OLD.rowid, OLD.content);
+			END
+		`);
+	}
 
-	if (needsRebuild) {
+	// --- Rebuild FTS indexes if needed ---
+	// Three reasons, none of which reads an index to find out:
+	//   1) Migration (tokenizer change / dropped-and-recreated table): the index is empty or
+	//      built with the wrong tokenizer, so every index is rebuilt.
+	//   2) A background integrity check found an index corrupt (`repairFtsTables`): that index.
+	//   3) An unclean shutdown with NARRAFORK_FTS_FULL_REBUILD=1: every index, by request.
+	// An unclean shutdown alone probes nothing. FTS5's 'integrity-check' reads the whole index
+	// (and, for external content, the whole content table) on the main thread before the server
+	// listens, and it needs the write lock, so it cannot move off this thread: on a 47 GB database
+	// the server sat unreachable in it. WAL commits an index change with the row it indexes, so a
+	// crash cannot split them; the background `quick_check` (integrity-check.ts) runs FTS5's own
+	// check read-only in a subprocess and names any index it finds broken for the next startup.
+	const migrationForcedRebuild = ftsTablesRecreated.length > 0;
+	const forcedAfterCrash = uncleanShutdown && FORCE_FULL_FTS_REBUILD;
+	const needsRebuild = migrationForcedRebuild || forcedAfterCrash;
+
+	const ftsTables = [
+		"narrators_fts",
+		...envelopeIndex,
+		...(hasKnowledgeEntries ? ["knowledge_entries_fts"] : []),
+		...(hasOutlineBlocks ? ["outline_blocks_fts"] : []),
+	];
+	const toRebuild = ftsTables.filter(
+		(table) => !repairedContentIndexes.has(table) && (needsRebuild || corruptIndexes.has(table)),
+	);
+	if (toRebuild.length > 0) {
 		const startedAt = Date.now();
-		// Migration always rebuilds unconditionally. Unclean shutdown only rebuilds tables that
-		// fail the cheap integrity probe (unless the force flag is set).
-		const probeThenRebuild = uncleanShutdown && !migrationForcedRebuild && !FORCE_FULL_FTS_REBUILD;
-		const ftsTables = [
-			"narrators_fts",
-			"chapters_fts",
-			"narrator_messages_fts",
-			...(hasKnowledgeEntries ? ["knowledge_entries_fts"] : []),
-		];
-		const rebuilt: string[] = [];
-		const healthy: string[] = [];
 		try {
-			for (const table of ftsTables) {
-				if (repairedContentIndexes.has(table)) continue;
-				if (probeThenRebuild && probeFtsIntegrity(sqlite, table) === "ok") {
-					healthy.push(table);
-					continue;
-				}
+			for (const table of toRebuild)
 				sqlite.run(`INSERT INTO ${table}(${table}) VALUES ('rebuild')`);
-				rebuilt.push(table);
-			}
-			logger.info("FTS indexes checked on startup", {
-				reason: migrationForcedRebuild ? "migration" : "unclean_shutdown",
-				mode: probeThenRebuild ? "probe_then_rebuild" : "full_rebuild",
-				rebuilt,
-				healthy,
+			logger.info("FTS indexes rebuilt on startup", {
+				reason: migrationForcedRebuild
+					? "migration"
+					: forcedAfterCrash
+						? "forced_after_unclean_shutdown"
+						: "integrity_finding",
+				rebuilt: toRebuild,
 				durationMs: Date.now() - startedAt,
 			});
 		} catch (err) {
@@ -553,7 +900,10 @@ export function ensureFts(
 	if (
 		hasKnowledgeDrafts &&
 		!draftsFtsPopulated &&
-		(needsRebuild || draftsFtsFreshlyCreated || repairedContentIndexes.has("knowledge_drafts_fts"))
+		(needsRebuild ||
+			draftsFtsFreshlyCreated ||
+			repairedContentIndexes.has("knowledge_drafts_fts") ||
+			corruptIndexes.has("knowledge_drafts_fts"))
 	) {
 		repopulateKnowledgeDraftsFts(sqlite, hasKnowledgeEntries);
 		draftsFtsPopulated = true;
@@ -564,5 +914,5 @@ export function ensureFts(
 	// process from being misclassified as a crashed previous process.
 	sqlite.run("PRAGMA application_id = 0");
 
-	return { rebuilt: needsRebuild || repairedContentIndexes.size > 0 };
+	return { rebuilt: toRebuild.length > 0 || repairedContentIndexes.size > 0 };
 }

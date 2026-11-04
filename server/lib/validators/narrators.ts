@@ -1,8 +1,10 @@
+import { MAX_COMPOSER_QUOTE_CHARS, parseComposerDocument } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
 	HUMAN_ATTENTION_MAX_PAGE_SIZE,
 } from "@shared/human-attention";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	handleLength,
 	isValidHandle,
@@ -19,6 +21,18 @@ import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 import { legacyRuleDeviceScopeSchema, pathFlavorSchema, ruleTargetSelectorSchema } from "./common";
 import { fileReferencesSchema } from "./file-references";
+
+const composerDocumentSchema = z
+	.unknown()
+	.transform((value, ctx) => {
+		try {
+			return parseComposerDocument(value);
+		} catch {
+			ctx.addIssue({ code: "custom", message: "Invalid composer document" });
+			return z.NEVER;
+		}
+	})
+	.optional();
 
 const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh", "max"]);
 const booleanOverrideSchema = z.enum(["inherit", "on", "off"]);
@@ -56,7 +70,9 @@ export const narratorHandleSchema = z
 	});
 
 export const createNarratorSchema = z.object({
-	chapterId: z.string().min(1).nullish(),
+	/** 自定义会话标题；留空（或不传）时由首条消息自动命名。 */
+	title: z.string().trim().min(1).max(200).optional(),
+	contextProjectId: z.string().min(1).max(128).nullish(),
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
@@ -97,12 +113,14 @@ export const createNarratorSchema = z.object({
 	// mentionable via @handle in any session.
 	makeNamed: z.boolean().optional(),
 	handle: narratorHandleSchema.optional(),
-	// Specialized standalone narrator kind. Both must be standalone.
+	// Specialized standalone narrator kind. All must be standalone.
 	//   "knowledge" → Knowledge Steward (knowledge-base mgmt): preinstalls the knowledge
 	//                 toolset and a steward system prompt.
 	//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
 	//                 Terminal and a setup-assistant system prompt.
-	kind: z.enum(["knowledge", "setup"]).optional(),
+	//   "bot"       → a bot: people talk to it in a chat room and see only what it sends
+	//                 them with Send({ user }). Requires `title`, its name in that room.
+	kind: z.enum(["knowledge", "setup", "bot"]).optional(),
 });
 
 /**
@@ -121,6 +139,12 @@ export const createSetupAssistantSchema = z.object({
 /** Update a narrator's handle (rename / claim / clear a named narrator handle). */
 export const updateNarratorHandleSchema = z.object({
 	handle: narratorHandleSchema.nullable(),
+});
+
+export const codexUpdateCredentialSchema = z.object({
+	displayName: z.string().optional(),
+	priority: z.number().optional(),
+	useCreditQuota: z.boolean().optional(),
 });
 
 export const codexUseWebSocketSchema = z.object({
@@ -165,6 +189,7 @@ export const sendMessageSchema = z
 		interrupt: z.boolean().optional(),
 		queueMode: bufferQueueModeSchema.optional(),
 		fileReferences: fileReferencesSchema.optional(),
+		composerDocument: composerDocumentSchema,
 	})
 	.refine((body) => !!body.message.trim() || !!body.fileReferences?.length, {
 		message: "message or an attachment is required",
@@ -173,7 +198,11 @@ export const sendMessageSchema = z
 export const updateNarratorDraftSchema = z.object({
 	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS),
 	fileReferences: fileReferencesSchema.optional(),
-	baseRevision: z.number().int().min(0),
+	composerDocument: composerDocumentSchema,
+	sourceId: z.string().min(1).max(120).optional(),
+});
+
+export const restoreNarratorDraftSchema = z.object({
 	sourceId: z.string().min(1).max(120).optional(),
 });
 
@@ -184,7 +213,7 @@ export const updateNarratorDraftSchema = z.object({
  * narrator's own changes — a shared worktree makes discarding another actor's work
  * the more dangerous default.
  */
-export const revertScopeSchema = z.enum(["narrator", "workspace"]).optional();
+export const revertScopeSchema = z.literal("narrator").optional();
 
 const revertPlanIdentifierSchema = z
 	.string()
@@ -251,6 +280,7 @@ export const revertActionSchema = z.enum([
 	"revert_files",
 	"rollback_to_block",
 	"delete_tool_block",
+	"edit_and_regenerate",
 ]);
 export const createRevertActionPreviewSchema = z
 	.object({
@@ -268,15 +298,24 @@ export const createRevertActionPreviewSchema = z
 	.strict()
 	.refine(
 		(value) =>
-			value.action === "revert_files"
+			value.action === "revert_files" || value.action === "edit_and_regenerate"
 				? value.blockIndex === undefined
 				: value.messageId !== "__all__" && value.blockIndex !== undefined,
 		"The action requires an exact message/block boundary",
 	);
+const confirmedRevertPlanSchema = z
+	.object({
+		planId: revertPlanIdSchema,
+		planHash: z.string().regex(/^[a-f0-9]{64}$/),
+		action: revertActionSchema,
+		acceptSnapshotRestore: z.literal(true).optional(),
+	})
+	.strict();
+
 export const applyRevertPlanSchema = z
 	.object({
 		planHash: z.string().regex(/^[a-f0-9]{64}$/),
-		action: revertActionSchema,
+		action: revertActionSchema.exclude(["edit_and_regenerate"]),
 		acceptSnapshotRestore: z.literal(true).optional(),
 	})
 	.strict();
@@ -297,6 +336,9 @@ export const revertFilesSchema = z.object({
 });
 
 export const rollbackToBlockSchema = z.object({
+	revertPlan: confirmedRevertPlanSchema
+		.extend({ action: z.literal("rollback_to_block") })
+		.optional(),
 	blockIndex: z.number().int().min(0),
 	skipRevert: z.boolean().optional(),
 	scope: revertScopeSchema,
@@ -465,9 +507,11 @@ export const updateBlacklistCmdSchema = z.object({
  * the original File objects where two same-named files can coexist.
  */
 export const updateBufferedMessageSchema = z.object({
-	text: z.string().max(100_000).optional(),
+	text: z.string().max(MAX_NARRATOR_DRAFT_CHARS).optional(),
 	fileReferences: fileReferencesSchema.optional(),
+	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_IMAGES_PER_MESSAGE).optional(),
+	keepMediaIds: z.array(z.string().min(1)).max(MAX_MEDIA_ATTACHMENTS).optional(),
 	keepTextFiles: z
 		.array(z.object({ index: z.number().int().min(0), filename: z.string().min(1) }))
 		.max(MAX_EDIT_TEXT_FILES_PER_MESSAGE)
@@ -530,6 +574,21 @@ export const extractPrimarySchema = z.object({
 export const askInPassingSchema = z.object({
 	question: z.string().min(1).max(10000),
 	pendingMessageId: z.string().min(1),
+	/** Selected excerpt the question is about; sent to the fork ahead of the question. */
+	quote: z
+		.object({
+			label: z
+				.string()
+				.min(1)
+				.max(200)
+				.regex(/^\S[^\r\n]*$/u),
+			text: z.string().min(1).max(MAX_COMPOSER_QUOTE_CHARS),
+			anchor: z
+				.string()
+				.regex(/^[mt]:[A-Za-z0-9_-]{4,}$/u)
+				.optional(),
+		})
+		.optional(),
 });
 
 /** Resume error subagents listed on the post-error recovery card. */
@@ -546,6 +605,17 @@ export const askInPassingStartSchema = z.object({
 
 export const updateNarratorModelSchema = z.object({
 	model: z.union([z.literal("__default__"), z.string().min(1).max(200)]),
+});
+
+// === Git commit identity pick ===
+
+/**
+ * Which of MY git identities this narrator commits under; null clears the pick so
+ * the default identity applies again. The service validates that the id belongs
+ * to the caller — one user cannot select (or even see) another's identity.
+ */
+export const setNarratorGitIdentitySchema = z.object({
+	identityId: z.string().min(1).max(64).nullable(),
 });
 
 // === Narrator transcript export ===
@@ -658,32 +728,32 @@ export const suggestAnswersSchema = z.object({
 
 export const MAX_BATCH_DELETE_BLOCKS = 200;
 
-export const batchDeleteBlocksSchema = z.object({
-	blocks: z
-		.array(
-			z.object({
-				messageId: z.string().min(1),
-				blockIndex: z.number().int().min(0),
-			}),
-		)
-		.min(1)
-		.max(MAX_BATCH_DELETE_BLOCKS)
-		.transform((blocks) => {
-			const seen = new Map<string, Set<number>>();
-			return blocks.filter(({ messageId, blockIndex }) => {
-				const indices = seen.get(messageId) ?? new Set<number>();
-				if (indices.has(blockIndex)) return false;
-				indices.add(blockIndex);
-				seen.set(messageId, indices);
-				return true;
-			});
-		}),
-	// When true, delete the blocks from history only, leaving files/spec untouched.
+/** Block ids of one operation (docs/BLOCK_STORAGE-DESIGN.md §5.5): rows, or decoded ids. */
+export const blockIdsSchema = z
+	.array(z.string().min(1).max(256))
+	.min(1)
+	.max(MAX_BATCH_DELETE_BLOCKS)
+	.transform((ids) => [...new Set(ids)]);
+
+export const deleteBlocksSchema = z.object({
+	blockIds: blockIdsSchema,
 	skipRevert: z.boolean().optional(),
-	// The narrator scope is the default and refuses on conflict, so the caller needs
-	// a way to ask for the wider one its error suggests.
 	scope: revertScopeSchema,
 });
+
+export const rollbackToBlocksSchema = rollbackToBlockSchema
+	.omit({ blockIndex: true })
+	.extend({ blockIds: blockIdsSchema });
+
+/** A file-restore preview for an operation addressed by block id. */
+export const blockRevertActionPreviewSchema = z
+	.object({
+		action: z.enum(["rollback_to_block", "delete_tool_block"]),
+		blockIds: blockIdsSchema,
+		idempotencyKey: revertPlanIdentifierSchema,
+		recoveryMode: z.literal("snapshot").optional(),
+	})
+	.strict();
 
 export const forkFromMessagesSchema = z.object({
 	messageIds: z.array(z.string().min(1)).min(1).max(500),
@@ -707,14 +777,19 @@ export const editAssistantMessageSchema = z.object({
  * since that is what its UI offered.
  */
 export const editAndRegenerateJsonSchema = z.object({
-	content: z.string().max(100000).optional(),
+	content: z.string().max(MAX_NARRATOR_DRAFT_CHARS).optional(),
 	fileReferences: fileReferencesSchema.optional(),
+	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string()).max(100).optional(),
+	keepMediaIds: z.array(z.string().min(1)).max(MAX_MEDIA_ATTACHMENTS).optional(),
 	keepTextFilePaths: z.array(z.string()).max(100).optional(),
 	/** True => delete the messages but leave the workspace alone. */
 	skipRevert: z.boolean().optional(),
 	scope: revertScopeSchema,
 	rollback: z.boolean().optional(),
+	revertPlan: confirmedRevertPlanSchema
+		.extend({ action: z.literal("edit_and_regenerate") })
+		.optional(),
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -766,3 +841,15 @@ export const optimizePromptSchema = z.object({
 	withContext: z.boolean().optional().default(false),
 	messageId: z.string().optional(),
 });
+
+/**
+ * Optimizing a draft prompt that has no session yet (the "new session" dialog's
+ * project-prompt box).
+ *
+ * Only `text` and `style`, because the omitted fields are exactly the ones that
+ * describe a SESSION: `withContext` would need messages to attach and `messageId`
+ * would need an inline editor. Deriving rather than restating keeps the text cap and
+ * the style list in one place; unknown keys are stripped by Zod, so a client that
+ * sends them gets the documented behaviour (none) instead of a silent context load.
+ */
+export const optimizeDraftPromptSchema = optimizePromptSchema.pick({ text: true, style: true });

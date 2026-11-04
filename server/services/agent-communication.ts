@@ -1,46 +1,41 @@
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
-import { getSubagentType, isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
+import { getSubagentType, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
+import { runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
 import { isParentSelector, type SendDeliveryTarget } from "@shared/communication-tool";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { narratorBufferedMessages, narratorToolCalls } from "../db/schema";
+import { narratorBufferedMessages } from "../db/schema";
 import type { ToolCallBinding } from "../lib/agent/types";
 import { createAgentMessageDelivery } from "./agent-message-delivery";
 import {
-	type AgentReplyScope,
-	type AgentReplyWaitHandle,
-	type AgentReplyWaitResult,
-	type AgentReplyWaitRunHandle,
-	type AgentReplyWaitRunSnapshot,
-	beginAgentReplyWaitRun,
-	isPreparedAgentReplyPending,
-	preparePendingAgentReply,
-	registerAgentReplyWait,
-	registerAgentReplyWaitFromSnapshot,
-	type SendAwaitDeliveryCoordinates,
-	settlePreparedAgentReply,
-	snapshotDeliveryCoordinates,
-} from "./agent-reply-waiter";
-import { enqueueInboxAgent, inboxDelivery, wakeInboxIfEligible } from "./agent-runtime/inbox";
-import { getExecutionOwner } from "./agent-runtime/ownership";
+	blockingStopReason,
+	enqueueInboxAgent,
+	type ResumableStopReason,
+	wakeInboxIfEligible,
+} from "./agent-runtime/inbox";
+import { getExecutionOwner, getRunHold } from "./agent-runtime/ownership";
 import { getRuntimePublicationService, type PublicationRun } from "./agent-runtime/publication";
+import { controlRun, wakeHeldRun } from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
+import { authorizeAgentControl } from "./narrator-control";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
-import {
-	assertSubagentCanAwaitAgent,
-	assertSubagentSendIsAsync,
-} from "./subagent-communication-policy";
-import { interruptForegroundSubagent } from "./subagent-detach";
-import { pushSubagentBufferedMessage } from "./subagent-executor";
+import { assertRuntimeCanAwaitAgent } from "./subagent-communication-policy";
 import { agentLabelFromNarrator, resolveAgentLabel, shortAgentId } from "./subagent-label";
-import { resumeSubagent } from "./subagent-resume";
-import { waitForBackgroundTask } from "./subagent-runner";
-import { isTakenOver, TAKEN_OVER_SUBSTATUS } from "./subagent-takeover";
+import {
+	applySubagentModelSwitch,
+	planSubagentModelSwitch,
+	type SubagentModelSwitchPlan,
+} from "./subagent-model-switch";
+
+const TAKEN_OVER_SUBSTATUS = "taken_over";
+const isTakenOver = (narratorId: string) => !!getRunHold(narratorId);
+
+import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -56,19 +51,18 @@ export interface ResolveTargetsInput {
 
 export interface SendSubagentInput extends ResolveTargetsInput {
 	toolCallBinding?: ToolCallBinding;
-	/** Exact waiting Send message, resolved from its durable tool binding at setup. */
-	requesterMessageId?: string;
 	/** Navigation only; reserved IDs must be checked for actual existence before opening. */
 	onDeliveryResolved?: (target: SendDeliveryTarget & { deliveryMessageId: string }) => void;
 	onTargetsResolved?: (count: number) => void;
-	/** Internal original display text when reply-request instructions were appended. */
-	displayMessage?: string;
 	message: string;
 	doInterrupt?: boolean;
-	shouldAwait?: boolean;
-	/** Explicit request id being answered by this Send call. */
-	replyTo?: string;
-	timeoutMs?: number;
+	/**
+	 * Explicitly restart a direct child whose last turn ended with an error. Agent
+	 * messages alone never restart such a session; this is the one-call opt-in.
+	 */
+	resume?: boolean;
+	/** Switch each direct child's model before delivery (`"parent"` follows the delegator again). */
+	model?: string;
 	toolUseId: string;
 	signal: AbortSignal;
 	locale: string;
@@ -78,15 +72,13 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	 * against a real user instead of anonymous/disabled.
 	 */
 	userId?: string | null;
-	/** Internal aggregate registry used to checkpoint an already-delivered Send await. */
-	replyRun?: AgentReplyWaitRunHandle;
-	/** Navigation only; called after authorization, before waiting for replies. */
-	onTargetResolved?: (narratorId: string) => void;
 }
 
 export interface AwaitAgentInput {
 	callerNarratorId: string;
 	id: string;
+	/** Execution principal of the caller's run; the ceiling is resolved for it. */
+	userId?: string | null;
 	timeoutMs?: number;
 	signal: AbortSignal;
 	/**
@@ -104,8 +96,12 @@ export interface AwaitAgentInput {
 	 * metadata carries this id only in its RETURN value, which for a 30-minute wait
 	 * is 30 minutes too late. Must never throw and must never block; the caller
 	 * treats it as fire-and-forget notification.
+	 *
+	 * `title` carries the narrator's current display name when the resolver already
+	 * holds the row (the common case), so the running card can headline the session
+	 * name rather than the slug. Null when the resolver never loaded it.
 	 */
-	onTargetResolved?: (subagentNarratorId: string) => void;
+	onTargetResolved?: (subagentNarratorId: string, title?: string | null) => void;
 }
 
 export interface AwaitAgentResult {
@@ -116,6 +112,12 @@ export interface AwaitAgentResult {
 	 * can hand the frontend something it can navigate to.
 	 */
 	label: string;
+	/**
+	 * The subagent session's current title (the Agent call's `description`, or a
+	 * generated title) when the producing path already had the narrator row in
+	 * hand. Null when it did not — the frontend falls back to `label`.
+	 */
+	title?: string | null;
 	status: string;
 	output: string;
 	formatted: string;
@@ -125,8 +127,6 @@ export interface AwaitAgentResult {
 }
 
 export interface SendTargetResult extends SendDeliveryTarget {
-	/** Reply-wait special path: identifies the existing receiving tool row. */
-	recipientToolUseId?: string;
 	/** Exact receiving row, reserved while queued; not a delivery-status assertion. */
 	deliveryMessageId?: string;
 	/** Real narrator id, so the frontend can open the target's session. */
@@ -142,9 +142,14 @@ export interface SendTargetResult extends SendDeliveryTarget {
 		| "timeout"
 		| "aborted"
 		| "cancelled"
-		| "taken_over";
+		| "taken_over"
+		| "blocked";
+	/** `blocked` only: why the queued message cannot start the target by itself. */
+	blockedReason?: ResumableStopReason;
+	/** Model reference stored for the target by this Send's `model` switch. */
+	model?: string;
+	resumed?: boolean;
 	interrupted?: boolean;
-	awaited?: boolean;
 	error?: string;
 }
 
@@ -153,323 +158,7 @@ export interface SendSubagentResult {
 	targets: SendTargetResult[];
 }
 
-interface ReplyTarget {
-	id: string;
-	label?: string;
-	title?: string | null;
-}
-
-interface PendingSendReply extends ReplyTarget, SendAwaitDeliveryCoordinates {
-	deliveryMessageId?: string;
-	handle: AgentReplyWaitHandle;
-	deliveryNote: string;
-	interrupted?: boolean;
-}
-
-export function appendSendReplyRequest(
-	message: string,
-	requesterId: string,
-	requestId: string,
-	locale: Locale,
-): string {
-	const instruction =
-		locale === "zh-CN"
-			? `[请求回复 requestId=${requestId}] 有实质答复时调用 Send({ id: "${requesterId}", message: "<你的回复>", replyTo: "${requestId}" })。发送方等待的是你的 Send 回信，不是等待你结束任务；不要仅为满足等待而中断当前工作。`
-			: `[Reply requested requestId=${requestId}] Reply with Send({ id: "${requesterId}", message: "<your reply>", replyTo: "${requestId}" }). The sender is waiting for your Send reply, not for your task to finish; do not interrupt ongoing work.`;
-	return `${message}\n\n${instruction}`;
-}
-
-/** A reply target paired with the scope its pending Send reply would live under. */
-export interface ScopedReplyTarget extends ReplyTarget {
-	scope: AgentReplyScope;
-}
-
-/**
- * Resolve incoming Send replies for a whole target list at once.
- *
- * IMPORTANT: this is a two-phase operation. Phase 1 only DETECTS which targets
- * have a pending reply (via the side-effect-free `hasPendingAgentReply`) and
- * validates the no-mixing rule. Only after that validation passes does phase 2
- * actually settle/deliver the replies. Callers must pass every target of the
- * Send in a single call — never one target at a time — otherwise a matched
- * reply would be delivered before the aggregate mix check runs, resuming the
- * waiter while the caller is told the Send failed (→ duplicate delivery).
- */
-export function resolveIncomingSendReplies(
-	fromNarratorId: string,
-	targets: ScopedReplyTarget[],
-	message: string,
-	replyTo?: string,
-): SendSubagentResult | null {
-	const uniqueTargets = [...new Map(targets.map((target) => [target.id, target])).values()];
-	if (replyTo && uniqueTargets.length !== 1) {
-		return {
-			output: "An explicit replyTo Send must address exactly one requester.",
-			targets: uniqueTargets.map((target) => ({
-				id: target.id,
-				label: target.label ?? target.id,
-				title: target.title,
-				status: "failed" as const,
-				awaited: false,
-				error: "replyTo requires exactly one target.",
-			})),
-		};
-	}
-
-	// Phase 1 prepares EVERY exact waiter, including implicit uniqueness, with zero settlement.
-	const preparations = uniqueTargets.map((target) => ({
-		target,
-		match: preparePendingAgentReply({
-			fromNarratorId,
-			toNarratorId: target.id,
-			scope: target.scope,
-			replyTo,
-		}),
-	}));
-	const invalid = preparations.find(
-		({ match }) => !match.matched && (match.error || match.ambiguous || replyTo),
-	);
-	if (invalid) {
-		const error = invalid.match.matched
-			? "Invalid Send reply request."
-			: (invalid.match.error ?? "No matching Send reply request.");
-		return {
-			output: `Send reply batch rejected before delivery: ${error}`,
-			targets: uniqueTargets.map((target) => ({
-				id: target.id,
-				label: target.label ?? target.id,
-				title: target.title,
-				status: "failed",
-				awaited: false,
-				error,
-			})),
-		};
-	}
-	const replyTargets = preparations.filter(
-		(
-			item,
-		): item is typeof item & {
-			match: Extract<import("./agent-reply-waiter").AgentReplyPreparation, { matched: true }>;
-		} => item.match.matched,
-	);
-	if (replyTargets.length === 0) return null;
-	if (replyTargets.length !== uniqueTargets.length) {
-		return {
-			output:
-				"A Send call cannot mix replies to waiting narrators with ordinary message targets. " +
-				"Split this into separate Send calls.",
-			targets: uniqueTargets.map((target) => ({
-				id: target.id,
-				label: target.label ?? target.id,
-				title: target.title,
-				status: "failed" as const,
-				awaited: false,
-				error: "Mixed reply and ordinary Send targets.",
-			})),
-		};
-	}
-
-	// Phase 2 checks prepared object identities for the whole batch, then settles in one
-	// synchronous segment. Promise callbacks cannot run between these target settlements.
-	if (!replyTargets.every(({ match }) => isPreparedAgentReplyPending(match.prepared))) {
-		return {
-			output: "Send reply batch changed before delivery; no replies were settled.",
-			targets: uniqueTargets.map((target) => ({
-				id: target.id,
-				label: target.label ?? target.id,
-				title: target.title,
-				status: "failed",
-				awaited: false,
-				error: "Prepared Send reply request is no longer pending.",
-			})),
-		};
-	}
-	const sections: string[] = [];
-	const results: SendTargetResult[] = [];
-	for (const { target, match } of replyTargets) {
-		const resolved = settlePreparedAgentReply(match.prepared, message);
-		if (!resolved.matched) {
-			const error = resolved.error ?? "No matching Send reply request.";
-			sections.push(`Failed to deliver Send reply to ${target.label ?? target.id}: ${error}`);
-			results.push({
-				id: target.id,
-				label: target.label ?? target.id,
-				title: target.title,
-				status: "failed",
-				awaited: false,
-				error,
-			});
-			continue;
-		}
-		sections.push(
-			`Delivered Send reply to ${target.label ?? target.id} for request ${resolved.requestId}; ` +
-				"the waiting Send call resumed immediately.",
-		);
-		results.push({
-			id: target.id,
-			label: target.label ?? target.id,
-			title: target.title,
-			status: "completed",
-			...(resolved.recipientToolUseId ? { recipientToolUseId: resolved.recipientToolUseId } : {}),
-			...(resolved.recipientMessageId ? { deliveryMessageId: resolved.recipientMessageId } : {}),
-			awaited: false,
-		});
-	}
-	return { output: sections.join("\n"), targets: results };
-}
-
-function formatSendReplyWaitResult(
-	pending: Omit<PendingSendReply, "handle">,
-	result: AgentReplyWaitResult,
-): { section: string; target: SendTargetResult } {
-	const label = pending.label ?? pending.id;
-	const baseTarget = {
-		id: pending.id,
-		label,
-		title: pending.title,
-		interrupted: pending.interrupted,
-		...(pending.deliveryMessageId ? { deliveryMessageId: pending.deliveryMessageId } : {}),
-		...snapshotDeliveryCoordinates(pending),
-		awaited: true,
-	};
-	switch (result.status) {
-		case "replied":
-			return {
-				section:
-					`${pending.deliveryNote}\nReceived Send reply from ${label}:\n` +
-					`<subagent_id>${label}</subagent_id>\n\n${result.message}`,
-				target: { ...baseTarget, status: "completed" },
-			};
-		case "timeout":
-			return {
-				section:
-					`${pending.deliveryNote}\nTimed out waiting for a Send reply from ${label}. ` +
-					"Only the reply wait ended; the target task was not stopped and may still be running.",
-				target: { ...baseTarget, status: "timeout" },
-			};
-		case "aborted":
-			return {
-				section:
-					`${pending.deliveryNote}\nWaiting for a Send reply from ${label} was interrupted. ` +
-					"The target task was not stopped.",
-				target: { ...baseTarget, status: "aborted" },
-			};
-		case "failed":
-			return {
-				section: `${pending.deliveryNote}\nFailed while waiting for ${label} to reply: ${result.error}`,
-				target: { ...baseTarget, status: "failed", error: result.error },
-			};
-		case "cancelled":
-			return {
-				section: `${pending.deliveryNote}\nThe Send reply wait for ${label} was cancelled.`,
-				target: { ...baseTarget, status: "cancelled" },
-			};
-	}
-}
-
-async function waitForSendReplies(
-	pendingReplies: PendingSendReply[],
-	replyRun?: AgentReplyWaitRunHandle,
-	prefix: { sections?: string[]; targets?: SendTargetResult[] } = {},
-): Promise<SendSubagentResult> {
-	replyRun?.markStable({
-		prefixSections: prefix.sections,
-		prefixTargets: prefix.targets,
-	});
-	const settled = await Promise.all(
-		pendingReplies.map(async ({ handle, ...pending }) =>
-			formatSendReplyWaitResult(pending, await handle.promise),
-		),
-	);
-	const sections = [...(prefix.sections ?? []), ...settled.map((item) => item.section)];
-	return {
-		output: sections.join("\n\n"),
-		targets: [...(prefix.targets ?? []), ...settled.map((item) => item.target)],
-	};
-}
-
-export function formatSendAwaitSnapshotWithFallback(
-	snapshot: AgentReplyWaitRunSnapshot,
-	fallback: AgentReplyWaitResult,
-): SendSubagentResult {
-	const settled = snapshot.waiters.map((waiter) =>
-		formatSendReplyWaitResult(
-			{
-				id: waiter.responderId,
-				label: waiter.label,
-				title: waiter.title,
-				deliveryNote: waiter.deliveryNote,
-				interrupted: waiter.interrupted,
-				deliveryMessageId: waiter.deliveryMessageId,
-				...snapshotDeliveryCoordinates(waiter),
-			},
-			waiter.result ?? fallback,
-		),
-	);
-	const sections = [...snapshot.prefixSections, ...settled.map((item) => item.section)];
-	return {
-		output: sections.join("\n\n"),
-		targets: [...snapshot.prefixTargets, ...settled.map((item) => item.target)],
-	};
-}
-
-/** Restore only the reply waits from a checkpoint; the original messages are never sent again. */
-export async function restoreSendAwaitFromSnapshot(
-	snapshot: AgentReplyWaitRunSnapshot,
-	signal: AbortSignal,
-): Promise<SendSubagentResult> {
-	const replyRun = beginAgentReplyWaitRun({
-		toolUseId: snapshot.toolUseId,
-		requesterId: snapshot.requesterId,
-		requesterToolCallBinding: snapshot.requesterToolCallBinding,
-		doInterrupt: snapshot.doInterrupt,
-	});
-	replyRun.setTargetCount?.(
-		snapshot.targetCount ??
-			new Set([
-				...snapshot.waiters.map((waiter) => waiter.responderId),
-				...snapshot.prefixTargets.map((target) => target.id),
-			]).size,
-	);
-	try {
-		const handles = new Map<string, AgentReplyWaitHandle>();
-		for (const waiter of snapshot.waiters) {
-			const handle = registerAgentReplyWaitFromSnapshot(replyRun, waiter, signal);
-			if (handle) handles.set(waiter.requestId, handle);
-		}
-		replyRun.markStable({
-			prefixSections: snapshot.prefixSections,
-			prefixTargets: snapshot.prefixTargets,
-		});
-		const settled = await Promise.all(
-			snapshot.waiters.map(async (waiter) => {
-				const result =
-					waiter.result ?? (await (handles.get(waiter.requestId) as AgentReplyWaitHandle).promise);
-				return formatSendReplyWaitResult(
-					{
-						id: waiter.responderId,
-						label: waiter.label,
-						title: waiter.title,
-						deliveryNote: waiter.deliveryNote,
-						interrupted: waiter.interrupted,
-						deliveryMessageId: waiter.deliveryMessageId,
-						...snapshotDeliveryCoordinates(waiter),
-					},
-					result,
-				);
-			}),
-		);
-		const sections = [...snapshot.prefixSections, ...settled.map((item) => item.section)];
-		return {
-			output: sections.join("\n\n"),
-			targets: [...snapshot.prefixTargets, ...settled.map((item) => item.target)],
-		};
-	} finally {
-		replyRun.complete();
-	}
-}
-
-/** Stable coordinates survive COW and can be recovered for old reply checkpoints by reserved address. */
+/** Stable coordinates survive COW and can be recovered by reserved address. */
 function stableSendCoordinates(
 	id: string,
 	messageId?: string,
@@ -550,15 +239,8 @@ async function getCommunicationScope(callerNarratorId: string): Promise<{
 	callerIsSubagent: boolean;
 }> {
 	const caller = await narratorService.getById(callerNarratorId);
-	const callerIsSubagent = isSubagentVariant(caller.variant);
-	if (callerIsSubagent && !caller.parentNarratorId) {
-		throw new Error("Subagent has no parent narrator");
-	}
-	return {
-		caller,
-		teamParentId: callerIsSubagent ? (caller.parentNarratorId as string) : callerNarratorId,
-		callerIsSubagent,
-	};
+	const teamParentId = teamRootOf(caller);
+	return { caller, teamParentId, callerIsSubagent: teamParentId !== caller.id };
 }
 
 function assertTargetAllowed(
@@ -568,10 +250,11 @@ function assertTargetAllowed(
 	// These messages reach the model, so they name the target the same readable
 	// way every other Send/Await outlet does.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
-	if (!isSubagentVariant(target.variant)) {
+	const root = teamRootOf(target);
+	if (root === target.id) {
 		throw new Error(`${label} is not a subagent`);
 	}
-	if (target.parentNarratorId !== scope.teamParentId) {
+	if (root !== scope.teamParentId) {
 		throw new Error(`${label} does not belong to this narrator's subagent team`);
 	}
 	if (scope.callerIsSubagent && target.id === scope.caller.id) {
@@ -604,7 +287,7 @@ async function resolveOneTarget(
 		return direct;
 	}
 
-	const siblings = await narratorService.listSubagentsByParent(scope.teamParentId);
+	const siblings = await narratorService.listTeamMembers(scope.teamParentId);
 	const candidates = siblings.filter((s) => {
 		if (scope.callerIsSubagent && s.id === scope.caller.id) return false;
 		return subagentMatchesSelector(s, selector);
@@ -728,6 +411,7 @@ async function buildAwaitAgentResult(
 	output: string | null | undefined,
 	knownLabel?: string,
 	receipt?: Pick<AwaitAgentResult, "terminalResultReceived" | "publicationRun" | "sourceResultRef">,
+	knownTitle?: string | null,
 ): Promise<AwaitAgentResult> {
 	let recentActivity: string | undefined;
 	if (status === "timeout" || status === "running") {
@@ -744,6 +428,7 @@ async function buildAwaitAgentResult(
 	return {
 		id,
 		label,
+		...(knownTitle ? { title: knownTitle } : {}),
 		status,
 		output: output ?? "(no output)",
 		formatted: formatAgentAwaitResult(label, status, output ?? null, recentActivity),
@@ -799,7 +484,7 @@ type SubagentWaitResult = Pick<
 /** Never pair a later run lookup with an earlier assistant result. */
 async function readSubagentTerminal(
 	subagentId: string,
-	parentNarratorId: string,
+	recipientId: string,
 	current: Narrator,
 	observedRunningRunId?: string | null,
 ): Promise<SubagentWaitResult> {
@@ -807,7 +492,7 @@ async function readSubagentTerminal(
 		? {
 				producerKind: "agent",
 				taskId: subagentId,
-				recipientId: parentNarratorId,
+				recipientId,
 				logicalRunId: current.logicalRunId,
 			}
 		: undefined;
@@ -861,14 +546,15 @@ async function readSubagentTerminal(
 
 export async function waitForSubagentResult(opts: {
 	subagentId: string;
-	parentNarratorId: string;
+	/** Recipient of the subagent's current run. */
+	recipientId: string;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 }): Promise<SubagentWaitResult> {
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const current = await narratorService.getById(opts.subagentId);
 	if (current.status !== "working" && current.status !== "waiting") {
-		return readSubagentTerminal(opts.subagentId, opts.parentNarratorId, current);
+		return readSubagentTerminal(opts.subagentId, opts.recipientId, current);
 	}
 
 	const observedRunningRunId = current.logicalRunId;
@@ -897,7 +583,7 @@ export async function waitForSubagentResult(opts: {
 					return;
 				const result = await readSubagentTerminal(
 					opts.subagentId,
-					opts.parentNarratorId,
+					opts.recipientId,
 					current,
 					observedRunningRunId,
 				);
@@ -1027,10 +713,14 @@ function buildAwaitTimeoutContext(opts: AwaitAgentInput): {
  * wait. The callback only drives a UI affordance, so a throwing listener must not
  * turn a working Await into a failed tool call.
  */
-function notifyTargetResolved(opts: AwaitAgentInput, subagentNarratorId: string): void {
+function notifyTargetResolved(
+	opts: AwaitAgentInput,
+	subagentNarratorId: string,
+	title?: string | null,
+): void {
 	if (!opts.onTargetResolved || !subagentNarratorId) return;
 	try {
-		opts.onTargetResolved(subagentNarratorId);
+		opts.onTargetResolved(subagentNarratorId, title);
 	} catch (err) {
 		logger.warn("Await target-resolved notification failed", {
 			subagentId: subagentNarratorId,
@@ -1054,8 +744,8 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 	}
 
 	const subagentId = task.subagentNarratorId ?? task.id;
-	notifyTargetResolved(opts, subagentId);
 	const current = await narratorService.getById(subagentId).catch(() => null);
+	notifyTargetResolved(opts, subagentId, current?.title);
 	if (current && isTakenOver(subagentId)) return null;
 	if (current && task.status !== "running" && !current.isBackground) {
 		// The background task row is from a previous run. The same subagent may have
@@ -1071,12 +761,19 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 		opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 		signal,
 	);
-	return { id: subagentId, ...waited, status: relabel(waited.status) };
+	return {
+		id: subagentId,
+		...waited,
+		status: relabel(waited.status),
+		title: current?.title ?? null,
+	};
 }
 
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
 	const scope = await getCommunicationScope(opts.callerNarratorId);
-	assertSubagentCanAwaitAgent(scope.callerIsSubagent);
+	assertRuntimeCanAwaitAgent(
+		await resolveNarratorRuntimePolicy(scope.caller.id, opts.userId ?? null),
+	);
 
 	const background = await awaitBackgroundAgentTask(opts);
 	if (background) {
@@ -1087,15 +784,18 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			background.output,
 			undefined,
 			background,
+			background.title,
 		);
 	}
 
 	const target = await resolveOneTarget(opts.id, scope);
 	// Announce the target before waiting: every branch below may block for the full
 	// timeout, and the UI needs this id to offer "open session" meanwhile.
-	notifyTargetResolved(opts, target.id);
+	notifyTargetResolved(opts, target.id, target.title);
 	// The narrator row is in hand, so the label needs no extra query.
 	const label = agentLabelFromNarrator(target, scope.teamParentId);
+	// The result belongs to whoever the target's current run delivers to.
+	const recipientId = runDeliverToOf(target)?.narratorId ?? scope.teamParentId;
 	const build = (
 		status: string,
 		output: string | null | undefined,
@@ -1103,34 +803,19 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			AwaitAgentResult,
 			"terminalResultReceived" | "publicationRun" | "sourceResultRef"
 		>,
-	) => buildAwaitAgentResult(scope.teamParentId, target.id, status, output, label, receipt);
-	if (target.isBackground && target.backgroundStatus === "running") {
-		const { signal, relabel } = buildAwaitTimeoutContext(opts);
-		const waited = await waitForBackgroundTask(
+	) =>
+		buildAwaitAgentResult(
+			scope.teamParentId,
 			target.id,
-			opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-			signal,
+			status,
+			output,
+			label,
+			receipt,
+			target.title,
 		);
-		// Legacy background completion events have no run. Verify their result against
-		// the same narrator epoch captured BEFORE waiting, never getAgentRun afterward.
-		const latest = await narratorService.getById(target.id).catch(() => null);
-		if (
-			["completed", "failed", "cancelled", "timed_out"].includes(waited.status) &&
-			latest &&
-			target.logicalRunId === latest.logicalRunId
-		) {
-			const terminal = await readSubagentTerminal(
-				target.id,
-				scope.teamParentId,
-				latest,
-				target.status === "working" || target.status === "waiting"
-					? target.logicalRunId
-					: undefined,
-			);
-			return build(relabel(waited.status), terminal.output, terminal);
-		}
-		return build(relabel(waited.status), waited.result);
-	}
+	// Every background run is projected by a task row (creation, detach, recovery and
+	// each later run of the session), handled above; the session row alone never
+	// settles a background wait.
 	if (target.status === "working" || target.status === "waiting") {
 		// If the subagent is being taken over by the user, do not block waiting for
 		// a result that only arrives when takeover ends. Report it immediately.
@@ -1140,13 +825,13 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await waitForSubagentResult({
 			subagentId: target.id,
-			parentNarratorId: target.parentNarratorId as string,
+			recipientId,
 			timeoutMs: opts.timeoutMs,
 			signal,
 		});
 		return build(relabel(waited.status), waited.output, waited);
 	}
-	const terminal = await readSubagentTerminal(target.id, scope.teamParentId, target);
+	const terminal = await readSubagentTerminal(target.id, recipientId, target);
 	return build(terminal.status, terminal.output, terminal);
 }
 
@@ -1155,14 +840,6 @@ export async function awaitAgentResult(opts: AwaitAgentInput): Promise<string> {
 }
 
 export { isParentSelector };
-
-function parentChildReplyScope(parentNarratorId: string, childNarratorId: string): AgentReplyScope {
-	return { type: "parent-child", id: `${parentNarratorId}\u0000${childNarratorId}` };
-}
-
-function teamReplyScope(teamParentId: string): AgentReplyScope {
-	return { type: "team", id: teamParentId };
-}
 
 /** Subagent type label for a caller narrator (explore/plan/general/...). */
 function callerSubagentType(caller: Narrator): string {
@@ -1195,8 +872,7 @@ function withSenderPrefix(
 }
 
 /**
- * Deliver a subagent → parent progress report. The parent is always a primary
- * narrator (subagents cannot spawn nested subagents). A working/waiting parent
+ * Deliver a subagent → parent (team root) progress report. A working/waiting parent
  * drains the report at its next sidecar boundary; an idle parent is woken.
  */
 async function deliverSubagentMessageToParent(
@@ -1207,15 +883,6 @@ async function deliverSubagentMessageToParent(
 	const parent = await narratorService.getById(parentId).catch(() => null);
 	if (!parent) {
 		return { id: parentId, status: "failed", error: "Parent narrator not found" };
-	}
-	// Defensive: nested subagents are impossible (createSubagent rejects them),
-	// so a subagent's parent must be a primary narrator. Guard anyway.
-	if (isSubagentVariant(parent.variant)) {
-		logger.warn("Subagent parent is unexpectedly a subagent; refusing parent delivery", {
-			callerNarratorId: input.callerNarratorId,
-			parentNarratorId: parentId,
-		});
-		return { id: parentId, status: "failed", error: "Parent is not a primary narrator" };
 	}
 	if (parent.status === "archived") {
 		return { id: parentId, title: parent.title, status: "failed", error: "Parent is archived" };
@@ -1233,7 +900,7 @@ async function deliverSubagentMessageToParent(
 			isParent: false,
 		},
 		input.toolUseId,
-		input.displayMessage ?? input.message,
+		input.message,
 		input.toolCallBinding,
 	);
 	const accepted = await enqueueInboxAgent(delivery, input.message, {
@@ -1276,75 +943,76 @@ async function resolveSendTargets(
 		const target = targetsParent
 			? await narratorService.getById(scope.teamParentId)
 			: await resolveOneTarget(selector, scope);
-		if (targetsParent && isSubagentVariant(target.variant))
+		if (targetsParent && teamRootOf(target) !== target.id)
 			throw new Error("Parent is not a primary narrator");
 		targets.set(target.id, target);
 	}
 	return [...targets.values()];
 }
 
-async function sendSubagentMessageDetailedWithRun(
+function blockedSendNote(
+	label: string,
+	reason: ResumableStopReason,
+	resumeRequested: boolean,
+): string {
+	if (reason === "user_interrupt")
+		return (
+			`Sent to ${label}, but it is NOT running: the user stopped its last turn, so agent ` +
+			"messages do not restart it" +
+			(resumeRequested ? " and resume=true cannot override the user's stop" : "") +
+			". The message stays queued (visible on its page) until the user resumes it; " +
+			"do not assume it has been read."
+		);
+	return (
+		`Sent to ${label}, but it is NOT running: its last turn ended with an error, so agent ` +
+		"messages do not restart it automatically. The message stays queued (visible on its " +
+		"page) and has not been read. Send again with resume=true to restart it (optionally " +
+		"with model=... to switch its model first), or ask the user to resume it."
+	);
+}
+
+export async function sendSubagentMessageDetailed(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
 	const scope = await getCommunicationScope(input.callerNarratorId);
-	assertSubagentSendIsAsync(scope.callerIsSubagent, input.shouldAwait);
 
-	if (input.doInterrupt && scope.callerIsSubagent) {
-		throw new Error("doInterrupt is only supported from a primary narrator to its child subagents");
-	}
-
-	// Resolve and authorize the WHOLE call before any reply settlement, enqueue or interrupt.
+	// Resolve and authorize the WHOLE call before any enqueue or interrupt.
+	// Reaching a target (step 4 owns that rule) is not control: an interrupt additionally
+	// needs the target's registered controller grant for "steer".
 	const targets = await resolveSendTargets(input, scope);
-	if (
-		input.doInterrupt &&
-		targets.some(
-			(target) => target.parentNarratorId !== scope.caller.id || !isSubagentVariant(target.variant),
-		)
-	)
-		throw new Error("doInterrupt is only supported for this narrator's direct child subagents");
-	input.replyRun?.setTargetCount?.(targets.length);
+	const modelRequest = input.model?.trim() ? input.model : undefined;
+	if (input.doInterrupt || input.resume || modelRequest !== undefined) {
+		for (const target of targets)
+			await authorizeAgentControl({
+				callerNarratorId: scope.caller.id,
+				targetNarratorId: target.id,
+				action: "steer",
+				userId: input.userId ?? null,
+			});
+	}
+	// Validated for every target before anything is written, like the grant above.
+	const modelPlans = new Map<string, SubagentModelSwitchPlan>();
+	if (modelRequest !== undefined) {
+		for (const target of targets) {
+			if (isTakenOver(target.id))
+				throw new Error(
+					`Agent ${agentLabelFromNarrator(target, scope.teamParentId)} is taken over by the user; its model cannot be changed now.`,
+				);
+			modelPlans.set(
+				target.id,
+				await planSubagentModelSwitch(target, modelRequest, input.userId ?? null),
+			);
+		}
+	}
 	try {
 		input.onTargetsResolved?.(targets.length);
 	} catch (error) {
 		logger.warn("Send target count notification failed", { error: String(error) });
 	}
-	if (targets.length === 1) input.onTargetResolved?.(targets[0].id);
-	if (input.replyTo && targets.length !== 1) {
-		return {
-			output: "An explicit replyTo Send must address exactly one requester.",
-			targets: targets.map((target) => ({
-				id: target.id,
-				label: agentLabelFromNarrator(target, scope.teamParentId),
-				title: target.title,
-				status: "failed" as const,
-				error: "replyTo requires exactly one target.",
-			})),
-		};
-	}
-	const targetReplyScope = (target: Narrator): AgentReplyScope =>
-		scope.callerIsSubagent
-			? target.id === scope.teamParentId
-				? parentChildReplyScope(scope.teamParentId, scope.caller.id)
-				: teamReplyScope(scope.teamParentId)
-			: parentChildReplyScope(scope.caller.id, target.id);
-	const incomingReplies = resolveIncomingSendReplies(
-		scope.caller.id,
-		targets.map((target) => ({
-			id: target.id,
-			label: agentLabelFromNarrator(target, scope.teamParentId),
-			title: target.title,
-			scope: targetReplyScope(target),
-		})),
-		input.message,
-		input.replyTo,
-	);
-	if (incomingReplies) return incomingReplies;
 
 	const sections: string[] = [];
 	const targetResults: SendTargetResult[] = [];
-	const pendingReplies: PendingSendReply[] = [];
 	for (const target of targets) {
-		let replyHandle: AgentReplyWaitHandle | undefined;
 		// Readable name for every message about this target, refreshed from `fresh`
 		// below once it is loaded.
 		let label = agentLabelFromNarrator(target, scope.teamParentId);
@@ -1352,7 +1020,7 @@ async function sendSubagentMessageDetailedWithRun(
 			if (scope.callerIsSubagent && target.id === scope.teamParentId) {
 				label = "parent";
 				const delivered = await deliverSubagentMessageToParent(input, scope);
-				targetResults.push({ ...delivered, label, awaited: false });
+				targetResults.push({ ...delivered, label });
 				sections.push(
 					delivered.status === "failed"
 						? `Failed to send to parent: ${delivered.error}`
@@ -1361,9 +1029,6 @@ async function sendSubagentMessageDetailedWithRun(
 							: "Sent to parent; queued at a safe input boundary (reading not guaranteed).",
 				);
 				continue;
-			}
-			if (input.doInterrupt && target.parentNarratorId !== input.callerNarratorId) {
-				throw new Error("doInterrupt is only supported for this narrator's direct child subagents");
 			}
 
 			const fresh = await narratorService.getById(target.id);
@@ -1389,35 +1054,22 @@ async function sendSubagentMessageDetailedWithRun(
 					" wait for the user again; its final result arrives after the user stops the takeover."
 				: "";
 			const interruptTarget = input.doInterrupt && !takenOver;
-
-			if (input.shouldAwait) {
-				replyHandle = registerAgentReplyWait({
-					requesterId: scope.caller.id,
-					requesterMessageId: input.requesterMessageId,
-					requesterToolCallBinding: input.toolCallBinding,
-					responderId: fresh.id,
-					scope: targetReplyScope(fresh),
-					timeoutMs: input.timeoutMs,
-					signal: input.signal,
-					run: input.replyRun,
-					toolUseId: input.toolUseId,
-					title: fresh.title,
-				});
+			const running = fresh.status === "working" || fresh.status === "waiting";
+			const modelPlan = modelPlans.get(fresh.id);
+			let modelNote = "";
+			if (modelPlan) {
+				await applySubagentModelSwitch(fresh.id, modelPlan);
+				modelNote =
+					` Model switched to ${modelPlan.model}` +
+					(running ? " (applies from its next model request)." : ".");
 			}
-			const message = replyHandle
-				? appendSendReplyRequest(
-						input.message,
-						scope.caller.id,
-						replyHandle.requestId,
-						input.locale as Locale,
-					)
-				: input.message;
+
 			// Prefix sibling/child-bound messages with a sender label so the recipient
 			// can tell who sent it (user-typed page messages bypass this path entirely).
 			const deliveredMessage = withSenderPrefix(
 				scope.caller,
 				scope.callerIsSubagent,
-				message,
+				input.message,
 				input.locale as Locale,
 			);
 			// Keep display identity/body separate from unchanged model-facing text.
@@ -1437,59 +1089,46 @@ async function sendSubagentMessageDetailedWithRun(
 			);
 			let deliveryMessageId = delivery.recipientMessageId;
 
-			if (fresh.status === "working" || fresh.status === "waiting") {
-				const buffered = await pushSubagentBufferedMessage(fresh.id, deliveredMessage, {
-					position: interruptTarget ? "front" : "back",
-					delivery,
+			if (running) {
+				const enqueued = await enqueueInboxAgent(delivery, deliveredMessage, {
 					createdBy: input.userId ?? null,
 				});
-				if (!buffered.ok) {
+				if (enqueued.delivery.state === "cancelled" || enqueued.delivery.state === "failed")
 					throw new Error(
-						buffered.full ? "Target message queue is full" : "Message was not buffered",
+						`Previous delivery is ${enqueued.delivery.state}; explicit retry is required`,
 					);
-				}
+				const buffered = { duplicate: enqueued.status === "duplicate" };
+				// The run may have ended while this was being queued; the ordinary wake
+				// rechecks ownership, so a still-live run simply adopts it at its boundary.
+				if (!buffered.duplicate)
+					void wakeInboxIfEligible(fresh.id, input.locale as Locale).catch((error) =>
+						logger.warn("Queued Send wake deferred", {
+							narratorId: fresh.id,
+							error: String(error),
+						}),
+					);
 				deliveryMessageId = delivery.recipientMessageId;
-				let interruptNote = takeoverNote;
+				let interruptNote = modelNote + takeoverNote;
 				let interrupted: boolean | undefined;
 				if (interruptTarget && !buffered.duplicate) {
-					interrupted = interruptForegroundSubagent(fresh.id);
+					interrupted = await controlRun(fresh.id, { kind: "stop" });
 					interruptNote = interrupted
 						? " Interrupted foreground subagent."
 						: " Target is not an interruptible foreground subagent.";
 				} else if (input.doInterrupt && takenOver) {
 					interruptNote += " doInterrupt was ignored because the user is driving this subagent.";
 				}
-				if (replyHandle) {
-					const deliveryNote = `Sent to ${label}; message queued.${interruptNote} Requested a Send reply.`;
-					replyHandle.updateSnapshot({
-						deliveryNote,
-						interrupted,
-						deliveryMessageId,
-						...snapshotDeliveryCoordinates(delivery),
-					});
-					pendingReplies.push({
-						id: fresh.id,
-						label,
-						title: fresh.title,
-						handle: replyHandle,
-						interrupted,
-						deliveryMessageId,
-						...snapshotDeliveryCoordinates(delivery),
-						deliveryNote,
-					});
-				} else {
-					sections.push(`Sent to ${label}; message queued.${interruptNote}`);
-					targetResults.push({
-						id: fresh.id,
-						label,
-						title: fresh.title,
-						status: "queued",
-						deliveryMessageId,
-						...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
-						interrupted,
-						awaited: false,
-					});
-				}
+				sections.push(`Sent to ${label}; message queued.${interruptNote}`);
+				targetResults.push({
+					id: fresh.id,
+					label,
+					title: fresh.title,
+					status: "queued",
+					deliveryMessageId,
+					...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
+					...(modelPlan && { model: modelPlan.model }),
+					interrupted,
+				});
 				notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 				continue;
 			}
@@ -1503,24 +1142,23 @@ async function sendSubagentMessageDetailedWithRun(
 				throw new Error(
 					`Previous delivery is ${accepted.delivery.state}; explicit retry is required`,
 				);
+			// Agent messages never restart a failed or user-stopped session by themselves;
+			// `resume` is the explicit opt-in, and only for a failure (the user's stop stands).
+			const stopped = takenOver ? null : blockingStopReason(fresh.lastStopReason);
+			const resumeRequested = input.resume === true && stopped === "error";
 			let wakeFailed = false;
 			if (accepted.delivery.state === "queued") {
-				const bgAbort = new AbortController();
+				// The ordinary wake of any idle session: a held run is woken in place, an
+				// idle session starts a run that adopts the message in order. The sender's
+				// identity is the message author only, never the recipient's principal.
 				try {
-					await resumeSubagent({
-						toolCallBinding: input.toolCallBinding,
-						bindingToolUseId: input.toolUseId,
-						bindingNarratorId: input.callerNarratorId,
-						subagentId: fresh.id,
-						intent: "follow_up",
-						actor: "parent_agent",
-						mailboxInput: true,
-						prompt: deliveredMessage,
-						delivery: inboxDelivery(accepted.delivery),
-						createdBy: input.userId ?? null,
-						signal: bgAbort.signal,
-						locale: input.locale as Locale,
-					});
+					wakeFailed =
+						!wakeHeldRun(fresh.id) &&
+						!(await wakeInboxIfEligible(
+							fresh.id,
+							input.locale as Locale,
+							resumeRequested ? { resumeStopped: ["error"] } : {},
+						));
 				} catch (error) {
 					wakeFailed = true;
 					logger.warn("Accepted mailbox input awaits eligible wake", {
@@ -1529,123 +1167,42 @@ async function sendSubagentMessageDetailedWithRun(
 					});
 				}
 			} else wakeFailed = true;
-			if (replyHandle) {
-				const deliveryNote = wakeFailed
-					? `Sent to ${label}; durable message retained for the next eligible turn.${takeoverNote} A Send reply was requested.`
-					: `Sent to ${label}; subagent started asynchronously.${takeoverNote} A Send reply was requested.`;
-				replyHandle.updateSnapshot({
-					deliveryNote,
-					deliveryMessageId,
-					...snapshotDeliveryCoordinates(delivery),
-				});
-				pendingReplies.push({
-					id: fresh.id,
-					label,
-					title: fresh.title,
-					handle: replyHandle,
-					deliveryMessageId,
-					...snapshotDeliveryCoordinates(delivery),
-					deliveryNote,
-				});
-			} else {
-				sections.push(
-					(wakeFailed
-						? `Sent to ${label}; durable message retained for the next eligible turn.`
-						: `Sent to ${label}; subagent started asynchronously.`) + takeoverNote,
-				);
-				targetResults.push({
-					id: fresh.id,
-					label,
-					title: fresh.title,
-					status: wakeFailed ? "queued" : "started",
-					deliveryMessageId,
-					...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
-					awaited: false,
-				});
-			}
+			const blockedReason = wakeFailed && stopped && !resumeRequested ? stopped : undefined;
+			const outcome = blockedReason
+				? blockedSendNote(label, blockedReason, input.resume === true)
+				: wakeFailed
+					? resumeRequested
+						? `Sent to ${label}; resume was requested but it cannot start right now, so the message stays queued for its next eligible turn.`
+						: `Sent to ${label}; durable message retained for the next eligible turn.`
+					: resumeRequested
+						? `Sent to ${label}; resumed after its failed last turn and started asynchronously.`
+						: `Sent to ${label}; subagent started asynchronously.`;
+			sections.push(outcome + modelNote + takeoverNote);
+			targetResults.push({
+				id: fresh.id,
+				label,
+				title: fresh.title,
+				status: blockedReason ? "blocked" : wakeFailed ? "queued" : "started",
+				...(blockedReason && { blockedReason }),
+				...(modelPlan && { model: modelPlan.model }),
+				...(resumeRequested && !wakeFailed && { resumed: true }),
+				deliveryMessageId,
+				...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
+			});
 			notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 		} catch (err) {
 			const error = err instanceof Error ? err.message : String(err);
-			if (replyHandle) {
-				const deliveryNote = `Failed to send to ${label}.`;
-				replyHandle.updateSnapshot({ deliveryNote });
-				replyHandle.fail(error);
-				pendingReplies.push({
-					id: target.id,
-					label,
-					title: target.title,
-					handle: replyHandle,
-					deliveryNote,
-				});
-			} else {
-				sections.push(`Failed to send to ${label}: ${error}`);
-				targetResults.push({
-					id: target.id,
-					label,
-					title: target.title,
-					status: "failed",
-					awaited: input.shouldAwait,
-					error,
-				});
-			}
+			sections.push(`Failed to send to ${label}: ${error}`);
+			targetResults.push({
+				id: target.id,
+				label,
+				title: target.title,
+				status: "failed",
+				error,
+			});
 		}
-	}
-	if (pendingReplies.length > 0) {
-		return waitForSendReplies(pendingReplies, input.replyRun, {
-			sections,
-			targets: targetResults,
-		});
 	}
 	return { output: sections.join("\n\n"), targets: targetResults };
-}
-
-export async function sendSubagentMessageDetailed(
-	input: SendSubagentInput,
-): Promise<SendSubagentResult> {
-	if (input.shouldAwait && input.toolCallBinding) {
-		// Resolve at setup using the durable attempt, not a possibly reused provider ID
-		// after the reply has already settled. Only the narrow PK row is read.
-		const binding = input.toolCallBinding;
-		try {
-			const row = await db.query.narratorToolCalls.findFirst({
-				where: and(
-					eq(narratorToolCalls.id, binding.toolCallId),
-					eq(narratorToolCalls.narratorId, input.callerNarratorId),
-					eq(narratorToolCalls.toolUseId, input.toolUseId),
-					eq(narratorToolCalls.executionAttempt, binding.attempt),
-				),
-				columns: { messageId: true },
-			});
-			input = { ...input, requesterMessageId: row?.messageId };
-		} catch (error) {
-			logger.warn("Failed to resolve waiting Send's bound message", { error: String(error) });
-			input = { ...input, requesterMessageId: undefined };
-		}
-	}
-	const replyRun =
-		input.shouldAwait && !input.replyRun
-			? beginAgentReplyWaitRun({
-					toolUseId: input.toolUseId,
-					requesterId: input.callerNarratorId,
-					requesterToolCallBinding: input.toolCallBinding,
-					doInterrupt: input.doInterrupt,
-				})
-			: undefined;
-	try {
-		const result = await sendSubagentMessageDetailedWithRun(
-			replyRun ? { ...input, replyRun } : input,
-		);
-		// A reply is received by the already-existing waiting Send message. The
-		// waiter preserved that exact address; no additional inbox row is created.
-		for (const target of result.targets) {
-			if (target.recipientToolUseId && target.deliveryMessageId) {
-				notifyDeliveryResolved(input, target.id, target.deliveryMessageId, target.title);
-			}
-		}
-		return result;
-	} finally {
-		replyRun?.complete();
-	}
 }
 
 export async function sendSubagentMessage(input: SendSubagentInput): Promise<string> {

@@ -8,6 +8,7 @@ import {
 	rmSync,
 	statSync,
 } from "node:fs";
+import { link, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { AppError, ValidationError } from "./errors";
 import { generateShortId } from "./id";
@@ -60,8 +61,6 @@ export function contentJsonHasImageBlocks(contentJson: unknown): boolean {
 	});
 }
 
-const ALLOWED_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-
 export const MIME_TO_EXT: Record<string, string> = {
 	"image/png": ".png",
 	"image/jpeg": ".jpg",
@@ -88,6 +87,8 @@ export interface ImageRef {
 	imageId: string;
 	filename: string;
 	mediaType: string;
+	size?: number;
+	sourceMimeType?: string;
 	width?: number;
 	height?: number;
 	/** Original narrator that owns the uploaded image file. */
@@ -109,6 +110,8 @@ export type PersistedUserImageBlock = {
 	imageId: string;
 	filename: string;
 	mediaType: string;
+	size?: number;
+	sourceMimeType?: string;
 	width?: number;
 	height?: number;
 	uploadNarratorId?: string;
@@ -137,6 +140,8 @@ export function imageRefToContentBlock(
 		imageId: image.imageId,
 		filename: image.filename,
 		mediaType: image.mediaType,
+		...(image.size !== undefined ? { size: image.size } : {}),
+		...(image.sourceMimeType !== undefined ? { sourceMimeType: image.sourceMimeType } : {}),
 		...dimensions,
 		...(uploadNarratorId ? { uploadNarratorId } : {}),
 	};
@@ -396,12 +401,8 @@ function validateImageDimensions(dimensions: ImageDimensions | undefined): void 
 	}
 }
 
+// Check the byte budget before reading; processImageUpload validates the actual image format.
 export function validateUploadedImage(file: File): void {
-	if (!ALLOWED_MIME_TYPES.has(file.type)) {
-		throw new ValidationError(
-			`Unsupported image type: ${file.type}. Supported: PNG, JPEG, GIF, WebP`,
-		);
-	}
 	if (file.size > MAX_IMAGE_SIZE) {
 		throw new ValidationError(
 			`Image too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 20MB`,
@@ -424,11 +425,9 @@ export interface ProcessedImageUpload {
  * so the (up to 20 MiB) payload is never read from the File twice — only a
  * bounded header prefix is ever scanned on the main thread.
  *
- * Fail-closed: a file that declares an image MIME type but whose magic bytes do
- * not match a supported format, or whose dimensions cannot be parsed, is
- * rejected rather than silently stored. This blocks disguised or corrupt
- * uploads from later being served back as images or sent to AI providers.
- * Callers must validate the declared MIME type and size *before* calling this.
+ * Reject unsupported signatures and unparseable dimensions. The detected format is
+ * authoritative: client declarations and multipart MIME inference may be inaccurate.
+ * Callers must validate the byte budget *before* calling this.
  */
 export async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
 	const bytes = new Uint8Array(await file.arrayBuffer());
@@ -436,11 +435,6 @@ export async function processImageUpload(file: File): Promise<ProcessedImageUplo
 	if (!detectedMediaType) {
 		throw new ValidationError(
 			"Unrecognized image content: file does not match a supported PNG, JPEG, GIF, or WebP signature.",
-		);
-	}
-	if (detectedMediaType !== file.type) {
-		throw new ValidationError(
-			`Image content type mismatch: declared ${file.type}, detected ${detectedMediaType}.`,
 		);
 	}
 	const dimensions = parseImageDimensions(bytes);
@@ -563,17 +557,24 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 	};
 }
 
+const IMAGE_FILE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
+
+function validUploadIdentifier(id: string): boolean {
+	return /^[A-Za-z0-9_-]{1,100}$/.test(id);
+}
+
 export function getImagePath(narratorId: string, imageId: string): string | null {
+	if (!validUploadIdentifier(narratorId) || !validUploadIdentifier(imageId)) return null;
 	const uploadsDir = getUploadsDir();
 	const dir = resolve(uploadsDir, narratorId);
 	if (!isWithinDir(uploadsDir, dir)) return null; // prevent path traversal
 	if (!existsSync(dir)) return null;
 
-	const files = readdirSync(dir);
-	const match = files.find((f) => f.startsWith(imageId));
+	// A fixed number of exact candidates avoids an unbounded directory scan.
+	const match = IMAGE_FILE_EXTENSIONS.find((ext) => existsSync(resolve(dir, `${imageId}${ext}`)));
 	if (!match) return null;
 
-	const filePath = resolve(dir, match);
+	const filePath = resolve(dir, `${imageId}${match}`);
 	if (!isWithinDir(dir, filePath)) return null; // belt-and-suspenders
 	return filePath;
 }
@@ -719,6 +720,199 @@ export interface TextFileRef {
 	size: number;
 }
 
+function isMissingFile(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+}
+
+/** Reject symlink components even when they currently point inside the worktree. */
+async function checkedImageAttachmentDir(root: string): Promise<string> {
+	let dir = root;
+	for (const part of [".narrafork", "attached"]) {
+		dir = resolve(dir, part);
+		try {
+			await mkdir(dir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+		}
+		const info = await lstat(dir);
+		if (!info.isDirectory() || info.isSymbolicLink() || !isWithinDir(root, await realpath(dir))) {
+			throw new ValidationError("Unsafe image attachment directory");
+		}
+	}
+	return dir;
+}
+
+async function existingImageCopy(root: string, filePath: string): Promise<number | null> {
+	try {
+		const info = await lstat(filePath);
+		if (!info.isFile() || info.isSymbolicLink() || !isWithinDir(root, await realpath(filePath))) {
+			throw new ValidationError("Unsafe image attachment file");
+		}
+		if (info.size > MAX_IMAGE_SIZE) throw new ValidationError("Image attachment too large");
+		return info.size;
+	} catch (error) {
+		if (isMissingFile(error)) return null;
+		throw error;
+	}
+}
+
+export interface ImageWorktreeCopyBudget {
+	remainingCopies: number;
+	remainingBytes: number;
+	deadlineAt: number;
+}
+
+/**
+ * Materialize an image in the active worktree; keep any existing user-edited copy.
+ * Uses a 64 KiB buffer, a hard byte cap, and a cooperative 10 second copy deadline.
+ * In-flight filesystem calls cannot be cancelled; the deadline is checked between
+ * reads/writes, along with the optional session abort signal. Rejects static symlinks;
+ * portable Node APIs cannot prevent a hostile concurrent parent-directory rename.
+ */
+export async function ensureImageWorktreeCopy(
+	cwd: string,
+	image: ImageRef,
+	fallbackUploadNarratorId?: string,
+	signal?: AbortSignal,
+	budget?: ImageWorktreeCopyBudget,
+): Promise<TextFileRef | null> {
+	signal?.throwIfAborted();
+	const owner = image.uploadNarratorId ?? fallbackUploadNarratorId;
+	if (!owner || !validUploadIdentifier(owner) || !validUploadIdentifier(image.imageId)) {
+		throw new ValidationError("Invalid image owner or ID");
+	}
+	const root = await realpath(cwd);
+	const dir = await checkedImageAttachmentDir(root);
+	// Length-prefixing the owner prevents collisions between IDs containing hyphens.
+	const stem = `${owner.length}-${owner}-${image.imageId}`;
+	for (const ext of IMAGE_FILE_EXTENSIONS) {
+		const filePath = resolve(dir, `${stem}${ext}`);
+		const size = await existingImageCopy(root, filePath);
+		if (size !== null) return { filename: image.filename, filePath, size };
+	}
+
+	if (budget && (budget.remainingCopies <= 0 || Date.now() >= budget.deadlineAt)) return null;
+	let sourcePath: string | null = null;
+	const uploadsRoot = await realpath(getUploadsDir()).catch((error) => {
+		if (isMissingFile(error)) return null;
+		throw error;
+	});
+	if (!uploadsRoot) return null;
+	const sourceDir = resolve(uploadsRoot, owner);
+	try {
+		if ((await lstat(sourceDir)).isSymbolicLink()) {
+			throw new ValidationError("Unsafe image upload directory");
+		}
+		for (const ext of IMAGE_FILE_EXTENSIONS) {
+			const candidate = resolve(sourceDir, `${image.imageId}${ext}`);
+			try {
+				const info = await lstat(candidate);
+				if (!info.isFile() || info.isSymbolicLink()) {
+					throw new ValidationError("Unsafe image upload file");
+				}
+				if (!isWithinDir(uploadsRoot, await realpath(candidate))) {
+					throw new ValidationError("Unsafe image upload path");
+				}
+				sourcePath = candidate;
+				break;
+			} catch (error) {
+				if (!isMissingFile(error)) throw error;
+			}
+		}
+	} catch (error) {
+		if (!isMissingFile(error)) throw error;
+	}
+	if (!sourcePath) return null;
+
+	const source = await open(
+		sourcePath,
+		constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+	).catch((error) => {
+		if (isMissingFile(error)) return null;
+		throw error;
+	});
+	if (!source) return null;
+	let temporaryPath: string | undefined;
+	try {
+		const info = await source.stat();
+		if (!info.isFile() || info.size > MAX_IMAGE_SIZE) {
+			throw new ValidationError("Image attachment too large or not a regular file");
+		}
+		if (budget && info.size > budget.remainingBytes) return null;
+		const maxBytes = Math.min(MAX_IMAGE_SIZE, budget?.remainingBytes ?? MAX_IMAGE_SIZE);
+		const header = Buffer.alloc(12);
+		const { bytesRead } = await source.read(header, 0, header.length, 0);
+		const mediaType = detectImageMime(header.subarray(0, bytesRead));
+		if (!mediaType) throw new ValidationError("Unrecognized image attachment format");
+		const filePath = resolve(dir, `${stem}${MIME_TO_EXT[mediaType]}`);
+		await checkedImageAttachmentDir(root);
+		const allocatedPath = resolve(dir, `.image-${generateShortId()}.tmp`);
+		const target = await open(
+			allocatedPath,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+			0o600,
+		);
+		temporaryPath = allocatedPath;
+		let copiedBytes = 0;
+		const deadline = performance.now() + 10_000;
+		const checkDeadline = () => {
+			signal?.throwIfAborted();
+			if (performance.now() > deadline || (budget && Date.now() >= budget.deadlineAt))
+				throw new ValidationError("Image attachment copy timed out");
+		};
+		try {
+			const buffer = Buffer.alloc(64 * 1024);
+			while (true) {
+				checkDeadline();
+				const { bytesRead: count } = await source.read(buffer, 0, buffer.length, copiedBytes);
+				checkDeadline();
+				if (count === 0) break;
+				if (copiedBytes + count > maxBytes) {
+					throw new ValidationError("Image attachment too large");
+				}
+				let written = 0;
+				while (written < count) {
+					checkDeadline();
+					const { bytesWritten } = await target.write(
+						buffer,
+						written,
+						count - written,
+						copiedBytes + written,
+					);
+					checkDeadline();
+					if (bytesWritten === 0) throw new ValidationError("Image attachment write stalled");
+					written += bytesWritten;
+				}
+				copiedBytes += count;
+			}
+		} finally {
+			await target.close();
+		}
+		signal?.throwIfAborted();
+		await checkedImageAttachmentDir(root);
+		signal?.throwIfAborted();
+		try {
+			// Atomic publication without overwriting a concurrently created copy.
+			await link(temporaryPath, filePath);
+			if (budget) {
+				budget.remainingCopies--;
+				budget.remainingBytes -= copiedBytes;
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+		}
+		const size = await existingImageCopy(root, filePath);
+		if (size === null) throw new ValidationError("Image attachment disappeared");
+		return { filename: image.filename, filePath, size };
+	} finally {
+		try {
+			await source.close();
+		} finally {
+			if (temporaryPath) await unlink(temporaryPath).catch(() => {});
+		}
+	}
+}
+
 /**
  * Validate a text file upload (type + size). Does NOT save the file.
  * Saving happens later in feedMessage when the worktree cwd is known.
@@ -813,9 +1007,6 @@ export async function deleteNarratorUploads(narratorId: string): Promise<void> {
 const AVATAR_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 export async function saveAvatarImage(userId: string, file: File): Promise<ImageRef> {
-	if (!AVATAR_MIME_TYPES.has(file.type)) {
-		throw new ValidationError(`Unsupported avatar type: ${file.type}. Supported: PNG, JPEG, WebP`);
-	}
 	if (file.size > MAX_AVATAR_SIZE) {
 		throw new ValidationError(
 			`Avatar too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 2MB`,
@@ -824,6 +1015,11 @@ export async function saveAvatarImage(userId: string, file: File): Promise<Image
 	// Shares the upload pipeline: bytes are read once, the content is sniffed
 	// and dimensions parsed (fail-closed), and the same buffer is written to disk.
 	const { bytes, dimensions, detectedMediaType } = await processImageUpload(file);
+	if (!AVATAR_MIME_TYPES.has(detectedMediaType)) {
+		throw new ValidationError(
+			`Unsupported avatar type: ${detectedMediaType}. Supported: PNG, JPEG, WebP`,
+		);
+	}
 
 	const imageId = generateShortId();
 	const ext = MIME_TO_EXT[detectedMediaType] ?? ".bin";

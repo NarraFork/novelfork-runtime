@@ -11,15 +11,19 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "@server/db/schema";
 import { AppError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { safeSpawn } from "@server/lib/spawn";
 import { narratorRoutes } from "@server/routes/narrators";
 import { type ActiveNarrator, activeNarrators } from "@server/services/narrator-session-state";
+import { treeSnapshotPhysicalDir } from "@server/services/tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "@server/services/worktree-tree-snapshot";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
+import { ZodError } from "zod";
+import { blockIdAt } from "../../block-ids";
 
 const ids: string[] = [];
 const dirs: string[] = [];
@@ -30,8 +34,10 @@ app.use("*", async (c, next) => {
 });
 app.onError((error) =>
 	Response.json(
-		{ error: error.message },
-		{ status: error instanceof AppError ? error.statusCode : 500 },
+		{ error: error.message, code: error instanceof AppError ? error.code : "VALIDATION_ERROR" },
+		{
+			status: error instanceof AppError ? error.statusCode : error instanceof ZodError ? 400 : 500,
+		},
 	),
 );
 app.route("/api/narrators", narratorRoutes);
@@ -50,6 +56,16 @@ async function fixture(
 	const toolUseId = generateId();
 	const now = new Date().toISOString();
 	const file = join(repo, "a.txt");
+	await db
+		.insert(users)
+		.values({
+			id: "test-admin",
+			username: "test-admin",
+			passwordHash: "test",
+			role: "admin",
+			createdAt: now,
+		})
+		.onConflictDoNothing();
 	await db.insert(narrators).values({ id: narratorId, cwd: repo, createdAt: now, updatedAt: now });
 	ids.push(narratorId);
 	// Rollback keeps the boundary turn and previews every subsequent tool operation.
@@ -145,8 +161,12 @@ function request(id: string, endpoint: string, body: unknown = {}) {
 async function assertUnavailable(response: Response) {
 	expect(response.status).toBe(409);
 	const body = await response.json();
-	expect(body.code).toBe("SNAPSHOT_REVERT_FAILED");
-	expect(body.failures[0].code).toBe("REVERT_UNAVAILABLE");
+	if (body.code === "SNAPSHOT_REVERT_FAILED") {
+		expect(body.files[0]).toMatchObject({ status: "not_attempted" });
+		expect(body.historyCommitted).toBe(false);
+	} else {
+		expect(body.code).toBe("REVERT_CONFIRMATION_REQUIRED");
+	}
 }
 
 afterEach(async () => {
@@ -159,7 +179,7 @@ afterEach(async () => {
 		await db.delete(narrators).where(eq(narrators.id, id));
 	}
 	for (const dir of dirs.splice(0)) {
-		await worktreeTreeSnapshot.destroy(dir);
+		rmSync(treeSnapshotPhysicalDir("local", dir), { recursive: true, force: true });
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
@@ -183,9 +203,9 @@ describe("M0 rollback route safety", () => {
 		false,
 	])("explicit workspace scope rejects historical evidence (tree exists=%s)", async (capture) => {
 		const f = await fixture(capture);
-		await assertUnavailable(
-			await request(f.narratorId, "revert", { messageId: "__all__", scope: "workspace" }),
-		);
+		expect(
+			(await request(f.narratorId, "revert", { messageId: "__all__", scope: "workspace" })).status,
+		).toBe(409);
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
 
@@ -216,12 +236,12 @@ describe("M0 rollback route safety", () => {
 	test("single-block preview remains available without advertising unsafe legacy rollback", async () => {
 		const f = await fixture(true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/block-delete-preview?messageId=${f.messageId}&blockIndex=0`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.messageId, 0)}/delete-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({
 			available: false,
-			reason: "legacy_unverified",
+			reason: "incomplete_coverage",
 		});
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
@@ -233,7 +253,7 @@ describe("M0 rollback route safety", () => {
 	] as const)("an orphaned %s tool reports missing completion evidence without changing its status", async (status) => {
 		const f = await fixture(false, status);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
@@ -259,33 +279,33 @@ describe("M0 rollback route safety", () => {
 			_loopRunning: true,
 		} as ActiveNarrator);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
 			available: false,
-			reason: "legacy_unverified",
+			reason: "incomplete_coverage",
 		});
 		await assertUnavailable(await request(f.narratorId, "revert", { messageId: f.messageId }));
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
 
-	test("operation-backed preview names the disconnected executor and still refuses mutation", async () => {
+	test("incomplete operation evidence still refuses mutation", async () => {
 		const f = await fixture(false, "success", true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
 			available: false,
-			reason: "execution_unavailable",
+			reason: "incomplete_coverage",
 			files: [],
 		});
 		const refusal = await request(f.narratorId, "revert", { messageId: f.messageId });
 		expect(refusal.status).toBe(409);
 		const body = await refusal.json();
-		expect(body.failures[0]).toMatchObject({ code: "REVERT_UNAVAILABLE" });
-		expect(body.failures[0].message).toContain("execution_unavailable");
+		expect(body.code).toBe("REVERT_CONFIRMATION_REQUIRED");
+		expect(body.error).toContain("plan ID and hash");
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 		expect(
 			await db.query.narratorMessageRefs.findFirst({
@@ -298,12 +318,15 @@ describe("M0 rollback route safety", () => {
 	test("preview cannot advertise a legacy workspace snapshot as an available fallback", async () => {
 		const f = await fixture(true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		const preview = await response.json();
 		expect(preview.scope).toBe("narrator");
-		expect(preview.narratorScope).toMatchObject({ available: false, reason: "legacy_unverified" });
+		expect(preview.narratorScope).toMatchObject({
+			available: false,
+			reason: "incomplete_coverage",
+		});
 		expect(preview.workspaceScope).toMatchObject({ available: false, reason: "legacy_unverified" });
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});

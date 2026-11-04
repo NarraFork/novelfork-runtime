@@ -5,7 +5,6 @@
 import { and, asc, eq, lte, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
-	chapters,
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narrators,
@@ -155,7 +154,7 @@ export class ReplayDivergedError extends FileHistoryError {
  * Best-effort cwd used only to canonicalize legacy relative paths.
  *
  * Follows the same order as `resolveNarratorSessionCwd` — explicit `narrator.cwd`
- * first, then the chapter worktree, then the project repo — because these records
+ * first, then the project repo — because these records
  * were written relative to whatever directory the session was actually running in.
  * Resolving them against a different directory would silently point history at the
  * wrong files.
@@ -163,26 +162,10 @@ export class ReplayDivergedError extends FileHistoryError {
 async function resolveLegacyLocalCwd(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, cwd: true, contextProjectId: true },
+		columns: { cwd: true, contextProjectId: true },
 	});
 	if (!narrator) return null;
 	if (narrator.cwd) return narrator.cwd;
-
-	if (narrator.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { worktreePath: true, projectId: true },
-		});
-		if (chapter?.worktreePath) return chapter.worktreePath;
-		if (chapter?.projectId) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, chapter.projectId),
-				columns: { gitPath: true },
-			});
-			if (project?.gitPath) return project.gitPath;
-		}
-		return null;
-	}
 
 	if (narrator.contextProjectId) {
 		const project = await db.query.projects.findFirst({
@@ -498,6 +481,14 @@ export function applyToolCall(
 	toolCall: OrderedToolCall,
 ): string | null {
 	const input = toolCall.inputJson as Record<string, unknown> | null;
+	if (toolCall.toolName === "GenUI" && input?.action !== "show") {
+		// Template bytes live in the v2 journal, not the input. Never silently
+		// replay generated creates as no-ops or recreate a historical template.
+		throw new ReplayDivergedError(
+			`GenUI call ${toolCall.toolUseId} requires its file-change journal.`,
+			toolCall.toolUseId,
+		);
+	}
 	if (!input) return currentContent;
 
 	if (toolCall.toolName === "Write") {
@@ -1119,7 +1110,7 @@ export async function rebuildDeviceFileStatesUpToSeq(
 	return rebuildDeviceStates(narratorId, maxSeq, new Set());
 }
 
-/** Legacy/local projection retained for chapter fork and Git UI callers. */
+/** Legacy/local projection retained for Git UI callers. */
 export async function rebuildFileStatesUpToSeq(
 	narratorId: string,
 	maxSeq: number,

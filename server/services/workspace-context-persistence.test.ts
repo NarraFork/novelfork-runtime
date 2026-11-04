@@ -6,11 +6,12 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ZodError } from "zod";
+import { blockIdAt } from "../../tests/block-ids";
 import {
-	chapters,
 	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorProjectLinks,
 	narrators,
 	narratorToolCalls,
 	projects,
@@ -134,9 +135,15 @@ describe("real SQLite workspace CAS", () => {
 					})
 				: null,
 		);
+		await db
+			.update(narrators)
+			.set({ apiConversationId: "stable-device-cache" })
+			.where(eq(narrators.id, id));
 		const initial = await workspaceContextService.get(id);
 		const active = {
 			alive: true,
+			conversationId: "stable-device-cache",
+			_persistedConversationId: "stable-device-cache",
 			cwd: initial.cwd,
 			_defaultDeviceId: null,
 			_workspaceContext: initial,
@@ -206,10 +213,15 @@ describe("real SQLite workspace CAS", () => {
 					defaultDeviceId: true,
 					workspaceRevision: true,
 					workspaceContext: true,
+					apiConversationId: true,
 				},
 			});
 			expect(persisted?.cwd).toBe(initial.cwd);
 			expect(persisted?.workspaceRevision).toBe(4);
+			expect(persisted?.apiConversationId).toBe("stable-device-cache");
+			expect(active.conversationId).toBe("stable-device-cache");
+			expect(active._persistedConversationId).toBe("stable-device-cache");
+			expect(active._resetUpstreamSessionOnNextRequest).toBeUndefined();
 			expect(persisted?.workspaceContext).toEqual(active._workspaceContext);
 			expect(broadcasts).toHaveLength(4);
 			expect(
@@ -261,50 +273,46 @@ describe("real SQLite workspace CAS", () => {
 			setRemoteBackendResolver(null);
 		}
 	});
-	test("project-filtered pagination preserves narrator ACL and gives legacy chapter authority precedence", async () => {
+	test("project-filtered pagination preserves narrator ACL and lists every linked project", async () => {
 		const router = app(owner);
 		const query = `/api/narrators?standalone=all&projectId=${projectId}&limit=10`;
 		const first = await router.request(query);
 		expect(first.status).toBe(200);
 		expect((await first.json()).items.map((item: { id: string }) => item.id)).toContain(id);
 		const otherProject = generateId();
-		const chapterId = generateId();
+		const otherQuery = `/api/narrators?standalone=all&projectId=${otherProject}&limit=10`;
 		const now = new Date().toISOString();
 		await db.insert(projects).values({
 			id: otherProject,
-			name: "legacy project",
+			name: "linked project",
 			gitPath: join(root, "other"),
 			ownerUserId: owner,
 			createdAt: now,
 			updatedAt: now,
 		});
 		try {
-			await db.insert(chapters).values({
-				id: chapterId,
-				projectId: otherProject,
-				title: "legacy chapter",
-				branch: "main",
-				baseBranch: "main",
-				worktreePath: join(root, "other"),
-				createdAt: now,
-				updatedAt: now,
-			});
-			await db.update(narrators).set({ chapterId }).where(eq(narrators.id, id));
-			const original = await router.request(query);
-			expect(original.status).toBe(200);
-			expect((await original.json()).items.map((item: { id: string }) => item.id)).not.toContain(
+			const unlinked = await router.request(otherQuery);
+			expect(unlinked.status).toBe(200);
+			expect((await unlinked.json()).items.map((item: { id: string }) => item.id)).not.toContain(
 				id,
 			);
-			const actual = await router.request(
-				`/api/narrators?standalone=all&projectId=${otherProject}&limit=10`,
-			);
-			expect(actual.status).toBe(200);
-			expect((await actual.json()).items.map((item: { id: string }) => item.id)).toContain(id);
+			// An additional working directory in another project only adds it to that page.
+			await db.insert(narratorProjectLinks).values({
+				narratorId: id,
+				projectId: otherProject,
+				role: "additional",
+				source: "cwd",
+				directory: join(root, "other"),
+				updatedAt: now,
+			});
+			const linked = await router.request(otherQuery);
+			expect(linked.status).toBe(200);
+			expect((await linked.json()).items.map((item: { id: string }) => item.id)).toContain(id);
+			const primary = await router.request(query);
+			expect((await primary.json()).items.map((item: { id: string }) => item.id)).toContain(id);
 			const denied = await app("unrelated-user").request(query);
 			expect([403, 404]).toContain(denied.status);
 		} finally {
-			await db.update(narrators).set({ chapterId: null }).where(eq(narrators.id, id));
-			await db.delete(chapters).where(eq(chapters.id, chapterId));
 			await db.delete(projects).where(eq(projects.id, otherProject));
 		}
 	});
@@ -341,13 +349,30 @@ describe("real SQLite workspace CAS", () => {
 		});
 		expect(legacy.status).toBe(200);
 		expect((await legacy.json()).current.revision).toBe(2);
+		const versionBefore = (
+			await db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { messageVersion: true },
+			})
+		)?.messageVersion;
 		const revert = await router.request(`/api/narrators/${id}/revert`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: "{}",
+			body: JSON.stringify({ messageId: "__all__", scope: "workspace" }),
 		});
+		// The retired immediate restore entry point refuses before any file or history IO;
+		// a restore now requires a confirmed plan ID and hash from an action preview.
 		expect(revert.status).toBe(409);
-		expect((await revert.json()).code).toBe("WORKSPACE_REVERT_UNSUPPORTED");
+		expect(await revert.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect((await workspaceContextService.get(id)).revision).toBe(2);
+		expect(
+			(
+				await db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { messageVersion: true },
+				})
+			)?.messageVersion,
+		).toBe(versionBefore);
 	});
 	test("real HTTP busy/waiting records return 409 without incrementing revision", async () => {
 		const router = app(owner);
@@ -497,46 +522,52 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			createdAt: new Date().toISOString(),
 		});
 		await change(join(root, "new"));
-		return { user, answer, later, oldFile, newFile };
+		const afterSwitch = await refs();
+		expect(afterSwitch.slice(0, 3)).toEqual([user, answer, later]);
+		expect(afterSwitch).toHaveLength(4);
+		const workspaceReminder = afterSwitch[3];
+		if (!workspaceReminder) throw new Error("Missing workspace switch reminder");
+		const reminder = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, workspaceReminder),
+			columns: { role: true },
+		});
+		expect(reminder?.role).toBe("disp");
+		return { user, answer, later, oldFile, newFile, workspaceReminder };
 	}
 
 	type Fixture = Awaited<ReturnType<typeof fixture>>;
 	type Action = "rollback" | "message" | "block" | "batch";
-	function request(f: Fixture, action: Action, skipRevert?: boolean) {
+	async function request(f: Fixture, action: Action, skipRevert?: boolean) {
 		const base = `/api/narrators/${id}`;
 		const headers = { "content-type": "application/json" };
 		const opts = skipRevert === undefined ? {} : { skipRevert };
+		if (action === "message")
+			return {
+				path: `${base}/messages/${f.answer}${skipRevert ? "?skipRevert=1" : ""}`,
+				init: { method: "DELETE" },
+			};
 		if (action === "rollback")
 			return {
-				path: `${base}/rollback/${f.user}`,
-				init: { method: "POST", headers, body: JSON.stringify({ blockIndex: 0, ...opts }) },
-			};
-		if (action === "batch")
-			return {
-				path: `${base}/messages/batch-blocks`,
+				path: `${base}/blocks/rollback`,
 				init: {
-					method: "DELETE",
+					method: "POST",
 					headers,
-					body: JSON.stringify({
-						blocks: [
-							{ messageId: f.answer, blockIndex: 1 },
-							{ messageId: f.later, blockIndex: 0 },
-						],
-						...opts,
-					}),
+					body: JSON.stringify({ blockIds: [await blockIdAt(f.user, 0)], ...opts }),
 				},
 			};
-		const path =
-			action === "message"
-				? `${base}/messages/${f.answer}`
-				: `${base}/messages/${f.answer}/blocks/1`;
-		return { path: `${path}${skipRevert ? "?skipRevert=1" : ""}`, init: { method: "DELETE" } };
+		const blockIds =
+			action === "batch"
+				? [await blockIdAt(f.answer, 1), await blockIdAt(f.later, 0)]
+				: [await blockIdAt(f.answer, 1)];
+		return {
+			path: `${base}/blocks`,
+			init: { method: "DELETE", headers, body: JSON.stringify({ blockIds, ...opts }) },
+		};
 	}
 
 	async function forbidFileRollback() {
 		const preview = await import("./revert-planner-local-access");
 		const scoped = await import("./narrator-scoped-revert");
-		const snapshot = await import("./snapshot-revert");
 		const forbidden = () => {
 			throw new Error("History-only operation accessed file rollback");
 		};
@@ -545,7 +576,6 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			spyOn(preview, "prepareLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(preview, "applyLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(scoped, "revertNarratorScopedForMessages").mockImplementation(forbidden),
-			spyOn(snapshot, "revertForMessagesTree").mockImplementation(forbidden),
 		];
 		for (const spy of spies) restorers.push(() => spy.mockRestore());
 		return spies;
@@ -575,15 +605,18 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	] as const)("%s with skipRevert changes only history despite missing file evidence", async (action) => {
 		const f = await fixture();
 		const spies = await forbidFileRollback();
-		const req = request(f, action, true);
+		const req = await request(f, action, true);
 		const response = await app(owner).request(req.path, req.init);
 		const body = await response.json();
 		expect(response.status, JSON.stringify(body)).toBe(200);
 		expect(body.ok).toBe(true);
 		if (action === "rollback" || action === "message") expect(await refs()).toEqual([f.user]);
 		else {
+			// Deleting selected blocks must retain the unrelated manual-switch reminder.
 			expect(await refs()).toEqual(
-				action === "block" ? [f.user, f.answer, f.later] : [f.user, f.answer],
+				action === "block"
+					? [f.user, f.answer, f.later, f.workspaceReminder]
+					: [f.user, f.answer, f.workspaceReminder],
 			);
 			const remaining = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, f.answer),
@@ -609,10 +642,12 @@ describe("history-only HTTP actions after a workspace switch", () => {
 				new Error("must not interrupt"),
 			);
 			restorers.push(() => interrupt.mockRestore());
-			const req = request(f, action, skipRevert);
+			const req = await request(f, action, skipRevert);
 			const response = await app(owner).request(req.path, req.init);
 			expect(response.status).toBe(409);
-			expect((await response.json()).code).toBe("WORKSPACE_REVERT_UNSUPPORTED");
+			// A file-restoring rollback needs a confirmed plan and HTTP deletions are
+			// history-only, so every action is refused at that gate before any IO.
+			expect((await response.json()).code).toBe("REVERT_CONFIRMATION_REQUIRED");
 			expect(interrupt).not.toHaveBeenCalled();
 			expect(await refs()).toEqual(before);
 			await assertFiles(f);
@@ -627,7 +662,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	] as const)("%s history-only still requires write access", async (action) => {
 		const f = await fixture();
 		const before = await refs();
-		const req = request(f, action, true);
+		const req = await request(f, action, true);
 		const response = await app("unrelated-user").request(req.path, req.init);
 		expect([403, 404]).toContain(response.status);
 		expect(await refs()).toEqual(before);
@@ -637,16 +672,16 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	test("history-only requests do not bypass parameter validation or exclusive history admission", async () => {
 		const f = await fixture();
 		const before = await refs();
-		const invalid = await app(owner).request(`/api/narrators/${id}/rollback/${f.user}`, {
+		const invalid = await app(owner).request(`/api/narrators/${id}/blocks/rollback`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ blockIndex: -1, skipRevert: true }),
+			body: JSON.stringify({ blockIds: [], skipRevert: true }),
 		});
 		expect(invalid.status).toBe(400);
 		const { reserveNarratorRevertAdmission } = await import("./narrator-session-state");
 		const reservation = reserveNarratorRevertAdmission(id);
 		try {
-			const req = request(f, "message", true);
+			const req = await request(f, "message", true);
 			const response = await app(owner).request(req.path, req.init);
 			expect(response.status).toBe(409);
 			expect((await response.json()).code).toBe("NARRATOR_REVERT_IN_PROGRESS");

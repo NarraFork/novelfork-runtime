@@ -1,5 +1,9 @@
 import type { JsonValue, ProviderStreamEvent } from "@server/lib/plugins/protocol";
-import { PLUGIN_REQUEST_DUMP_MAX_BYTES } from "@server/lib/plugins/protocol";
+import {
+	isHostTruncatedDump,
+	PLUGIN_REQUEST_DUMP_MAX_BYTES,
+	providerNativeMediaSchema,
+} from "@server/lib/plugins/protocol";
 import type {
 	ModelCatalog,
 	PluginProviderRpcClient,
@@ -12,32 +16,36 @@ import type {
 	ProviderOperation,
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
-import { settings } from "../settings";
+import { ProviderRpcError } from "@server/services/plugin-provider-rpc";
+import type { NativeMediaInput } from "@shared/media-attachments";
+import { parseModelId } from "@shared/model-id";
+import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
+import { redactNativeMediaForDump, visitNativeMedia } from "./native-media";
+import { type NeutralTurn, projectHistory, type ResolvedImage } from "./projection";
 import type {
 	BuiltHistory,
 	ChatParams,
 	DbMessage,
-	DbToolCall,
 	GenerateMetaResult,
 	GenerateOptions,
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import type { ApiRequestDump } from "./request-dump";
 import {
 	BoundedUtf8Capture,
 	collectSecretConfigValues,
 	maskSecretValues,
-	responseDumpBudget,
+	type RecordingAttemptRequest,
 	sanitizeHeaders,
 } from "./request-dump";
+import { unsupportedResponseFormatReason } from "./response-format";
 import { resolveToolJsonSchema } from "./tool-registry";
 import type {
-	AgentToolUse,
 	ApiRequestDiagnostics,
 	ReasoningProviderMetadata,
 	ResolvedToolDefinition,
 } from "./types";
+import { orderUserContent } from "./user-content-order";
 
 type ProviderUsage = NonNullable<Extract<ProviderStreamEvent, { type: "usage" }>["usage"]>;
 
@@ -108,6 +116,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 	private readonly resolveConfig?: () => Promise<Record<string, JsonValue>>;
 	readonly modelCatalog: ReadonlyMap<string, ProviderModelDescriptor>;
 	private activeReasoningSource: string;
+	private readonly mediaCapabilities: { inputAudio: boolean; inputVideo: boolean };
 
 	constructor(options: RemoteProviderAdapterOptions) {
 		const rpc = options.rpc ?? options.client;
@@ -121,6 +130,10 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		this.modelCatalog = normalizeModelCatalog(options.modelCatalog);
 		this.activeReasoningSource = this.defaultReasoningSource();
 		this.mayLeakXmlToolCalls = options.descriptor?.capabilities.mayLeakXmlToolCalls ?? false;
+		this.mediaCapabilities = {
+			inputAudio: options.descriptor?.capabilities.inputAudio === true,
+			inputVideo: options.descriptor?.capabilities.inputVideo === true,
+		};
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
@@ -135,44 +148,129 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
+		model: string,
+		narratorId?: string,
 	): Promise<BuiltHistory> {
+		const projected = await projectHistory(
+			dbMessages,
+			{
+				strict: hasCredentialBoundReasoning(parseModelId(model).model),
+				reasoningSource: this.activeReasoningSource,
+			},
+			narratorId,
+		);
+		return {
+			history: this.remoteWireHistory(projected.turns),
+			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
+		};
+	}
+
+	/** Second projection stage for plugin providers: neutral turns → the canonical DTO. */
+	private remoteWireHistory(turns: readonly NeutralTurn[]): ProviderMessage[] {
 		const history: ProviderMessage[] = [];
-		let pendingToolResults: ProviderContentBlock[] = [];
-
-		for (const message of dbMessages) {
-			if (message.role === "disp") continue;
-			const role = canonicalRole(message.role);
-			if (!role) continue;
-
-			if (role === "assistant") {
-				if (pendingToolResults.length > 0) {
-					history.push({ role: "tool", content: pendingToolResults });
-					pendingToolResults = [];
+		const source = this.activeReasoningSource;
+		const image = (resolved: ResolvedImage): ProviderContentBlock => ({
+			type: "image",
+			mediaType: resolved.mediaType,
+			dataBase64: resolved.base64,
+		});
+		for (const turn of turns) {
+			if (turn.kind === "input") {
+				for (const item of turn.items) {
+					const content = orderUserContent(
+						item.text,
+						item.images.flatMap((resolved) => (resolved ? [resolved] : [])),
+						"after",
+					).map(
+						(part): ProviderContentBlock =>
+							part.type === "text" ? { type: "text", text: part.text } : image(part.image),
+					);
+					content.push(...(item.media ?? []).map(canonicalNativeMedia));
+					if (content.length) history.push({ role: "user", content });
 				}
-				const content = canonicalAssistantContent(message, this.activeReasoningSource);
-				if (content.length > 0) history.push({ role, content });
-				pendingToolResults = [
-					...pendingToolResults,
-					...canonicalToolResults(message.toolCalls ?? []),
-				];
 				continue;
 			}
-
-			if (pendingToolResults.length > 0) {
-				history.push({ role: "tool", content: pendingToolResults });
-				pendingToolResults = [];
+			if (turn.kind === "tool_results") {
+				history.push({
+					role: "tool",
+					content: turn.results.map((result) => ({
+						type: "tool_result",
+						toolUseId: result.wireId,
+						name: result.name,
+						content: [
+							{ type: "text", text: result.text },
+							...result.images.map(image),
+							...(result.media ?? []).map(canonicalNativeMedia),
+						],
+						isError: result.isError,
+					})),
+				});
+				continue;
 			}
-
-			const content = canonicalMessageContent(message, role, this.activeReasoningSource);
-			if (content.length > 0) history.push({ role, content });
+			const content: ProviderContentBlock[] = [];
+			for (const item of turn.items) {
+				switch (item.kind) {
+					case "text":
+						content.push({ type: "text", text: item.text });
+						break;
+					case "reasoning": {
+						const plugin = item.credentials.plugin;
+						const continuation = isCanonicalReasoningMetadata(plugin)
+							? compatibleContinuation(plugin, source)
+							: undefined;
+						if (item.text || continuation)
+							content.push({
+								type: "reasoning",
+								text: item.text,
+								...(continuation ? { continuation } : {}),
+							});
+						break;
+					}
+					case "redacted_reasoning":
+						content.push({
+							type: "redacted_reasoning",
+							data: item.data,
+							...(item.sameSource ? { source } : {}),
+						});
+						break;
+					case "tool_call":
+						content.push({
+							type: "tool_call",
+							toolUseId: item.wireId,
+							name: item.name,
+							input: cloneJson(item.input as JsonObject),
+							...(item.signature?.sameSource
+								? {
+										continuation: {
+											source,
+											format: "tool-continuation",
+											data: item.signature.value,
+										},
+									}
+								: {}),
+						});
+						break;
+					case "web_search":
+						content.push({
+							type: "web_search",
+							id: item.wireId,
+							...(item.query ? { query: item.query } : {}),
+							...(item.queries ? { queries: item.queries } : {}),
+						});
+						break;
+					case "image_generation":
+						content.push({
+							type: "image_generation",
+							id: item.wireId,
+							...(item.result ? { result: item.result } : {}),
+							...(item.revisedPrompt ? { revisedPrompt: item.revisedPrompt } : {}),
+						});
+						break;
+				}
+			}
+			if (content.length) history.push({ role: "assistant", content });
 		}
-
-		return {
-			history,
-			trailingToolResults: pendingToolResults,
-		};
+		return history;
 	}
 
 	getActiveReasoningSource(): string {
@@ -209,6 +307,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		}
 		const removeAbort = this.listenForAbort(operation, params.signal);
 		const dumpTap = this.createDumpTap(params, chatParams);
+		let usage: ProviderUsage | undefined;
 		let requestStarted = false;
 		let cancelled = false;
 		try {
@@ -231,7 +330,12 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 					requestStarted = true;
 					params.onRequestStart?.();
 				}
-				const mapped = mapStreamEvent(event, {
+				let mergedEvent = event;
+				if ((event.type === "usage" || event.type === "done") && event.usage) {
+					usage = mergeUsage(usage, event.usage);
+					mergedEvent = { ...event, usage };
+				}
+				const mapped = mapStreamEvent(mergedEvent, {
 					providerPrefix: this.providerPrefix,
 					providerTypeId: this.providerTypeId,
 					providerInstanceId: this.providerInstanceId,
@@ -240,6 +344,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				});
 				if (mapped === undefined) continue;
 				if (mapped === CANCELLED) {
+					// A cancelled terminal may be the only (or corrected) billing snapshot.
+					if (event.type === "done" && event.usage && usage) yield mapUsage(usage);
 					// Drain the RPC generator so its post-done error takes precedence.
 					cancelled = true;
 					continue;
@@ -252,210 +358,6 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			// Preserve a request that never got a response (e.g. connect failure) so the
 			// persisted dump still shows what was sent.
 			dumpTap.flush();
-		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		const content: ProviderContentBlock[] = [{ type: "text", text: output }];
-		for (const image of images ?? []) {
-			content.push({
-				type: "image",
-				mediaType: mediaTypeFor(image.format),
-				dataBase64: image.base64,
-			});
-		}
-		return {
-			type: "tool_result",
-			toolUseId,
-			...(toolName ? { name: toolName } : {}),
-			content,
-			isError,
-		} satisfies ProviderContentBlock;
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const canonical = history as ProviderMessage[];
-		const results = toolResults.map(canonicalizeToolResult).filter(isProviderContentBlock);
-		if (results.length > 0) canonical.push({ role: "tool", content: results });
-		const blocks: ProviderContentBlock[] = [];
-		if (content) blocks.push({ type: "text", text: content });
-		for (const image of images ?? []) {
-			blocks.push({
-				type: "image",
-				mediaType: mediaTypeFor(image.format),
-				dataBase64: image.base64,
-			});
-		}
-		if (blocks.length > 0) canonical.push({ role: "user", content: blocks });
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: import("./provider").WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		if (orderedContent) {
-			const content = orderedContent
-				.map((block) => canonicalizeContentBlock(block, this.activeReasoningSource))
-				.filter(isProviderContentBlock);
-			if (content.length)
-				(history as ProviderMessage[]).push({
-					role: "assistant",
-					content,
-					...(messageId ? { messageId } : {}),
-				});
-			return;
-		}
-		const blocks: Array<{ block: ProviderContentBlock; outputIndex?: number; order: number }> = [];
-		let order = 0;
-		if (text)
-			blocks.push({
-				block: withOptionalIndex({ type: "text", text }, textOutputIndex),
-				outputIndex: textOutputIndex,
-				order: order++,
-			});
-		for (const block of reasoningBlocks ?? []) {
-			if (!block.text) continue;
-			const continuation = continuationFromMetadata(
-				block.providerMetadata,
-				this.activeReasoningSource,
-			);
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "reasoning",
-						text: block.text,
-						...(continuation ? { continuation } : {}),
-					},
-					block.outputIndex,
-				),
-				outputIndex: block.outputIndex,
-				order: order++,
-			});
-		}
-		for (const block of redactedThinkingBlocks ?? []) {
-			if (!block.data) continue;
-			const source =
-				block.signatureSource === this.activeReasoningSource ? block.signatureSource : undefined;
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "redacted_reasoning",
-						data: block.data,
-						...(source ? { source } : {}),
-					},
-					block.outputIndex,
-				),
-				outputIndex: block.outputIndex,
-				order: order++,
-			});
-		}
-		for (const tool of toolUses) {
-			if (!tool.toolUseId || !tool.name) continue;
-			const continuation = tool.thoughtSignature
-				? {
-						source: tool.thoughtSignatureSource ?? this.activeReasoningSource,
-						format: "tool-continuation",
-						data: tool.thoughtSignature,
-					}
-				: undefined;
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "tool_call",
-						toolUseId: tool.toolUseId,
-						name: tool.name,
-						input: jsonObject(tool.input),
-						...(continuation ? { continuation } : {}),
-					},
-					tool.outputIndex,
-				),
-				outputIndex: tool.outputIndex,
-				order: order++,
-			});
-		}
-		for (const search of webSearches ?? []) {
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "web_search",
-						id: search.id,
-						...(search.query ? { query: search.query } : {}),
-						...(search.queries ? { queries: [...search.queries] } : {}),
-					},
-					search.outputIndex,
-				),
-				outputIndex: search.outputIndex,
-				order: order++,
-			});
-		}
-		for (const image of imageGenerations ?? []) {
-			blocks.push({
-				block: withOptionalIndex(
-					{
-						type: "image_generation",
-						id: image.id,
-						...(image.revisedPrompt ? { revisedPrompt: image.revisedPrompt } : {}),
-						...(image.result ? { result: image.result } : {}),
-					},
-					image.outputIndex,
-				),
-				outputIndex: image.outputIndex,
-				order: order++,
-			});
-		}
-		blocks.sort((left, right) => {
-			if (left.outputIndex === undefined && right.outputIndex === undefined)
-				return left.order - right.order;
-			if (left.outputIndex === undefined) return 1;
-			if (right.outputIndex === undefined) return -1;
-			return left.outputIndex - right.outputIndex || left.order - right.order;
-		});
-		if (blocks.length > 0) {
-			const message: ProviderMessage = {
-				role: "assistant",
-				content: blocks.map(({ block }) => block),
-				...(messageId ? { messageId } : {}),
-			};
-			(history as ProviderMessage[]).push(message);
 		}
 	}
 
@@ -473,11 +375,18 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.runGenerate({
+		const result = await this.runGenerate({
 			model,
 			request: { mode: "prompt", text, ...(systemInstruction ? { systemInstruction } : {}) },
 			options,
 		});
+		// The remote-executor protocol carries no schema constraint, so a
+		// requested responseFormat is reported as degraded rather than dropped.
+		if (!options?.responseFormat || result.responseFormatDegraded) return result;
+		return {
+			...result,
+			responseFormatDegraded: unsupportedResponseFormatReason("Remote executor"),
+		};
 	}
 
 	async generateWithHistory(
@@ -522,8 +431,8 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 	 *
 	 * Attempt tracking mirrors the collector's model: a `dump.request` carrying
 	 * url/headers opens a new upstream attempt, and the first `dump.response` of an
-	 * attempt calls `beginResponseAttempt`, which archives the previous attempt into
-	 * `attempts[]` — so plugins that retry internally produce a faithful attempt list.
+	 * attempt calls `beginResponseAttempt` — so plugins that retry internally produce a
+	 * faithful attempt sequence in the recording.
 	 */
 	private createDumpTap(
 		params: ChatParams,
@@ -535,7 +444,27 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 
 		const maxBytes = chatParams.requestDump?.maxBytes ?? PLUGIN_REQUEST_DUMP_MAX_BYTES;
 		const secrets = collectSecretConfigValues(chatParams.config);
-		const mask = (text: string): string => maskSecretValues(text, secrets);
+		let hasNativeInput = false;
+		const nativePayloads = new Set<string>();
+		visitNativeMedia(
+			[
+				chatParams.request.current.media,
+				chatParams.request.history,
+				chatParams.request.current.toolResults,
+			],
+			(item) => {
+				hasNativeInput = true;
+				const data = item.dataBase64 ?? item.base64;
+				// A complete larger payload cannot fit this bounded diagnostic capture.
+				if (typeof data === "string" && data.length > 0 && data.length <= maxBytes)
+					nativePayloads.add(data);
+			},
+		);
+		const mask = (text: string): string => {
+			let masked = maskSecretValues(text, secrets);
+			for (const data of nativePayloads) masked = masked.replaceAll(data, "[native media omitted]");
+			return masked;
+		};
 		const maskHeaders = (
 			headers: Record<string, string> | undefined,
 		): Record<string, string> | undefined => {
@@ -550,64 +479,108 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			transport?: string;
 			url?: string;
 			headers?: Record<string, string>;
-			body: BoundedUtf8Capture;
-			truncated: boolean;
 		}
 		let pendingRequest: PendingRequest | null = null;
 		let responseOpen = false;
 		let responseFailed = false;
-		let responseBody: BoundedUtf8Capture | null = null;
-
-		const buildRequest = (): NonNullable<ApiRequestDump["request"]> => {
-			const pending = pendingRequest;
-			const sanitizedBody = new BoundedUtf8Capture(maxBytes);
-			sanitizedBody.append(mask(pending?.body.text() ?? ""));
-			let bodyText = sanitizedBody.text();
-			if (
-				pending?.truncated ||
-				(pending && pending.body.received > pending.body.kept) ||
-				sanitizedBody.received > sanitizedBody.kept
-			) {
-				bodyText += "\n[request body truncated by plugin to fit the dump budget]";
-			}
-			let body: unknown = bodyText;
-			if (bodyText) {
-				try {
-					body = JSON.parse(bodyText);
-				} catch {
-					// Non-JSON bodies stay as raw text; the dump exists to show what was sent.
-				}
-			}
-			return {
-				transport: pending?.transport ?? "plugin",
-				...(pending?.url ? { url: pending.url } : {}),
-				...(pending?.headers ? { headers: pending.headers } : {}),
-				body,
-			};
+		let responseTruncated = false;
+		let responseBytes = 0;
+		// Delay only a bounded suffix so credentials split across arbitrary plugin
+		// chunks are still masked. All other reported bytes reach the worker live.
+		const secretTail = Math.min(
+			maxBytes,
+			Math.max(0, ...secrets.map((secret) => secret.length * 12 + 16)),
+		);
+		let requestTail = "";
+		let responseTail = "";
+		const nativeCaptures = {
+			request: new BoundedUtf8Capture(maxBytes),
+			response: new BoundedUtf8Capture(maxBytes),
 		};
+		const emitBody = (direction: "request" | "response", chunk: string, final = false): void => {
+			if (hasNativeInput) {
+				const capture = nativeCaptures[direction];
+				capture.append(chunk);
+				if (!final) return;
+				const raw = capture.text();
+				if (!raw) return;
+				let text = `[native media ${direction} body omitted]`;
+				if (capture.received === capture.kept) {
+					try {
+						text = mask(JSON.stringify(redactNativeMediaForDump(JSON.parse(raw))));
+					} catch {
+						/* Partial native bytes must never enter diagnostics. */
+					}
+				}
+				collector.frame({
+					direction,
+					type: "plugin.reported_body",
+					text,
+					metadata: { source: "plugin-reported", boundary: "sanitized-native-media" },
+				});
+				nativeCaptures[direction] = new BoundedUtf8Capture(maxBytes);
+				return;
+			}
+			const pending = mask((direction === "request" ? requestTail : responseTail) + chunk);
+			let cut = final ? pending.length : Math.max(0, pending.length - secretTail);
+			if (!final && cut > 0 && /[\uD800-\uDBFF]/.test(pending[cut - 1])) cut--;
+			const text = pending.slice(0, cut);
+			if (direction === "request") requestTail = pending.slice(cut);
+			else responseTail = pending.slice(cut);
+			if (text)
+				collector.frame({
+					direction,
+					type: "plugin.reported_body",
+					text,
+					metadata: { source: "plugin-reported", boundary: "sanitized-chunks" },
+				});
+		};
+
+		// Bodies already reached the recorder as sanitized frames; attempts carry metadata only.
+		const buildRequest = (): RecordingAttemptRequest => ({
+			transport: pendingRequest?.transport ?? "plugin",
+			...(pendingRequest?.url ? { url: pendingRequest.url } : {}),
+			...(pendingRequest?.headers ? { headers: pendingRequest.headers } : {}),
+		});
 		const closeResponse = (complete: boolean): void => {
 			if (!responseOpen) return;
 			responseOpen = false;
-			// Mask the bounded concatenation, not each chunk: plugins choose arbitrary
+			// Mask the pending tail, not each chunk: plugins choose arbitrary
 			// boundaries (including inside escaped secrets). Reset for EVERY retry.
-			if (responseBody) collector.appendResponseText(mask(responseBody.text()));
-			collector.finishResponseCapture(complete && !responseFailed);
-			if (responseBody)
-				collector.setResponseMeta({
-					bodyBytesReceived: responseBody.received,
-					...(responseBody.received > responseBody.kept ? { bodyTruncated: true } : {}),
-				});
-			responseBody = null;
+			emitBody("response", "", true);
+			collector.finishResponseCapture(complete && !responseFailed && !responseTruncated);
+			collector.setResponseMeta({
+				bodyBytesReceived: responseBytes,
+				...(responseTruncated ? { bodyTruncated: true } : {}),
+			});
+			responseBytes = 0;
 			responseFailed = false;
+			responseTruncated = false;
 		};
 		/** Preserve a request whose response never arrived before starting the next attempt. */
 		const preservePendingRequest = (): void => {
 			if (!pendingRequest) return;
-			collector.setRequest(buildRequest());
+			emitBody("request", "", true);
+			collector.setRequest(buildRequest(), false);
 			pendingRequest = null;
 		};
 
 		const tap = ((event: DumpStreamEvent): void => {
+			collector.frame({
+				direction: event.type === "dump.request" ? "request" : "response",
+				type: `plugin.${event.type}`,
+				...(event.truncated
+					? {
+							sourceTruncated: isHostTruncatedDump(event) ? ("host" as const) : ("plugin" as const),
+						}
+					: {}),
+				metadata: {
+					source: "plugin-reported",
+					...(event.type === "dump.request" && event.url ? { url: mask(event.url) } : {}),
+					...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
+					...(event.truncated ? { truncated: true } : {}),
+				},
+			});
 			if (event.type === "dump.request") {
 				const opensAttempt =
 					event.transport !== undefined || event.url !== undefined || event.headers !== undefined;
@@ -618,27 +591,28 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						...(event.transport ? { transport: mask(event.transport) } : {}),
 						...(event.url ? { url: mask(event.url) } : {}),
 						...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
-						body: new BoundedUtf8Capture(maxBytes),
-						truncated: false,
 					};
 				}
-				if (event.bodyChunk) pendingRequest?.body.append(event.bodyChunk);
-				if (event.truncated && pendingRequest) pendingRequest.truncated = true;
+				if (event.bodyChunk) emitBody("request", event.bodyChunk);
 				return;
 			}
 			// dump.response
 			if (!responseOpen) {
 				responseOpen = true;
 				responseFailed = false;
-				responseBody = new BoundedUtf8Capture(maxBytes);
-				collector.beginResponseAttempt(buildRequest(), maxBytes);
+				emitBody("request", "", true);
+				collector.beginResponseAttempt(buildRequest(), false);
 				pendingRequest = null;
 				collector.setResponseMeta({
 					...(event.status !== undefined ? { status: event.status } : {}),
 					...(event.headers ? { headers: maskHeaders(event.headers) } : {}),
 				});
 			}
-			if (event.bodyChunk) responseBody?.append(event.bodyChunk);
+			if (event.bodyChunk) {
+				responseBytes += Buffer.byteLength(event.bodyChunk);
+				emitBody("response", event.bodyChunk);
+			}
+			if (event.truncated) responseTruncated = true;
 			if (event.error) {
 				responseFailed = true;
 				collector.setResponseError(mask(event.error));
@@ -652,11 +626,87 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		return tap;
 	}
 
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		const capability = media.type === "audio" ? "inputAudio" : "inputVideo";
+		return (
+			this.mediaCapabilities[capability] &&
+			this.modelCatalog.get(modelIdFor(model, this.providerPrefix))?.capabilities[capability] ===
+				true
+		);
+	}
+
+	private assertNativeMedia(type: "audio" | "video", model?: string): void {
+		const capability = type === "audio" ? "inputAudio" : "inputVideo";
+		if (!this.mediaCapabilities[capability]) {
+			throw new ProviderRpcError(
+				"UNSUPPORTED_MEDIA",
+				`Plugin provider ${this.providerTypeId} did not explicitly negotiate ${capability}; native ${type} cannot be sent.`,
+			);
+		}
+		if (
+			model &&
+			this.modelCatalog.get(modelIdFor(model, this.providerPrefix))?.capabilities[capability] !==
+				true
+		) {
+			throw new ProviderRpcError(
+				"UNSUPPORTED_MEDIA",
+				`Plugin model ${model} did not explicitly declare ${capability}; native ${type} cannot be sent.`,
+			);
+		}
+	}
+
+	private assertMediaBlocks(blocks: ProviderContentBlock[], model: string): void {
+		for (const block of blocks) {
+			if (block.type === "audio" || block.type === "video")
+				this.assertNativeMedia(block.type, model);
+			if (block.type === "tool_result" && Array.isArray(block.content))
+				this.assertMediaBlocks(block.content as ProviderContentBlock[], model);
+		}
+	}
+
 	private async buildChatParams(params: ChatParams): Promise<ProviderChatParams> {
 		const history = canonicalHistory(params.history, this.activeReasoningSource);
-		const toolResults = params.toolResults
+		const toolResults = (params.toolResults ?? [])
 			.map(canonicalizeToolResult)
 			.filter(isProviderContentBlock);
+		let currentMedia = (params.media ?? []).map(canonicalNativeMedia);
+		let currentText = params.content;
+		let currentImages = (params.images ?? []).map((image) => ({
+			mediaType: mediaTypeFor(image.format),
+			dataBase64: image.base64,
+		}));
+		// The projected history already ends with the current turn. Plugins expect it in
+		// `current`, so the trailing user or tool message moves there.
+		if (!currentText && !currentImages.length && !currentMedia.length && !toolResults.length) {
+			const last = history.at(-1);
+			if (last?.role === "tool") {
+				history.pop();
+				toolResults.push(...last.content.filter((block) => block.type === "tool_result"));
+			} else if (last?.role === "user") {
+				history.pop();
+				currentText = last.content
+					.flatMap((block) =>
+						block.type === "text" && typeof block.text === "string" ? [block.text] : [],
+					)
+					.join("");
+				currentMedia = last.content
+					.filter((block) => block.type === "audio" || block.type === "video")
+					.map(canonicalNativeMedia);
+				currentImages = last.content.flatMap((block) =>
+					block.type === "image" &&
+					typeof block.mediaType === "string" &&
+					typeof block.dataBase64 === "string"
+						? [{ mediaType: block.mediaType, dataBase64: block.dataBase64 }]
+						: [],
+				);
+			}
+		}
+		for (const media of currentMedia) this.assertNativeMedia(media.type, params.model);
+		for (const message of history) this.assertMediaBlocks(message.content, params.model);
+		this.assertMediaBlocks(toolResults, params.model);
 		return {
 			...(await this.baseParams(params.model)),
 			conversation: {
@@ -666,30 +716,21 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 			},
 			// The hint's presence doubles as protocol negotiation: a plugin may emit
 			// dump.request/dump.response events only for calls that carry it, so hosts
-			// predating those event types never receive one. `maxBytes` stays well below
-			// the per-operation RPC output budget that dump events share with real output.
+			// predating those event types never receive one. `maxBytes` is a separate
+			// diagnostic retention ceiling, never model-output admission.
 			...(params.requestDump
 				? {
 						requestDump: {
-							maxBytes: Math.min(
-								responseDumpBudget(settings.agent?.requestDumpMaxSize),
-								PLUGIN_REQUEST_DUMP_MAX_BYTES,
-							),
+							maxBytes: PLUGIN_REQUEST_DUMP_MAX_BYTES,
 						},
 					}
 				: {}),
 			request: {
 				history,
 				current: {
-					text: params.content,
-					...(params.images?.length
-						? {
-								images: params.images.map((image) => ({
-									mediaType: mediaTypeFor(image.format),
-									dataBase64: image.base64,
-								})),
-							}
-						: {}),
+					text: currentText,
+					...(currentImages.length ? { images: currentImages } : {}),
+					...(currentMedia.length ? { media: currentMedia } : {}),
 					toolResults,
 				},
 				tools: canonicalTools(params.tools),
@@ -772,7 +813,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						await input.options?.onTextDelta?.(event.text);
 						break;
 					case "usage":
-						usage = event.usage;
+						usage = mergeUsage(usage, event.usage);
 						break;
 					case "error":
 						throw operationError(event.error, {
@@ -791,7 +832,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						if (event.status === "failed") {
 							throw new Error(`Provider generation failed (${event.stopReason})`);
 						}
-						usage = event.usage ?? usage;
+						if (event.usage) usage = mergeUsage(usage, event.usage);
 						return buildGenerateMeta(text, usage, credentialId);
 					case "reasoning.delta":
 						// Surfaced so lightweight callers can show a "thinking" progress
@@ -957,19 +998,50 @@ function mapDone(
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function mergeUsage(previous: ProviderUsage | undefined, update: ProviderUsage): ProviderUsage {
+	const merged = { ...previous, ...update };
+	if (update.promptTokens === 0 && (previous?.promptTokens ?? 0) > 0) {
+		merged.promptTokens = previous?.promptTokens;
+	}
+	// An old net counter must not survive a correction to its prompt/cache buckets.
+	// A freshly reported inputTokens (including zero) remains authoritative.
+	if (
+		merged.promptTokens !== undefined &&
+		update.inputTokens === undefined &&
+		((update.promptTokens ?? 0) > 0 ||
+			update.cachedInputTokens !== undefined ||
+			update.cacheCreationInputTokens !== undefined ||
+			update.cacheCreation5mTokens !== undefined ||
+			update.cacheCreation1hTokens !== undefined)
+	) {
+		delete merged.inputTokens;
+	}
+	return merged;
+}
+
 function mapUsage(usage: ProviderUsage): ParsedStreamEvent {
 	return {
 		usage: {
-			...(usage.promptTokens === undefined ? {} : { promptTokens: usage.promptTokens }),
-			...(usage.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
+			...(usage.promptTokens === undefined && usage.inputTokens === undefined
+				? {}
+				: {
+						promptTokens:
+							usage.promptTokens ??
+							(usage.inputTokens ?? 0) + (usage.cachedInputTokens ?? 0) + cacheWriteTokens(usage),
+					}),
+			...(usage.inputTokens === undefined && usage.promptTokens === undefined
+				? {}
+				: { inputTokens: netInputTokens(usage) }),
 			...(usage.completionTokens === undefined ? {} : { completionTokens: usage.completionTokens }),
 			...(usage.reasoningTokens === undefined ? {} : { reasoningTokens: usage.reasoningTokens }),
 			...(usage.cachedInputTokens === undefined
 				? {}
 				: { cachedInputTokens: usage.cachedInputTokens }),
-			...(usage.cacheCreationInputTokens === undefined
+			...(usage.cacheCreationInputTokens === undefined &&
+			usage.cacheCreation5mTokens === undefined &&
+			usage.cacheCreation1hTokens === undefined
 				? {}
-				: { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
+				: { cacheCreationInputTokens: cacheWriteTokens(usage) }),
 			...(usage.cacheCreation5mTokens === undefined
 				? {}
 				: { cacheCreation5mTokens: usage.cacheCreation5mTokens }),
@@ -1100,61 +1172,6 @@ function canonicalHistory(history: unknown[], reasoningSource: string): Provider
 	});
 }
 
-function canonicalMessageContent(
-	message: DbMessage,
-	role: ProviderMessage["role"],
-	reasoningSource: string,
-): ProviderContentBlock[] {
-	const blocks = Array.isArray(message.contentJson)
-		? message.contentJson.flatMap((block) => {
-				const canonical = canonicalizeContentBlock(block, reasoningSource);
-				return canonical ? [canonical] : [];
-			})
-		: [];
-	if (blocks.length > 0) return blocks;
-	if (message.contentText) return [{ type: "text", text: message.contentText }];
-	return role === "assistant" ? [] : [];
-}
-
-function canonicalAssistantContent(
-	message: DbMessage,
-	reasoningSource: string,
-): ProviderContentBlock[] {
-	const content = canonicalMessageContent(message, "assistant", reasoningSource);
-	const seen = new Set(
-		content.flatMap((block) => (block.type === "tool_call" ? [String(block.toolUseId)] : [])),
-	);
-	for (const call of message.toolCalls ?? []) {
-		if (call.status !== "success" && call.status !== "fail") continue;
-		if (seen.has(call.toolUseId)) continue;
-		const input = parseJsonObject(call.inputJson);
-		content.push({
-			type: "tool_call",
-			toolUseId: call.toolUseId,
-			name: call.toolName,
-			input,
-		});
-		seen.add(call.toolUseId);
-	}
-	return content;
-}
-
-function canonicalToolResults(toolCalls: DbToolCall[]): ProviderContentBlock[] {
-	return toolCalls.flatMap((call) => {
-		if (call.status !== "success" && call.status !== "fail") return [];
-		const output = outputText(call.outputJson);
-		return [
-			{
-				type: "tool_result",
-				toolUseId: call.toolUseId,
-				name: call.toolName,
-				content: [{ type: "text", text: output }],
-				isError: call.status === "fail",
-			},
-		];
-	});
-}
-
 function canonicalizeToolResult(value: unknown): ProviderContentBlock | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const record = value as Record<string, unknown>;
@@ -1191,6 +1208,21 @@ function canonicalToolResultContent(value: unknown): ProviderContentBlock[] {
 		for (const entry of value) {
 			if (!entry || typeof entry !== "object") continue;
 			const record = entry as Record<string, unknown>;
+			if (record.type === "audio" || record.type === "video") {
+				result.push(canonicalNativeMedia(record));
+				continue;
+			}
+			if (
+				record.type === "input_audio" ||
+				record.type === "input_video" ||
+				record.type === "audio_url" ||
+				record.type === "video_url"
+			) {
+				throw new ProviderRpcError(
+					"INVALID_REQUEST",
+					`Unsupported tool media representation ${record.type}`,
+				);
+			}
 			if (record.type === "text" && typeof record.text === "string") {
 				result.push({ type: "text", text: record.text });
 				continue;
@@ -1206,6 +1238,24 @@ function canonicalToolResultContent(value: unknown): ProviderContentBlock[] {
 	return [{ type: "text", text: typeof value === "string" ? value : outputText(value) }];
 }
 
+function canonicalNativeMedia(value: unknown) {
+	if (!value || typeof value !== "object")
+		throw new ProviderRpcError("INVALID_REQUEST", "Invalid native media block");
+	const record = value as Record<string, unknown>;
+	const parsed = providerNativeMediaSchema.safeParse({
+		type: record.type,
+		mediaType: record.mediaType,
+		dataBase64: record.dataBase64 ?? record.base64,
+		...(typeof record.filename === "string" ? { filename: record.filename } : {}),
+	});
+	if (!parsed.success)
+		throw new ProviderRpcError(
+			"INVALID_REQUEST",
+			`Invalid native media; complete original base64 bytes are required: ${parsed.error.message}`,
+		);
+	return parsed.data;
+}
+
 function canonicalizeContentBlock(
 	value: unknown,
 	reasoningSource: string,
@@ -1213,6 +1263,18 @@ function canonicalizeContentBlock(
 	if (!value || typeof value !== "object") return undefined;
 	const record = value as Record<string, unknown>;
 	const type = typeof record.type === "string" ? record.type : undefined;
+	if (type === "audio" || type === "video") return canonicalNativeMedia(record);
+	if (
+		type === "input_audio" ||
+		type === "input_video" ||
+		type === "audio_url" ||
+		type === "video_url"
+	) {
+		throw new ProviderRpcError(
+			"INVALID_REQUEST",
+			`Unsupported media representation ${type}; original audio/video bytes are required`,
+		);
+	}
 	if (type === "text" && typeof record.text === "string" && record.text) {
 		return withOptionalIndex(
 			{ type: "text", text: record.text },
@@ -1330,16 +1392,6 @@ function continuationFromStoredBlock(
 	return undefined;
 }
 
-function continuationFromMetadata(
-	metadata: ReasoningProviderMetadata | undefined,
-	reasoningSource: string,
-): CanonicalReasoningMetadata | undefined {
-	if (!metadata) return undefined;
-	const plugin = (metadata as PluginReasoningMetadata).plugin;
-	if (!plugin) return undefined;
-	return compatibleContinuation(plugin, reasoningSource);
-}
-
 function compatibleContinuation(
 	metadata: CanonicalReasoningMetadata,
 	reasoningSource: string,
@@ -1381,6 +1433,24 @@ function buildGenerateMeta(
 	};
 }
 
+function cacheWriteTokens(usage: ProviderUsage): number {
+	return Math.max(
+		usage.cacheCreationInputTokens ?? 0,
+		(usage.cacheCreation5mTokens ?? 0) + (usage.cacheCreation1hTokens ?? 0),
+	);
+}
+
+function netInputTokens(usage: ProviderUsage): number {
+	// Plugin inputTokens 遵循内部净输入契约；promptTokens 则是含缓存读写的完整输入。
+	return (
+		usage.inputTokens ??
+		Math.max(
+			(usage.promptTokens ?? 0) - (usage.cachedInputTokens ?? 0) - cacheWriteTokens(usage),
+			0,
+		)
+	);
+}
+
 function usageToUsageData(usage: ProviderUsage | undefined): GenerateMetaResult["usage"] {
 	if (!usage) return null;
 	if (
@@ -1388,15 +1458,17 @@ function usageToUsageData(usage: ProviderUsage | undefined): GenerateMetaResult[
 		usage.promptTokens === undefined &&
 		usage.completionTokens === undefined &&
 		usage.cachedInputTokens === undefined &&
-		usage.cacheCreationInputTokens === undefined
+		usage.cacheCreationInputTokens === undefined &&
+		usage.cacheCreation5mTokens === undefined &&
+		usage.cacheCreation1hTokens === undefined
 	) {
 		return null;
 	}
 	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
+		inputTokens: netInputTokens(usage),
 		outputTokens: usage.completionTokens ?? 0,
 		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreationInputTokens: cacheWriteTokens(usage),
 		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
 		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
 		reasoningTokens: usage.reasoningTokens ?? 0,

@@ -5,21 +5,47 @@
  * domain under `./prompts` so new locales can fall back without duplicating
  * every internal instruction.
  */
-export type { Locale, MergeSummaryLabelKey, ToolMessageKey } from "./i18n";
+export type { Locale, ToolMessageKey } from "./i18n";
 export {
-	getMergeSummaryLabel,
 	getToolMessage,
 	getToolMessageWithParams,
 	getUserLanguage,
 	getUserReplyInLanguage,
 } from "./i18n";
+export { getBotModePrompt } from "./prompts/bot";
 export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
+export type {
+	OutlineCompactNote,
+	OutlineTaskPromptTask,
+	OutlineTasksViewSection,
+	OutlineTaskWaitText,
+	OutlineViewTask,
+} from "./prompts/outline-tasks";
 export {
-	buildReviewSystemPrompt,
-	getReviewStartMessage,
-} from "./prompts/review";
+	getOutlineBehaviorFenceTruncated,
+	getOutlineBehaviorForkCutNote,
+	getOutlineBehaviorPageTitle,
+	getOutlineBehaviorViewFence,
+	getOutlineBehaviorViewHeading,
+	getOutlineBehaviorViewPage,
+	getOutlineBehaviorViewSop,
+	getOutlineBehaviorViewTruncated,
+	getOutlineBoundedContinuationPrompt,
+	getOutlineCompactContext,
+	getOutlineCompactNoteLine,
+	getOutlineCompactTaskLine,
+	getOutlineContinuationPrompt,
+	getOutlineInterruptNote,
+	getOutlineSpecUnavailableHint,
+	getOutlineTaskSystemReminder,
+	getOutlineTasksViewHeading,
+	getOutlineTasksViewMore,
+	getOutlineTasksViewSection,
+	getOutlineTurnEndNote,
+	getOutlineViewTaskLine,
+} from "./prompts/outline-tasks";
 export type {
 	SetupAuthorization,
 	SetupAuthorizationResolution,
@@ -37,7 +63,7 @@ export {
 } from "./prompts/setup-assistant";
 export type { BuiltinSubagentType, SubagentType } from "./prompts/subagents";
 export {
-	getSubagentParentReportingHint,
+	getRunDeliveryHint,
 	getSubagentPrompt,
 } from "./prompts/subagents";
 export {

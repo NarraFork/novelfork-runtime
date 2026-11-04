@@ -1,3 +1,4 @@
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { resolveProxyForUrl } from "../net/proxy";
 import {
 	getNugCachedModelHash,
@@ -9,7 +10,6 @@ import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import { ensureNugRelayClient, getNugRelayChannelId, usesLocalEgress } from "../nug-relay/manager";
 import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
-
 import { AnthropicProvider } from "./anthropic-provider";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 
@@ -27,6 +27,7 @@ import {
 } from "./nug-image-dedup";
 import { OpenAIProvider } from "./openai-provider";
 import type {
+	BuiltHistory,
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
@@ -35,13 +36,8 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { parseJsonResponseWithBody } from "./response-body";
-
-import {
-	type AgentToolUse,
-	ApiError,
-	type ApiRequestDiagnostics,
-	type ResolvedToolDefinition,
-} from "./types";
+import type { ToolLoadingTarget } from "./tool-loading";
+import { ApiError, type ApiRequestDiagnostics, type ResolvedToolDefinition } from "./types";
 
 /** Create an API error with bounded diagnostics for retry detection and persistence. */
 function httpError(message: string, status: number, diagnostics?: ApiRequestDiagnostics): Error {
@@ -263,10 +259,6 @@ export class NugProvider implements ProviderAdapter {
 						: {}),
 				});
 				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
-				// The delegate is created per model, so the target is known here — the
-				// synchronous pushAssistantTurn can classify reasoning (strict vs
-				// relay) without waiting for a chat() run to note it.
-				delegate.noteActiveModel(this.modelForDelegate(meta));
 				return delegate;
 			}
 			case "anthropic": {
@@ -366,6 +358,17 @@ export class NugProvider implements ProviderAdapter {
 
 	// === ProviderAdapter interface ===
 
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		const delegate = this.ensureDelegateForModel(model);
+		return (
+			!!this.activeMeta &&
+			delegate.supportsNativeMediaInput?.(media, this.modelForDelegate(this.activeMeta)) === true
+		);
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.activeDelegate) {
 			const effectiveTools =
@@ -379,11 +382,29 @@ export class NugProvider implements ProviderAdapter {
 		return tools;
 	}
 
+	toolLoadingTarget(model: string): ToolLoadingTarget | undefined {
+		const meta = this.resolveMeta(model);
+		const protocol: ToolLoadingTarget["protocol"] | undefined =
+			meta.channelType === "anthropic"
+				? "anthropic-messages"
+				: meta.channelType === "codex" || meta.channelType === "responses"
+					? "openai-responses"
+					: meta.channelType === "openai"
+						? "completions-compatible"
+						: undefined;
+		if (!protocol) return undefined;
+		return {
+			protocol,
+			codexBackend: meta.channelType === "codex",
+			model: meta.routedModel,
+		};
+	}
+
 	async buildHistory(
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+	): Promise<BuiltHistory> {
 		const meta = this.resolveMeta(model);
 		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
@@ -504,86 +525,6 @@ export class NugProvider implements ProviderAdapter {
 
 		// Retry once with full inline payloads restored.
 		yield* runOnce();
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		if (this.activeDelegate) {
-			return this.activeDelegate.formatToolResult(toolUseId, output, isError, images, toolName);
-		}
-		// Unreachable: all supported channel types create a delegate.
-		return { toolUseId, content: [{ text: output }], isError };
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const delegate = this.ensureDelegateForModel(model);
-		if (this.activeMeta) {
-			delegate.pushUserTurn(
-				history,
-				content,
-				this.modelForDelegate(this.activeMeta),
-				toolResults,
-				images,
-			);
-		}
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: import("./provider").WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		if (this.activeDelegate) {
-			this.activeDelegate.pushAssistantTurn(
-				history,
-				text,
-				toolUses,
-				reasoningBlocks,
-				webSearches,
-				messageId,
-				imageGenerations,
-				textOutputIndex,
-				redactedThinkingBlocks,
-				orderedContent,
-			);
-		}
 	}
 
 	async generate(text: string, model: string): Promise<string> {

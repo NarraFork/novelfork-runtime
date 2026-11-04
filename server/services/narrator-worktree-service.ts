@@ -1,8 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { access, lstat } from "node:fs/promises";
+import { access, lstat, open, opendir, realpath } from "node:fs/promises";
+import { isAbsolute, normalize } from "node:path";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type { WorktreeListResult, WorktreePrepareResult } from "@shared/narrator-worktrees";
+import { z } from "zod/v4";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -23,6 +25,7 @@ import {
 
 import type {
 	VerifiedWorktreeScope,
+	WorktreeResourceRegistration,
 	WorktreeResourceRegistry,
 } from "./narrator-worktree-resources";
 
@@ -43,6 +46,20 @@ export const WORKTREE_MAX_ENTRIES = 128;
 export const WORKTREE_READ_TIMEOUT_MS = 10_000;
 export const WORKTREE_CREATE_TIMEOUT_MS = 120_000;
 export const WORKTREE_NAME_TIMEOUT_MS = 5000;
+/** Listing is not the fail-closed inventory used to authorize mutations. */
+export const WORKTREE_LIST_MAX_ENTRIES = 4096;
+export const WORKTREE_LIST_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+export const WORKTREE_LIST_CACHE_TTL_MS = 60_000;
+export const WORKTREE_LIST_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+export const WORKTREE_LIST_CACHE_MAX_SNAPSHOTS = 16;
+
+type ListSnapshot = {
+	binding: string;
+	entries: WorktreeEntry[];
+	truncated: boolean;
+	expiresAt: number;
+	bytes: number;
+};
 
 type ResolvedWorktreeRequest = Omit<WorktreeCreateRequest, "branch"> & {
 	branch: { kind: "new" | "existing"; name: string };
@@ -51,21 +68,22 @@ type ResolvedWorktreeRequest = Omit<WorktreeCreateRequest, "branch"> & {
 export type { WorktreeListResult, WorktreePrepareResult } from "@shared/narrator-worktrees";
 
 /** safeSpawn may append a truncation explanation; structured porcelain must stay byte bounded. */
-export function boundWorktreeGitResult(result: SafeSpawnResult): SafeSpawnResult {
+export function boundWorktreeGitResult(
+	result: SafeSpawnResult,
+	maxBytes = WORKTREE_MAX_OUTPUT_BYTES,
+): SafeSpawnResult {
 	const bound = (text: string) => {
 		const bytes = Buffer.from(text);
-		return bytes.byteLength <= WORKTREE_MAX_OUTPUT_BYTES
+		return bytes.byteLength <= maxBytes
 			? text
-			: new TextDecoder().decode(bytes.subarray(0, WORKTREE_MAX_OUTPUT_BYTES), { stream: true });
+			: new TextDecoder().decode(bytes.subarray(0, maxBytes), { stream: true });
 	};
 	return {
 		...result,
 		stdout: bound(result.stdout),
 		stderr: bound(result.stderr),
-		stdoutTruncated:
-			result.stdoutTruncated || Buffer.byteLength(result.stdout) > WORKTREE_MAX_OUTPUT_BYTES,
-		stderrTruncated:
-			result.stderrTruncated || Buffer.byteLength(result.stderr) > WORKTREE_MAX_OUTPUT_BYTES,
+		stdoutTruncated: result.stdoutTruncated || Buffer.byteLength(result.stdout) > maxBytes,
+		stderrTruncated: result.stderrTruncated || Buffer.byteLength(result.stderr) > maxBytes,
 	};
 }
 
@@ -75,6 +93,8 @@ export interface WorktreeTarget {
 	repositoryPath?: string;
 	/** Verified server-side evidence; omitted fixture/legacy registrations stay unknown. */
 	resourceScope?: VerifiedWorktreeScope;
+	/** Authorized missing-checkout recovery, admitted by list() only. */
+	worktreeListOnly?: boolean;
 }
 export interface WorktreeServicePorts<Principal> {
 	/** Must be the existing Git ACL/policy authorization, not a client-path resolver. */
@@ -84,6 +104,17 @@ export interface WorktreeServicePorts<Principal> {
 		need: "read" | "write",
 		signal: AbortSignal,
 	): Promise<WorktreeTarget>;
+	/** Dedicated read-only recovery; ordinary read/create never receive this target. */
+	authorizeList?: WorktreeServicePorts<Principal>["authorize"];
+	/** Explicit path-scope authorization; repository identity alone never grants sibling access. */
+	authorizeDestination?(
+		principal: Principal,
+		narratorId: string,
+		target: WorktreeTarget,
+		destination: string,
+		need: "read" | "write",
+		signal: AbortSignal,
+	): Promise<void>;
 	/** Shared with directory switching; holds revision admission for the entire mutation. */
 	withRevision<T>(narratorId: string, expectedRevision: number, fn: () => Promise<T>): Promise<T>;
 	/** Shared with ALL existing Git writes, fail-fast rather than an unbounded queue. */
@@ -102,6 +133,8 @@ export interface WorktreeServicePorts<Principal> {
 	) => Promise<string>;
 	/** Tests may shorten (never increase) the naming deadline. */
 	nameTimeoutMs?: number;
+	/** Tests may shorten (never increase) the best-effort listing metadata deadline. */
+	metadataTimeoutMs?: number;
 	/** Test seam for directory birthtime; production uses asynchronous lstat, never mtime/ctime. */
 	statDirectory?: (path: string) => Promise<Pick<Stats, "birthtimeMs" | "isDirectory">>;
 	/** Test seam. Production defaults to local-only argv execution with hard bounds. */
@@ -117,6 +150,7 @@ export interface WorktreeServicePorts<Principal> {
 export function parseWorktreePorcelain(
 	output: string,
 	truncated = false,
+	maxEntries = WORKTREE_MAX_ENTRIES,
 ): {
 	entries: WorktreeEntry[];
 	truncated: boolean;
@@ -126,7 +160,7 @@ export function parseWorktreePorcelain(
 	for (const field of output.split("\0")) {
 		if (field === "") {
 			if (entry) {
-				if (entries.length === WORKTREE_MAX_ENTRIES) return { entries, truncated: true };
+				if (entries.length === maxEntries) return { entries, truncated: true };
 				entries.push(entry);
 				entry = null;
 			}
@@ -147,6 +181,212 @@ export function parseWorktreePorcelain(
 		}
 	}
 	return { entries, truncated: truncated || entry !== null };
+}
+
+/** Old Git prints paths verbatim. Grammar alone cannot distinguish embedded fake records.
+ * Only an exact match to independently read registration paths can certify completeness. */
+export function parseLegacyWorktreePorcelain(
+	output: string,
+	truncated = false,
+	registeredPaths?: readonly string[],
+	pathKey: (path: string) => string = (path) => path,
+	maxEntries = WORKTREE_MAX_ENTRIES,
+): ReturnType<typeof parseWorktreePorcelain> {
+	const entries: WorktreeEntry[] = [];
+	const incomplete = { entries: [] as WorktreeEntry[], truncated: true };
+	let entry: WorktreeEntry | null = null;
+	let hasHead = false;
+	let bare = false;
+	let hasBranch = false;
+	const fields = output.split("\n");
+	// The final split token is an end-of-line terminator, not a record separator.
+	if (fields.at(-1) === "") fields.pop();
+	for (const field of fields) {
+		if (field === "") {
+			if (entry) {
+				if ((!hasHead && !bare) || entries.length === maxEntries) return incomplete;
+				entries.push(entry);
+				entry = null;
+			}
+			continue;
+		}
+		if (field.startsWith("worktree ")) {
+			const path = field.slice(9);
+			if (entry || !path || path.length > 4096 || path.includes("\0") || path.includes("\r"))
+				return incomplete;
+			entry = { path, head: null, branch: null, detached: false, locked: false, prunable: false };
+			hasHead = false;
+			bare = false;
+			hasBranch = false;
+		} else if (!entry || field.includes("\0")) {
+			return incomplete;
+		} else if (/^HEAD (?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(field) && !hasHead && !bare) {
+			entry.head = field.slice(5);
+			hasHead = true;
+		} else if (
+			field.startsWith("branch refs/") &&
+			field.length <= 512 &&
+			!/\s/.test(field.slice(7)) &&
+			!hasControlCharacters(field.slice(7)) &&
+			hasHead &&
+			!hasBranch &&
+			!entry.detached
+		) {
+			entry.branch = field.slice(7);
+			hasBranch = true;
+		} else if (field === "detached" && hasHead && !hasBranch && !entry.detached) {
+			entry.detached = true;
+		} else if (field === "bare" && !hasHead && !bare) {
+			bare = true;
+		} else if (
+			(field === "locked" || field.startsWith("locked ")) &&
+			(hasHead || bare) &&
+			!entry.locked
+		) {
+			entry.locked = true;
+		} else if (
+			(field === "prunable" || field.startsWith("prunable ")) &&
+			(hasHead || bare) &&
+			!entry.prunable
+		) {
+			entry.prunable = true;
+		} else {
+			return incomplete;
+		}
+	}
+	if (truncated || entry !== null || !output.endsWith("\n\n") || !registeredPaths)
+		return incomplete;
+	// Reject newlines in raw registrations before comparing platform-specific path identities.
+	const registered = new Set(registeredPaths.map(pathKey));
+	if (
+		registered.size !== registeredPaths.length ||
+		entries.length !== registered.size ||
+		registeredPaths.some((path) => /[\r\n]/.test(path) || path.includes("\0"))
+	)
+		return incomplete;
+	for (const entry of entries) {
+		if (!registered.delete(pathKey(entry.path))) return incomplete;
+	}
+	return { entries, truncated: false };
+}
+
+function worktreeListError(result: SafeSpawnResult): never {
+	const detail = result.stderr
+		.slice(0, 512)
+		.replace(/\p{Cc}/gu, " ")
+		.trim();
+	error("WORKTREE_LIST_FAILED", `Unable to list Git worktrees${detail ? `: ${detail}` : ""}`, 409);
+}
+
+/** Read only the already-authorized common Git directory, never the worktrees themselves.
+ * Git 2.34's main path is the common directory with a trailing /.git removed; linked
+ * paths are recorded verbatim in worktrees/<id>/gitdir (including prunable targets). */
+async function readLegacyRegisteredPaths(
+	target: WorktreeTarget,
+	signal: AbortSignal,
+	maxEntries = WORKTREE_MAX_ENTRIES,
+	maxBytes = WORKTREE_MAX_OUTPUT_BYTES,
+): Promise<string[]> {
+	const paths = target.backend?.paths;
+	const common = target.repositoryPath;
+	if (!paths || !common || /[\r\n]/.test(common) || common.includes("\0"))
+		throw new Error("Invalid legacy Git common directory");
+	const registered = [paths.basename(common) === ".git" ? paths.dirname(common) : common];
+	const directoryPath = paths.resolve(common, "worktrees");
+	signal.throwIfAborted();
+	const info = await lstat(directoryPath).catch((cause) => {
+		if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw cause;
+	});
+	signal.throwIfAborted();
+	if (!info) return registered;
+	if (
+		!info.isDirectory() ||
+		info.isSymbolicLink() ||
+		!paths.equals(await realpath(directoryPath), directoryPath)
+	)
+		throw new Error("Unsafe legacy Git registration directory");
+	signal.throwIfAborted();
+	const directory = await opendir(directoryPath);
+	try {
+		let count = 0;
+		let totalBytes = 0;
+		while (true) {
+			signal.throwIfAborted();
+			const item = await directory.read();
+			signal.throwIfAborted();
+			if (!item) break;
+			if (++count >= maxEntries || !item.isDirectory() || item.isSymbolicLink())
+				throw new Error("Incomplete legacy Git registration inventory");
+			const adminPath = paths.resolve(directoryPath, item.name);
+			if (!paths.equals(await realpath(adminPath), adminPath))
+				throw new Error("Unsafe legacy Git registration entry");
+			signal.throwIfAborted();
+			const pointerPath = paths.resolve(adminPath, "gitdir");
+			const pointerInfo = await lstat(pointerPath);
+			signal.throwIfAborted();
+			if (!pointerInfo.isFile() || pointerInfo.isSymbolicLink())
+				throw new Error("Unsafe legacy Git registration file");
+			// Bound reads; the lstat check also rejects symlinks on platforms without NOFOLLOW.
+			const file = await open(
+				pointerPath,
+				constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+			);
+			try {
+				signal.throwIfAborted();
+				const stat = await file.stat();
+				signal.throwIfAborted();
+				if (
+					!stat.isFile() ||
+					stat.dev !== pointerInfo.dev ||
+					stat.ino !== pointerInfo.ino ||
+					stat.size <= 0 ||
+					stat.size > 16 * 1024 ||
+					totalBytes + stat.size > maxBytes
+				)
+					throw new Error("Oversized or invalid legacy Git registration file");
+				const bytes = new Uint8Array(stat.size + 1);
+				const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+				signal.throwIfAborted();
+				if (bytesRead !== stat.size) throw new Error("Legacy Git registration changed during read");
+				totalBytes += bytesRead;
+				// Remove only the file terminator, NOT embedded newlines in the pathname.
+				const pointer = new TextDecoder("utf-8", { fatal: true })
+					.decode(bytes.subarray(0, bytesRead))
+					.replace(/\r?\n$/, "");
+				if (
+					!paths.isAbsolute(pointer) ||
+					paths.basename(pointer) !== ".git" ||
+					/[\r\n]/.test(pointer) ||
+					pointer.includes("\0")
+				)
+					throw new Error("Ambiguous legacy Git worktree registration path");
+				registered.push(paths.dirname(pointer));
+			} finally {
+				await file.close();
+			}
+		}
+		return registered;
+	} finally {
+		await directory.close();
+	}
+}
+
+/** Bound waiting even when an async filesystem/test adapter cannot cancel its pending IO. */
+async function abortableRead<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	let onAbort: (() => void) | undefined;
+	try {
+		return await Promise.race([
+			operation,
+			new Promise<never>((_resolve, reject) => {
+				onAbort = () => reject(signal.reason);
+				signal.addEventListener("abort", onAbort, { once: true });
+				if (signal.aborted) onAbort();
+			}),
+		]);
+	} finally {
+		if (onAbort) signal.removeEventListener("abort", onAbort);
+	}
 }
 
 function error(code: string, message: string, status = 400): never {
@@ -173,18 +413,209 @@ function assertReady(target: WorktreeTarget, need: "read" | "write", workspaceKe
 		error("GIT_WORKSPACE_UNAVAILABLE", "Canonical Git identity unavailable", 409);
 }
 
+// Receipts are untrusted filesystem data, not typed service responses. Parse into fresh,
+// bounded objects before using them for recovery or exposing a stored result.
+const receiptIdentity = z
+	.string()
+	.min(1)
+	.max(256)
+	.refine((value) => !hasControlCharacters(value));
+const receiptPath = z
+	.string()
+	.min(1)
+	.max(4096)
+	.refine(
+		(value) => isAbsolute(value) && normalize(value) === value && !hasControlCharacters(value),
+	);
+const receiptHead = z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/);
+const receiptBranch = z
+	.string()
+	.min(1)
+	.max(256)
+	.refine(
+		(value) =>
+			!value.startsWith("-") &&
+			!/[\s\\~^:?*[]/.test(value) &&
+			!hasControlCharacters(value) &&
+			!value.includes("..") &&
+			!value.includes("@{") &&
+			value !== "@" &&
+			!value.endsWith(".") &&
+			value
+				.split("/")
+				.every((part) => part !== "" && !part.startsWith(".") && !part.endsWith(".lock")),
+	);
+const receiptResultSchema = z
+	.object({
+		outcome: z.enum(["created", "failed", "unknown"]),
+		worktree: z
+			.object({
+				path: receiptPath,
+				head: receiptHead.nullable(),
+				branch: z
+					.string()
+					.max(267)
+					.refine(
+						(value) =>
+							value.startsWith("refs/heads/") &&
+							receiptBranch.safeParse(value.slice("refs/heads/".length)).success,
+					)
+					.nullable(),
+				detached: z.boolean(),
+				locked: z.boolean(),
+				prunable: z.boolean(),
+				createdAt: z.number().finite().nonnegative().nullable().optional(),
+				lastCommitAt: z.number().finite().nonnegative().nullable().optional(),
+			})
+			.strict()
+			.nullable(),
+		residuals: z
+			.object({ destinationExists: z.boolean().nullable(), branchExists: z.boolean().nullable() })
+			.strict(),
+		error: z
+			.object({ code: receiptIdentity, message: z.string().max(1024) })
+			.strict()
+			.optional(),
+	})
+	.strict();
+const receiptSchema = z
+	.object({
+		proposalHash: z.string().regex(/^[a-f0-9]{64}$/),
+		request: z.unknown(),
+		repositoryKey: receiptIdentity,
+		actorKey: receiptIdentity,
+		deviceId: receiptIdentity,
+		destination: z.string().min(1).max(4096),
+		// A claimed receipt can fail validation before resolving either HEAD or branch.
+		expectedHead: z.union([z.literal(""), receiptHead]),
+		branchName: z.string().min(1).max(256).optional(),
+		dispatchState: z.enum(["not_started", "started"]).optional(),
+		commandSucceeded: z.boolean().optional(),
+		result: receiptResultSchema.optional(),
+	})
+	.strict();
+function validateReceipt(input: unknown, requestId: string): WorktreeJournalRecord {
+	const parsed = receiptSchema.safeParse(input);
+	if (!parsed.success) error("WORKTREE_RECEIPT_INVALID", "Invalid worktree request receipt", 409);
+	const request = worktreeCreateSchema.safeParse(parsed.data.request);
+	if (!request.success)
+		error("WORKTREE_RECEIPT_INVALID", "Invalid original worktree proposal", 409);
+	const record = { ...parsed.data, request: request.data };
+	const branchName = record.branchName ?? record.request.branch.name;
+	// HEAD is persisted only after all Git/path validation succeeds and before dispatch.
+	// An empty HEAD therefore proves this terminal validation failure never ran worktree add.
+	// Keep its original typed proposal queryable, but never use it as reconciliation evidence.
+	const validationFailure =
+		record.result?.outcome === "failed" &&
+		record.dispatchState !== "started" &&
+		record.expectedHead === "" &&
+		record.commandSucceeded === undefined &&
+		record.result.error !== undefined &&
+		record.result.residuals.destinationExists === null &&
+		record.result.residuals.branchExists === null;
+	if (
+		record.request.requestId !== requestId ||
+		record.proposalHash !== worktreeProposalHash(record.request) ||
+		record.destination !== record.request.destinationPath ||
+		(record.branchName !== undefined &&
+			record.request.branch.name !== undefined &&
+			record.branchName !== record.request.branch.name) ||
+		(!validationFailure &&
+			(!receiptPath.safeParse(record.destination).success ||
+				(record.branchName !== undefined && !receiptBranch.safeParse(record.branchName).success) ||
+				(record.request.branch.name !== undefined &&
+					!receiptBranch.safeParse(record.request.branch.name).success) ||
+				(record.request.baseRef !== undefined &&
+					(hasControlCharacters(record.request.baseRef) ||
+						/\s/.test(record.request.baseRef) ||
+						record.request.baseRef.startsWith("-"))))) ||
+		(record.commandSucceeded === true && (!branchName || !record.expectedHead)) ||
+		(record.dispatchState === "started" && (!branchName || !record.expectedHead)) ||
+		(record.dispatchState === "not_started" &&
+			(record.commandSucceeded !== undefined ||
+				(record.result !== undefined &&
+					(record.result.outcome !== "failed" ||
+						record.result.error === undefined ||
+						record.result.residuals.destinationExists !== null ||
+						record.result.residuals.branchExists !== null))))
+	)
+		error("WORKTREE_RECEIPT_INVALID", "Inconsistent worktree request receipt", 409);
+	const result = record.result;
+	if (
+		result &&
+		(result.outcome === "created"
+			? !result.worktree ||
+				!branchName ||
+				!record.expectedHead ||
+				result.worktree.path !== record.destination ||
+				result.worktree.head !== record.expectedHead ||
+				result.worktree.branch !== `refs/heads/${branchName}` ||
+				result.worktree.detached ||
+				result.worktree.prunable ||
+				result.residuals.destinationExists !== true
+			: result.worktree !== null)
+	)
+		error("WORKTREE_RECEIPT_INVALID", "Inconsistent stored worktree result", 409);
+	return record;
+}
+
 export class NarratorWorktreeService<Principal> {
+	private readonly listCursorSecret = randomUUID();
+	private readonly listSnapshots = new Map<string, ListSnapshot>();
+	private listCacheBytes = 0;
+
 	constructor(private readonly ports: WorktreeServicePorts<Principal>) {}
+
+	private listCursor(id: string, offset: number): string {
+		const token = `${id}:${offset}`;
+		const signature = createHmac("sha256", this.listCursorSecret)
+			.update(token)
+			.digest("hex")
+			.slice(0, 32);
+		return `${token}:${signature}`;
+	}
+
+	private pruneListSnapshots(now: number) {
+		for (const [id, snapshot] of this.listSnapshots) {
+			if (snapshot.expiresAt <= now) {
+				this.listSnapshots.delete(id);
+				this.listCacheBytes -= snapshot.bytes;
+			}
+		}
+	}
+
+	private rememberListSnapshot(snapshot: ListSnapshot): string {
+		this.pruneListSnapshots(Date.now());
+		while (
+			this.listSnapshots.size >= WORKTREE_LIST_CACHE_MAX_SNAPSHOTS ||
+			this.listCacheBytes + snapshot.bytes > WORKTREE_LIST_CACHE_MAX_BYTES
+		) {
+			const oldest = this.listSnapshots.entries().next().value;
+			if (!oldest) error("WORKTREE_LIST_TOO_LARGE", "List snapshot exceeds cache budget", 413);
+			this.listSnapshots.delete(oldest[0]);
+			this.listCacheBytes -= oldest[1].bytes;
+		}
+		const id = randomUUID();
+		this.listSnapshots.set(id, snapshot);
+		this.listCacheBytes += snapshot.bytes;
+		return id;
+	}
 
 	private actorKey(principal: Principal): string {
 		const key =
 			this.ports.principalKey?.(principal) ?? (typeof principal === "string" ? principal : "");
-		if (!key || key.length > 256)
+		if (!key || key.length > 256 || hasControlCharacters(key))
 			error("WORKTREE_ACTOR_REQUIRED", "A stable authenticated actor is required", 403);
 		return key;
 	}
 
-	private async run(target: WorktreeTarget, args: string[], signal: AbortSignal, writing = false) {
+	private async run(
+		target: WorktreeTarget,
+		args: string[],
+		signal: AbortSignal,
+		writing = false,
+		maxBytes = WORKTREE_MAX_OUTPUT_BYTES,
+	) {
 		if (!target.backend || target.backend.kind !== "local")
 			error(
 				"WORKTREE_UNSUPPORTED",
@@ -192,31 +623,112 @@ export class NarratorWorktreeService<Principal> {
 				409,
 			);
 		signal.throwIfAborted();
-		const result = await (this.ports.runGit
+		const operation = this.ports.runGit
 			? this.ports.runGit(target, args, signal, writing)
 			: safeSpawn({
-					cmd: ["git", "--no-optional-locks", "-C", target.workspace.rootPath ?? "", ...args],
+					cmd: [
+						"git",
+						"--no-optional-locks",
+						...(target.worktreeListOnly && !writing
+							? [`--git-dir=${target.repositoryPath}`]
+							: ["-C", target.workspace.rootPath ?? ""]),
+						...args,
+					],
 					timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
-					maxOutputBytes: WORKTREE_MAX_OUTPUT_BYTES,
+					maxOutputBytes: maxBytes,
 					killProcessTree: true,
 					env: {
 						...process.env,
+						// Keep the unsupported-option diagnostic stable across server locales.
+						LC_ALL: "C",
 						GIT_DIR: undefined,
 						GIT_COMMON_DIR: undefined,
 						GIT_WORK_TREE: undefined,
 						GIT_INDEX_FILE: undefined,
 					},
 					signal,
-				}));
-		return boundWorktreeGitResult(result);
+				});
+		const result = writing ? await operation : await abortableRead(operation, signal);
+		signal.throwIfAborted();
+		return boundWorktreeGitResult(result, maxBytes);
 	}
 
-	private async entries(target: WorktreeTarget, signal: AbortSignal) {
-		const result = await this.run(target, ["worktree", "list", "--porcelain", "-z"], signal);
-		if (result.exitCode !== 0) error("WORKTREE_LIST_FAILED", "Unable to list Git worktrees", 409);
+	private async legacyEntries(
+		target: WorktreeTarget,
+		result: SafeSpawnResult,
+		signal: AbortSignal,
+		listing = false,
+	): Promise<ReturnType<typeof parseWorktreePorcelain>> {
+		const incomplete = { entries: [] as WorktreeEntry[], truncated: true };
+		if (result.stdoutTruncated || result.stderrTruncated) return incomplete;
+		const limited = AbortSignal.any([signal, AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS)]);
+		const started = performance.now();
+		let abort: (() => void) | undefined;
+		try {
+			limited.throwIfAborted();
+			const cancelled = new Promise<never>((_resolve, reject) => {
+				abort = () => reject(limited.reason);
+				limited.addEventListener("abort", abort, { once: true });
+				if (limited.aborted) abort();
+			});
+			// Cancellation bounds the caller's wait. Pending async FS calls drain and close their
+			// handles in finally; the scan checks limited before launching each subsequent read.
+			const registered = await Promise.race([
+				readLegacyRegisteredPaths(
+					target,
+					limited,
+					listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+					listing ? WORKTREE_LIST_MAX_OUTPUT_BYTES : WORKTREE_MAX_OUTPUT_BYTES,
+				),
+				cancelled,
+			]);
+			limited.throwIfAborted();
+			return parseLegacyWorktreePorcelain(
+				result.stdout,
+				false,
+				registered,
+				target.backend?.paths.identityKey,
+				listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
+			);
+		} catch (cause) {
+			signal.throwIfAborted();
+			logger.warn("Unable to verify legacy Git worktree registrations", {
+				reason: String(cause).slice(0, 256),
+			});
+			return incomplete;
+		} finally {
+			if (abort) limited.removeEventListener("abort", abort);
+			const elapsedMs = Math.round(performance.now() - started);
+			if (elapsedMs >= 1000)
+				logger.warn("Slow legacy Git registration verification", { elapsedMs });
+		}
+	}
+	private async entries(target: WorktreeTarget, signal: AbortSignal, listing = false) {
+		const maxBytes = listing ? WORKTREE_LIST_MAX_OUTPUT_BYTES : WORKTREE_MAX_OUTPUT_BYTES;
+		let result = await this.run(
+			target,
+			["worktree", "list", "--porcelain", "-z"],
+			signal,
+			false,
+			maxBytes,
+		);
+		let legacy = false;
+		// Retry only an explicit unsupported -z diagnostic, never an ordinary Git failure.
+		// No capability cache: a server can change/upgrade its Git executable while running.
+		if (
+			result.exitCode !== 0 &&
+			!result.stderrTruncated &&
+			/^error: unknown (?:switch|option) [`'"]z['"`]\r?$/m.test(result.stderr)
+		) {
+			legacy = true;
+			result = await this.run(target, ["worktree", "list", "--porcelain"], signal, false, maxBytes);
+		}
+		if (result.exitCode !== 0) worktreeListError(result);
+		if (legacy) return this.legacyEntries(target, result, signal, listing);
 		return parseWorktreePorcelain(
 			result.stdout,
 			!!(result.stdoutTruncated || result.stderrTruncated),
+			listing ? WORKTREE_LIST_MAX_ENTRIES : WORKTREE_MAX_ENTRIES,
 		);
 	}
 
@@ -226,7 +738,11 @@ export class NarratorWorktreeService<Principal> {
 		entries: WorktreeEntry[],
 		signal: AbortSignal,
 	): Promise<void> {
-		const metadataSignal = AbortSignal.any([signal, AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS)]);
+		const metadataTimeout = Math.max(
+			1,
+			Math.min(this.ports.metadataTimeoutMs ?? WORKTREE_READ_TIMEOUT_MS, WORKTREE_READ_TIMEOUT_MS),
+		);
+		const metadataSignal = AbortSignal.any([signal, AbortSignal.timeout(metadataTimeout)]);
 		for (const entry of entries) {
 			entry.createdAt = null;
 			entry.lastCommitAt = null;
@@ -235,27 +751,37 @@ export class NarratorWorktreeService<Principal> {
 			(head): head is string =>
 				!!head && /^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(head) && !/^0+$/.test(head),
 		);
+		const started = performance.now();
+		const times = new Map<string, number>();
 		const commits = async () => {
-			if (!heads.length) return;
-			try {
-				const result = await this.run(
-					target,
-					["show", "--no-walk", "--no-patch", "--format=%H %ct", ...heads, "--"],
-					metadataSignal,
-				);
-				if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated) return;
-				const times = new Map<string, number>();
-				for (const line of result.stdout.split("\n")) {
-					const match = /^(\S+) (\d+)$/.exec(line);
-					if (!match) continue;
-					const time = Number(match[2]) * 1000;
-					if (Number.isSafeInteger(time)) times.set(match[1]?.toLowerCase() ?? "", time);
+			// Bound argv size and source output; one Git child at a time, at most 128 heads per batch.
+			for (let offset = 0; offset < heads.length && !metadataSignal.aborted; offset += 128) {
+				try {
+					const result = await this.run(
+						target,
+						[
+							"show",
+							"--no-walk",
+							"--no-patch",
+							"--format=%H %ct",
+							...heads.slice(offset, offset + 128),
+							"--",
+						],
+						metadataSignal,
+					);
+					if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated) continue;
+					for (const line of result.stdout.split("\n")) {
+						const match = /^(\S+) (\d+)$/.exec(line);
+						if (!match) continue;
+						const time = Number(match[2]) * 1000;
+						if (Number.isSafeInteger(time)) times.set(match[1]?.toLowerCase() ?? "", time);
+					}
+				} catch {
+					// Missing objects or deadline leave only this batch's metadata unknown.
 				}
-				for (const entry of entries)
-					entry.lastCommitAt = times.get(entry.head?.toLowerCase() ?? "") ?? null;
-			} catch {
-				// Missing objects, Git failures and metadata deadlines do not invalidate the inventory.
 			}
+			for (const entry of entries)
+				entry.lastCommitAt = times.get(entry.head?.toLowerCase() ?? "") ?? null;
 		};
 		let next = 0;
 		const directories = async () => {
@@ -285,8 +811,18 @@ export class NarratorWorktreeService<Principal> {
 			}
 		};
 		// At most four filesystem reads; after cancellation no replacement reads are launched.
-		await Promise.all([commits(), ...Array.from({ length: 4 }, directories)]);
-		signal.throwIfAborted();
+		try {
+			await Promise.all([commits(), ...Array.from({ length: 4 }, directories)]);
+			signal.throwIfAborted();
+		} finally {
+			const elapsedMs = Math.round(performance.now() - started);
+			if (elapsedMs >= 1000)
+				logger.warn("Slow worktree list metadata", {
+					elapsedMs,
+					entries: entries.length,
+					incomplete: metadataSignal.aborted,
+				});
+		}
 	}
 
 	async list(
@@ -295,14 +831,117 @@ export class NarratorWorktreeService<Principal> {
 		input: unknown,
 		signal: AbortSignal,
 	): Promise<WorktreeListResult> {
-		const { workspaceKey } = worktreeListSchema.parse(input);
-		const target = await this.ports.authorize(principal, narratorId, "read", signal);
-		assertReady(target, "read", workspaceKey);
-		const result = await this.entries(target, signal);
-		await this.enrichListEntries(target, result.entries, signal);
+		const { workspaceKey, limit, cursor, sort, order, search } = worktreeListSchema.parse(input);
+		signal.throwIfAborted();
+		const target = await (this.ports.authorizeList ?? this.ports.authorize)(
+			principal,
+			narratorId,
+			"read",
+			signal,
+		);
+		if (target.worktreeListOnly && target.workspace.state === "missing_directory") {
+			if (target.workspace.workspaceKey !== workspaceKey)
+				error("GIT_WORKSPACE_CHANGED", "Git workspace changed; refresh before retrying", 409);
+			if (
+				!target.repositoryPath ||
+				!target.workspace.repositoryKey ||
+				!target.backend ||
+				target.backend.kind !== "local"
+			)
+				error("GIT_WORKSPACE_UNAVAILABLE", "Canonical repository unavailable", 409);
+		} else assertReady(target, "read", workspaceKey);
+		const binding = JSON.stringify([
+			this.actorKey(principal),
+			narratorId,
+			target.workspace.repositoryKey,
+			target.workspace.deviceId,
+			target.repositoryPath,
+			target.workspace.rootPath,
+			workspaceKey,
+			sort,
+			order,
+			search,
+		]);
+		this.pruneListSnapshots(Date.now());
+		let snapshot: ListSnapshot;
+		let id: string | undefined;
+		let offset = 0;
+		if (cursor) {
+			const match = /^([a-f0-9-]{36}):([1-9]\d{0,4}):([a-f0-9]{32})$/.exec(cursor);
+			if (!match) error("WORKTREE_CURSOR_INVALID", "Invalid worktree cursor");
+			id = match[1] ?? "";
+			offset = Number(match[2]);
+			const cached = this.listSnapshots.get(id);
+			if (!cached)
+				error("WORKTREE_CURSOR_EXPIRED", "Worktree cursor expired; reload the first page", 410);
+			if (cursor !== this.listCursor(id, offset))
+				error("WORKTREE_CURSOR_INVALID", "Cursor signature is invalid");
+			if (cached.binding !== binding)
+				error(
+					"WORKTREE_CURSOR_MISMATCH",
+					"Cursor does not match actor, workspace or list query",
+					409,
+				);
+			if (offset >= cached.entries.length)
+				error("WORKTREE_CURSOR_INVALID", "Cursor offset is invalid");
+			snapshot = cached;
+		} else {
+			const started = performance.now();
+			const listSignal = AbortSignal.any([
+				signal,
+				AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS * 2),
+			]);
+			try {
+				const result = await this.entries(target, listSignal, true);
+				await this.enrichListEntries(target, result.entries, listSignal);
+				const needle = search.toLowerCase();
+				const name = (entry: WorktreeEntry) =>
+					entry.branch?.replace(/^refs\/heads\//, "") ??
+					entry.path.split(/[\\/]/).at(-1) ??
+					entry.path;
+				const compareText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+				const entries = result.entries
+					.filter(
+						(entry) =>
+							!needle ||
+							`${name(entry)}\n${entry.branch ?? ""}\n${entry.path}`.toLowerCase().includes(needle),
+					)
+					.sort((a, b) => {
+						const tie = compareText(name(a), name(b)) || compareText(a.path, b.path);
+						if (sort === "name")
+							return (
+								(order === "asc" ? 1 : -1) * compareText(name(a), name(b)) ||
+								compareText(a.path, b.path)
+							);
+						const left = a[sort] ?? null;
+						const right = b[sort] ?? null;
+						if (left === null || right === null)
+							return left === right ? tie : left === null ? 1 : -1;
+						return (order === "asc" ? 1 : -1) * (left - right) || tie;
+					});
+				listSignal.throwIfAborted();
+				snapshot = {
+					binding,
+					entries,
+					truncated: result.truncated,
+					expiresAt: Date.now() + WORKTREE_LIST_CACHE_TTL_MS,
+					bytes: Buffer.byteLength(JSON.stringify(entries)) + Buffer.byteLength(binding) + 256,
+				};
+				if (entries.length > limit) id = this.rememberListSnapshot(snapshot);
+			} finally {
+				const elapsedMs = Math.round(performance.now() - started);
+				if (elapsedMs >= 1000) logger.warn("Slow worktree listing", { elapsedMs });
+			}
+		}
+		signal.throwIfAborted();
+		const entries = snapshot.entries.slice(offset, offset + limit).map((entry) => ({ ...entry }));
+		const hasMore = offset + entries.length < snapshot.entries.length;
 		return {
 			repositoryKey: target.workspace.repositoryKey,
-			...result,
+			hasMore,
+			nextCursor: hasMore && id ? this.listCursor(id, offset + entries.length) : null,
+			truncated: snapshot.truncated,
+			entries,
 			capabilities: {
 				list: true,
 				create: target.workspace.capabilities.write,
@@ -416,7 +1055,10 @@ export class NarratorWorktreeService<Principal> {
 				worktreeName = backend.paths.basename(destinationPath);
 			} else {
 				worktreeName = worktreeDirectoryName(branchName);
-				const parent = backend.paths.resolve(root, ".worktrees");
+				const repositoryRoot = this.ports.authorizeDestination
+					? await this.repositoryRoot(target, signal)
+					: root;
+				const parent = backend.paths.resolve(repositoryRoot, ".worktrees");
 				const parentStat = await lstat(parent).catch((cause) => {
 					if ((cause as NodeJS.ErrnoException).code === "ENOENT") return null;
 					throw cause;
@@ -424,22 +1066,59 @@ export class NarratorWorktreeService<Principal> {
 				if (parentStat?.isSymbolicLink())
 					error("WORKTREE_SYMLINK_PATH", "Default worktree parent is a symlink");
 				destinationPath = backend.paths.resolve(
-					parentStat?.isDirectory() ? parent : root,
+					parentStat?.isDirectory() ? parent : repositoryRoot,
 					parentStat?.isDirectory() ? worktreeName : `nf-worktree-${worktreeName}`,
 				);
 			}
-			await this.requireDestination(target, destinationPath, signal);
+			await this.requireDestination(principal, narratorId, target, destinationPath, signal);
 			return { branchName, worktreeName, destinationPath };
 		});
 	}
 
+	/** Discover the main checkout through Git, not by interpreting a .git path as a grant. */
+	private async repositoryRoot(target: WorktreeTarget, signal: AbortSignal): Promise<string> {
+		await this.verifyIdentity(target, signal);
+		const backend = target.backend;
+		if (!backend || !target.repositoryPath)
+			error("GIT_WORKSPACE_CHANGED", "Repository identity unavailable", 409);
+		const candidate = backend.paths.dirname(target.repositoryPath);
+		const result = await this.run(
+			{ ...target, workspace: { ...target.workspace, rootPath: candidate } },
+			["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+			signal,
+		);
+		const lines = result.stdout.trim().split("\n");
+		if (
+			result.exitCode !== 0 ||
+			result.stdoutTruncated ||
+			result.stderrTruncated ||
+			lines.length !== 2 ||
+			!backend.paths.equals(lines[0], candidate) ||
+			!backend.paths.equals(lines[1], target.repositoryPath)
+		)
+			error("GIT_WORKSPACE_CHANGED", "Cannot verify the main repository checkout", 409);
+		const identity = await backend.resolvePathIdentity(candidate, {
+			signal,
+			timeoutMs: WORKTREE_READ_TIMEOUT_MS,
+		});
+		if (
+			!backend.paths.equals(identity.canonicalPath, candidate) ||
+			identity.runtimeGeneration !== backend.runtimeGeneration
+		)
+			error("WORKTREE_SYMLINK_PATH", "Main repository identity is not canonical");
+		return candidate;
+	}
+
 	private async requireDestination(
+		principal: Principal,
+		narratorId: string,
 		target: WorktreeTarget,
 		destination: string,
 		signal: AbortSignal,
+		recovery = false,
 	) {
 		const backend = target.backend;
-		const root = target.workspace.rootPath;
+		let root = target.workspace.rootPath;
 		if (!backend || !root)
 			error("GIT_WORKSPACE_UNAVAILABLE", "Workspace identity unavailable", 409);
 		const paths = backend.paths;
@@ -449,11 +1128,13 @@ export class NarratorWorktreeService<Principal> {
 			paths.normalize(destination) !== destination
 		)
 			error("WORKTREE_INVALID_PATH", "Destination must be an absolute normalized path");
-		// Existing Git authorization checks the WHOLE root for nested blacklist/ACL restrictions.
-		// Do not widen that grant to a sibling path just because the client supplies one.
+		// Sibling access requires both Git identity evidence and a fresh destination grant.
+		const sibling = !paths.contains(root, destination);
+		if (sibling && this.ports.authorizeDestination)
+			root = await this.repositoryRoot(target, signal);
 		if (
 			!paths.contains(root, destination) ||
-			paths.equals(root, destination) ||
+			(!recovery && paths.equals(root, destination)) ||
 			(target.repositoryPath && paths.contains(target.repositoryPath, destination))
 		)
 			error(
@@ -470,6 +1151,14 @@ export class NarratorWorktreeService<Principal> {
 			identity.runtimeGeneration !== backend.runtimeGeneration
 		)
 			error("WORKTREE_SYMLINK_PATH", "Symlink/junction destination identities are not supported");
+		await this.ports.authorizeDestination?.(
+			principal,
+			narratorId,
+			target,
+			identity.canonicalPath,
+			recovery ? "read" : "write",
+			signal,
+		);
 		let cursor = destination;
 		let first = true;
 		while (!paths.equals(cursor, root)) {
@@ -483,13 +1172,36 @@ export class NarratorWorktreeService<Principal> {
 			}
 			if (entry?.isSymbolicLink())
 				error("WORKTREE_SYMLINK_PATH", "Symlink destinations are not supported");
-			if (first && entry) error("WORKTREE_DESTINATION_EXISTS", "Destination already exists", 409);
+			if (first && entry && !recovery)
+				error("WORKTREE_DESTINATION_EXISTS", "Destination already exists", 409);
+			if (first && entry && recovery && !entry.isDirectory())
+				error("WORKTREE_INVALID_PATH", "Recovery destination is not a directory");
 			if (!first && !entry?.isDirectory())
 				error("WORKTREE_INVALID_PATH", "Destination parent is not a directory");
 			first = false;
 			cursor = paths.dirname(cursor);
 		}
-		await access(paths.dirname(destination), constants.W_OK | constants.X_OK);
+		if (sibling) {
+			// A nested unrelated checkout under the main directory is not the same repository.
+			const parent = paths.dirname(destination);
+			const result = await this.run(
+				{ ...target, workspace: { ...target.workspace, rootPath: parent } },
+				["rev-parse", "--path-format=absolute", "--git-common-dir"],
+				signal,
+			);
+			if (
+				result.exitCode !== 0 ||
+				result.stdoutTruncated ||
+				result.stderrTruncated ||
+				!paths.equals(result.stdout.trim(), target.repositoryPath ?? "")
+			)
+				error(
+					"WORKTREE_DESTINATION_DENIED",
+					"Destination parent belongs to a different repository",
+					403,
+				);
+		}
+		if (!recovery) await access(paths.dirname(destination), constants.W_OK | constants.X_OK);
 		return identity.canonicalPath;
 	}
 
@@ -558,6 +1270,16 @@ export class NarratorWorktreeService<Principal> {
 		target: WorktreeTarget,
 		record: WorktreeJournalRecord,
 	): Promise<WorktreeCreateResult> {
+		if (record.dispatchState === "not_started")
+			return {
+				outcome: "failed",
+				worktree: null,
+				residuals: { destinationExists: null, branchExists: null },
+				error: {
+					code: "WORKTREE_NOT_DISPATCHED",
+					message: "Creation stopped before Git dispatch; no creation or cleanup was dispatched",
+				},
+			};
 		// Verification has its own bounded deadline, independent of the disconnected request.
 		const signal = AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS);
 		let destinationExists: boolean | null = null;
@@ -666,6 +1388,33 @@ export class NarratorWorktreeService<Principal> {
 		};
 	}
 
+	/** Operation lookup accepts only the tool's stable internal request identifier. */
+	async getOperation(
+		principal: Principal,
+		narratorId: string,
+		operationId: string,
+		signal: AbortSignal,
+	): Promise<WorktreeCreateResult> {
+		const target = await this.ports.authorize(principal, narratorId, "read", signal);
+		assertReady(target, "read", target.workspace.workspaceKey ?? "");
+		this.actorKey(principal);
+		if (typeof operationId !== "string" || !/^wt1_[a-f0-9]{64}$/.test(operationId))
+			error("WORKTREE_INVALID_OPERATION", "Invalid worktree operation identifier");
+		signal.throwIfAborted();
+		let record: WorktreeJournalRecord | null;
+		try {
+			record = await this.ports.journal.read(narratorId, operationId);
+		} catch (cause) {
+			if (cause instanceof AppError && cause.code === "WORKTREE_RECEIPT_INVALID") throw cause;
+			error("WORKTREE_RECEIPT_UNAVAILABLE", "Cannot read the original worktree receipt", 409);
+		}
+		if (!record) error("WORKTREE_REQUEST_NOT_FOUND", "Worktree request receipt not found", 404);
+		const receipt = validateReceipt(record, operationId);
+		// Reuse recovery authorization, lock and path scope checks, with the frozen old revision.
+		// Recovery validates its independent read again: receipt replacement cannot bypass parsing.
+		return this.reconcileRequest(principal, narratorId, receipt.request, signal);
+	}
+
 	/** Read-only receipt recovery: old revisions/roots never admit another worktree add. */
 	async reconcileRequest(
 		principal: Principal,
@@ -680,7 +1429,8 @@ export class NarratorWorktreeService<Principal> {
 		let record: WorktreeJournalRecord | null;
 		try {
 			record = await this.ports.journal.read(narratorId, request.requestId);
-		} catch {
+		} catch (cause) {
+			if (cause instanceof AppError && cause.code === "WORKTREE_RECEIPT_INVALID") throw cause;
 			return {
 				outcome: "unknown",
 				worktree: null,
@@ -693,6 +1443,7 @@ export class NarratorWorktreeService<Principal> {
 		}
 		if (!record)
 			throw new AppError("Worktree request receipt not found", 404, "WORKTREE_REQUEST_NOT_FOUND");
+		record = validateReceipt(record, request.requestId);
 		if (
 			record.actorKey !== actorKey ||
 			record.deviceId !== initial.workspace.deviceId ||
@@ -719,10 +1470,20 @@ export class NarratorWorktreeService<Principal> {
 				target.backend?.runtimeGeneration !== initial.backend?.runtimeGeneration
 			)
 				error("WORKTREE_RECOVERY_DENIED", "Recovery repository or execution device changed", 403);
-			// The old request cannot turn a narrow current-tree grant into a sibling-directory grant.
-			if (
+			// Runtime supplies a separate destination grant; legacy ports remain current-tree-only.
+			if (this.ports.authorizeDestination) {
+				await this.requireDestination(
+					principal,
+					narratorId,
+					target,
+					receipt.destination,
+					signal,
+					true,
+				);
+			} else if (
 				!target.backend ||
 				!target.workspace.rootPath ||
+				!target.backend.paths.isAbsolute(receipt.destination) ||
 				!target.backend.paths.contains(target.workspace.rootPath, receipt.destination)
 			)
 				error(
@@ -759,9 +1520,14 @@ export class NarratorWorktreeService<Principal> {
 						deviceId: target.workspace.deviceId,
 						destination: request.destinationPath,
 						expectedHead: "",
+						dispatchState: "not_started",
 					});
 				} catch (cause) {
-					if (cause instanceof AppError && cause.code === "WORKTREE_REQUEST_CONFLICT") throw cause;
+					if (
+						cause instanceof AppError &&
+						["WORKTREE_REQUEST_CONFLICT", "WORKTREE_RECEIPT_INVALID"].includes(cause.code)
+					)
+						throw cause;
 					return {
 						outcome: "unknown",
 						worktree: null,
@@ -773,7 +1539,15 @@ export class NarratorWorktreeService<Principal> {
 						},
 					};
 				}
-				const record = claim.record;
+				const record = claim.fresh
+					? claim.record
+					: validateReceipt(claim.record, request.requestId);
+				if (!claim.fresh && record.proposalHash !== worktreeProposalHash(request))
+					error(
+						"WORKTREE_REQUEST_CONFLICT",
+						"Replay must use the exact original creation proposal",
+						409,
+					);
 				if (record.actorKey !== actorKey || record.deviceId !== target.workspace.deviceId)
 					error(
 						"WORKTREE_RECOVERY_DENIED",
@@ -783,6 +1557,17 @@ export class NarratorWorktreeService<Principal> {
 				if (record.repositoryKey !== target.workspace.repositoryKey)
 					error("WORKTREE_REQUEST_CONFLICT", "Request receipt belongs to another repository", 409);
 				if (!claim.fresh) {
+					if (
+						!target.backend ||
+						!target.workspace.rootPath ||
+						!target.backend.paths.isAbsolute(record.destination) ||
+						!target.backend.paths.contains(target.workspace.rootPath, record.destination)
+					)
+						error(
+							"WORKTREE_RECOVERY_DENIED",
+							"Receipt replay requires the original authorized directory scope",
+							403,
+						);
 					if (record.result && record.result.outcome !== "unknown") return record.result;
 					const result = await this.reconcile(target, record);
 					await this.ports.journal
@@ -797,10 +1582,13 @@ export class NarratorWorktreeService<Principal> {
 					return result;
 				}
 				let dispatched = false;
+				let registeredResource: WorktreeResourceRegistration | undefined;
 				const started = performance.now();
 				let result: WorktreeCreateResult;
 				try {
 					record.destination = await this.requireDestination(
+						principal,
+						narratorId,
 						target,
 						request.destinationPath,
 						signal,
@@ -831,27 +1619,37 @@ export class NarratorWorktreeService<Principal> {
 					)
 						error("GIT_WORKSPACE_CHANGED", "Repository or backend changed before write", 409);
 					await this.verifyIdentity(fresh, signal);
-					await this.requireDestination(fresh, record.destination, signal);
+					await this.requireDestination(principal, narratorId, fresh, record.destination, signal);
 					// Durable protection is admitted under the same lock used by storage cleanup.
-					// Failure to register means no Git dispatch; uncertain/failed adds stay protected.
-					await this.ports.resources?.register({
-						ownerNarratorId: narratorId,
-						deviceId: record.deviceId ?? "local",
-						repositoryKey: record.repositoryKey,
-						worktreePath: record.destination,
-						createRequestId: request.requestId,
-						scope: fresh.resourceScope,
-					});
+					// A fresh receipt may reuse historical inventory after receipt loss. Only this
+					// register call's actual INSERT may be retracted before Git dispatch.
+					if (this.ports.resources) {
+						const resource: WorktreeResourceRegistration = {
+							ownerNarratorId: narratorId,
+							deviceId: record.deviceId ?? "local",
+							repositoryKey: record.repositoryKey,
+							worktreePath: record.destination,
+							createRequestId: request.requestId,
+							scope: fresh.resourceScope,
+						};
+						const registration = await this.ports.resources.register(resource);
+						if (registration && registration.inserted === true) registeredResource = resource;
+					}
 					signal.throwIfAborted();
 					const args =
 						request.branch.kind === "new"
 							? ["worktree", "add", "-b", branchName, "--", record.destination, record.expectedHead]
 							: ["worktree", "add", "--", record.destination, branchName];
+					// Crash/lost response after this durable boundary is potentially side-effectful.
+					record.dispatchState = "started";
+					await this.ports.journal.save(narratorId, request.requestId, record);
+					signal.throwIfAborted();
 					dispatched = true;
 					const execution = await this.run(fresh, args, signal, true);
 					record.commandSucceeded = execution.exitCode === 0;
 					result = await this.reconcile(fresh, record);
 				} catch (cause) {
+					if (!dispatched) record.dispatchState = "not_started";
 					result = dispatched
 						? await this.reconcile(target, record)
 						: {
@@ -866,6 +1664,11 @@ export class NarratorWorktreeService<Principal> {
 											: "Worktree validation failed before Git execution",
 								},
 							};
+				}
+				if (claim.fresh && registeredResource && !dispatched) {
+					await this.ports.resources?.releaseUndispatched?.(registeredResource).catch(() => {
+						logger.warn("Unable to release undispatched worktree registration", { narratorId });
+					});
 				}
 				if (dispatched) {
 					await this.ports.resources

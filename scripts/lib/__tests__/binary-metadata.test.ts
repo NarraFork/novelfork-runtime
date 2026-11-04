@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	COMPONENT_VERSIONS,
+	createHelperDistributionDependencies,
+} from "../../../shared/helper-distribution";
+import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../../../shared/update-identity";
+import {
 	type BinaryMetadata,
 	computeBinaryMetadataFromBuffer,
 	formatChecksumsReport,
@@ -30,6 +35,70 @@ describe("computeBinaryMetadataFromBuffer", () => {
 		expect(meta.size).toBe(buf.length);
 		expect(meta.sha256).toBe(createHash("sha256").update(buf).digest("hex"));
 		expect(meta.sha512).toBe(createHash("sha512").update(buf).digest("base64"));
+	});
+
+	test("application upgrades retain the independently pinned component identity", () => {
+		const helperDistribution = createHelperDistributionDependencies();
+		for (const version of ["0.9.2", "0.9.3", "1.0.0"]) {
+			const meta = computeBinaryMetadataFromBuffer(
+				`narrafork-${version}-linux-x64`,
+				Buffer.from(`application ${version}`),
+				{ ...INPUT, version, helperDistribution },
+			);
+			expect(meta.version).toBe(version);
+			expect(JSON.parse(formatMetadataJson(meta)).helperDistribution).toEqual(helperDistribution);
+			expect(meta.helperDistribution?.executor).toEqual({
+				...COMPONENT_VERSIONS.executor,
+				tag: `executor-v${COMPONENT_VERSIONS.executor.version}`,
+			});
+		}
+	});
+
+	test("legacy sidecars stay undeclared and malformed declarations cannot become legacy", () => {
+		const legacy = computeBinaryMetadataFromBuffer("legacy", Buffer.from("old"), INPUT);
+		expect(Object.hasOwn(legacy, "helperDistribution")).toBe(false);
+		const declared = createHelperDistributionDependencies();
+		expect(() =>
+			computeBinaryMetadataFromBuffer("invalid", Buffer.from("bad"), {
+				...INPUT,
+				helperDistribution: {
+					...declared,
+					executor: { ...declared.executor, tag: "executor-latest" },
+				},
+			}),
+		).toThrow();
+	});
+
+	test("only explicit main-program declarations serialize recovery capabilities", () => {
+		const helperDistribution = createHelperDistributionDependencies();
+		const meta = computeBinaryMetadataFromBuffer("main", Buffer.from("binary"), {
+			...INPUT,
+			helperDistribution,
+			recoveryManifestVersions: CURRENT_RECOVERY_MANIFEST_VERSIONS,
+		});
+		expect(JSON.parse(formatMetadataJson(meta)).recoveryManifestVersions).toEqual([1, 2, 3]);
+		expect(meta.helperDistribution).toEqual(helperDistribution);
+		for (const name of ["legacy-main", "narrafork-executor", "helper"]) {
+			const legacy = computeBinaryMetadataFromBuffer(name, Buffer.from("binary"), INPUT);
+			expect(
+				Object.hasOwn(JSON.parse(formatMetadataJson(legacy)), "recoveryManifestVersions"),
+			).toBe(false);
+		}
+		for (const versions of [[], [1, 2, 3, 3], [0], [256], [1.5]]) {
+			expect(() =>
+				computeBinaryMetadataFromBuffer("bad", Buffer.from("binary"), {
+					...INPUT,
+					recoveryManifestVersions: versions,
+				}),
+			).toThrow("recoveryManifestVersions");
+			expect(() => formatMetadataJson({ ...meta, recoveryManifestVersions: versions })).toThrow(
+				"recoveryManifestVersions",
+			);
+		}
+		expect(
+			JSON.parse(formatMetadataJson({ ...meta, recoveryManifestVersions: [3, 1, 2] }))
+				.recoveryManifestVersions,
+		).toEqual([1, 2, 3]);
 	});
 
 	test("sha256 is lowercase 64-char hex", () => {

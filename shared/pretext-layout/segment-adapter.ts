@@ -23,6 +23,7 @@ import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { isSubagentModelInheritance } from "../model-inheritance";
+import { blockAtIndex, type MessageWithBody, messageBody } from "../narrator-blocks/message-blocks";
 import {
 	contextBlockViews,
 	injectionBlockViews,
@@ -41,7 +42,24 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
-import { resolveToolDisplayDurationMs } from "../tool-display-duration";
+import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
+
+type ToolTimingRecord = Partial<
+	Record<
+		| "startedAt"
+		| "streamStartedAt"
+		| "streamCompletedAt"
+		| "permissionStartedAt"
+		| "executionStartedAt"
+		| "completedAt"
+		| "createdAt"
+		| "durationMs"
+		| "execDurationMs",
+		number
+	>
+> & { fileChangeTiming?: FileChangeTiming };
+
+import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
 import {
 	type CommunicationState,
@@ -75,6 +93,7 @@ import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
 } from "./reflection";
+import { classifyReflectionReasonSummary } from "./reflection-reason";
 import { reconcileSourceText } from "./source-text";
 import {
 	isLiveStreamingBlock,
@@ -87,6 +106,7 @@ import {
 	classifyToolDetail,
 	describeToolBody,
 	isTruncated,
+	parseLiveOutputChars,
 	resolveFileDiffStats,
 	type ToolCappedDetail,
 	toolInputFieldRange,
@@ -127,6 +147,7 @@ export interface AdapterContentBlock {
 	filename?: string | null;
 	mediaType?: string | null;
 	imageId?: string | null;
+	mediaId?: string | null;
 	previewUrl?: string | null;
 	/**
 	 * image_generation: the server-side file the generated image was saved to.
@@ -180,19 +201,23 @@ export interface AdapterContentBlock {
 	[key: string]: unknown;
 }
 
-export interface AdapterMessage {
+/**
+ * A message as the adapter reads it. Its body is its blocks (`messageBody` /
+ * `messageBlocks`); its elements are keyed by block id (`elementKey`), so a row keeps its
+ * key when blocks before it are deleted or inserted.
+ */
+export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	/** Actual per-message identity; absent legacy identity must not enable GPT parsing. */
 	model?: string | null;
 	provider?: string | null;
 	id?: string;
 	role: string;
-	contentJson: AdapterContentBlock[];
 	createdAt?: string;
 	/**
 	 * Slash command the user typed, when this user message was produced by one.
 	 *
 	 * The server EXPANDS a command into its full prompt template before storing
-	 * it, so `contentJson`'s text block holds the whole (often multi-thousand
+	 * it, so the body's text element holds the whole (often multi-thousand
 	 * character) expansion while this field keeps the short `/name args` the user
 	 * actually wrote. Rendering the expansion as the bubble body is what turned a
 	 * one-line command into a screen-filling wall of text in the virtual list;
@@ -341,7 +366,7 @@ export interface AdapterToolDetailRef {
 
 export function resolveToolDetailRef(item: AdapterToolItem): AdapterToolDetailRef {
 	const messageId = item.msg?.id ?? item.tc.messageId;
-	const block = item.msg?.contentJson[item.blockIndex];
+	const block = messageBody(item.msg)[item.blockIndex];
 	const attempt =
 		item.tc.executionAttempt ??
 		(block?.type === "tool_use" && block.id === item.tc.toolUseId
@@ -413,7 +438,21 @@ function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
 	// field is present on the item and never looked at, so a running transfer
 	// renders with no bar.
 	const liveProgress = (tc as { _structuredProgress?: unknown })._structuredProgress;
-	if (liveOutput === undefined && liveProgress === undefined) return persisted;
+	// The running Await's resolved target id + session title also live on the call
+	// record (the message loader's `_awaitAgentNarratorId` patch and the
+	// `await_agent_resolved` frame). Lifting them here lets classifyAwait draw the
+	// identity row and headline the title while the wait is still in flight. The
+	// row's arrival mid-wait is an intentional grow (it replaced the old badge
+	// row), keyed by the meta-rows component in `leafTextRevision`.
+	const awaitAgentId = (tc as { _awaitAgentNarratorId?: unknown })._awaitAgentNarratorId;
+	const awaitAgentTitle = (tc as { _awaitAgentTitle?: unknown })._awaitAgentTitle;
+	if (
+		liveOutput === undefined &&
+		liveProgress === undefined &&
+		awaitAgentId === undefined &&
+		awaitAgentTitle === undefined
+	)
+		return persisted;
 	const base = persisted && typeof persisted === "object" ? (persisted as object) : {};
 	const out: Record<string, unknown> = { ...base };
 	if (
@@ -427,6 +466,18 @@ function resolveToolMetadata(tc: AdapterToolItem["tc"]): unknown {
 		(base as { _structuredProgress?: unknown })._structuredProgress === undefined
 	) {
 		out._structuredProgress = liveProgress;
+	}
+	if (
+		typeof awaitAgentId === "string" &&
+		(base as { _awaitAgentNarratorId?: unknown })._awaitAgentNarratorId === undefined
+	) {
+		out._awaitAgentNarratorId = awaitAgentId;
+	}
+	if (
+		typeof awaitAgentTitle === "string" &&
+		(base as { _awaitAgentTitle?: unknown })._awaitAgentTitle === undefined
+	) {
+		out._awaitAgentTitle = awaitAgentTitle;
 	}
 	return out;
 }
@@ -473,6 +524,12 @@ function asObject(value: unknown): Record<string, unknown> {
 function readNonEmptyString(record: Record<string, unknown>, key: string): string | undefined {
 	const v = record[key];
 	return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** Read a string-array field from a record; drops entries that are not strings. */
+function readStringArray(record: Record<string, unknown>, key: string): string[] {
+	const v = record[key];
+	return Array.isArray(v) ? v.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
 /** Trim a possibly-null string; undefined when absent or blank. */
@@ -612,7 +669,7 @@ interface AdapterTraceItem {
 	 * is a single truncation-free span in the row's fixed-height flex line and the
 	 * popover is portaled.
 	 */
-	timing?: Record<string, number>;
+	timing?: ToolTimingRecord;
 	/**
 	 * The duration the row PAINTS, when it differs from `timing.durationMs`.
 	 *
@@ -1065,7 +1122,14 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 	"system_injection",
 ]);
 /** Extra recognized system block types beyond the simple/text sets. */
-const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
+/** One ellipsized line is all the resolved card shows; more is wasted payload. */
+const ASK_IN_PASSING_QUOTE_CHARS = 200;
+const SYSTEM_OTHER_TYPES = new Set([
+	"knowledge_hint",
+	"ask_in_passing",
+	"subagent_recovery",
+	"modeltrace_result",
+]);
 /**
  * Block types that make a role=user message render as a SYSTEM card rather than a
  * chat bubble.
@@ -1102,6 +1166,41 @@ const USER_SYSTEM_CARD_TYPES = new Set([
 	"segment_compact",
 ]);
 
+/** The named context parts of an outline session's built-in views (outline plan PR 4). */
+const OUTLINE_VIEW_LABEL_KEYS: Readonly<Record<string, string>> = {
+	"outline.tasks": "contextViewOutlineTasks",
+	"outline.behavior": "contextViewOutlineBehavior",
+};
+
+/** How the host's `context_update` notice row starts (`narrator-epochs.ts`). */
+const CONTEXT_UPDATE_NOTICE = "Context updated: ";
+
+/**
+ * The line a host `context_update` row reads as when it updates an outline session's views:
+ * "Context updated: Current tasks / Behavior boundary" in the reader's language, other keys as
+ * they are. Null for any other row, which keeps the stored notice text. The stored row is not
+ * changed: its English text names the keys, and the change itself is in its snapshot.
+ */
+function outlineViewUpdateLine(
+	blocks: readonly AdapterContentBlock[],
+	ctx: AdapterContext,
+): string | null {
+	if (!blocks.some((block) => block.type === "context_update")) return null;
+	const notice = blocks.find((block) => block.type === "text")?.text ?? "";
+	if (!notice.startsWith(CONTEXT_UPDATE_NOTICE)) return null;
+	const keys = notice
+		.slice(CONTEXT_UPDATE_NOTICE.length)
+		.split(",")
+		.map((key) => key.trim())
+		.filter(Boolean);
+	if (!keys.some((key) => OUTLINE_VIEW_LABEL_KEYS[key])) return null;
+	const names = keys.map((key) => {
+		const label = OUTLINE_VIEW_LABEL_KEYS[key];
+		return label ? sysLabel(ctx, label) : key;
+	});
+	return formatSysLabel(ctx, "contextViewsUpdated", { parts: names.join(" / ") });
+}
+
 /** True when a block type is a recognized system-card block (used to locate the
  * meaningful block within a system message, which may not be blocks[0]). */
 function isRecognizedSystemBlockType(type: string): boolean {
@@ -1122,6 +1221,8 @@ export function classifyContentBlock(block: AdapterContentBlock): VListElementKi
 		case "text":
 			return block.text?.trim() ? "markdown" : null;
 		case "image":
+		case "audio":
+		case "video":
 		case "text_file":
 		case "image_generation":
 			return "media";
@@ -1284,7 +1385,7 @@ function webSearchData(block: AdapterContentBlock, ctx: AdapterContext) {
 }
 
 /**
- * Attachment payload for a user bubble's image / text_file block. `type` plus
+ * Attachment payload for a user bubble's image / audio / video / text_file block. `type` plus
  * the image's intrinsic `width`/`height` are height-relevant (known dimensions
  * reserve an aspect-ratio-fitted box; absent ones fall back to the fixed
  * placeholder height); the rest are render-only fields the integration layer
@@ -1301,6 +1402,17 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		});
 	}
 	const uploadNarratorId = readNonEmptyString(block, "uploadNarratorId") ?? msg.narratorId;
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: uploadNarratorId ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1340,6 +1452,17 @@ function imageGenerationStatusText(ctx: AdapterContext, status: string | null | 
 
 function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 	// measureMedia dispatches on `type`.
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: readNonEmptyString(block, "uploadNarratorId") ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1368,7 +1491,7 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 
 /** Render native/legacy context blocks independently while preserving physical order. */
 function adaptContextBlocks(
-	blocks: AdapterContentBlock[],
+	blocks: readonly AdapterContentBlock[],
 	idBase: string,
 	msg: AdapterMessage,
 	ctx: AdapterContext,
@@ -1417,7 +1540,7 @@ function adaptContextBlocks(
 	for (let index = 0; index < blocks.length; index++) {
 		const block = blocks[index];
 		if (!block || owned.has(index) || block.type !== "text" || !block.text?.trim()) continue;
-		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: block.text });
+		specs.push({ kind: "markdown", key: `${elementKey(idBase, msg, index)}`, data: block.text });
 	}
 	return specs;
 }
@@ -1530,13 +1653,36 @@ function longSingleReasoningStep(key: string, text: string): ReasoningSegment[] 
 	return [{ title: probe.title, body, isEmpty: body.length === 0 || body === "<!-- -->" }];
 }
 
+/**
+ * The key base of a message's element `index`: its block — `${idBase}-blk[<blockId>]`,
+ * plus `+<offset>` for a later element of a multi-element block — so the key stays put
+ * when blocks before it come or go (docs/BLOCK_STORAGE-DESIGN.md §8.3). The blocks are the
+ * ones the message names, or, for a row built on the client, the ones the server would
+ * split it into (`messageBlocks`). Block ids hold no `[` or `]`, so the id is recoverable
+ * from the key (`blockIdFromElementKey`). An index past the body keeps a positional key.
+ */
+export function elementKey(idBase: string, msg: AdapterMessage, index: number): string {
+	const block = blockAtIndex(msg, index);
+	if (!block) return `${idBase}-b${index}`;
+	const offset = index - block.from;
+	return `${idBase}-blk[${block.id}]${offset ? `+${offset}` : ""}`;
+}
+
+const ELEMENT_BLOCK_TOKEN = /-blk\[([^\]]+)\](?:\+(\d+))?/;
+
+/** The block id and element offset an `elementKey` names; null for a positional key. */
+export function blockIdFromElementKey(key: string): { blockId: string; offset: number } | null {
+	const match = ELEMENT_BLOCK_TOKEN.exec(key);
+	return match ? { blockId: match[1], offset: match[2] ? Number(match[2]) : 0 } : null;
+}
+
 function adaptMessage(
 	msg: AdapterMessage,
 	visibleBlockIndices: number[] | undefined,
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const specs: ElementSpec[] = [];
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	const indices = visibleBlockIndices ?? blocks.map((_, i) => i);
 	const idBase = msg.id ?? "msg";
 
@@ -1615,7 +1761,7 @@ function adaptMessage(
 		const reviewBlockIndex = blocks.findIndex((b) => b.type === "review_feedback");
 		if (reviewBlockIndex >= 0 && !blocks.some((b) => b.type === "system_injection")) {
 			const reviewBlock = blocks[reviewBlockIndex];
-			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, ctx)];
+			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, msg, ctx)];
 		}
 		// Send deliveries keep role=user for the model, but their structured block owns
 		// the reader-facing identity. Match it BEFORE origin erases that structure.
@@ -1657,7 +1803,7 @@ function adaptMessage(
 			return [
 				{
 					kind: "injection-bubble",
-					key: `${idBase}-b0-m-legacy`,
+					key: `${elementKey(idBase, msg, 0)}-m-legacy`,
 					data: {
 						markdown: rawSideCarToMarkdown(text),
 						speaker: originHeadingLabel(ctx, msg.origin, msg.originLabel),
@@ -1705,6 +1851,8 @@ function adaptMessage(
 			.filter(
 				(b) =>
 					b.type === "image" ||
+					b.type === "audio" ||
+					b.type === "video" ||
 					b.type === "text_file" ||
 					(b.type === "file_reference" && b.reference),
 			)
@@ -1788,7 +1936,7 @@ function adaptMessage(
 			return [
 				{
 					kind: "system-simple",
-					key: `${idBase}-b${snapshotIndex}`,
+					key: `${elementKey(idBase, msg, snapshotIndex)}`,
 					data: {
 						kind: "publication_result",
 						text: "",
@@ -1831,7 +1979,19 @@ function adaptMessage(
 		// affordances the reader can use (branch names, a commit sha, badges).
 		const framed = adaptFramedSystemCard(sysBlock, idBase, blockIndex, msg, modelFacingText, ctx);
 		if (framed) return [...specs, framed];
-		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx, blockIndex));
+		// An update of an outline session's views reads in the reader's words, not as the stored
+		// English notice naming internal keys (the row itself is unchanged).
+		const viewUpdate = outlineViewUpdateLine(blocks, ctx);
+		specs.push(
+			adaptSystemBlock(
+				sysBlock.type,
+				viewUpdate === null ? sysBlock : { ...sysBlock, text: viewUpdate },
+				idBase,
+				msg,
+				ctx,
+				blockIndex,
+			),
+		);
 		return specs;
 	}
 
@@ -1863,7 +2023,7 @@ function adaptMessage(
 		if (!block) continue;
 		const kind = classifyContentBlock(block);
 		if (kind === null) continue;
-		const key = `${idBase}-b${bi}`;
+		const key = `${elementKey(idBase, msg, bi)}`;
 		if (kind === "reasoning") {
 			const reasoningBlocks = [block];
 			let nextPosition = position + 1;
@@ -2067,6 +2227,8 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// icon: an icon-only control hides its meaning behind a hover tooltip, which
 	// touch users never see at all.
 	disableImageGen: "Turn off image generation and retry",
+	viewErrorRequest: "View request details",
+	downloadErrorDump: "Download Dump",
 	// The error card's conditional model probe (admin-only, network errors only).
 	// Carried over from the deleted chunked card's icon-only action; a label for the
 	// same reason as above.
@@ -2083,8 +2245,6 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	reviewVerdict_request_changes: "Changes Requested",
 	reviewVerdict_comment_only: "Comments Only",
 	reviewFeedbackRevisedBadge: "Revised",
-	reviewFeedbackApply: "Handle",
-	reviewFeedbackApplied: "Handled",
 	// Message-origin attribution (see @shared/message-origin). The heading row of
 	// an origin_notice card, and the name shown on a user bubble whose author is
 	// not a NarraFork account.
@@ -2143,6 +2303,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	subagentRecoveryResolvedNotify:
 		"Restarted {count} subagent(s); the narrator was told to await them.",
 	subagentRecoveryResolvedWait: "Restarted {count} subagent(s) and waited for every result.",
+	subagentRecoveryDismiss: "Dismiss without restarting",
 	// Reflection notice titles: `${kind}Reflection${Status}` (see
 	// reflectionTitleKeyPrefix / reflectionTitleKeySuffix). The title participates
 	// in the measured height, so it must flow through the adapter, not the render
@@ -2172,6 +2333,22 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	taskReflectionAborted: "Task review interrupted",
 	taskReflectionResolved: "Task review finished",
 	reflectionNextSteps: "Next: {nextSteps}",
+	// Distinct system facts that are NOT status restatements (see
+	// reflection-reason.ts). Measured like every other summary line.
+	reflectionReasonNarratorAborted: "Narrator aborted",
+	reflectionReasonDangerCancelledByUser: "Danger reflection pause cancelled by user",
+	reflectionReasonDangerCancelledByLoop: "Danger reflection pause cancelled by reflection loop",
+	reflectionReasonDangerInterrupted:
+		"Danger reflection was interrupted before manual takeover; no live reflection loop remains",
+	reflectionReasonDangerAlreadyResolved:
+		"The danger reflection pause was already resolved by another decision path.",
+	reflectionReasonTaskApprovedByUser: "User approved the protected task change via takeover.",
+	reflectionReasonTaskRejectedByUser: "User rejected the protected task change.",
+	reflectionReasonTaskDeclinedNextSteps:
+		"The user declined this protected task change. Do not retry it without new instructions.",
+	// Danger assessment copy (summaries / consequences / detail chrome). English
+	// fallbacks come from the shared catalog so measure stays self-contained.
+	...dangerCopyEnglishFallbacks(),
 	// ── sidecar cards (one collapsible card per system injection) ─────────────
 	// The source badge text is measured into the card's single-line header, so it
 	// flows through the adapter like every other composed chrome string. Keys map
@@ -2187,15 +2364,47 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
+	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
+	// An update of an outline session's views (`context_update` row of `outline.*` parts).
+	contextViewsUpdated: "Context updated: {parts}",
+	contextViewOutlineTasks: "Current tasks",
+	contextViewOutlineBehavior: "Behavior boundary",
 	sidecarSourceTutorialLesson: "Tutorial lesson",
+	sidecarSourceTurnNudge: "Turn budget",
+	sidecarSourceBrokenCall: "Invalid tool call",
+	sidecarSourceContinuePrompt: "Continue",
+	sidecarSourceWorkspaceChanged: "Workspace changed",
 	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
 	// routine digest reads differently from a turn-end continuation in the header.
 	cadenceEveryNTools: "every {n} tool calls",
+	// ── communication bubble footer warning ───────────────────────────────────
+	// The tools report these sentences as codes (`metadata.warningCodes`) instead of
+	// prose because only the shell can translate them: `communicationWarning_<code>` is
+	// the key the adapter looks up, and `{status}` is the resolved target's `status_*`
+	// word — the same words the narrator status chip shows.
+	communicationWarning_broadcastWorkingOnly:
+		"Only working/waiting members receive broadcasts. Idle and archived members are excluded and never woken.",
+	communicationWarning_broadcastCancelled: "Broadcast cancelled; no further recipients admitted.",
+	communicationWarning_sendTargetNotWorking: "Target is {status} — the message may not be received",
+	status_idle: "Idle",
+	status_waiting: "Waiting",
+	status_archived: "Archived",
 };
 
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
 function sysLabel(ctx: AdapterContext, key: string): string {
 	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
+}
+
+/** Resolve a chrome label and interpolate `{param}` placeholders. */
+function formatSysLabel(ctx: AdapterContext, key: string, params?: Record<string, string>): string {
+	const template = sysLabel(ctx, key);
+	if (!params) return template;
+	let out = template;
+	for (const [name, value] of Object.entries(params)) {
+		out = out.replaceAll(`{${name}}`, value);
+	}
+	return out;
 }
 
 /** Stable compact labels carried to the renderer for fixed-height live repainting. */
@@ -2271,6 +2480,13 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// An outline session's long turn that left a task in progress it never touched (plan PR 4).
+	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
+	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
+	turn_nudge: "sidecarSourceTurnNudge",
+	broken_call: "sidecarSourceBrokenCall",
+	continue_prompt: "sidecarSourceContinuePrompt",
+	workspace_changed: "sidecarSourceWorkspaceChanged",
 	// The interactive tutorial's lesson boundary. Named because a reused tutorial
 	// narrator shows one of these per lesson, and the generic "System" heading would
 	// make the row that separates lessons the least legible thing in the transcript.
@@ -2363,15 +2579,15 @@ function adaptReviewCard(
 	block: AdapterContentBlock,
 	idBase: string,
 	blockIndex: number,
+	msg: AdapterMessage,
 	ctx: AdapterContext,
 ): ElementSpec {
 	const verdict = reviewVerdict(block);
-	const applied = block.applied === true;
 	return {
 		kind: "review-card",
 		// `-b{blockIndex}` ties the row to its content block, so the selection system can
 		// address it for the context menu (delete / rollback / fork).
-		key: `${idBase}-b${blockIndex}-review`,
+		key: `${elementKey(idBase, msg, blockIndex)}-review`,
 		data: {
 			text: composeReviewFeedbackText(block, ctx),
 			verdictLabel: sysLabel(ctx, `reviewVerdict_${verdict}`),
@@ -2379,10 +2595,6 @@ function adaptReviewCard(
 			...(block.revised === true
 				? { revisedLabel: sysLabel(ctx, "reviewFeedbackRevisedBadge") }
 				: {}),
-			// Always present, so the reserved action row is never empty; `applied` only
-			// changes the wording and disables it.
-			actionLabel: sysLabel(ctx, applied ? "reviewFeedbackApplied" : "reviewFeedbackApply"),
-			applied,
 		},
 	};
 }
@@ -2558,7 +2770,7 @@ function adaptFramedSystemCard(
 			kind: "injection-bubble",
 			// `-b{blockIndex}` ties the row to its single content block, so the selection
 			// system can address it for the context menu (delete / rollback / fork).
-			key: `${idBase}-b${blockIndex}-f-${kind}`,
+			key: `${elementKey(idBase, msg, blockIndex)}-f-${kind}`,
 			data: {
 				payload: {
 					kind: "spec-task",
@@ -2582,41 +2794,18 @@ function adaptFramedSystemCard(
 	const inner = adaptSystemBlock(kind, block, idBase, msg, ctx, blockIndex);
 	return {
 		kind: "injection-bubble",
-		key: `${idBase}-b${blockIndex}-f-${kind}`,
+		key: `${elementKey(idBase, msg, blockIndex)}-f-${kind}`,
 		data: {
 			payload: { kind: innerPayloadKind(inner), data: inner.data },
 			source: kind,
-			// A merge is authored by whoever pressed the button, and `creator` is already
-			// loaded for system rows — so the header can name a real person with a real
-			// avatar instead of a placeholder.
+			// `creator` is already loaded for system rows — so the header can name a real
+			// person with a real avatar instead of a placeholder.
 			creator: msg.creator ?? null,
 			hasHeader: true,
 			// The verbatim model-facing copy for the context-menu inspector.
 			modelFacing: modelFacingText,
-			// Both of these rows are ABOUT another chapter, and each already carries its
-			// id: a review's feedback names the review chapter it came from, a merge
-			// summary names the source chapter that was merged in. Read off the raw block
-			// rather than the projected card data, because the projection keeps only what
-			// the card paints.
-			target: framedCardTarget(kind, block),
 		},
 	};
-}
-
-/**
- * The chapter a framed system card refers to, when it names one.
- *
- * `merge_summary` carries `sourceChapterId` (the chapter that was merged in), written by
- * its producer today, so it needs no new field.
- *
- * Returns null when the id is absent, which is the shape of rows written before that
- * producer recorded it. An inert header is the correct outcome there; a link built on a
- * missing id would 404.
- */
-function framedCardTarget(kind: string, block: AdapterContentBlock): InjectionTarget | null {
-	const raw = block as unknown as Record<string, unknown>;
-	const id = kind === "merge_summary" ? raw.sourceChapterId : undefined;
-	return typeof id === "string" && id.trim().length > 0 ? { kind: "chapter", chapterId: id } : null;
 }
 
 /**
@@ -2742,7 +2931,7 @@ function adaptSpokenInjection(
 				// Keyed by block index + SENDER: the block index ties the row to its single
 				// content block so the selection system can address it; the sender keeps the
 				// key stable across a same-block re-projection.
-				key: `${idBase}-b${blockIndex}-m-${message.fromId ?? "anon"}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-m-${message.fromId ?? "anon"}`,
 				data: {
 					...deliveryProjection(msg),
 					markdown: rawSideCarToMarkdown(text),
@@ -2813,7 +3002,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-t-${task.id}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-t-${task.id}`,
 				data: {
 					...deliveryProjection(msg),
 					markdown,
@@ -2888,7 +3077,7 @@ function adaptSpokenInjection(
 		// and key correctness, and relaxing the policy later would silently break it.
 		return substantive.map(({ hit, excerpt }) => ({
 			kind: "injection-bubble" as const,
-			key: `${idBase}-b${blockIndex}-k-${hit.entryId}`,
+			key: `${elementKey(idBase, msg, blockIndex)}-k-${hit.scope === "personal" ? "personal-" : ""}${hit.entryId}`,
 			data: {
 				...deliveryProjection(msg),
 				// PLAIN text, escaped rather than parsed: the excerpt is prose by
@@ -2902,11 +3091,14 @@ function adaptSpokenInjection(
 				speakerKind: null,
 				// The excerpt is a FLATTENED slice of the entry, so "read the rest" is the
 				// natural next action — this is the one bubble kind whose body is knowingly
-				// incomplete. Injected hits come from the global collections (see
-				// `knowledge-injection.ts`, which ACL-filters `knowledgeService` entries), so
-				// the scope is global rather than a guess.
+				// incomplete. Preserve personal identity; legacy rows without a scope
+				// came from global collections.
 				target: hit.entryId
-					? ({ kind: "knowledge", entryId: hit.entryId, scope: "global" } satisfies InjectionTarget)
+					? ({
+							kind: "knowledge",
+							entryId: hit.entryId,
+							scope: hit.scope ?? "global",
+						} satisfies InjectionTarget)
 					: null,
 				// Without this the row had no context-menu inspector at all.
 				modelFacing: modelFacingText,
@@ -2938,13 +3130,14 @@ function adaptSpokenInjection(
 		const tasks = Array.isArray(body.tasks) ? body.tasks : [];
 		// Empty / over-threshold digests have no rows to draw; they carry the same
 		// localized sentence the markdown projection used as its headline.
+		const outline = body.taskBackend === "outline";
 		const emptyLabel =
 			variant === "current" && tasks.length > 0
 				? null
 				: variant === "emptyNever"
-					? sysLabel(ctx, "tasksEmptyNever")
+					? sysLabel(ctx, outline ? "outlineTasksEmptyNever" : "tasksEmptyNever")
 					: variant === "emptyDone"
-						? sysLabel(ctx, "tasksEmptyDone")
+						? sysLabel(ctx, outline ? "outlineTasksEmptyDone" : "tasksEmptyDone")
 						: variant === "tooMany"
 							? // `tasksTooMany` carries an `{n}` placeholder; sysLabel has no
 								// interpolation, so substitute here (same as the markdown path).
@@ -2964,7 +3157,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-p-${source}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-p-${source}`,
 				data: {
 					...deliveryProjection(msg),
 					payload: {
@@ -2997,7 +3190,7 @@ function adaptSpokenInjection(
 		return [
 			{
 				kind: "injection-bubble",
-				key: `${idBase}-b${blockIndex}-p-${source}`,
+				key: `${elementKey(idBase, msg, blockIndex)}-p-${source}`,
 				data: {
 					markdown,
 					// No speaker name: the integration layer resolves the shared platform
@@ -3038,6 +3231,10 @@ export const PLATFORM_INJECTION_SOURCES = new Set([
 	"silent_progress",
 	"pipeline_exit_confirmation",
 	"spec_update",
+	"turn_nudge",
+	"broken_call",
+	"continue_prompt",
+	"workspace_changed",
 ]);
 
 /**
@@ -3123,17 +3320,24 @@ function adaptSystemBlock(
 	ctx: AdapterContext,
 	blockIndex = 0,
 ): ElementSpec {
-	const keyBase = `${idBase}-b${blockIndex}`;
+	const keyBase = `${elementKey(idBase, msg, blockIndex)}`;
 	// The message's leading text block is the chunk renderer's `contentText`
 	// fallback (goalBlock.task ?? message.contentText, etc.).
 	const contentText =
-		msg.contentJson.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
+		messageBody(msg).find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
 
 	if (blockType === "compact" && block.subtype === "plan") {
 		return {
 			kind: "plan-card",
 			key: `${idBase}-plan`,
 			data: { summary: block.summary ?? block.text ?? "" },
+		};
+	}
+	if (blockType === "modeltrace_result") {
+		return {
+			kind: "modeltrace-result",
+			key: `${keyBase}-modeltrace`,
+			data: block,
 		};
 	}
 	if (blockType === "knowledge_hint") {
@@ -3154,10 +3358,20 @@ function adaptSystemBlock(
 			typeof block.question === "string" && block.question.length > 0
 				? block.question
 				: (block.text ?? "");
+		// A selection-started question records its excerpt; the card shows it on one line.
+		const quote = block.quote as { text?: unknown } | undefined;
+		const quoteText =
+			!pending && typeof quote?.text === "string"
+				? quote.text.replace(/\s+/gu, " ").trim().slice(0, ASK_IN_PASSING_QUOTE_CHARS)
+				: "";
 		return {
 			kind: "ask-in-passing",
 			key: `${idBase}-aip`,
-			data: { kind: pending ? "pending" : "resolved", question },
+			data: {
+				kind: pending ? "pending" : "resolved",
+				question,
+				...(quoteText ? { quoteText } : {}),
+			},
 		};
 	}
 	if (blockType === "subagent_recovery") {
@@ -3189,6 +3403,9 @@ function adaptSystemBlock(
 				notifyLabel: sysLabel(ctx, "subagentRecoveryResumeAndNotify"),
 				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWait"),
 				backgroundBadge: sysLabel(ctx, "subagentRecoveryToBackground"),
+				// Close button (aria-label + tooltip). Height-neutral: it sits inside
+				// the header lane the measure layer already reserves.
+				dismissLabel: sysLabel(ctx, "subagentRecoveryDismiss"),
 			},
 		};
 	}
@@ -3331,6 +3548,13 @@ function adaptSystemTextData(
 			const offerModelTest = ctx.canOfferModelTest?.(errorText) === true;
 			const buttons: string[] = [];
 			const buttonIds: string[] = [];
+			const diagnostics = asObject(block.diagnostics);
+			const requestId = readNonEmptyString(diagnostics, "recordingRequestId");
+			const hasRequest = requestId != null && /^req_[A-Za-z0-9_-]{1,160}$/.test(requestId);
+			if (hasRequest) {
+				buttons.push(sysLabel(ctx, "viewErrorRequest"), sysLabel(ctx, "downloadErrorDump"));
+				buttonIds.push("viewErrorRequest", "downloadErrorDump");
+			}
 			if (offerFix) {
 				buttons.push(sysLabel(ctx, "disableImageGen"));
 				buttonIds.push("disableImageGen");
@@ -3344,6 +3568,7 @@ function adaptSystemTextData(
 				text: errorText,
 				color: "red",
 				actions: true,
+				...(hasRequest ? { diagnostics } : {}),
 				...(buttons.length > 0 ? { buttons, buttonIds } : {}),
 			};
 		}
@@ -3538,7 +3763,7 @@ export interface CommunicationBubbleData {
 	status: string;
 	error?: string;
 	warning?: string;
-	timing?: Record<string, number>;
+	timing?: ToolTimingRecord;
 	toolDetailRef?: AdapterToolDetailRef;
 }
 
@@ -3571,6 +3796,38 @@ function communicationRecipients(
 		return [{ label: selectors[0] ?? resolved, id: resolved }];
 	}
 	return selectors.map((label) => ({ label }));
+}
+
+/**
+ * The footer warning under a communication bubble. `metadata.warningCodes` are the
+ * tool's fixed sentences — localized here, because the server cannot know the reader's
+ * language — and `metadata.warningDetails` are per-target failure lines that have no
+ * translation at all. `interrupted` keeps the interruption fallback the bubble already
+ * derived, and results persisted before the code channel carry the whole text in
+ * `metadata.warning`, which is still read when no code arrives.
+ */
+function communicationWarning(
+	ctx: AdapterContext,
+	metadata: Record<string, unknown>,
+	interrupted: string | undefined,
+): string | undefined {
+	const codes = readStringArray(metadata, "warningCodes");
+	const details = readStringArray(metadata, "warningDetails");
+	if (codes.length === 0 && details.length === 0) {
+		return readNonEmptyString(metadata, "warning") ?? interrupted;
+	}
+	// Only the send warning names a status, and it always arrives with one; a template
+	// without the placeholder ignores the params anyway.
+	const status = readNonEmptyString(metadata, "warningStatus");
+	const params = status ? { status: sysLabel(ctx, `status_${status}`) } : undefined;
+	const sentences = codes.flatMap((code) => {
+		const key = `communicationWarning_${code}`;
+		// A code this build does not know (a stale frontend bundle reading a newer tool
+		// result) has no sentence: skip it rather than paint its key at the reader.
+		if (!ctx.labels?.[key] && !SYSTEM_LABEL_FALLBACKS[key]) return [];
+		return [formatSysLabel(ctx, key, params)];
+	});
+	return [...sentences, ...details].join("\n");
 }
 
 function buildCommunicationBubbleData(
@@ -3614,11 +3871,13 @@ function buildCommunicationBubbleData(
 		(status === "fail" || status === "error" || status === "failed"
 			? (readLeafText(item.tc.outputJson) ?? readLeafText(asObject(item.tc.outputJson)._text))
 			: undefined);
-	const warning =
-		readNonEmptyString(metadata, "warning") ??
-		(interruptedTarget
+	const warning = communicationWarning(
+		ctx,
+		metadata,
+		interruptedTarget
 			? interruptedTarget.error?.trim() || String(interruptedTarget.status)
-			: undefined);
+			: undefined,
+	);
 	return {
 		toolUseId: item.tc.toolUseId,
 		toolName: item.tc.toolName,
@@ -3816,9 +4075,25 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	const metadata = resolveToolMetadata(item.tc);
 	const outputJson = toolOutputValue(withFullOutput(item, ctx), metadata);
 	const resultValue = readLeafText(outputJson) ?? readLeafText(asObject(outputJson)._text);
-	const resultContent = resultValue === undefined ? undefined : subagentResultText(outputJson);
-	const resultText = resultContent || undefined;
 	const isActive = !isTerminalStatus(item.tc.status);
+	// The subagent's live reply length, streamed by the server as a bare numeric
+	// `tool_output` payload (the ContextAsk convention) and bridged onto the
+	// metadata by resolveToolMetadata. Height-neutral: painted as a badge on the
+	// fixed header row, so it is keyed in `subagentRevision` instead of measured.
+	const liveOutputChars = isActive
+		? parseLiveOutputChars(asObject(metadata)?._streamingOutput)
+		: null;
+	// A running card's "output" can BE that bare counter — `toolOutputValue` folds
+	// `_streamingOutput` in when no real output exists. The count rides the header
+	// badge, so it must never become the conclusion body (a lone number reading
+	// as the child's result).
+	const resultIsLiveCount =
+		liveOutputChars != null &&
+		resultValue !== undefined &&
+		resultValue.trim() === readLeafText(asObject(metadata)?._streamingOutput)?.trim();
+	const resultContent =
+		resultValue === undefined || resultIsLiveCount ? undefined : subagentResultText(outputJson);
+	const resultText = resultContent || undefined;
 	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 	// derivations). prompt/isBackground/agentType live on inputJson.
 	// Send is conversation content and never reaches this subagent constructor.
@@ -3897,6 +4172,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? { modelInheritance: activity.modelInheritance }
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+		...(liveOutputChars != null ? { liveOutputChars } : {}),
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is
@@ -4081,6 +4357,7 @@ function buildToolCardData(
 		// Expanded detail region height model (line counts / body lines / px).
 		// null when the tool call has no meaningful detail body.
 		detail: classifyToolDetail({
+			toolCallId: resolveToolDetailRef(item).toolCallId,
 			...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
 			...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : { previewId: toolItemKey(item) }),
 			toolName: item.tc.toolName,
@@ -4232,10 +4509,36 @@ function toolTimingStamps(source: Record<string, unknown>): Record<string, numbe
  * duration (explicit, else derived from the start/complete pair — same fallback
  * the tool header uses).
  */
-function cardTiming(tc: AdapterToolItem["tc"]): Record<string, number> {
+function toolTimingMetadata(
+	metadata: unknown,
+): Pick<ToolTimingRecord, "execDurationMs" | "fileChangeTiming"> {
+	const meta = asObject(metadata);
+	const execDurationMs = readFiniteNumber(meta.execDurationMs);
+	const file = asObject(meta.fileChangeTiming);
+	const waitMs = readFiniteNumber(file.waitMs);
+	const executionMs = readFiniteNumber(file.executionMs);
+	const totalMs = readFiniteNumber(file.totalMs);
+	return {
+		...(execDurationMs != null && execDurationMs >= 0 ? { execDurationMs } : {}),
+		...(waitMs != null &&
+		waitMs >= 0 &&
+		executionMs != null &&
+		executionMs >= 0 &&
+		totalMs != null &&
+		totalMs >= 0
+			? { fileChangeTiming: { waitMs, executionMs, totalMs } }
+			: {}),
+	};
+}
+
+function cardTiming(tc: AdapterToolItem["tc"]): ToolTimingRecord {
 	const stamps = toolTimingStamps(tc);
 	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
-	return durationMs != null ? { ...stamps, durationMs } : stamps;
+	return {
+		...stamps,
+		...(durationMs != null ? { durationMs } : {}),
+		...toolTimingMetadata(resolveToolMetadata(tc)),
+	};
 }
 
 /**
@@ -4264,18 +4567,18 @@ function toolTimingFields(
 	tc: AdapterToolItem["tc"],
 	category: string,
 	metadata: unknown,
-): Record<string, number | undefined> {
-	const meta = asObject(metadata);
+): ToolTimingRecord & { timeoutMs?: number } {
 	const durationMs = readFiniteNumber(tc.durationMs) ?? deriveDuration(tc);
-	const execDurationMs = readFiniteNumber(meta.execDurationMs);
 	const stamps = toolTimingStamps(tc);
 	// `startedAt` keeps its historical precedence (explicit → execution → created)
 	// so the live elapsed counter is unaffected by the new stamp passthrough.
 	const startedAt = stamps.startedAt ?? stamps.executionStartedAt ?? stamps.createdAt;
 	const timeoutMs = effectiveTimeoutMs(tc, category);
-	const out: Record<string, number | undefined> = { ...stamps };
+	const out: ToolTimingRecord & { timeoutMs?: number } = {
+		...stamps,
+		...toolTimingMetadata(metadata),
+	};
 	if (durationMs != null) out.durationMs = durationMs;
-	if (execDurationMs != null) out.execDurationMs = execDurationMs;
 	if (startedAt != null) out.startedAt = startedAt;
 	if (timeoutMs != null) out.timeoutMs = timeoutMs;
 	return out;
@@ -4379,15 +4682,13 @@ function collectUpstreamPeers(
 	ctx: AdapterContext,
 ): ToolUpstreamPeer[] {
 	const peers: ToolUpstreamPeer[] = [];
-	const blocks = item.msg?.contentJson;
+	const blocks = messageBody(item.msg);
 	const covered = new Set<string>();
-	if (Array.isArray(blocks)) {
-		for (let i = 0; i < item.blockIndex; i++) {
-			const block = blocks[i];
-			if (!block || block.type !== "tool_use") continue;
-			if (typeof block.id === "string" && block.id) covered.add(block.id);
-			peers.push(blockAsToolUpstreamPeer(block, ctx));
-		}
+	for (let i = 0; i < item.blockIndex; i++) {
+		const block = blocks[i];
+		if (!block || block.type !== "tool_use") continue;
+		if (typeof block.id === "string" && block.id) covered.add(block.id);
+		peers.push(blockAsToolUpstreamPeer(block, ctx));
 	}
 	for (const peer of earlier) {
 		// Same-message peers are already in `peers` via blockIndex order.
@@ -4484,6 +4785,26 @@ function resolveToolReflection(
 		// id, exactly like the chunked notice's fallback chain.
 		readNonEmptyString(item.tc, "tcId") ?? readNonEmptyString(item.tc, "id"),
 	);
+	// System defaults written by the gate are English chrome that would otherwise
+	// sit under the localized title. Classify them: omit status restatements,
+	// re-label distinct system facts, pass custom content through.
+	if (data.summary) {
+		const classified = classifyReflectionReasonSummary(data.summary);
+		if (classified?.kind === "omit") {
+			delete data.summary;
+		} else if (classified?.kind === "label") {
+			data.summary = formatSysLabel(ctx, classified.key, classified.params);
+			if (classified.nextSteps && !data.nextSteps) {
+				data.nextSteps = classified.nextSteps;
+			}
+		} else if (classified?.kind === "content") {
+			if (classified.text) data.summary = classified.text;
+			else delete data.summary;
+			if (classified.nextSteps && !data.nextSteps) {
+				data.nextSteps = classified.nextSteps;
+			}
+		}
+	}
 	// The advisory line is a template with a {nextSteps} placeholder.
 	if (data.nextSteps) {
 		data.nextSteps = sysLabel(ctx, "reflectionNextSteps").replace("{nextSteps}", data.nextSteps);
@@ -4682,11 +5003,8 @@ function toolTraceItem(
 	// that field absorbs permission / reflection / queue waiting, and a 1.2s command
 	// that waited 19s on a gate read as a 20s command. Same shared rule the card
 	// header uses — the two must not disagree about one call. Height-neutral.
-	const displayDurationMs = resolveToolDisplayDurationMs({
-		category,
-		execDurationMs: readFiniteNumber(asObject(resolveToolMetadata(item.tc)).execDurationMs),
-		durationMs: readFiniteNumber(item.tc.durationMs) ?? deriveDuration(item.tc),
-	});
+	const timing = cardTiming(item.tc);
+	const displayDurationMs = resolveToolDisplayDurationMs({ category, ...timing });
 	return {
 		title: truncateTitle(rawTitle),
 		hasIcon: true,
@@ -4711,7 +5029,7 @@ function toolTraceItem(
 		...(reflectionStatus ? { reflectionStatus } : {}),
 		// Same stamp record a subagent card's header uses, so the row's timing popover
 		// reports the same phase breakdown the full card would. Height-neutral.
-		timing: cardTiming(item.tc),
+		timing,
 		...(displayDurationMs != null ? { displayDurationMs } : {}),
 		identity: toolRowIdentity(item),
 		// Same value the standalone card carries, so the two renderings of this tool
@@ -4838,11 +5156,11 @@ function reasoningRowIdentity(
 	const messageId = item.msg?.id;
 	if (!messageId || messageId === "__streaming__") return undefined;
 	const blockIndex = item.blockIndex ?? 0;
-	const blocks = item.msg?.contentJson;
-	if (Array.isArray(blocks) && blocks.length > 0) {
+	const blocks = messageBody(item.msg);
+	if (blocks.length > 0) {
 		// AdapterContentBlock allows null on text/thinking, so it is not structurally
 		// assignable to ContentBlockLike; grouping only reads `type`, which matches.
-		const { runs } = groupReasoningRuns(blocks as unknown as ContentBlockLike[]);
+		const { runs } = groupReasoningRuns(blocks as unknown as readonly ContentBlockLike[]);
 		for (const run of runs) {
 			if (run.indices.includes(blockIndex)) {
 				return {

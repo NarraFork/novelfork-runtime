@@ -34,6 +34,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import {
 	ActionIcon,
 	Badge,
@@ -51,6 +52,7 @@ import {
 	IconChevronDown,
 	IconDotsVertical,
 	IconGripVertical,
+	IconListTree,
 } from "@tabler/icons-react";
 import { Fragment, type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -283,7 +285,15 @@ export interface NarratorToolbarOverflowMenuProps {
 	/** Archive action, pinned below the sortable list. Omit to hide it. */
 	onArchive?: () => void;
 	archiveLoading?: boolean;
-	compatibilityEntry?: ReactNode;
+	/**
+	 * Opens the compatibility modal. The modal itself lives outside this dropdown
+	 * (rendered by the caller): nested in here it would unmount with the menu and
+	 * sit under the open dropdown on a phone.
+	 */
+	onOpenCompatibility?: () => void;
+	onOpenSavedRecordings?: () => void;
+	/** Opens the session's outline space; absent while the outline is switched off. */
+	onOpenOutline?: () => void;
 }
 
 export function NarratorToolbarOverflowMenu({
@@ -297,9 +307,12 @@ export function NarratorToolbarOverflowMenu({
 	renderInlineOptions,
 	onArchive,
 	archiveLoading,
-	compatibilityEntry,
+	onOpenCompatibility,
+	onOpenSavedRecordings,
+	onOpenOutline,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
+	const { t: tp } = useTranslation("projects");
 	const [menuOpen, setMenuOpen] = useState(false);
 	/**
 	 * At most one expansion at a time, and never across an open/close cycle: a
@@ -430,6 +443,7 @@ export function NarratorToolbarOverflowMenu({
 				<DndContext
 					sensors={sensors}
 					collisionDetection={closestCenter}
+					modifiers={[restrictToVerticalAxis]}
 					onDragStart={handleDragStart}
 					onDragEnd={handleDragEnd}
 				>
@@ -496,11 +510,39 @@ export function NarratorToolbarOverflowMenu({
 						})}
 					</SortableContext>
 				</DndContext>
-				{compatibilityEntry && (
+				{onOpenCompatibility && (
 					<>
 						<Menu.Divider />
-						{compatibilityEntry}
+						<Menu.Item
+							onClick={() => {
+								closeMenu();
+								onOpenCompatibility();
+							}}
+						>
+							{tp("compatibility.title")}
+						</Menu.Item>
 					</>
+				)}
+				{onOpenOutline && (
+					<Menu.Item
+						leftSection={<IconListTree size={14} />}
+						onClick={() => {
+							closeMenu();
+							onOpenOutline();
+						}}
+					>
+						{t("openOutline")}
+					</Menu.Item>
+				)}
+				{onOpenSavedRecordings && (
+					<Menu.Item
+						onClick={() => {
+							closeMenu();
+							onOpenSavedRecordings();
+						}}
+					>
+						{t("saveDump.history")}
+					</Menu.Item>
 				)}
 				{onArchive ? (
 					<>

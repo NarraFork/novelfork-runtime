@@ -56,6 +56,7 @@ process.env.NARRAFORK_HOME = HOME;
 const {
 	cleanupBufferedTextFiles,
 	cleanupBufferedTextFilesAsync,
+	clearBufferedMessages,
 	enqueueBufferedMessage,
 	projectMailboxUserMessage,
 	releaseBufferedMessage,
@@ -75,12 +76,121 @@ const { activeNarrators } = await import("../narrator-session-state");
 const { getImagePath, saveUploadedImage, setUploadsDirForTests } = await import(
 	"../../lib/uploads"
 );
-const {
-	clearSubagentBufferedMessages,
-	getSubagentBufferedMessages,
-	pushSubagentBufferedMessage,
-	updateSubagentBufferedMessage,
-} = await import("../subagent-executor");
+
+test("composer layout survives cold durable queue projection, summary stays small, and legacy edits clear it", async () => {
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "text" as const, text: "rich" }] }],
+		assets: [],
+	};
+	const result = await enqueueBufferedMessage(
+		NARRATOR_ID,
+		"rich",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		"back",
+		undefined,
+		undefined,
+		"fifo",
+		undefined,
+		undefined,
+		document,
+	);
+	const row = db
+		.select()
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.id, result.id))
+		.get();
+	if (!row) throw new Error("Missing buffered row");
+	const projected = projectMailboxUserMessage(row);
+	expect(projected.composerDocument).toEqual(document);
+	const descriptors = Object.getOwnPropertyDescriptors(projected);
+	Object.defineProperty(projected, "composerDocument", {
+		get() {
+			throw new Error("summary read full document");
+		},
+		configurable: true,
+	});
+	expect(JSON.stringify(toBufferSummary([projected]))).not.toContain("paragraphs");
+	Object.defineProperties(projected, descriptors);
+	expect(await updateBufferedMessage(NARRATOR_ID, result.id, "legacy")).toBe(true);
+	const changed = db
+		.select()
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.id, result.id))
+		.get();
+	if (!changed) throw new Error("Missing edited row");
+	expect(projectMailboxUserMessage(changed).composerDocument).toBeUndefined();
+	await expect(
+		enqueueBufferedMessage(
+			NARRATOR_ID,
+			"mismatch",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"back",
+			undefined,
+			undefined,
+			"fifo",
+			undefined,
+			undefined,
+			document,
+		),
+	).rejects.toThrow("does not match");
+	await removeBufferedMessage(NARRATOR_ID, result.id);
+});
+
+test("ZIP MIME alias survives durable queue reload and editing a kept attachment", async () => {
+	const zip = new File(["PK archive bytes"], "archive.zip", {
+		type: "application/x-zip-compressed",
+	});
+	const body = new FormData();
+	body.append("textFiles", zip);
+	const parsed = await new Request("http://localhost", { method: "POST", body }).formData();
+	const files = parsed.getAll("textFiles") as File[];
+	const document = {
+		version: 1 as const,
+		paragraphs: [{ children: [{ type: "attachment" as const, id: "node", assetId: "asset" }] }],
+		assets: [
+			{
+				id: "asset",
+				kind: "textFile" as const,
+				name: zip.name,
+				size: zip.size,
+				mimeType: zip.type,
+			},
+		],
+	};
+	const result = await enqueueBufferedMessage(
+		NARRATOR_ID,
+		"",
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		files,
+		"back",
+		undefined,
+		undefined,
+		"fifo",
+		undefined,
+		undefined,
+		document,
+	);
+	const [reloaded] = getBufferedMessages(NARRATOR_ID);
+	expect(reloaded.composerDocument).toEqual(document);
+	expect(reloaded.textFiles?.[0].type).toBe("application/zip");
+	expect(
+		await updateBufferedMessage(NARRATOR_ID, result.id, "", { composerDocument: document }),
+	).toBe(true);
+	expect(getBufferedMessages(NARRATOR_ID)[0].composerDocument).toEqual(document);
+	await removeBufferedMessage(NARRATOR_ID, result.id);
+});
 
 const NARRATOR_ID = "buffer-attach-narrator";
 const SUBAGENT_ID = "buffer-attach-subagent";
@@ -145,7 +255,7 @@ async function readTextFilePathsJson(
 afterEach(() => {
 	bindRuntimeQueue(undefined);
 	activeNarrators.clear();
-	clearSubagentBufferedMessages(SUBAGENT_ID);
+	clearBufferedMessages(SUBAGENT_ID);
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
 
@@ -190,12 +300,13 @@ describe("toBufferSummary — attachments are visible to clients", () => {
 		expect(summary.textFiles).toEqual([{ index: 0, filename: "notes.md", size: 10 }]);
 	});
 
-	test("a subagent queue durably preserves same-named attachment contents", async () => {
-		await pushSubagentBufferedMessage(SUBAGENT_ID, "queued", {
-			textFiles: [textFile("dup.md", "aa"), textFile("dup.md", "bbbb")],
-		});
+	test("a queue durably preserves same-named attachment contents", async () => {
+		await enqueueBufferedMessage(SUBAGENT_ID, "queued", undefined, null, null, null, [
+			textFile("dup.md", "aa"),
+			textFile("dup.md", "bbbb"),
+		]);
 
-		const [summary] = toBufferSummary(getSubagentBufferedMessages(SUBAGENT_ID));
+		const [summary] = toBufferSummary(getBufferedMessages(SUBAGENT_ID));
 
 		// Same filename twice: only the index tells them apart, which is why the
 		// keep key is positional rather than name-based.
@@ -324,35 +435,43 @@ describe("updateBufferedMessage — editing attachments", () => {
 	});
 });
 
-describe("updateSubagentBufferedMessage — in-memory attachment overwrite", () => {
+describe("updateBufferedMessage — attachment overwrite", () => {
 	test("replaces images and text files", async () => {
-		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
-			images: [{ imageId: "old", filename: "old.png", mediaType: "image/png" }],
-			textFiles: [textFile("old.md")],
-		});
+		const queued = await enqueueBufferedMessage(
+			SUBAGENT_ID,
+			"before",
+			[{ imageId: "old", filename: "old.png", mediaType: "image/png" }],
+			null,
+			null,
+			null,
+			[textFile("old.md")],
+		);
 
-		const ok = await updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after", {
+		const savedFiles = await persistAdditionalBufferedTextFiles(
+			queued.id,
+			[textFile("new.md")],
+			[],
+		);
+		const ok = await updateBufferedMessage(SUBAGENT_ID, queued.id, "after", {
 			images: [{ imageId: "new", filename: "new.png", mediaType: "image/png" }],
-			textFiles: [textFile("new.md")],
+			savedFiles,
 		});
 
 		expect(ok).toBe(true);
-		const [message] = getSubagentBufferedMessages(SUBAGENT_ID);
+		const [message] = getBufferedMessages(SUBAGENT_ID);
 		expect(message.text).toBe("after");
 		expect(message.images?.map((i) => i.imageId)).toEqual(["new"]);
-		expect(message.textFiles?.map((f) => f.name)).toEqual(["new.md"]);
+		expect(message._savedFiles?.map((f) => f.filename)).toEqual(["new.md"]);
 	});
 
 	test("a text-only edit leaves attachments in place", async () => {
-		const queued = await pushSubagentBufferedMessage(SUBAGENT_ID, "before", {
-			images: [{ imageId: "keep", filename: "keep.png", mediaType: "image/png" }],
-		});
-
-		await updateSubagentBufferedMessage(SUBAGENT_ID, queued.id, "after");
-
-		expect(getSubagentBufferedMessages(SUBAGENT_ID)[0].images?.map((i) => i.imageId)).toEqual([
-			"keep",
+		const queued = await enqueueBufferedMessage(SUBAGENT_ID, "before", [
+			{ imageId: "keep", filename: "keep.png", mediaType: "image/png" },
 		]);
+
+		await updateBufferedMessage(SUBAGENT_ID, queued.id, "after");
+
+		expect(getBufferedMessages(SUBAGENT_ID)[0].images?.map((i) => i.imageId)).toEqual(["keep"]);
 	});
 });
 
@@ -973,6 +1092,167 @@ describe("persistent staging ownership", () => {
 		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([a.id, b.id]);
 		expect(await reorderBufferedMessages(NARRATOR_ID, [b.id, a.id])).toBe(true);
 		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.id)).toEqual([b.id, a.id]);
+	});
+});
+
+describe("native media mailbox durability", () => {
+	const media = {
+		mediaId: "audio-id",
+		filename: "voice.wav",
+		mediaType: "audio/wav",
+		size: 60,
+		uploadNarratorId: NARRATOR_ID,
+	};
+	async function enqueue(text = "") {
+		return enqueueBufferedMessage(
+			NARRATOR_ID,
+			text,
+			undefined,
+			null,
+			null,
+			null,
+			undefined,
+			"back",
+			undefined,
+			undefined,
+			"fifo",
+			undefined,
+			undefined,
+			undefined,
+			[media],
+		);
+	}
+	async function row(id: string) {
+		const stored = await db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, id))
+			.get();
+		if (!stored) throw new Error(`Missing buffered media row: ${id}`);
+		return stored;
+	}
+	test("media-only admission stores metadata, projects summaries and survives cold restore", async () => {
+		const accepted = await enqueue();
+		expect(accepted.ok).toBe(true);
+		const stored = await row(accepted.id);
+		expect(JSON.parse(stored.mediaJson ?? "null")).toEqual([media]);
+		activeNarrators.clear();
+		const projected = projectMailboxUserMessage(stored);
+		expect(projected.text).toBe("");
+		expect(projected.media).toEqual([media]);
+		expect(toBufferSummary([projected])[0].media).toEqual([media]);
+	});
+	test("text-only update preserves media; explicit empty list nulls durable column", async () => {
+		const accepted = await enqueue("before");
+		expect(await updateBufferedMessage(NARRATOR_ID, accepted.id, "after")).toBe(true);
+		expect(JSON.parse((await row(accepted.id)).mediaJson ?? "null")).toEqual([media]);
+		expect(await updateBufferedMessage(NARRATOR_ID, accepted.id, "without", { media: [] })).toBe(
+			true,
+		);
+		expect((await row(accepted.id)).mediaJson).toBeNull();
+		expect(getBufferedMessages(NARRATOR_ID)[0].media).toBeUndefined();
+	});
+	test("appended refs survive reload and caller mutation cannot rewrite the admitted metadata", async () => {
+		const accepted = await enqueue("before");
+		const added = { ...media, mediaId: "added" };
+		await updateBufferedMessage(NARRATOR_ID, accepted.id, "after", { media: [media, added] });
+		added.filename = "mutated";
+		expect(
+			projectMailboxUserMessage(await row(accepted.id)).media?.map((ref) => ref.filename),
+		).toEqual(["voice.wav", "voice.wav"]);
+	});
+	test("subagent uses the unified durable mailbox and preserves the original upload owner", async () => {
+		const accepted = await enqueueBufferedMessage(
+			SUBAGENT_ID,
+			"",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"tool",
+			undefined,
+			[media],
+		);
+		expect(accepted.ok).toBe(true);
+		const [queued] = getBufferedMessages(SUBAGENT_ID);
+		expect(queued.media).toEqual([media]);
+		expect(queued.queueMode).toBe("tool");
+		const { createMailboxStore } = await import("../agent-runtime/mailbox");
+		const [claimed] = createMailboxStore(db).claimBatch(
+			SUBAGENT_ID,
+			{ token: "media-owner", epoch: "media-epoch" },
+			{ count: 1 },
+		);
+		expect(claimed.id).toBe(accepted.id);
+		expect(projectMailboxUserMessage(claimed).media).toEqual([media]);
+	});
+	test("runtime extras never enter durable queue refs or client summaries", async () => {
+		const dirty = { ...media, base64: "secret-bytes", source: { data: "embedded" } };
+		const accepted = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"before",
+			undefined,
+			null,
+			null,
+			null,
+			undefined,
+			"back",
+			undefined,
+			undefined,
+			"fifo",
+			undefined,
+			undefined,
+			undefined,
+			[dirty],
+		);
+		expect((await row(accepted.id))?.mediaJson).toBe(JSON.stringify([media]));
+		await updateBufferedMessage(NARRATOR_ID, accepted.id, "after", { media: [dirty] });
+		expect((await row(accepted.id))?.mediaJson).toBe(JSON.stringify([media]));
+		expect(toBufferSummary(getBufferedMessages(NARRATOR_ID))[0].media).toEqual([media]);
+	});
+	test("tracked schema upgrades an existing SQLite queue without ignored migration assets", async () => {
+		const { sqlite: upgrade } = getTestDb();
+		try {
+			upgrade.run("ALTER TABLE narrator_buffered_messages DROP COLUMN media_json");
+			upgrade.run(
+				"INSERT INTO narrator_buffered_messages (id, narrator_id, text, seq, buffered_at) VALUES ('legacy', 'owner', 'keep me', 1, '2026-10-28')",
+			);
+			const { ensureColumns } = await import("../../db/ensure-columns");
+			ensureColumns(upgrade);
+			expect(
+				upgrade
+					.query("SELECT text, media_json FROM narrator_buffered_messages WHERE id = 'legacy'")
+					.get(),
+			).toEqual({ text: "keep me", media_json: null });
+			upgrade.run("UPDATE narrator_buffered_messages SET media_json = ? WHERE id = 'legacy'", [
+				JSON.stringify([media]),
+			]);
+			expect(
+				upgrade
+					.query("SELECT media_json FROM narrator_buffered_messages WHERE id = 'legacy'")
+					.get(),
+			).toEqual({ media_json: JSON.stringify([media]) });
+		} finally {
+			upgrade.close();
+		}
+	});
+	test("PostgreSQL schema and generated coverage map mediaJson to media_json", async () => {
+		const pg = await import("../../db/postgres-schema");
+		expect(pg.narratorBufferedMessages.mediaJson.name).toBe("media_json");
+		const table = pg.POSTGRES_SCHEMA_COVERAGE.tables.find(
+			(entry) => entry.name === "narrator_buffered_messages",
+		);
+		expect(
+			table?.columns.some(
+				(column) => column.property === "mediaJson" && column.name === "media_json",
+			),
+		).toBe(true);
 	});
 });
 

@@ -1,10 +1,15 @@
+import { isMediaContentBlock, type MediaRef } from "@shared/media-attachments";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
-import { buildHistory } from "../../lib/agent";
+import { contextUpdateOf } from "@shared/prefix-context";
+import { buildHistory, resolveHistoryToolLoadingStrategy } from "../../lib/agent";
+import { projectAttachmentLocations } from "../../lib/agent/attachment-projection";
 import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../../lib/agent/file-reference-projection";
+import { historyTail } from "../../lib/agent/history-build";
 import type { BuiltHistory } from "../../lib/agent/provider";
+import { projectFrozenSenders } from "../../lib/agent/sender-context";
 import {
 	findCurrentSenderMessage,
 	projectMessageSenderForModel,
@@ -12,64 +17,110 @@ import {
 	projectSenderText,
 	type SenderMessage,
 } from "../../lib/agent/sender-projection";
+import {
+	deriveToolLoadingState,
+	projectToolLoadingHistory,
+	resolveLoadableToolDefinition,
+	type ToolLoadingEpoch,
+	type ToolLoadingState,
+	usesToolLoading,
+} from "../../lib/agent/tool-loading";
+import type { ToolDefinition } from "../../lib/agent/types";
+import { isTopLevelMessage, type OwnTurnPlacement } from "../../lib/runtime-source";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
 
 export type RuntimeHistoryMessage = SenderMessage & {
 	injectionConsumedAt?: Date | string | null;
 };
 
+/** The one "top-level message" rule; defined beside the placement it reads. */
+export { isTopLevelMessage } from "../../lib/runtime-source";
+
 export interface RuntimeHistoryOptions {
 	narratorId: string;
 	model: string;
 	provider: string;
-	/** Only the child history view drops its subtree placement; persisted ownership never changes. */
-	profile: "primary" | "subagent";
+	/**
+	 * Explicit own transcript placement. Its placement is dropped for the
+	 * model view only; persisted ownership never changes. Omitted: read the session's
+	 * durable historical placement, falling back to its live run destination.
+	 */
+	ownTurnPlacement?: OwnTurnPlacement;
 	/** Already-authorized exact history page, when the caller also needs it for context preparation. */
 	sourceMessages?: readonly RuntimeHistoryMessage[];
 	/** Already accepted current input, with its original principal/attachment barrier. */
 	currentInput?: string;
+	/** Portable current refs; canonical persisted rows retain their own media blocks. */
+	currentMedia?: MediaRef[];
+	/** Explicit server-local cwd only; never a remote workspace path. */
+	attachmentCwd?: string;
+	attachmentSignal?: AbortSignal;
+	/** Optional deadline for the bounded source read, not large hydration/projection. */
+	deadline?: number;
+	/**
+	 * Optional tools whose presence follows session loading, and the currently loaded
+	 * ones. When set, loads inside the history keep the request's tool array fixed.
+	 */
+	toolLoading?: {
+		managed: ReadonlySet<string>;
+		current: Iterable<string>;
+		/** The request's already-materialized registry candidates; never re-read the registry. */
+		candidates?: readonly ToolDefinition[];
+		/** Captured with candidates before any asynchronous work. */
+		registryRevision?: string;
+		/** A reconciled epoch. Property presence suppresses the legacy compact query, even if empty. */
+		epoch?: ToolLoadingEpoch;
+	};
 }
 
 export interface PreparedRuntimeHistory extends BuiltHistory {
+	/** Provenance reported by the actual provider builder, never inferred from DB row presence. */
+	replayedInjectionMessageIds: readonly string[];
 	/** Original rows for audit/context consumers; never mutated by provider projection. */
 	sourceMessages: readonly RuntimeHistoryMessage[];
 	/** Detached rows that entered this particular provider build and receipt candidate registration. */
 	modelMessages: RuntimeHistoryMessage[];
+	/** Current input no persisted row carries; empty when `history` already holds it. */
 	currentText: string;
+	/** Refs not already owned by the accepted current row, for a separate current lane. */
+	currentMedia?: MediaRef[];
 	/** Projected caller packet only, for a subagent whose initial history is already prepared. */
 	currentInputText: string;
-	isPureToolResultReplay: boolean;
-	recoveredTrailingUserText: string | null;
+	/** Whether a persisted row (now part of `history`) carries the current input. */
+	currentInputPersisted: boolean;
+	/** Whether the history ends with tool results the model has not answered yet. */
+	endsWithToolResults: boolean;
+	/** Whether the history ends with input of any kind (a user or sys row, or tool results). */
+	endsWithInput: boolean;
+	/** Loading state of this history; the loop derives the tool array from it. */
+	toolLoading?: ToolLoadingState;
+	/** Full request candidates from the same registry view as `toolLoading`. */
+	toolCandidates?: readonly ToolDefinition[];
 }
 
-/** Recover only the final real user turn; neither a system injection nor a tool replay invents text. */
-export function recoverRuntimeTrailingUserText(
+/**
+ * The current input as the model reads it, and whether a persisted row already carries
+ * it. A persisted input is part of the projected history; only unpersisted control or
+ * continuation text still travels as the request's separate current content.
+ */
+function projectCurrentInput(
 	messages: readonly RuntimeHistoryMessage[],
-): string | null {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (message.parentToolUseId) continue;
-		if (message.role !== "user") return null;
-		const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
-		const text = blocks
-			.filter(
-				(block) => block?.type === "text" && typeof block.text === "string" && block.text.trim(),
-			)
-			.map((block) => block.text as string)
-			.join("\n");
-		const flat = message.contentText ?? "";
+	text: string,
+): { text: string; persisted: boolean } {
+	if (!text.trim()) {
+		// No prompt (a restart or recovery): the accepted tail user, if any, is the input.
+		const accepted = findCurrentSenderMessage(messages);
+		if (!accepted) return { text: "", persisted: true };
+		const blocks = Array.isArray(accepted.contentJson) ? accepted.contentJson : [];
 		const snapshots = getFileReferenceSnapshots(blocks);
-		const projected = projectFileReferenceText(
-			snapshots.length ? flat || text : text || flat,
+		const flat = accepted.contentText ?? "";
+		const blockText = modelTextFromContentBlocks(blocks);
+		const body = projectFileReferenceText(
+			snapshots.length ? flat || blockText : blockText || flat,
 			snapshots,
 		);
-		return projected.trim() ? projected : null;
+		return { text: body.trim() ? projectMessageSenderText(accepted, body) : "", persisted: true };
 	}
-	return null;
-}
-
-function projectCurrentInput(messages: readonly RuntimeHistoryMessage[], text: string): string {
-	if (!text.trim()) return text;
 	const projectMatch = (message: RuntimeHistoryMessage): string | undefined => {
 		const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 		const snapshots = getFileReferenceSnapshots(blocks);
@@ -86,17 +137,18 @@ function projectCurrentInput(messages: readonly RuntimeHistoryMessage[], text: s
 	const currentUser = findCurrentSenderMessage(messages);
 	if (currentUser) {
 		const projected = projectMatch(currentUser);
-		if (projected !== undefined) return projected;
+		if (projected !== undefined) return { text: projected, persisted: true };
 	}
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
+		// Model projection: own turns have no placement left (see isTopLevelMessage).
 		if (message.parentToolUseId || message.role === "disp" || message.role === "system") continue;
 		if (message.role === "assistant" || message.role === "user") break;
 		const projected = projectMatch(message);
-		if (projected !== undefined) return projected;
+		if (projected !== undefined) return { text: projected, persisted: true };
 	}
 	// Unpersisted control/continuation text has no authenticated human author.
-	return projectSenderText(text, { kind: "system" });
+	return { text: projectSenderText(text, { kind: "system" }), persisted: false };
 }
 /** Exact authenticated receipt candidates; supply is verified later against provider input. */
 export function questionModelReceipts(messages: readonly RuntimeHistoryMessage[]) {
@@ -143,22 +195,36 @@ export function projectQuestionFallbackToolResults(messages: RuntimeHistoryMessa
 	}
 }
 
-/** No principal changes, attachment reads, mailbox draining, persistence or adoption happen here. */
+/** No principal changes, mailbox draining or persistence; attachment copies require explicit cwd. */
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
 ): Promise<PreparedRuntimeHistory> {
+	// Source reads enforce their own short timeout. A valid large history must not
+	// expire just because hydration and projection take longer than that read.
+	const checkBudget = () => options.attachmentSignal?.throwIfAborted();
+	checkBudget();
 	const sourceMessages =
 		options.sourceMessages ??
 		(await (
 			await import("../narrator-service")
-		).narratorService.getModelHistorySinceLastCompact(options.narratorId));
+		).narratorService.getModelHistorySinceLastCompact(options.narratorId, undefined, {
+			signal: options.attachmentSignal,
+			deadline: options.deadline,
+		}));
+	checkBudget();
+	const ownPlacement =
+		options.ownTurnPlacement !== undefined
+			? options.ownTurnPlacement
+			: await (await import("../narrator-session")).readSessionOwnTurnPlacement(options.narratorId);
+	checkBudget();
 	// Detach mutable row arrays and block metadata, not huge text payloads,
 	// so shared/COW source rows remain unchanged during provider projection.
-	const modelMessages = sourceMessages
+	let modelMessages = sourceMessages
 		.filter((message) => message.role !== "disp")
 		.map((message) => ({
 			...message,
-			...(options.profile === "subagent" ? { parentToolUseId: null } : {}),
+			// Historical mounting is not nesting, even when no live run delivers there.
+			...(isTopLevelMessage(message, ownPlacement) ? { parentToolUseId: null } : {}),
 			contentJson: Array.isArray(message.contentJson)
 				? message.contentJson.map((block) =>
 						block && typeof block === "object" ? { ...block } : block,
@@ -166,6 +232,97 @@ export async function buildRuntimeHistory(
 				: message.contentJson,
 			toolCalls: message.toolCalls?.map((call) => ({ ...call })),
 		}));
+	let currentInput = options.currentInput;
+	if (options.attachmentCwd) {
+		const prepared = await projectAttachmentLocations(modelMessages, {
+			cwd: options.attachmentCwd,
+			narratorId: options.narratorId,
+			currentInput,
+			signal: options.attachmentSignal,
+		});
+		modelMessages = prepared.messages;
+		currentInput = prepared.currentInput;
+	}
+	checkBudget();
+	const loading = options.toolLoading;
+	let epoch = loading
+		? Object.hasOwn(loading, "epoch")
+			? loading.epoch
+			: await (await import("../narrator-epochs")).toolLoadingEpochOf(
+					options.narratorId,
+					sourceMessages,
+					options.attachmentSignal,
+				)
+		: undefined;
+	// A new baseline absorbs old state updates, not the conversation's historical facts.
+	if (epoch?.prefix && epoch.markerId) {
+		const markerId = epoch.markerId;
+		modelMessages = modelMessages.filter(
+			(message) =>
+				message.role !== "sys" ||
+				!Array.isArray(message.contentJson) ||
+				!message.contentJson.some((block) => {
+					const update = contextUpdateOf(block);
+					return update && update.epochId !== markerId;
+				}),
+		);
+	}
+	const prefixState = epoch?.prefix
+		? await (await import("../narrator-prefix-state")).loadPrefixState(
+				{ ...epoch, prefix: epoch.prefix },
+				sourceMessages,
+				options.attachmentSignal,
+			)
+		: undefined;
+	modelMessages = await (await import("../narrator-prefix-state")).hydrateContextUpdates(
+		modelMessages,
+		options.attachmentSignal,
+		sourceMessages,
+	);
+	if (prefixState && epoch) {
+		modelMessages = projectFrozenSenders(modelMessages, prefixState.parts.get("senders"));
+		// Reconciliation may have appended updates after its original view. Keep the
+		// final merged state alive in the runtime, not that pre-publication ancestor.
+		epoch = {
+			...epoch,
+			definitionSnapshots: prefixState.definitionSnapshots,
+			prefixState: prefixState.keepalive,
+		};
+	}
+	checkBudget();
+	const toolLoadingState = loading
+		? deriveToolLoadingState(
+				// Prefix epochs also track built-ins becoming available (e.g. devices).
+				loading.managed.size || epoch?.prefix ? modelMessages : [],
+				loading.managed,
+				loading.current,
+				epoch,
+				loading.candidates,
+			)
+		: undefined;
+	const toolLoadingStrategy = usesToolLoading(toolLoadingState)
+		? (toolLoadingState.strategy ??
+			resolveHistoryToolLoadingStrategy(options.model, options.provider))
+		: undefined;
+	// Injected schemas are plain notice text, so they are written here: the receipt guards
+	// and a notice recovered as the current turn then carry the same bytes as a rebuild.
+	if (toolLoadingState && toolLoadingStrategy === "custom_injection") {
+		const candidates = loading?.candidates;
+		const byName = candidates ? new Map(candidates.map((tool) => [tool.name, tool])) : undefined;
+		const resolveDefinition = (name: string) => {
+			if (!byName) return resolveLoadableToolDefinition(name);
+			const tool = byName.get(name);
+			if (!tool || (tool.isAvailable && !tool.isAvailable())) return null;
+			if (typeof tool.description !== "string") return null;
+			return { ...tool, description: tool.description };
+		};
+		modelMessages = projectToolLoadingHistory(
+			modelMessages,
+			toolLoadingState,
+			toolLoadingStrategy,
+			resolveDefinition,
+		) as typeof modelMessages;
+	}
 	// Full Await outputs remain intact until the actual provider-input boundary.
 	// A builder may omit/move a user receipt (or a prebuilt child may replace
 	// this history), so row presence alone is not a safe deduplication decision.
@@ -175,9 +332,14 @@ export async function buildRuntimeHistory(
 		options.provider,
 		options.narratorId,
 		{
-			currentInput: options.currentInput,
+			// The current input row, when persisted, is part of this history with its
+			// referenced files; nothing is withheld for a separate current turn.
+			...(toolLoadingState && toolLoadingStrategy && toolLoadingStrategy !== "custom_injection"
+				? { toolLoading: { state: toolLoadingState, strategy: toolLoadingStrategy } }
+				: {}),
 		},
 	);
+	checkBudget();
 	// The WeakMap key MUST stay the builder's actual history array. A copied array loses
 	// the exact sourceHistory/adoption boundary, including edited currentRevision candidates.
 	await trackAgentMessageHistory(
@@ -186,35 +348,35 @@ export async function buildRuntimeHistory(
 		// Receipt guards must compare the same bytes the model receives, especially
 		// grouped agent messages whose markers are inserted between item bodies.
 		modelMessages.map(projectMessageSenderForModel),
-		built.trailingUserText,
 	);
-	const input = projectCurrentInput(modelMessages, options.currentInput ?? "");
-	const combined = built.trailingUserText?.trim()
-		? input.trim()
-			? `${built.trailingUserText}\n\n${input}`
-			: built.trailingUserText
-		: input;
-	const isPureToolResultReplay = !combined.trim() && built.trailingToolResults.length > 0;
-	const recoveredTrailingUserText =
-		combined.trim() || isPureToolResultReplay
-			? null
-			: recoverRuntimeTrailingUserText(modelMessages);
-	const recoveredMessage = findCurrentSenderMessage(modelMessages);
-	const recoveredModelText =
-		recoveredTrailingUserText && recoveredMessage
-			? projectMessageSenderText(recoveredMessage, recoveredTrailingUserText)
-			: recoveredTrailingUserText;
+	// The history carries every persisted row, the current input included; only text no
+	// row holds is still sent as the request's current content.
+	const current = projectCurrentInput(modelMessages, currentInput ?? "");
+	const accepted = findCurrentSenderMessage(modelMessages);
+	const acceptedBlocks = Array.isArray(accepted?.contentJson) ? accepted.contentJson : [];
+	const currentMedia = options.currentMedia?.filter(
+		(ref) =>
+			!acceptedBlocks.some(
+				(block) =>
+					isMediaContentBlock(block) &&
+					block.mediaId === ref.mediaId &&
+					(block.uploadNarratorId || accepted?.narratorId || options.narratorId) ===
+						(ref.uploadNarratorId || options.narratorId),
+			),
+	);
+	const tail = historyTail(modelMessages);
 	return {
 		...built,
+		replayedInjectionMessageIds: built.replayedInjectionMessageIds ?? [],
 		sourceMessages,
 		modelMessages,
-		currentInputText: input,
-		currentText: isPureToolResultReplay
-			? ""
-			: combined.trim()
-				? combined
-				: (recoveredModelText ?? combined),
-		isPureToolResultReplay,
-		recoveredTrailingUserText,
+		currentInputText: current.text,
+		currentText: current.persisted ? "" : current.text,
+		currentInputPersisted: current.persisted,
+		currentMedia: currentMedia?.length ? currentMedia : undefined,
+		endsWithToolResults: tail.toolResults,
+		endsWithInput: tail.input,
+		...(toolLoadingState ? { toolLoading: toolLoadingState } : {}),
+		...(loading?.candidates ? { toolCandidates: loading.candidates } : {}),
 	};
 }

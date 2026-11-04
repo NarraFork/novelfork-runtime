@@ -195,8 +195,16 @@ async function waitForNarratorIdle(
 
 /** Collect metrics from narrator messages and tool calls. */
 async function collectMetrics(narratorId: string) {
+	// Usage columns only: the bodies are never read here.
 	const messages = await db
-		.select()
+		.select({
+			role: narratorMessages.role,
+			contentText: narratorMessages.contentText,
+			tokensIn: narratorMessages.tokensIn,
+			outputTokens: narratorMessages.outputTokens,
+			reasoningTokens: narratorMessages.reasoningTokens,
+			costUsd: narratorMessages.costUsd,
+		})
 		.from(narratorMessages)
 		.where(eq(narratorMessages.narratorId, narratorId));
 
@@ -367,7 +375,7 @@ async function executeTask(
 			.where(eq(benchmarkTaskResults.id, taskResultId));
 
 		// Send the task prompt
-		await sendMessage(narrator.id, task.prompt, undefined, "en", false);
+		await sendMessage(narrator.id, task.prompt, undefined, "en", false, null, null);
 
 		// Wait for completion
 		const timeoutMs =

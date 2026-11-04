@@ -21,7 +21,9 @@ import {
 	Title,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { pickLocalizedValue } from "@shared/i18n-locales";
+import { type McpLoadingMode, resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import {
 	normalizeToolRoutineMode,
 	TOOL_ROUTINE_MODES,
@@ -31,17 +33,21 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconPlug,
-	IconPlugOff,
 	IconPlus,
 	IconRefresh,
+	IconSparkles,
 	IconTrash,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import { ProxyOverrideField } from "../../components/common/ProxyOverrideField";
+import {
+	TextareaOptimizeControls,
+	textareaOptimizeControlsWidth,
+} from "../../components/narrator/composer/TextareaOptimizeControls";
 import { ProjectSkillsManager } from "../../components/project/ProjectSkillsManager";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
@@ -62,7 +68,6 @@ import {
 	useConnectMcpServer,
 	useCreateMcpServer,
 	useDeleteMcpServer,
-	useDisconnectMcpServer,
 	useImportMcpServers,
 	useMcpServers,
 	useRefreshAllMcpServers,
@@ -77,6 +82,13 @@ import {
 	useMcpTransportsCapability,
 } from "../../hooks/usePlatform";
 import { useProjects } from "../../hooks/useProjects";
+import {
+	useCreatePrompt,
+	useDeletePrompt,
+	usePromptLibrary,
+	useUpdatePrompt,
+} from "../../hooks/usePromptLibrary";
+import type { OptimizeStyle } from "../../hooks/usePromptOptimize";
 import {
 	useGlobalPrompt,
 	useRoutines,
@@ -190,6 +202,7 @@ function RoutinesPage() {
 					<Tabs.Tab value="custom-subagents">{t("tabCustomSubagents")}</Tabs.Tab>
 					<Tabs.Tab value="global-prompt">{t("tabGlobalPrompt")}</Tabs.Tab>
 					<Tabs.Tab value="default-system-prompt">{t("tabDefaultSystemPrompt")}</Tabs.Tab>
+					<Tabs.Tab value="prompt-library">{t("tabPromptLibrary")}</Tabs.Tab>
 					<Tabs.Tab value="mcp-tools">{t("tabMcpTools")}</Tabs.Tab>
 					<Tabs.Tab value="hooks">{t("tabHooks")}</Tabs.Tab>
 				</Tabs.List>
@@ -211,6 +224,9 @@ function RoutinesPage() {
 				</Tabs.Panel>
 				<Tabs.Panel value="custom-subagents">
 					<CustomSubagentsTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="prompt-library">
+					<PromptLibraryTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="global-prompt">
 					<GlobalPromptTab />
@@ -378,7 +394,6 @@ const HOOK_COMMON_FIELDS = [
 	["hook_event_name", "hookFieldHookEventName"],
 	["narrator_id", "hookFieldNarratorId"],
 	["narrator_title", "hookFieldNarratorTitle"],
-	["chapter_id", "hookFieldChapterId"],
 	["project_id", "hookFieldProjectId"],
 	["cwd", "hookFieldCwd"],
 ] as const;
@@ -407,6 +422,7 @@ const HOOK_EVENT_FIELDS: Record<string, ReadonlyArray<readonly [string, string]>
 	Attention: [
 		["attention_reason", "hookFieldAttentionReason"],
 		["attention_detail", "hookFieldAttentionDetail"],
+		["background_work_active", "hookFieldBackgroundWorkActive"],
 	],
 	AttentionResolved: [
 		["attention_reason", "hookFieldAttentionReason"],
@@ -419,7 +435,6 @@ function buildHookExample(event: string): string {
 		hook_event_name: event,
 		narrator_id: "n_abc123",
 		narrator_title: "Refactor auth flow",
-		chapter_id: "c_def456",
 		project_id: "p_ghi789",
 		cwd: "/home/user/project/.worktrees/feature",
 	};
@@ -1847,7 +1862,7 @@ interface McpServerDraft {
 	headers: McpSecretDraftEntry[];
 	originalEnvKeys: string[];
 	originalHeaderKeys: string[];
-	enabled: boolean;
+	mode: McpLoadingMode;
 	defaultBehavior: "" | "readOnly" | "readWrite" | "ask" | "deny";
 }
 
@@ -1868,7 +1883,7 @@ const EMPTY_DRAFT: McpServerDraft = {
 	headers: [],
 	originalEnvKeys: [],
 	originalHeaderKeys: [],
-	enabled: true,
+	mode: "auto",
 	defaultBehavior: "",
 };
 
@@ -1896,20 +1911,8 @@ const MCP_STATUS_LABEL_KEYS = {
 
 type McpStatusLabelKey = (typeof MCP_STATUS_LABEL_KEYS)[keyof typeof MCP_STATUS_LABEL_KEYS];
 
-/**
- * Translation key for a server's badge.
- *
- * A disabled server and a manually disconnected one used to render identically
- * ("Disconnected", gray), which hid the fact that disconnecting persists. Only
- * the settled `disconnected` state is relabeled: a `connecting`/`error` entry
- * that still exists while `enabled` is already false is a real transient and
- * should be shown as such rather than dressed up as "Disabled".
- */
-function mcpStatusLabelKey(
-	status: string,
-	enabled: boolean | undefined,
-): McpStatusLabelKey | "mcpStatusDisabled" {
-	if (enabled === false && status === "disconnected") return "mcpStatusDisabled";
+/** Connection health is independent of the configured loading mode. */
+function mcpStatusLabelKey(status: string): McpStatusLabelKey {
 	// An unrecognised status falls back to the disconnected label rather than
 	// rendering a missing key: the badge is a hint, not a diagnostic surface.
 	return (
@@ -1919,6 +1922,11 @@ function mcpStatusLabelKey(
 
 function McpToolsTab() {
 	const { t } = useTranslation("routines");
+	const mcpModeOptions = [
+		{ value: "disabled", label: t("mcpModeDisabled") },
+		{ value: "auto", label: t("mcpModeAuto") },
+		{ value: "resident", label: t("mcpModeResident") },
+	];
 	const { data: currentUser } = useCurrentUser();
 	const isAdmin = currentUser?.role === "admin";
 	const mcpServerSettingsStorageCapability = useMcpServerSettingsStorageCapability();
@@ -1955,7 +1963,6 @@ function McpToolsTab() {
 	const updateMutation = useUpdateMcpServer();
 	const deleteMutation = useDeleteMcpServer();
 	const connectMutation = useConnectMcpServer();
-	const disconnectMutation = useDisconnectMcpServer();
 	const refreshMutation = useRefreshMcpServer();
 	const refreshAllMutation = useRefreshAllMcpServers();
 	const testMutation = useTestMcpConnection();
@@ -2089,6 +2096,7 @@ function McpToolsTab() {
 			url?: string;
 			envKeys?: string[];
 			headerKeys?: string[];
+			mode?: McpLoadingMode;
 			enabled?: boolean;
 			defaultBehavior?: string;
 		}) => {
@@ -2109,7 +2117,7 @@ function McpToolsTab() {
 				headers: createPreservedMcpSecretEntries(headerKeys),
 				originalEnvKeys: [...envKeys],
 				originalHeaderKeys: [...headerKeys],
-				enabled: server.enabled ?? true,
+				mode: resolveMcpLoadingMode(server),
 				defaultBehavior: (server.defaultBehavior as McpServerDraft["defaultBehavior"]) ?? "",
 			});
 			testMutation.reset();
@@ -2122,7 +2130,7 @@ function McpToolsTab() {
 		const payload: Record<string, unknown> = {
 			name: d.name.trim(),
 			transport: d.transport,
-			enabled: d.enabled,
+			mode: d.mode,
 		};
 		if (d.transport === "stdio") {
 			payload.command = d.command.trim();
@@ -2327,7 +2335,7 @@ function McpToolsTab() {
 										{server.name}
 									</Text>
 									<Badge size="xs" variant="light" color={statusColor(server.status)}>
-										{t(mcpStatusLabelKey(server.status, server.enabled))}
+										{t(mcpStatusLabelKey(server.status))}
 									</Badge>
 									<Badge size="xs" variant="outline">
 										{server.transport}
@@ -2339,49 +2347,31 @@ function McpToolsTab() {
 									)}
 								</Group>
 								<Group gap={4}>
-									{/* These buttons write the persisted `enabled` intent, so they branch on
-									    it rather than on the live socket state. An enabled-but-unreachable
-									    server still needs a disable button here: branching on `connected`
-									    alone would leave it with only "Connect", making it impossible to
-									    stop from this list while it retries on every startup. */}
-									{server.enabled && (
-										<ActionIcon
-											variant="subtle"
-											size="sm"
-											color="orange"
-											disabled={!mcpServerManagementSupported}
-											onClick={() => {
-												if (!mcpServerManagementSupported) return;
-												disconnectMutation.mutate(server.id);
-											}}
-											loading={disconnectMutation.isPending}
-											title={
-												mcpServerManagementSupported
-													? server.status === "connected"
-														? t("mcpDisconnect")
-														: t("mcpDisableAndDisconnect")
-													: mcpServerManagementUnsupportedReason
-											}
-										>
-											<IconPlugOff size={14} />
-										</ActionIcon>
-									)}
-									{server.status !== "connected" && (
-										<ActionIcon
-											variant="subtle"
-											size="sm"
-											color="green"
-											disabled={!canConnectServer}
-											onClick={() => {
-												if (!canConnectServer) return;
-												connectMutation.mutate(server.id);
-											}}
-											loading={connectMutation.isPending}
-											title={canConnectServer ? t("mcpConnect") : connectUnsupportedReason}
-										>
-											<IconPlug size={14} />
-										</ActionIcon>
-									)}
+									<SegmentedControl
+										size="xs"
+										aria-label={t("mcpLoadingMode")}
+										value={resolveMcpLoadingMode(server)}
+										data={mcpModeOptions}
+										disabled={!mcpServerManagementSupported || updateMutation.isPending}
+										onChange={(mode) => updateMutation.mutate({ id: server.id, mode })}
+									/>
+									{resolveMcpLoadingMode(server) !== "disabled" &&
+										server.status !== "connected" && (
+											<ActionIcon
+												variant="subtle"
+												size="sm"
+												color="green"
+												disabled={!canConnectServer}
+												onClick={() => {
+													if (!canConnectServer) return;
+													connectMutation.mutate(server.id);
+												}}
+												loading={connectMutation.isPending}
+												title={canConnectServer ? t("mcpConnect") : connectUnsupportedReason}
+											>
+												<IconPlug size={14} />
+											</ActionIcon>
+										)}
 									{/* Refresh re-lists tools on the live connection (or reconnects a
 									    dead one). Available whenever management is: a disabled server
 									    reports an error rather than silently coming back up. */}
@@ -2777,15 +2767,18 @@ function McpToolsTab() {
 								))}
 							</div>
 
-							<Switch
-								label={t("mcpEnabled")}
-								description={t("mcpEnabledDesc")}
-								checked={draft.enabled}
-								onChange={(e) => {
-									const val = e.currentTarget.checked;
-									setDraft((d) => ({ ...d, enabled: val }));
-								}}
-							/>
+							<Stack gap={4}>
+								<Text size="sm">{t("mcpLoadingMode")}</Text>
+								<SegmentedControl
+									aria-label={t("mcpLoadingMode")}
+									value={draft.mode}
+									data={mcpModeOptions}
+									onChange={(mode) => setDraft((d) => ({ ...d, mode: mode as McpLoadingMode }))}
+								/>
+								<Text size="xs" c="dimmed">
+									{t("mcpLoadingModeDesc")}
+								</Text>
+							</Stack>
 
 							<Select
 								label={t("mcpDefaultBehavior")}
@@ -2916,6 +2909,350 @@ function McpToolsTab() {
 							disabled={!mcpServerImportSupported || !importJson.trim()}
 						>
 							{t("mcpImportBtn")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+		</Stack>
+	);
+}
+
+/**
+ * 系统提示词库：集中管理可复用的系统提示词。
+ *
+ * 「创建叙述者」从这里的条目取值，但取的是**文本**——叙述者创建后保存的是自己的
+ * 引用方（项目提示词）写进 AGENTS.md 的是文本副本，不建立外键，所以删除某个条目
+ * 不会影响任何已存在的文件。因此这里允许删除，只是先做二次确认并说明这一点。
+ */
+function PromptLibraryTab() {
+	const { t } = useTranslation("routines");
+	const { data: prompts, isLoading } = usePromptLibrary();
+	const createMutation = useCreatePrompt();
+	const updateMutation = useUpdatePrompt();
+	const deleteMutation = useDeletePrompt();
+
+	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
+	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
+	const [editingId, setEditingId] = useState<string | null>(null);
+	const [draft, setDraft] = useState({ name: "", description: "", content: "" });
+	const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
+
+	const handleCreate = useCallback(() => {
+		setEditingId(null);
+		setDraft({ name: "", description: "", content: "" });
+		openEdit();
+	}, [openEdit]);
+
+	const handleEdit = useCallback(
+		(entry: { id: string; name: string; description: string; content: string }) => {
+			setEditingId(entry.id);
+			setDraft({ name: entry.name, description: entry.description, content: entry.content });
+			openEdit();
+		},
+		[openEdit],
+	);
+
+	const handleSave = useCallback(() => {
+		const data = {
+			name: draft.name.trim(),
+			description: draft.description.trim(),
+			content: draft.content,
+		};
+		if (!data.name || !data.content.trim()) return;
+		if (editingId) {
+			updateMutation.mutate({ id: editingId, ...data }, { onSuccess: () => closeEdit() });
+		} else {
+			createMutation.mutate(data, { onSuccess: () => closeEdit() });
+		}
+	}, [draft, editingId, createMutation, updateMutation, closeEdit]);
+
+	// ── AI 摘要 ────────────────────────────────────────────────────────────────
+	// Fills the description box with a summary-model result. It is a suggestion, not a
+	// field the entry depends on: the user can edit it, clear it, or never press the
+	// button, and `description` stays optional all the way through save.
+	const [summarizing, setSummarizing] = useState(false);
+	const summarizeAbortRef = useRef<AbortController | null>(null);
+	const handleSummarize = useCallback(async () => {
+		const content = draft.content;
+		if (!content.trim() || summarizing) return;
+		summarizeAbortRef.current?.abort();
+		const controller = new AbortController();
+		summarizeAbortRef.current = controller;
+		setSummarizing(true);
+		try {
+			const result = await api.summarizePromptLibraryContent(content, {
+				signal: controller.signal,
+			});
+			if (controller.signal.aborted) return;
+			const summary = result.summary.trim();
+			if (!summary) {
+				notifications.show({
+					message: t("promptSummarizeEmpty"),
+					color: "yellow",
+					autoClose: 6000,
+				});
+				return;
+			}
+			// Only overwrite when the body still matches what was sent: a slow summary
+			// landing on text the user has since rewritten would describe the old prompt.
+			setDraft((current) =>
+				current.content === content
+					? { ...current, description: summary }
+					: { ...current, description: current.description },
+			);
+			if (draft.content === content) {
+				// The box now holds a summary the user has not seen yet; keep focus where it is.
+				notifications.show({
+					message: t("promptSummarizeSuccess"),
+					color: "green",
+					autoClose: 4000,
+				});
+			}
+		} catch (error) {
+			if (controller.signal.aborted) return;
+			notifications.show({
+				title: t("promptSummarizeFailed"),
+				message: error instanceof Error ? error.message : String(error),
+				color: "red",
+				autoClose: 10000,
+			});
+		} finally {
+			if (!controller.signal.aborted) setSummarizing(false);
+		}
+	}, [draft.content, summarizing, t]);
+
+	// ── 提示词优化 ─────────────────────────────────────────────────────────────
+	// Same control cluster and same optimize model as the composer's ✨ button; the
+	// library has no session, so it uses the narrator-less draft route.
+	const [optimizing, setOptimizing] = useState(false);
+	const optimizeAbortRef = useRef<AbortController | null>(null);
+	const handleOptimize = useCallback(
+		async (style: OptimizeStyle) => {
+			const original = draft.content;
+			if (!original.trim() || optimizing) return;
+			optimizeAbortRef.current?.abort();
+			const controller = new AbortController();
+			optimizeAbortRef.current = controller;
+			setOptimizing(true);
+			try {
+				const result = await api.optimizeDraftPrompt(original, style, {
+					signal: controller.signal,
+				});
+				if (controller.signal.aborted) return;
+				setDraft((current) => {
+					if (current.content !== original) {
+						notifications.show({
+							title: t("promptOptimizeFailed"),
+							message: t("promptOptimizeChanged"),
+							color: "red",
+							autoClose: 10000,
+						});
+						return current;
+					}
+					notifications.show({
+						message: t("promptOptimizeSuccess"),
+						color: "green",
+						autoClose: 6000,
+					});
+					return { ...current, content: result.text };
+				});
+			} catch (error) {
+				if (controller.signal.aborted) return;
+				notifications.show({
+					title: t("promptOptimizeFailed"),
+					message: error instanceof Error ? error.message : String(error),
+					color: "red",
+					autoClose: 10000,
+				});
+			} finally {
+				if (!controller.signal.aborted) setOptimizing(false);
+			}
+		},
+		[draft.content, optimizing, t],
+	);
+
+	const confirmDelete = useCallback(() => {
+		if (!deleteTarget) return;
+		deleteMutation.mutate(deleteTarget.id, { onSuccess: () => closeDelete() });
+	}, [deleteTarget, deleteMutation, closeDelete]);
+
+	return (
+		<Stack>
+			<Group justify="space-between">
+				<Text size="sm" c="dimmed" style={{ flex: 1 }}>
+					{t("promptLibraryDesc")}
+				</Text>
+				<Button
+					size="xs"
+					variant="light"
+					leftSection={<IconPlus size={14} />}
+					onClick={handleCreate}
+				>
+					{t("createPrompt")}
+				</Button>
+			</Group>
+
+			{isLoading && (
+				<Text size="sm" c="dimmed">
+					{t("loading")}
+				</Text>
+			)}
+
+			{!isLoading && (!prompts || prompts.length === 0) && (
+				<Text size="sm" c="dimmed">
+					{t("noPrompts")}
+				</Text>
+			)}
+
+			{prompts?.map((entry) => (
+				<Paper key={entry.id} withBorder p="sm">
+					<Group justify="space-between" wrap="nowrap">
+						<div style={{ flex: 1, minWidth: 0 }}>
+							<Text size="sm" fw={600}>
+								{entry.name}
+							</Text>
+							<Text size="xs" c="dimmed" truncate="end">
+								{formatRoutineTextPreview(
+									entry.description || entry.content,
+									MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS,
+								)}
+							</Text>
+						</div>
+						<Group gap={4}>
+							<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(entry)}>
+								{t("editPrompt")}
+							</Button>
+							<ActionIcon
+								variant="subtle"
+								color="red"
+								size="sm"
+								aria-label={t("deletePrompt")}
+								onClick={() => {
+									setDeleteTarget({ id: entry.id, name: entry.name });
+									openDelete();
+								}}
+							>
+								<IconTrash size={14} />
+							</ActionIcon>
+						</Group>
+					</Group>
+				</Paper>
+			))}
+
+			<Modal
+				opened={editOpened}
+				onClose={closeEdit}
+				title={editingId ? t("editPrompt") : t("createPrompt")}
+				size="lg"
+				centered
+			>
+				<Stack>
+					<TextInput
+						label={t("promptName")}
+						value={draft.name}
+						onChange={(e) => {
+							const value = e.currentTarget.value;
+							setDraft((d) => ({ ...d, name: value }));
+						}}
+						maxLength={100}
+						required
+					/>
+					<div>
+						<Group justify="space-between" align="flex-end" gap="xs" wrap="nowrap">
+							<TextInput
+								style={{ flex: 1, minWidth: 0 }}
+								label={t("promptDescription")}
+								description={t("promptDescriptionHint")}
+								value={draft.description}
+								onChange={(e) => {
+									const value = e.currentTarget.value;
+									setDraft((d) => ({ ...d, description: value }));
+								}}
+								maxLength={500}
+							/>
+							{/* 建议值：结果只是填进输入框，用户仍可改、可清空。 */}
+							<Button
+								size="compact-sm"
+								variant="light"
+								leftSection={<IconSparkles size={14} />}
+								loading={summarizing}
+								disabled={!draft.content.trim()}
+								onClick={() => void handleSummarize()}
+								title={t("promptSummarizeHint")}
+							>
+								{t("promptSummarize")}
+							</Button>
+						</Group>
+					</div>
+					<Textarea
+						label={t("promptContent")}
+						value={draft.content}
+						onChange={(e) => {
+							const value = e.currentTarget.value;
+							setDraft((d) => ({ ...d, content: value }));
+						}}
+						autosize
+						minRows={8}
+						maxRows={20}
+						maxLength={10_000}
+						required
+						// Mirrors the composer: the cluster is not measured by Mantine, so the
+						// room it needs is reserved explicitly through padding.
+						styles={{
+							input: { paddingInlineEnd: textareaOptimizeControlsWidth(false) },
+						}}
+						rightSection={
+							<TextareaOptimizeControls
+								optimizeAvailable={draft.content.trim().length > 0}
+								loading={optimizing}
+								withContext={false}
+								// 提示词库里没有会话，因此没有可读的对话上下文。
+								contextAvailable={false}
+								onToggleContext={() => {}}
+								onOptimize={(style) => void handleOptimize(style)}
+								onCancelOptimize={() => {
+									optimizeAbortRef.current?.abort();
+									optimizeAbortRef.current = null;
+									setOptimizing(false);
+								}}
+							/>
+						}
+						rightSectionWidth={textareaOptimizeControlsWidth(false)}
+						rightSectionPointerEvents="auto"
+					/>
+					<Group justify="flex-end" gap="xs">
+						<Button variant="subtle" onClick={closeEdit}>
+							{t("cancel")}
+						</Button>
+						<Button
+							onClick={handleSave}
+							disabled={!draft.name.trim() || !draft.content.trim()}
+							loading={createMutation.isPending || updateMutation.isPending}
+						>
+							{t("save")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+
+			<Modal
+				opened={deleteOpened}
+				onClose={closeDelete}
+				title={t("deletePrompt")}
+				size="sm"
+				centered
+			>
+				<Stack>
+					<Text size="sm">{t("deletePromptConfirm", { name: deleteTarget?.name ?? "" })}</Text>
+					<Text size="xs" c="dimmed">
+						{t("deletePromptNote")}
+					</Text>
+					<Group justify="flex-end" gap="xs">
+						<Button variant="subtle" onClick={closeDelete}>
+							{t("cancel")}
+						</Button>
+						<Button color="red" onClick={confirmDelete} loading={deleteMutation.isPending}>
+							{t("deletePrompt")}
 						</Button>
 					</Group>
 				</Stack>

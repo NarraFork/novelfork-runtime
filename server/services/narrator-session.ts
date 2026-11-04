@@ -1,10 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import type { ComposerDocument } from "@shared/composer-document";
+import { serializeCatalogErrorMessage } from "@shared/error-catalog";
+import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import {
+	isMediaContentBlock,
+	MAX_MEDIA_ATTACHMENTS,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import { parseStored } from "@shared/narrator-blocks/plan";
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
+import { parseReplyContext, type ReplyContext } from "@shared/reply-context";
 import {
 	isPreloadedMode,
 	type RoutineModeConfig,
@@ -16,10 +30,9 @@ import {
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
-import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
-	chapters,
 	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
@@ -31,13 +44,16 @@ import {
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { forgetModelTraceRequest } from "../lib/agent/modeltrace-request";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
+import { toolRegistry } from "../lib/agent/tool-registry";
 import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
 } from "../lib/agent/tools/behavior-fence-grant";
 import { subagentMayUseDefaultOffTool } from "../lib/agent/tools/default-off-tools";
 import { isOptionalTool } from "../lib/agent/tools/index";
+import type { AgentInputPart } from "../lib/agent/types";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type BooleanOverride,
@@ -49,15 +65,27 @@ import {
 } from "../lib/boolean-override";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
+	parseOptionalComposerDocument,
+	validateComposerAssets,
+	validateComposerProjection,
+} from "../lib/composer-document";
+import {
 	measureMessageCharacters,
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
-import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
+import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
+import {
+	deleteUploadedMedia,
+	getMediaPath,
+	saveUploadedMedia,
+	validateUploadedMedia,
+} from "../lib/media-uploads";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
@@ -66,11 +94,20 @@ import {
 	isSubagentVariant,
 	parseSubstatus,
 	parseTraits,
+	redactDraftTraits,
 } from "../lib/narrator-utils";
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getToolMessage, type Locale } from "../lib/prompt-i18n";
+import {
+	executionPrincipalOf,
+	type OwnTurnPlacement,
+	ownTurnSql,
+	policySourceIdOf,
+	RUNTIME_SOURCE_COLUMNS,
+	runDeliverToOf,
+} from "../lib/runtime-source";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
@@ -110,8 +147,7 @@ import {
 	claimInboxHead,
 	deliverInboxInjection,
 	flushInboxPublicationBarrier,
-	hasInboxKind,
-	type InboxAgentMetadata,
+	type InboxWakeOptions,
 	inboxClaim,
 	inboxConsumption,
 	inboxMetadata,
@@ -125,42 +161,52 @@ import {
 } from "./agent-runtime/inbox";
 import { createInheritedModelRuntime } from "./agent-runtime/inherited-model";
 import { MAILBOX_LIMITS } from "./agent-runtime/limits";
-import { runAgentLoopUnlocked } from "./agent-runtime/orchestrator";
 import {
 	createRuntimeMapView,
 	type ExecutionOwner,
 	getExecutionOwner,
+	getRunControl,
 	isExecutionSuspended,
 	tryClaimExecution,
 } from "./agent-runtime/ownership";
+import type { RuntimePolicy } from "./agent-runtime/policy";
+import {
+	preparePrefixRequest,
+	type RequestModelIdentity,
+} from "./agent-runtime/prepare-prefix-request";
 import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
+import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { backgroundTaskService } from "./background-task-service";
 import {
 	backgroundAgentNoticePreview,
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
+import { cancelModelTrace } from "./modeltrace-service";
+import { isFormerChapterSessionWithoutDirectory } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
 	persistDetachedToolResult,
+	retireSubagentOutputCharCount,
 	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
+import type { InjectionRecipientPlacement } from "./narrator-injection";
 import { deliverInjection } from "./narrator-injection";
 import { isFirstUserTurn } from "./narrator-message-count";
 import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
-import { buildEffectiveSystemPrompt } from "./narrator-prompt";
+import { buildEffectiveSystemPrompt, taskSectionFor } from "./narrator-prompt";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
 import { getNarratorMessageRefsPort } from "./narrator-refs/store";
 import {
-	enrichToolUseBlocks,
-	handleBashCommand,
-	narratorService,
-	truncateToolIO,
-} from "./narrator-service";
+	adoptHumanReplyContext,
+	ensureReplyContext,
+	syncActiveReplyContext,
+} from "./narrator-reply-context";
+import { enrichToolUseBlocks, narratorService, truncateToolIO } from "./narrator-service";
 import { generateQuickTitle, setProvisionalTitleFromUserMessage } from "./narrator-title";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
 import {
@@ -173,32 +219,41 @@ import {
 	type PendingInjection,
 	projectPendingInjection,
 } from "./parent-injection-queue";
+import { syncNarratorProjectLinksSafely } from "./project-index";
 import { broadcastSpecChanged } from "./spec-broadcast";
-import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
-import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
 import { readSubagentExecutionBoundary } from "./subagent-execution-boundary";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
-import {
-	getConclusionWatcher,
-	getManualOverrideMap,
-	registerConclusionWatcher,
-	resolveManualOverride,
-} from "./subagent-manual-override";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
-import { isTakenOver } from "./subagent-takeover";
+import {
+	type ContinuationTarget,
+	type InterruptGuardNote,
+	type NarratorTaskSource,
+	resolveTaskBackend,
+	taskSourceForNarrator,
+} from "./task-source";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
-import { resolveEffectiveTraits } from "./trait-layer-service";
-import { worktreeWatcher } from "./worktree-watcher";
+import { mcpToolMarker, parseMcpServerMarker } from "./tool-load-markers";
+import { resolveEffectiveTraits, resolveNarratorRuntimePolicy } from "./trait-layer-service";
+import {
+	createSpecContinuationState,
+	planSpecContinuation,
+	type SpecContinuationCause,
+	type SpecContinuationState,
+} from "./turn-continuation-decisions";
 
 // === In-memory state (imported from narrator-session-state) ===
 
-import type { ActiveNarrator, BufferedMessage, NarratorEvent } from "./narrator-session-state";
+import type {
+	ActiveNarrator,
+	BufferedExecutionIntent,
+	BufferedMessage,
+	NarratorEvent,
+} from "./narrator-session-state";
 import {
 	activeNarrators,
-	activeSubagentSettings,
 	claimNarratorRuntime,
 	clearActiveHistoryCompactPending,
 	compactLocks,
@@ -219,8 +274,6 @@ import {
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
 	resolveNarratorAdmissionRoot,
-	updateActiveSubagentModel,
-	updateActiveSubagentReasoningEffort,
 	waitForNarratorAdmissionWork,
 	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
@@ -237,6 +290,7 @@ interface PlannedUpdateRecoveryControl {
 	controller: AbortController;
 	onInterrupt?: (token: string) => void | Promise<void>;
 	interruptFinalizer: Promise<void> | null;
+	releaseRuntimeClaim: () => void;
 	/**
 	 * Subagents this recovery owner is waiting on, if any.
 	 *
@@ -275,6 +329,7 @@ export function registerPlannedUpdateRecoveryController(
 		controller,
 		onInterrupt,
 		interruptFinalizer: null,
+		releaseRuntimeClaim,
 		foregroundSubagentIds: options.foregroundSubagentIds ?? [],
 	};
 	plannedUpdateRecoveryControls.set(narratorId, control);
@@ -335,12 +390,29 @@ import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
+import { recoverBlockStorage } from "./narrator-block-sync";
+import {
+	lastTargetElement,
+	materializeEnvelope,
+	resolveBlockTargets,
+	rowAt,
+} from "./narrator-block-targets";
+import {
+	bodyColumns,
+	contentJsonSql,
+	fillBodies,
+	fillBody,
+	storedBodyBytesSql,
+} from "./narrator-body-reads";
+import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
+	dropBufferedMessage,
 	enqueueBufferedMessage,
 	getBufferedMessages,
 	getBufferedMessagesAsync,
 	projectMailboxUserMessage,
+	removeBufferedMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
 } from "./narrator-buffer";
@@ -365,7 +437,23 @@ import {
 	resolveProductRuntimeToolNames,
 	runtimeProductIntegration,
 } from "./product-narrator-tools";
-import type { RevertScope, RevertWarning } from "./snapshot-revert";
+import {
+	revertNarratorScopedForEdit,
+	revertNarratorScopedToBlock,
+	revertPrincipalForUser,
+	type ScopedRevertOptions,
+} from "./narrator-scoped-revert";
+import { narratorStore } from "./narrator-store";
+import { recoverInterruptedTurns } from "./narrator-turns";
+import { invalidateRecoveryTarget } from "./recovery-handoff";
+import {
+	assertSnapshotRevertComplete,
+	type RevertResult,
+	type RevertScope,
+	type RevertWarning,
+	SnapshotRevertError,
+	unavailableSnapshotRevert,
+} from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete.
 // Defined next to the snapshot hooks so both loops agree on the set.
 import { buildTreeSnapshotExecutionHooks } from "./tree-snapshot-loop-hooks";
@@ -398,7 +486,19 @@ export type { ContinuationStallState };
  */
 export { computeContinuationStallState };
 
-export function parseQueuedNewCommand(message: string, commandText?: string | null) {
+export function parseQueuedNewCommand(
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
+) {
+	if (intent?.literal) return null;
+	if (
+		composerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		)
+	)
+		return null;
 	const raw = commandText?.trim().startsWith("/new") ? commandText.trim() : message.trim();
 	const match = raw.match(/^\/new(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
@@ -411,7 +511,19 @@ export function parseQueuedNewCommand(message: string, commandText?: string | nu
  * immediately; on consumption we parse it here and run executeQueuedGoalCommand.
  * Returns null (fall through to a normal model turn) when there is no objective.
  */
-export function parseQueuedGoalCommand(message: string, commandText?: string | null) {
+export function parseQueuedGoalCommand(
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
+) {
+	if (intent?.literal) return null;
+	if (
+		composerDocument?.paragraphs.some((paragraph) =>
+			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
+		)
+	)
+		return null;
 	const raw = commandText?.trim().startsWith("/goal") ? commandText.trim() : message.trim();
 	const match = raw.match(/^\/goal(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
@@ -546,7 +658,7 @@ export async function applySessionDefaultDevice(
 async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, contextProjectId: true },
+		columns: { id: true, contextProjectId: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	return await resolveSharedNarratorProjectId(narrator);
@@ -603,6 +715,13 @@ export async function setNarratorDefaultDevice(
 	return { defaultDeviceId: resolvedDeviceId, current };
 }
 
+export function shouldSendQueuedNewInitialMessage(
+	initialMessage: string,
+	buffered: Pick<BufferedMessage, "fileReferences" | "media">,
+): boolean {
+	return Boolean(initialMessage || buffered.fileReferences?.length || buffered.media?.length);
+}
+
 export async function executeQueuedNewCommand(
 	active: ActiveNarrator,
 	buffered: BufferedMessage,
@@ -622,7 +741,6 @@ export async function executeQueuedNewCommand(
 				).model
 			: (sourceNarrator.model ?? undefined);
 	const newNarrator = await narratorService.create({
-		chapterId: null,
 		model: newModel,
 		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
 		permissionMode: sourceNarrator.permissionMode ?? undefined,
@@ -642,7 +760,7 @@ export async function executeQueuedNewCommand(
 		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
 	});
 
-	if (initialMessage || buffered.fileReferences?.length) {
+	if (shouldSendQueuedNewInitialMessage(initialMessage, buffered)) {
 		await sendMessage(
 			newNarrator.id,
 			initialMessage,
@@ -655,6 +773,9 @@ export async function executeQueuedNewCommand(
 			undefined,
 			undefined,
 			buffered.fileReferences,
+			// `/new` has been removed from the prompt; its original document no longer projects it.
+			undefined,
+			buffered.media,
 		);
 	}
 
@@ -699,7 +820,12 @@ export async function executeQueuedGoalCommand(
 	narratorId: string,
 	buffered: BufferedMessage,
 	objective: string,
-): Promise<void> {
+): Promise<{ refused: true } | { refused: false; added: boolean }> {
+	// Before anything is saved: a session whose tasks live in the outline has no tasks.json.
+	if ((await resolveTaskBackend(narratorId)) === "outline") {
+		await refuseQueuedOutlineGoal(narratorId, buffered);
+		return { refused: true };
+	}
 	const rawCommand = buffered.commandText?.trim() || buffered.text;
 	const userMsg = await withInboxOwner(narratorId, async () => {
 		const row = buffered._mailboxClaim
@@ -711,27 +837,15 @@ export async function executeQueuedGoalCommand(
 		const claim = buffered._mailboxClaim ?? (row ? inboxClaim(row) : undefined);
 		if (!claim) throw new ValidationError("Buffered goal is no longer at the mailbox head");
 		try {
-			// PostgreSQL: the queue's materialize section commits message + ref + mailbox flip
-			// atomically; SQLite keeps the synchronous placement transaction.
-			if (getNarratorMessageRefsPort())
-				return await materializeClaimedInboxUserMessage({
-					claim,
-					reservedMessageId: row?.recipientMessageId,
-					narratorId,
-					text: rawCommand,
-					contentBlocks: [...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
-					commandText: rawCommand,
-					createdBy: buffered.createdBy,
-				});
-			return await narratorService.persistUserMessage(
+			return await persistClaimedUserInput({
+				claim,
+				reservedMessageId: row?.recipientMessageId,
 				narratorId,
-				rawCommand,
-				[...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
-				rawCommand,
-				buffered.createdBy,
-				undefined,
-				{ mailboxClaim: claim },
-			);
+				text: rawCommand,
+				contentBlocks: [...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
+				commandText: rawCommand,
+				createdBy: buffered.createdBy,
+			});
 		} catch (error) {
 			if (row) await releaseInboxClaim(row, error);
 			throw error;
@@ -760,6 +874,85 @@ export async function executeQueuedGoalCommand(
 			error: String(err),
 		});
 	});
+	return { refused: false, added };
+}
+
+/**
+ * Whether this input is a `/goal` the queue consumer would run, for a session whose tasks live in
+ * the outline (outline P2). Such a session has no tasks.json to add the goal to; its `/goal` (a
+ * person-created, locked task) arrives with the task board (plan PR 5). Every entry point that
+ * queues input refuses it before anything is queued or saved.
+ */
+export async function isOutlineSessionGoal(
+	narratorId: string,
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
+): Promise<boolean> {
+	if (!parseQueuedGoalCommand(message, commandText, composerDocument, intent)) return false;
+	return (await resolveTaskBackend(narratorId)) === "outline";
+}
+
+/**
+ * The consumers' backstop for a queued `/goal` that reached an outline session anyway (queued
+ * while the outline was switched off, say): the row is dropped from the queue without its message
+ * ever being saved, the person is told why, and the caller drains on as after any terminal
+ * command. Never throws: a refusal must not stall the queue.
+ */
+async function refuseQueuedOutlineGoal(narratorId: string, buffered: BufferedMessage) {
+	const refusal = catalogError("GOAL_IN_OUTLINE_SESSION");
+	try {
+		await withInboxOwner(narratorId, async () => {
+			let message = buffered;
+			if (!message._mailboxClaim) {
+				// Claim the exact row first, as the consumers do, so what is dropped is what was read.
+				const row = await claimInboxHead(
+					narratorId,
+					(candidate) => candidate.id === buffered.id && candidate.kind === "user_input",
+				);
+				// Not at the queue's head (or gone): its consumer will meet it and refuse it then.
+				if (!row) return;
+				message = projectMailboxUserMessage(row);
+				// Edited since it was read into something that is no /goal: not ours to drop.
+				if (
+					!parseQueuedGoalCommand(
+						message.text,
+						message.commandText,
+						message.composerDocument,
+						message.executionIntent,
+					)
+				) {
+					await releaseInboxClaim(row, "Edited before a refused /goal was dropped");
+					return;
+				}
+			}
+			await dropBufferedMessage(narratorId, message, refusal.message);
+		});
+	} catch (error) {
+		logger.warn("Failed to drop a queued /goal refused for an outline session", {
+			narratorId,
+			error: String(error),
+		});
+	}
+	broadcastToNarrator(narratorId, {
+		type: "narrator_error",
+		narratorId,
+		error: serializeCatalogErrorMessage(refusal),
+		errorCode: refusal.code,
+	});
+	try {
+		broadcastToNarrator(narratorId, {
+			type: "buffer_set",
+			narratorId,
+			messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+		});
+	} catch (error) {
+		logger.warn("Failed to broadcast the queue after a refused /goal", {
+			narratorId,
+			error: String(error),
+		});
+	}
 }
 
 /**
@@ -811,8 +1004,18 @@ async function resumeNextBufferedMessageUnlocked(
 		// differently: a terminal command owns its attachments from here on, while a
 		// plain message keeps its files on disk until delivery has actually succeeded —
 		// they are what a restore needs when it has not.
-		const newCommand = parseQueuedNewCommand(first.text, first.commandText);
-		const goalCommand = parseQueuedGoalCommand(first.text, first.commandText);
+		const newCommand = parseQueuedNewCommand(
+			first.text,
+			first.commandText,
+			first.composerDocument,
+			first.executionIntent,
+		);
+		const goalCommand = parseQueuedGoalCommand(
+			first.text,
+			first.commandText,
+			first.composerDocument,
+			first.executionIntent,
+		);
 		const controlCommand = first.executionIntent?.controlCommand;
 		if (newCommand || controlCommand) {
 			const commandMessage = await withInboxOwner(narratorId, async () => {
@@ -899,7 +1102,12 @@ async function resumeNextBufferedMessageUnlocked(
 			return async () => {
 				let commandError: unknown;
 				try {
-					await executeQueuedControlCommand(narratorId, first, locale, controller.signal);
+					await executeQueuedControlCommand(
+						narratorId,
+						first,
+						locale,
+						urgentActivitySignal(active, controller.signal),
+					);
 					await cleanupBufferedTextFilesAsync(first.id);
 				} catch (error) {
 					commandError = error;
@@ -945,8 +1153,13 @@ async function resumeNextBufferedMessageUnlocked(
 			// Queued /goal: persist the protected task, then launch its first Spec turn.
 			// If plan mode or another guard prevents starting, keep draining as before.
 			await executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
-				.then(async () => {
+				.then(async ({ refused }) => {
 					inputOwner.release();
+					// Refused for an outline session: nothing to start, drain on.
+					if (refused) {
+						await settleAfterTerminalCommand();
+						return;
+					}
 					const result = await startSpecContinuationIfPossible(
 						narratorId,
 						locale,
@@ -957,14 +1170,14 @@ async function resumeNextBufferedMessageUnlocked(
 				})
 				.catch((err) => handleTerminalCommandError("/goal", err));
 		} else {
-			await feedMessage(
+			await feedMessageUnlocked(
 				narratorId,
 				first.text,
 				first.images,
 				locale,
 				active._replyInUserLanguage ?? false,
 				first.commandText,
-				first.createdBy,
+				first.createdBy ?? undefined,
 				first.textFiles,
 				first.bashCommand,
 				{
@@ -975,6 +1188,8 @@ async function resumeNextBufferedMessageUnlocked(
 				},
 				undefined,
 				first.fileReferences,
+				first.composerDocument,
+				first.media,
 			)
 				.then(async ({ userMsg, userBroadcasted }) => {
 					// Delivered: the attachments have been re-materialized into the turn, so the
@@ -1078,6 +1293,16 @@ export async function buildSystemPrompt(
 		allowLocalExecution?: boolean;
 	},
 	planFilePath?: string,
+	context?: Pick<
+		import("./narrator-prompt").BuildPromptOptions,
+		| "workspaceContext"
+		| "skillsContext"
+		| "modelsContext"
+		| "modeContext"
+		| "runtimeHints"
+		| "taskSection"
+		| "contextParts"
+	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult & { runtimeToolNames: readonly string[] }> {
 	const productNarrator = runtimeProductIntegration.narrator;
 	const [runtimeContribution, trustedResourcePromptRoot] = productNarrator
@@ -1103,6 +1328,7 @@ export async function buildSystemPrompt(
 			runtimeContribution?.promptExtensions.map((extension) => extension.content) ?? [],
 		trustedResourcePromptRoot,
 		allowLocalExecution: deviceContext?.allowLocalExecution,
+		...context,
 	});
 	return {
 		...effectivePrompt,
@@ -1122,92 +1348,69 @@ async function createNarrator(
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
+		retireSubagentOutputCharCount(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
+	({ locale, replyInUserLanguage } = await ensureReplyContext(narratorId));
 	const initialOAuthRuntime = await assertOAuthNarratorRuntimeActive(narratorId);
 
 	// Use narrator-level state directly
 	const effectiveConversationId = narrator.apiConversationId;
 	const effectiveContextSummary = narrator.contextSummary;
 
-	// Resolve CWD and cache chapter info for git tracking
+	// Resolve CWD and the project context
 	let narratorCwd: string;
-	let narratorChapterId: string | undefined;
 	let narratorProjectId: string | undefined;
-	let narratorChapterRole: string | undefined;
-	let narratorWorktreePath: string | undefined;
-	let narratorBaseBranch: string | undefined;
 	let projectGitPath: string | null = null;
 	// Project-level optional tool modes. Read from the project row that is fetched
 	// anyway, so the preload decision below can honour a project override — without
 	// it, setting a tool to "resident" for one project changed nothing.
 	let projectRoutineConfig: RoutineModeConfig | undefined;
-	if (narrator.chapterId) {
-		const ch = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-		});
-		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
-		// Always try to resolve project gitPath for skill loading
+	const executionDeviceId =
+		initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? "local";
+	const committedLocalCwd =
+		narrator.workspaceContext?.revision === narrator.workspaceRevision &&
+		narrator.workspaceContext.deviceId === "local"
+			? narrator.workspaceContext.cwd
+			: null;
+	// A former chapter session's directory came from its committed workspace first (its
+	// own cwd column was often never written); every other session keeps its own cwd first.
+	const storedCwd = isFormerChapterSessionWithoutDirectory({ cwd: null, traits: narrator.traits })
+		? committedLocalCwd || narrator.cwd
+		: narrator.cwd || committedLocalCwd;
+	if (
+		executionDeviceId === "local" &&
+		isFormerChapterSessionWithoutDirectory({ cwd: storedCwd, traits: narrator.traits })
+	) {
+		throw new AppError(
+			"This legacy workspace has no directory. Choose a working directory to continue.",
+			409,
+			"WORKSPACE_DIRECTORY_REQUIRED",
+		);
+	}
+	// Bring the project index up to date before the project decides configuration: the
+	// directory may have moved, or the session predates the index.
+	await syncNarratorProjectLinksSafely(narrator.id);
+	const resolvedProjectId = await resolveSharedNarratorProjectId(narrator);
+	if (resolvedProjectId) {
 		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, ch.projectId),
+			where: eq(projects.id, resolvedProjectId),
 		});
-		projectGitPath = project?.gitPath ?? null;
-		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
-		narratorProjectId = ch.projectId;
-		if (ch.worktreePath) {
-			// A saved narrator cwd is an explicit user override (for example, after
-			// recovering from a missing workdir). Keep the chapter worktree as the
-			// default only when no override has been chosen.
-			narratorCwd = resolveProductNarratorCwd({
-				traits: narrator.traits,
-				narratorCwd: narrator.cwd,
-				worktreePath: ch.worktreePath,
-				projectGitPath,
-				fallbackCwd: getHome(),
-			});
-			narratorChapterId = ch.id;
-			narratorChapterRole = ch.role;
-			narratorWorktreePath = ch.worktreePath;
-			narratorBaseBranch = ch.baseBranch;
-		} else {
-			// Chapter is dormant — fall back to project gitPath or narrator cwd
-			narratorCwd = resolveProductNarratorCwd({
-				traits: narrator.traits,
-				narratorCwd: narrator.cwd,
-				worktreePath: null,
-				projectGitPath: project?.gitPath,
-				fallbackCwd: getHome(),
-			});
-			logger.info("Chapter dormant, using fallback CWD", {
-				chapterId: narrator.chapterId,
-				narratorCwd,
-			});
-		}
-	} else if (narrator.contextProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narrator.contextProjectId),
-		});
-		if (!project) throw new NotFoundError("Project", narrator.contextProjectId);
+		if (!project) throw new NotFoundError("Project", resolvedProjectId);
 		narratorProjectId = project.id;
 		projectGitPath = project.gitPath;
 		projectRoutineConfig = parseProjectRoutineConfig(project.chapterSettings);
-		narratorCwd = resolveProductNarratorCwd({
-			traits: narrator.traits,
-			narratorCwd: narrator.cwd,
-			worktreePath: null,
-			projectGitPath: project.gitPath,
-			fallbackCwd: getHome(),
-		});
-	} else {
-		narratorCwd = resolveProductNarratorCwd({
-			traits: narrator.traits,
-			narratorCwd: narrator.cwd,
-			worktreePath: null,
-			projectGitPath: null,
-			fallbackCwd: getHome(),
-		});
 	}
+	// A product host may pin its own narrators to a trusted directory; otherwise this is
+	// the stock stored-cwd → project → home resolution.
+	narratorCwd = resolveProductNarratorCwd({
+		traits: narrator.traits,
+		narratorCwd: storedCwd,
+		worktreePath: null,
+		projectGitPath,
+		fallbackCwd: getHome(),
+	});
 
 	// Restore or create the persistent plan file ID if the narrator is already in plan mode
 	// (e.g. server restart recovery). Keeping this stable prevents file-based plans from
@@ -1226,6 +1429,7 @@ async function createNarrator(
 		narratorTraits: narrator.traits,
 		projectId: narratorProjectId ?? null,
 		actingUserId: null,
+		policySourceId: policySourceIdOf(narrator),
 	});
 
 	// OAuth narrators may only see devices frozen into their provision snapshot.
@@ -1266,6 +1470,12 @@ async function createNarrator(
 			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
 		},
 		planFilePath,
+		{
+			taskSection: taskSectionFor(
+				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+				narrator.type,
+			),
+		},
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -1281,15 +1491,13 @@ async function createNarrator(
 		// Skill root resolution failure is non-fatal
 	}
 
-	// For standalone narrators, only enable Bash git-status-based file tracking
-	// if cwd is inside a git repo. This prevents running `git status` on non-repo dirs.
-	let narratorIsInGitRepo = !!narratorChapterId;
-	if (!narratorChapterId) {
-		try {
-			narratorIsInGitRepo = await gitService.isGitRepo(narratorCwd);
-		} catch {
-			// Non-fatal — Bash file tracking just won't be enabled
-		}
+	// Only enable Bash git-status-based file tracking if cwd is inside a git repo.
+	// This prevents running `git status` on non-repo dirs.
+	let narratorIsInGitRepo = false;
+	try {
+		narratorIsInGitRepo = await gitService.isGitRepo(narratorCwd);
+	} catch {
+		// Non-fatal — Bash file tracking just won't be enabled
 	}
 
 	const abortController = new AbortController();
@@ -1311,10 +1519,10 @@ async function createNarrator(
 		cwd: narratorCwd,
 		_modelRef: narratorModelRef,
 		_modelSelectionRef: narrator.model ?? FOLLOW_DEFAULT_MODEL,
-		_followParentNarratorId:
-			narrator.model === FOLLOW_PARENT_MODEL ? narrator.parentNarratorId : undefined,
+		_modelSourceNarratorId:
+			narrator.model === FOLLOW_PARENT_MODEL ? policySourceIdOf(narrator) : undefined,
 		_inheritedReasoningEffort: inheritedModel?.reasoningEffort,
-		_parentReasoningEffort: inheritedModel?.parentReasoningEffort,
+		_sourceReasoningEffort: inheritedModel?.parentReasoningEffort,
 		_settingsRevision: getSettingsRevision(),
 		model: narratorModel,
 		provider: narratorProvider,
@@ -1331,11 +1539,7 @@ async function createNarrator(
 		locale,
 		_usedCompactSummary: usedCompactSummary,
 		_replyInUserLanguage: replyInUserLanguage,
-		_chapterId: narratorChapterId,
 		_projectId: narratorProjectId,
-		_chapterRole: narratorChapterRole,
-		_worktreePath: narratorWorktreePath,
-		_baseBranch: narratorBaseBranch,
 		_isInGitRepo: narratorIsInGitRepo,
 		_planFileId: planFileId,
 		_planFilePath: planFilePath,
@@ -1375,12 +1579,28 @@ async function createNarrator(
 	// only: the enabled set above is never rewritten from it.
 	active._productRuntimeToolNames = new Set(runtimeToolNames);
 
-	activeNarrators.set(narratorId, active);
-
-	// Start file watcher for the worktree (covers terminal/editor changes)
-	if (narratorWorktreePath && narratorChapterId) {
-		worktreeWatcher.watch(narratorWorktreePath, narratorChapterId, narratorId, locale);
+	if (!initialOAuthRuntime) {
+		const explicitlyLoaded = new Set(narrator.enabledTools ?? []);
+		const loadedServers = new Set(
+			(narrator.enabledTools ?? []).flatMap((value) => {
+				const id = parseMcpServerMarker(value);
+				return id ? [id] : [];
+			}),
+		);
+		for (const tool of toolRegistry.all()) {
+			const server = settings.mcpServers?.find((item) => item.id === tool.metadata?.mcpServerId);
+			if (
+				server &&
+				resolveMcpLoadingMode(server) !== "disabled" &&
+				(resolveMcpLoadingMode(server) === "resident" ||
+					loadedServers.has(server.id) ||
+					explicitlyLoaded.has(mcpToolMarker(server.id, tool.name)))
+			)
+				active._enabledOptionalTools.add(tool.name);
+		}
 	}
+
+	activeNarrators.set(narratorId, active);
 
 	return active;
 }
@@ -1400,10 +1620,13 @@ async function broadcastInterruptedPartialMessage(
 	partialId: string,
 ): Promise<void> {
 	try {
-		const fullMessage = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			with: { toolCalls: true },
-		});
+		const fullMessage = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		if (!fullMessage) return;
 
 		const ref = await db.query.narratorMessageRefs.findFirst({
@@ -1416,26 +1639,23 @@ async function broadcastInterruptedPartialMessage(
 
 		const processed = enrichToolUseBlocks(truncateToolIO([{ ...fullMessage, seq: ref?.seq }]))[0];
 
-		// Subagent dual-broadcast: also surface this message on the parent
-		// narrator's page (as a child of the spawning tool_use) so the
-		// SubagentCard's transcript stays consistent with the subagent page.
-		// Mirror the eventContext resolution: prefer the takeover watcher, then
-		// fall back to the narrator record's parentNarratorId.
-		const parentToolUseId = fullMessage.parentToolUseId ?? undefined;
-		if (parentToolUseId) {
-			const watcher = getConclusionWatcher(narratorId);
-			let parentNarratorId = watcher?.parentNarratorId;
-			if (!parentNarratorId) {
-				const self = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { parentNarratorId: true },
-				});
-				parentNarratorId = self?.parentNarratorId ?? undefined;
-			}
-			if (parentNarratorId && parentNarratorId !== narratorId) {
-				broadcastToNarrator(parentNarratorId, {
+		// Display adapter: a message placed under the tool call the session delivers to
+		// is also shown on that tool call's card.
+		if (fullMessage.parentToolUseId) {
+			const deliverTo = getRunControl(narratorId)?.deliverTo;
+			const recipientId =
+				deliverTo?.toolUseId === fullMessage.parentToolUseId
+					? deliverTo.narratorId
+					: (
+							await db.query.narrators.findFirst({
+								where: eq(narrators.id, narratorId),
+								columns: { parentNarratorId: true },
+							})
+						)?.parentNarratorId;
+			if (recipientId && recipientId !== narratorId) {
+				broadcastToNarrator(recipientId, {
 					type: "message",
-					narratorId: parentNarratorId,
+					narratorId: recipientId,
 					message: fileReferenceMessageForDisplay(processed),
 				});
 			}
@@ -1514,7 +1734,10 @@ export async function finalizeInterruptedRun(
 		});
 		const currentSubstatus = parseSubstatus(current?.substatus);
 		if (!(current?.status === "idle" && currentSubstatus.includes("error"))) {
-			await narratorService.updateStatus(narratorId, "idle", { substatus: ["interrupted"] });
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["interrupted"],
+				unlessArchived: true,
+			});
 		}
 	} catch (err) {
 		logger.warn("Failed to update narrator status after interrupt", {
@@ -1534,10 +1757,11 @@ export async function finalizeInterruptedRun(
 // === Interrupt task guard ===
 
 /**
- * Dedupe key for the interrupt task guard: narratorId → tasks.json revisionId the
- * guard last fired for. `hotSafe` so a dev hot-reload does not re-arm every guard.
- * When the spec has not changed since the last injection there is nothing new to
- * tell the model, so repeated interrupts stay quiet instead of stacking cards.
+ * Dedupe key for the interrupt task guard: narratorId → the task source revision key
+ * (spec: the tasks.json revisionId) the guard last fired for. `hotSafe` so a dev
+ * hot-reload does not re-arm every guard. When the tasks have not changed since the last
+ * injection there is nothing new to tell the model, so repeated interrupts stay quiet
+ * instead of stacking cards.
  */
 const interruptTaskGuardRevisions = hotSafe<Map<string, string | null>>(
 	"narrafork.interruptTaskGuardRevisions",
@@ -1561,9 +1785,12 @@ const suppressSpecContinuationOnce = hotSafe<Set<string>>(
 	() => new Set(),
 );
 
+/** How many open tasks the interrupt guard lists; the rest stay in the task source. */
+const INTERRUPT_TASK_GUARD_MAX_TASKS = 8;
+
 /**
- * After an interrupt, if spec://tasks.json still has open tasks, suppress the next
- * auto-continuation once and persist a system note telling the model to reconcile
+ * After an interrupt, if the narrator's task source still has open tasks, suppress the
+ * next auto-continuation once and persist a system note telling the model to reconcile
  * the open tasks against the user's next message before resuming anything.
  *
  * Best-effort: any failure is logged and swallowed so interrupt cleanup can never
@@ -1574,11 +1801,8 @@ async function maybeDeliverInterruptTaskGuard(
 	narratorId: string,
 ): Promise<void> {
 	try {
-		const file = await specVfsService.readTasksFileForNarrator(narratorId);
-		const compiled = compileSpecTasks(parseSpecTasksDocument(file.content));
-		const openTasks = compiled.tasks.filter(
-			(task) => task.status === "doing" || task.status === "todo" || task.status === "blocked",
-		);
+		const taskSource = await taskSourceForNarrator(narratorId);
+		const { tasks: openTasks, revision } = await taskSource.openTasks();
 		if (openTasks.length === 0) return;
 
 		// One-shot suppression: the user's next turn decides the direction; a stale
@@ -1587,32 +1811,13 @@ async function maybeDeliverInterruptTaskGuard(
 		// (see suppressSpecContinuationOnce).
 		suppressSpecContinuationOnce.add(narratorId);
 
-		const revisionId = file.revisionId ?? null;
-		if (interruptTaskGuardRevisions.get(narratorId) === revisionId) return;
-		interruptTaskGuardRevisions.set(narratorId, revisionId);
+		if (interruptTaskGuardRevisions.get(narratorId) === revision) return;
+		interruptTaskGuardRevisions.set(narratorId, revision);
 
-		const isZh = active.locale === "zh-CN";
-		const taskLines = openTasks
-			.slice(0, 8)
-			.map((task) => `- [${task.status}] ${task.text}${task.protected ? " [protected]" : ""}`)
-			.join("\n");
-		const content = isZh
-			? `刚才的运行被用户中断，这通常意味着方向有变化。当前 spec://tasks.json 中仍有以下开放任务：\n\n${taskLines}\n\n这些任务可能已经过期或与用户最新意图不一致。回复用户的下一条消息时，以用户消息为准；如需调整计划，先更新/删除过期任务（protected 任务变更会触发 taskReflection），再继续执行。不要无视用户新指令而直接恢复旧任务。`
-			: `The run was just interrupted by the user, which usually means the direction changed. spec://tasks.json still has these open tasks:\n\n${taskLines}\n\nThey may be stale or no longer match the user's latest intent. When the user's next message arrives, treat it as the source of truth; update or remove outdated tasks first if the plan changed (protected task changes trigger taskReflection), then continue. Do not resume an old task over the user's new instruction.`;
-		const body = {
-			kind: "tasks" as const,
-			variant: "current" as const,
-			tasks: openTasks.slice(0, 8).map((task) => ({
-				role:
-					task.status === "doing"
-						? ("doing" as const)
-						: task.status === "blocked"
-							? ("blocked" as const)
-							: ("todo" as const),
-				text: task.text,
-				...(task.protected ? { protected: true as const } : {}),
-			})),
-		};
+		const { content, body } = taskSource.interruptGuardNote(
+			openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS),
+			active.locale,
+		);
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
@@ -1632,16 +1837,127 @@ async function maybeDeliverInterruptTaskGuard(
 	}
 }
 
+/**
+ * Completed tool calls a run must have made for its end to leave the turn-end note (outline plan
+ * PR 4, decision 2026-11-02 Q4).
+ */
+export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
+
+/**
+ * At the start of a run of an outline session: move the old behavior fence's text to the
+ * session's behavior page (once; `importOutlineBehaviorFence`), then note where the run starts
+ * for the turn-end note (the completed tool count and the revision of the open tasks). Spec
+ * sessions only resolve their (cached) backend. Never rejects.
+ */
+export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
+	active._outlineTurnStart = undefined;
+	try {
+		if ((await resolveTaskBackend(active.narratorId)) !== "outline") return;
+		const { readTaskSession } = await import("./task-source/backend");
+		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
+		const { importOutlineBehaviorFence } = await import("./task-source/outline-behavior");
+		await importOutlineBehaviorFence(active.narratorId, active.locale);
+		const source = await taskSourceForNarrator(active.narratorId);
+		if (!source.turnEndNote) return;
+		const { revision } = await source.openTasks();
+		active._outlineTurnStart = {
+			toolCount: active._todoReminderCompletedToolCount ?? 0,
+			revision,
+		};
+	} catch (err) {
+		logger.warn("Failed to prepare an outline run", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * The turn-end note (outline plan PR 4, decision 2026-11-02 Q4), the smallest deterministic form
+ * of "sync at natural points" (design §4.8): at the end of a run after which no continuation
+ * follows, when the run made at least {@link OUTLINE_TURN_END_MIN_TOOL_CALLS} tool calls, none of
+ * the session's tasks changed during it (the revision of its open tasks is the one the run started
+ * with) and a task is still in progress, one line names that task and asks to tick it done when it
+ * is. Persisted as a plain row the next turn reads; it starts no turn. At most once per run.
+ * Best-effort: failures are logged.
+ *
+ * Two steps, so the orchestrator keeps the pre-idle drain and its takeover-vs-terminal arbitration
+ * back to back: this one (reads only) runs before that drain, after the continuation, compact
+ * restart and hold decisions; {@link deliverOutlineTurnEndNote} (one row) runs once the run has
+ * settled terminal. A note decided for a run the drain or a hold continues is dropped, and the
+ * run's start stays, so its real end decides again.
+ *
+ * "Unchanged" compares the revision of the open tasks read (at most the candidate read's limits):
+ * a task created and finished within the run, or one beyond those limits, leaves it unchanged.
+ */
+export async function decideOutlineTurnEndNote(
+	active: ActiveNarrator,
+): Promise<InterruptGuardNote | null> {
+	const start = active._outlineTurnStart;
+	if (!start) return null;
+	try {
+		const calls = (active._todoReminderCompletedToolCount ?? 0) - start.toolCount;
+		if (calls < OUTLINE_TURN_END_MIN_TOOL_CALLS) return null;
+		const source = await taskSourceForNarrator(active.narratorId);
+		if (!source.turnEndNote) return null;
+		const { tasks, revision } = await source.openTasks();
+		if (revision !== start.revision) return null;
+		const doing = tasks.find((task) => task.status === "doing");
+		if (!doing) return null;
+		return source.turnEndNote(doing, active.locale);
+	} catch (err) {
+		logger.warn("Failed to decide the outline turn-end note", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+		return null;
+	}
+}
+
+/** Persist a note {@link decideOutlineTurnEndNote} decided, once per run. */
+export async function deliverOutlineTurnEndNote(
+	active: ActiveNarrator,
+	note: InterruptGuardNote,
+): Promise<boolean> {
+	if (!active._outlineTurnStart) return false;
+	active._outlineTurnStart = undefined;
+	try {
+		await deliverInjection(active.narratorId, {
+			content: note.content,
+			body: note.body,
+			source: "outline_task_turn_end",
+			// A plain row: the next turn reads it from history; no turn starts for it.
+			schedule: "none",
+			locale: active.locale,
+		});
+		return true;
+	} catch (err) {
+		logger.warn("Failed to deliver the outline turn-end note", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+		return false;
+	}
+}
+
+/** Both steps at once (tests, and any caller with no arbitration between them). */
+export async function maybeDeliverOutlineTurnEndNote(active: ActiveNarrator): Promise<boolean> {
+	const note = await decideOutlineTurnEndNote(active);
+	return note ? await deliverOutlineTurnEndNote(active, note) : false;
+}
+
 // === Agent loop execution ===
 
-/** Sum non-cached input + output tokens from a usage snapshot (for round token totals). */
 function tokenUsageValue(usage?: TokenUsageSnapshot): number {
 	if (!usage) return 0;
-	const nonCachedInput = Math.max(0, (usage.inputTokens ?? 0) - (usage.cachedInputTokens ?? 0));
-	if (usage.inputTokens != null || usage.completionTokens != null) {
-		return nonCachedInput + Math.max(0, usage.completionTokens ?? 0);
-	}
-	return Math.max(0, usage.promptTokens ?? 0) + Math.max(0, usage.completionTokens ?? 0);
+	const cacheWrite = Math.max(
+		usage.cacheCreationInputTokens ?? 0,
+		(usage.cacheCreation5mTokens ?? 0) + (usage.cacheCreation1hTokens ?? 0),
+	);
+	const input =
+		usage.inputTokens ??
+		Math.max(0, (usage.promptTokens ?? 0) - (usage.cachedInputTokens ?? 0) - cacheWrite);
+	return Math.max(0, input) + Math.max(0, usage.completionTokens ?? 0);
 }
 
 export async function ensureSkillCacheFreshForActiveNarrator(
@@ -1674,12 +1990,10 @@ export async function updateActiveNarratorCwdAndSkillContext(
 	} catch {
 		active._skillRoot = active._projectGitPath ?? null;
 	}
-	if (!active._chapterId) {
-		try {
-			active._isInGitRepo = await gitService.isGitRepo(cwd);
-		} catch {
-			active._isInGitRepo = false;
-		}
+	try {
+		active._isInGitRepo = await gitService.isGitRepo(cwd);
+	} catch {
+		active._isInGitRepo = false;
 	}
 	await ensureSkillCacheFreshForActiveNarrator(active);
 }
@@ -1690,37 +2004,52 @@ export async function updateActiveNarratorCwdAndSkillContext(
  * obtain a round-level token total for the Stop hook.
  */
 export function accountTokenUsageForTurn(active: ActiveNarrator): number {
-	const tokenDelta = Math.max(
-		0,
-		tokenUsageValue(active._lastTokenUsage) - tokenUsageValue(active._tokenUsageBaseline),
-	);
-	active._tokenUsageBaseline = active._lastTokenUsage;
+	const total = active._requestTokenTotal ?? 0;
+	const tokenDelta = Math.max(0, total - (active._tokenUsageBaseline ?? 0));
+	active._tokenUsageBaseline = total;
 	return tokenDelta;
 }
 
-async function loadCompiledSpecForContinuation(narratorId: string) {
-	const file = await specVfsService.readTasksFileForNarrator(narratorId);
-	let document = parseSpecTasksDocument(file.content);
-	let compiled = compileSpecTasks(document);
-	if (!compiled.currentTask && compiled.nextTask) {
-		let promoted = false;
-		document = {
-			tasks: document.tasks.map((task) => {
-				if (!promoted && task.status === "todo") {
-					promoted = true;
-					return { ...task, status: "doing" as const };
-				}
-				return task;
-			}),
-		};
-		const content = `${JSON.stringify(document, null, "\t")}\n`;
-		await specVfsService.writeSpecFile(narratorId, "spec://tasks.json", content, {
-			createdBy: "system",
-			allowProtectedTaskMutation: true,
-		});
-		compiled = compileSpecTasks(document);
+/** Called once for each owned request end, independently of context occupancy snapshots. */
+export function accountRequestTokenUsage(active: ActiveNarrator, usage?: TokenUsageSnapshot): void {
+	active._requestTokenTotal = (active._requestTokenTotal ?? 0) + tokenUsageValue(usage);
+}
+
+export interface SpecContinuationOptions {
+	explicitStart?: boolean;
+	cause?: SpecContinuationCause;
+	state?: SpecContinuationState;
+	/** Delivery/transcript placement changes only persistence, never continuation decisions. */
+	placement?: InjectionRecipientPlacement;
+}
+
+/**
+ * The continuation input from one narrator's task source, promoting the first todo when
+ * the policy allows. An unreadable source means nothing to continue.
+ */
+async function readContinuationTarget(
+	taskSource: NarratorTaskSource,
+	promoteTodo: boolean,
+): Promise<ContinuationTarget> {
+	try {
+		return await taskSource.prepareContinuation({ promoteTodo });
+	} catch {
+		return { openTask: null, protectedOpenCount: 0 };
 	}
-	return compiled;
+}
+
+/**
+ * The task a turn-budget continuation is planned for (`ContinuationTarget.turnBudgetOnly`): the
+ * narrator has none of its own, so the prompt names none (`turnBudgetOnly` on the prompt input).
+ */
+const TURN_BUDGET_TASK = Object.freeze({ text: "", protected: false, status: "doing" as const });
+
+/** Read only this narrator's tasks; promotion is granted by the policy, not its relationships. */
+export async function readSpecContinuationState(
+	narratorId: string,
+	promoteTodo = true,
+): Promise<ContinuationTarget> {
+	return readContinuationTarget(await taskSourceForNarrator(narratorId), promoteTodo);
 }
 
 async function maybeStartSpecContinuation(
@@ -1731,9 +2060,10 @@ async function maybeStartSpecContinuation(
 		autoContinuationOverride?: string | null;
 	},
 	loopHadError: boolean,
-	options?: { explicitStart?: boolean },
+	policy: RuntimePolicy,
+	options?: SpecContinuationOptions,
 ): Promise<string | null> {
-	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._continuationSuppressed) {
+	if (loopHadError || isPlanModeTrait(freshNarrator.traits)) {
 		return null;
 	}
 	// One-shot interrupt guard: the turn right after a user interrupt belongs to the
@@ -1752,37 +2082,82 @@ async function maybeStartSpecContinuation(
 	// auto-continuation setting still governs any later turns after that first pass.
 	if (effectiveMode === "off" && !options?.explicitStart) return null;
 
-	let compiled: ReturnType<typeof compileSpecTasks>;
-	try {
-		compiled = await loadCompiledSpecForContinuation(active.narratorId);
-	} catch (err) {
-		logger.debug("Spec continuation skipped", {
-			narratorId: active.narratorId,
-			error: err instanceof Error ? err.message : String(err),
+	const state = options?.state ?? createSpecContinuationState();
+	state.stop = undefined;
+	state.stall = {
+		count: active._continuationStallCount ?? 0,
+		key: active._continuationStallKey,
+		suppressed: active._continuationSuppressed === true,
+	};
+	const taskSource = await taskSourceForNarrator(active.narratorId);
+	const spec = await readContinuationTarget(taskSource, policy.continuation.promoteTodo);
+	const cause = options?.cause ?? "spec";
+	// A narrator without tasks of its own (an outline subagent, D27c) continues only when a pass
+	// spent its turn budget before the final reply: the mode's task conditions do not apply to
+	// it (only `off` still stops it), the pass ceiling and stall rules do.
+	const budgetOnly = spec.turnBudgetOnly === true;
+	if (budgetOnly) state.turnBudgetOnly = true;
+	const plan = planSpecContinuation({
+		cause,
+		mode: budgetOnly && effectiveMode !== "off" ? "always" : effectiveMode,
+		openTask: budgetOnly ? (cause === "maxTurns" ? TURN_BUDGET_TASK : null) : spec.openTask,
+		protectedOpenCount: spec.protectedOpenCount,
+		previous: state,
+		maxPasses: policy.continuation.maxPasses,
+		explicitStart: options?.explicitStart,
+	});
+	state.stall = plan.stall;
+	state.grantedKind = plan.grantedKind;
+	if (plan.action === "none") return null;
+	if (plan.action === "stop") {
+		state.stop = plan;
+		return null;
+	}
+	state.passes = plan.passes;
+	const task = plan.task;
+	const canAskUserQuestion = policy.capabilities.askUserQuestion !== "disabled";
+	if (policy.continuation.maxPasses !== null || !canAskUserQuestion || budgetOnly) {
+		const content = taskSource.continuationPrompt({
+			form: "bounded",
+			cause: plan.cause,
+			task,
+			passes: plan.passes,
+			maxPasses: policy.continuation.maxPasses,
+			canAskUserQuestion,
+			locale: active.locale,
+			...(budgetOnly ? { turnBudgetOnly: true } : {}),
 		});
-		return null;
+		await deliverInjection(active.narratorId, {
+			content,
+			source: task.status === "blocked" ? "spec_blocked_continuation" : "spec_continuation",
+			schedule: "none",
+			locale: active.locale,
+			originSource: "autoContinuation",
+			subagent: options?.placement,
+		});
+		active._continuationTurn = plan.grantedKind;
+		return content;
 	}
-
-	// "protectedOnly": only continue if there are protected tasks still open
-	if (effectiveMode === "protectedOnly" && compiled.protectedOpenCount === 0) {
-		return null;
-	}
-
-	const current = compiled.currentTask;
+	const current = task.status === "doing" ? task : null;
 	if (!current) {
-		// Only blocked tasks remain
-		if (effectiveMode === "blockStop") return null;
-		const blocked = compiled.tasks.find((task) => task.status === "blocked");
-		if (!blocked) return null;
-		const actionInstruction = getBlockedTaskActionInstruction(active.locale);
-		// `actionInstruction` already classifies the blocker and covers both branches, so
-		// this copy only adds what it cannot: that the message is system-generated, the tool
-		// name for asking, and that a stale entry may be rewritten. Restating its branches
-		// here (an earlier revision did) just made the prompt longer and self-repeating.
-		const prompt =
-			active.locale === "zh-CN"
-				? `Dynamic Spec blocked 任务续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 有 blocked 条目时自动发出这条消息。\n\nblocked 任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n需要用户介入时，用 AskUserQuestion 提问并结束回合；不要靠反复改写 tasks.json 或重跑同样的调查来绕开。如果该条目已不符合当前实际，可在保留用户原意图的前提下改写或删除它，并说明原因。改动 tasks.json 时先读取再就地修改，不要按本消息重写整个文件。`
-				: `Dynamic Spec blocked-task continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json has a \`blocked\` entry.\n\nBlocked task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nWhen the blocker needs the user, ask with AskUserQuestion and end the turn; do not work around it by rewriting tasks.json or re-running the same investigation. If the entry no longer matches reality, rewrite or remove it while preserving the user's original intent, and say why. When you change tasks.json, read it first and edit in place; do not rewrite the file from this message.`;
+		const blocked = task;
+		const prompt = taskSource.continuationPrompt({
+			form: "open",
+			task: blocked,
+			locale: active.locale,
+		});
+		if (options?.placement) {
+			await deliverInjection(active.narratorId, {
+				content: prompt,
+				source: "spec_blocked_continuation",
+				schedule: "none",
+				locale: active.locale,
+				originSource: "autoContinuation",
+				subagent: options.placement,
+			});
+			active._continuationTurn = "blocked";
+			return prompt;
+		}
 		const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 			{
 				type: "spec_blocked_continuation",
@@ -1808,35 +2183,23 @@ async function maybeStartSpecContinuation(
 		active._continuationTurn = "blocked";
 		return prompt;
 	}
-	const protectedNote = current.protected
-		? active.locale === "zh-CN"
-			? "\n- protected：只有具备具体验收证据才能标记 done，该变更会触发 taskReflection。"
-			: "\n- Protected: mark it done only with concrete completion evidence; that change runs taskReflection."
-		: "";
-	// ⚠️ Compiled from tasks.json, not written by the user, and emitted purely because a
-	// `doing` entry is still open — so it has to say so.
-	//
-	// The wording it replaces restated the task and ordered the model to continue ("Do not
-	// ask the user whether to continue"), which is indistinguishable from the user insisting
-	// the work is unfinished. Three observed failure modes came from that:
-	//
-	//  1. Work done, tasks.json not yet updated → the model reads the restated task as "you
-	//     are not done" and reworks code that was already correct.
-	//  2. The task needs the user (one was titled "需用户跑") → being told to act rather than
-	//     ask, the model edited tasks and got nudged again, 37 times in one session.
-	//  3. The task no longer matches reality → with no licence to say so, it grinds a stale
-	//     objective.
-	//
-	// Hence: state provenance, then enumerate the legitimate outcomes. The list must not be
-	// framed as "ways to END the turn" — "keep working" is one of the branches.
-	//
-	// It also names ONE task while tasks.json may hold many, so it says so. A model that
-	// reads this single line as the whole file concludes its other entries were lost and
-	// "restores" them by rewriting tasks.json — destroying the entries that were fine.
-	const prompt =
-		active.locale === "zh-CN"
-			? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 仍有 doing 条目时自动发出这条消息。它只说明该条目尚未标记完成 —— 不代表系统判断你没做完，条目内容也可能已经过时。\n\n当前任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${current.text}${current.protected ? " [protected]" : ""}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户提供信息、权限、决策，或需要用户亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提出一个精确问题并结束回合。\n- 已不符合当前实际：在保留用户原意图的前提下改写或删除该条目，并说明原因。\n\n改动 spec://tasks.json 时先读取再就地修改，不要按本消息重写整个文件。${protectedNote}`
-			: `Dynamic Spec auto-continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json still has a \`doing\` entry. It only means the entry is not marked finished — not that the system judged your work incomplete, and its content may be out of date.\n\nCurrent task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${current.text}${current.protected ? " [protected]" : ""}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs the user's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with AskUserQuestion and end the turn.\n- No longer matches reality: rewrite or remove the entry while preserving the user's original intent, and say why.\n\nWhen you change spec://tasks.json, read it first and edit in place; do not rewrite the file from this message.${protectedNote}`;
+	const prompt = taskSource.continuationPrompt({
+		form: "open",
+		task: current,
+		locale: active.locale,
+	});
+	if (options?.placement) {
+		await deliverInjection(active.narratorId, {
+			content: prompt,
+			source: "spec_continuation",
+			schedule: "none",
+			locale: active.locale,
+			originSource: "autoContinuation",
+			subagent: options.placement,
+		});
+		active._continuationTurn = "task";
+		return prompt;
+	}
 	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 		{
 			type: "spec_continuation",
@@ -1864,50 +2227,6 @@ async function maybeStartSpecContinuation(
 }
 
 /**
- * Write the session's upstream conversation id back to the DB, but only while the
- * row still holds the id this session started from.
- *
- * The guard exists because `apiConversationId = null` is a compact's way of saying
- * "the history was replaced; the next request must open a fresh upstream session".
- * Background compacts are fire-and-forget and routinely settle around a turn
- * boundary, so a plain write at teardown — on a turn that ended with no error at
- * all — could reinstate the stale id and make the next activation resume a session
- * whose upstream state still contains the pre-compact conversation.
- *
- * Losing the CAS is the correct outcome, not a failure: it means someone
- * deliberately moved the row, so we leave their value alone.
- */
-export function persistConversationIdIfUnchanged(
-	narratorId: string,
-	active: ActiveNarrator,
-	context?: string,
-): void {
-	const expected = active._persistedConversationId ?? null;
-	const next = active.conversationId;
-	// Nothing to write: the row already holds exactly this id.
-	if (expected === next) return;
-	narratorService
-		.updateConversationId(narratorId, next, expected)
-		.then((applied) => {
-			if (applied) {
-				active._persistedConversationId = next;
-				return;
-			}
-			logger.debug("Skipped conversationId write: row moved since session start", {
-				narratorId,
-				...(context ? { context } : {}),
-			});
-		})
-		.catch((err) => {
-			logger.error("Failed to persist conversationId", {
-				narratorId,
-				...(context ? { context } : {}),
-				error: String(err),
-			});
-		});
-}
-
-/**
  * Start an auto-continuation turn if the Dynamic Spec has an active/blocked
  * task that warrants continuing. Returns the injected prompt, or null when there
  * is nothing to continue.
@@ -1915,13 +2234,31 @@ export function persistConversationIdIfUnchanged(
 export async function maybeStartContinuation(
 	active: ActiveNarrator,
 	loopHadError: boolean,
-	options?: { explicitStart?: boolean },
+	options?: SpecContinuationOptions,
 ): Promise<string | null> {
 	// Settings can change while a provider turn is in flight. Re-read the narrator
 	// immediately before deciding whether to continue so every strategy change takes
 	// effect at the current turn boundary instead of using a stale mode for one extra turn.
 	const latestNarrator = await narratorService.getById(active.narratorId);
-	const prompt = await maybeStartSpecContinuation(active, latestNarrator, loopHadError, options);
+	const policy = await resolveNarratorRuntimePolicy(
+		active.narratorId,
+		active._currentUserId ?? null,
+	);
+	// Preserve the ordinary suppression guard before consuming flags or promoting queued tasks.
+	if (active._continuationSuppressed && policy.continuation.maxPasses === null) return null;
+	const deliverTo = runDeliverToOf(latestNarrator);
+	const placement =
+		options?.placement ??
+		(deliverTo
+			? {
+					parentNarratorId: deliverTo.narratorId,
+					parentToolUseId: deliverTo.toolUseId,
+				}
+			: undefined);
+	const prompt = await maybeStartSpecContinuation(active, latestNarrator, loopHadError, policy, {
+		...options,
+		placement,
+	});
 	// A continuation turn is not the user's turn — never let it write the behavior fence,
 	// even if the preceding user turn ran zero tools and left the grant open.
 	if (prompt) clearBehaviorFenceEditGrant(active.narratorId);
@@ -1987,8 +2324,7 @@ function resolveCadence(
  *            it is about to send (its in-memory history was built at pass start).
  *   `idle` — `schedule: "none"`, because the caller holds `continuationStartLock` and
  *            starts the loop itself; asking `deliverInjection` to wake would re-enter
- *            that lock and deadlock. Completions also carry their FULL result here, since
- *            a turn is being started specifically to deal with them.
+ *            that lock and deadlock. Both modes carry the full bounded completion result.
  *
  * Returns the concatenated model-facing text, or null when nothing was queued — the idle
  * callers use that as their "is a turn worth starting" signal.
@@ -2001,13 +2337,12 @@ async function deliverPendingInjectionsInOrder(
 	adoptedMailbox?: MailboxDeliveryConsumption[],
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
 	active?: ActiveNarrator,
+	inputParts?: AgentInputPart[],
 ): Promise<string | null> {
 	return withInboxOwner(narratorId, async () => {
 		await migrateLegacyParentInjections(narratorId);
 		const schedule = mode === "busy" ? "onNextTurn" : "none";
-		const parts: string[] = [];
-		const { pendingInjectionUserId } = await import("./parent-injection-queue");
-		let principalSet = false;
+		const parts: AgentInputPart[] = [];
 
 		// One injection row PER entry. The queue's global arrival order is the truth, so we
 		// walk `pending` directly rather than grouping consecutive same-kind entries into a
@@ -2028,9 +2363,6 @@ async function deliverPendingInjectionsInOrder(
 				narratorId,
 				(candidate) =>
 					candidate.kind !== "user_input" &&
-					(!subagent ||
-						candidate.kind !== "agent_message" ||
-						inboxMetadata<InboxAgentMetadata>(candidate).channel !== "buffer") &&
 					(projectedBytes === 0 ||
 						projectedBytes +
 							(candidate.kind === "task_notice"
@@ -2075,7 +2407,7 @@ async function deliverPendingInjectionsInOrder(
 						active._questionAnswerModelReceipts ??= new Map();
 						active._questionAnswerModelReceipts.set(questionAnswer.messageId, row.text);
 					}
-					parts.push(row.text);
+					parts.push({ text: row.text, messageId: questionAnswer.messageId });
 					projectedBytes += row.projectedByteSize;
 					continue;
 				}
@@ -2084,13 +2416,7 @@ async function deliverPendingInjectionsInOrder(
 					mailboxClaim: inboxClaim(row),
 					recipientMessageId: row.recipientMessageId ?? undefined,
 				};
-				if (active && !principalSet) {
-					const entryUser = pendingInjectionUserId(entry);
-					if (entryUser !== null && entryUser !== undefined) {
-						active._currentUserId = entryUser;
-						principalSet = true;
-					}
-				}
+				// Message and notice authors are attribution only, never execution identity.
 				const text = await deliverPendingInjection(
 					narratorId,
 					locale,
@@ -2098,10 +2424,10 @@ async function deliverPendingInjectionsInOrder(
 					schedule,
 					entry,
 					subagent,
+					(part) => parts.push(part),
 				);
 				if (text) {
 					projectedBytes += Buffer.byteLength(text);
-					parts.push(text);
 					if (row.kind !== "agent_message") adoptedMailbox?.push(inboxConsumption(row));
 					if (entry.kind === "subagent_message" && entry.message.delivery) {
 						adoptedDeliveries?.push(entry.message.delivery);
@@ -2122,14 +2448,14 @@ async function deliverPendingInjectionsInOrder(
 		const retried = !active?.abortController?.signal.aborted
 			? await retryDeferredQuestionAnswerDeliveries(narratorId, locale)
 			: 0;
-		const joined = parts.filter((part) => part.trim().length > 0).join("\n\n");
+		const projectedParts = parts.filter((part) => part.text.trim().length > 0);
 		// A just-accepted receipt may sit behind this bounded batch. Keep a pass
 		// alive so normal history rebuilding supplies its full persisted event.
-		return joined.length > 0
-			? joined
-			: retried
-				? "Pending question receipts were accepted for delivery."
-				: null;
+		if (projectedParts.length === 0 && retried) {
+			projectedParts.push({ text: "Pending question receipts were accepted for delivery." });
+		}
+		inputParts?.push(...projectedParts);
+		return projectedParts.length > 0 ? projectedParts.map((part) => part.text).join("\n\n") : null;
 	});
 }
 
@@ -2148,11 +2474,29 @@ export async function deliverPendingInjection(
 	schedule: "onNextTurn" | "none",
 	entry: PendingInjection,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
+	onDelivered?: (part: AgentInputPart) => void,
 ): Promise<string | null> {
-	const deliverInjection = (
+	const deliverInjection = async (
 		id: string,
 		options: import("./narrator-injection").DeliverInjectionOptions,
-	) => deliverInboxInjection(id, options, entry.mailboxClaim);
+	) => {
+		const result = await deliverInboxInjection(id, options, entry.mailboxClaim);
+		onDelivered?.({
+			text: result.turnText ?? options.content,
+			messageId: result.messageId ?? undefined,
+		});
+		return result;
+	};
+	const withBackgroundCompletionHint = async (content: string, status: string) => {
+		if (status !== "completed") return content;
+		// Read at delivery time, not publication time: other work may have finished
+		// or started while this notice was waiting in the mailbox. Services do not
+		// keep task work pending; use the same effective-state count as the task panel.
+		const { activeWorkCount } = await backgroundTaskService.countActiveKindsByParent(narratorId);
+		return activeWorkCount === 0
+			? `${content}\n\n${t("sidecar.noActiveBackgroundTasks", locale)}`
+			: content;
+	};
 	const claim = entry.mailboxClaim;
 	// The refs port decides the dialect. PostgreSQL: `deliverInboxInjection` drives the
 	// queue's own materialize section (message + ref + mailbox flip in one transaction),
@@ -2204,7 +2548,10 @@ export async function deliverPendingInjection(
 			);
 			// Completion is useful at either boundary only when it includes the result.
 			// Keep the bounded snapshot in the injected history, not just the UI sidecar.
-			const content = formatBackgroundCompletionNotifications([task], { includeResult: true });
+			const content = await withBackgroundCompletionHint(
+				formatBackgroundCompletionNotifications([task], { includeResult: true }),
+				task.status,
+			);
 			const { turnText } = await deliverInjection(narratorId, {
 				...placement,
 				content,
@@ -2229,11 +2576,13 @@ export async function deliverPendingInjection(
 			];
 			// `sideCarBodyWithText` renders the model-facing text from the SAME body in one
 			// call, which is what keeps the two projections from drifting apart.
-			const { body, content } = sideCarBodyWithText(
+			const projected = sideCarBodyWithText(
 				"bg_bash",
 				{ kind: "tasksDone", flavor: "bash", items },
 				locale,
 			);
+			const body = projected.body;
+			const content = await withBackgroundCompletionHint(projected.content, bashTask.status);
 			const { turnText } = await deliverInjection(narratorId, {
 				...placement,
 				content,
@@ -2269,7 +2618,8 @@ export async function deliverPendingInjection(
 			locale,
 		);
 		const content =
-			mode === "idle" ? formatParentInboundMessages([message], locale) : projected.content;
+			message.modelText ??
+			(mode === "idle" ? formatParentInboundMessages([message], locale) : projected.content);
 		const { turnText } = await deliverInjection(narratorId, {
 			...placement,
 			content,
@@ -2331,27 +2681,30 @@ export async function drainAndPersistPendingInjections(
  * now write a real message row through `deliverInjection`; they differ only in what
  * happens next, which is the whole point of separating `role` from `schedule`:
  *
- *   idle → `wakeIfIdle`, because nothing is running to notice the row
+ *   idle → `none`, because the caller starts a pass that rebuilds history
  *   busy → `onNextTurn`, because the loop is mid-flight and its in-memory history was
  *          built at pass start, so the row alone would go unseen until the next pass
  *
  * The returned text is what the loop folds into the turn it is about to send. Nothing
  * is yielded for persistence: the row is already written.
  *
- * `includeResult: false` keeps the busy path's existing economy — a preview here, the
- * full output on demand via `Await`. The idle path passes `true` because it is
- * starting a turn specifically to deal with the result.
+ * Both busy and idle paths carry the full bounded completion result, so a tool
+ * boundary gives the model the same completion context as a fresh pass.
  */
 export async function drainInjectionsIntoHistory(
 	active: ActiveNarrator,
 	locale: Locale,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
-): Promise<{ text: string; onConsumed: () => void }> {
+): Promise<{
+	text: string;
+	parts: AgentInputPart[];
+	lastInputWasMailbox: boolean;
+	onConsumed: () => void;
+}> {
 	const narratorId = active.narratorId;
-	const parts: string[] = [];
-	const { buildPendingQuestionHint } = await import("./narrator-question-service");
-	const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
-	if (pendingQuestionHint) parts.push(pendingQuestionHint);
+	// Every part is a persisted row. Unresolved questions are listed in the pass's system
+	// prompt instead of being re-sent, unpersisted, at every tool boundary.
+	const parts: AgentInputPart[] = [];
 	const adoptedDeliveries: AgentMessageDelivery[] = [];
 	const adoptedMailbox: MailboxDeliveryConsumption[] = [];
 
@@ -2384,7 +2737,17 @@ export async function drainInjectionsIntoHistory(
 		() => active._fenceInterval ?? -1,
 	).due(count);
 
-	const tasksBody = atTasksCadence ? await buildSpecTaskDigestBody(narratorId) : null;
+	// Both bodies come from the narrator's task source, resolved only when a cadence is due
+	// and at most once per drain. Injection reads resolve to null rather than reject; the
+	// catch keeps it that way for any source, since nothing above this drain catches.
+	let taskSource: NarratorTaskSource | undefined;
+	const getTaskSource = async () => {
+		taskSource ??= await taskSourceForNarrator(narratorId);
+		return taskSource;
+	};
+	const tasksBody = atTasksCadence
+		? await (await getTaskSource()).taskDigest().catch(() => null)
+		: null;
 	if (tasksBody) {
 		// Stamp the cadence that raised this digest so the reader-facing header can say
 		// "每 N 次工具调用", distinguishing a routine digest from a turn-end
@@ -2393,7 +2756,7 @@ export async function drainInjectionsIntoHistory(
 			tasksBody.cadenceInterval = active._tasksReminderInterval ?? 15;
 		}
 		const { body, content } = sideCarBodyWithText("living_work_spec", tasksBody, locale);
-		const { turnText } = await deliverInjection(narratorId, {
+		const { messageId, turnText } = await deliverInjection(narratorId, {
 			subagent,
 			content,
 			body,
@@ -2401,16 +2764,16 @@ export async function drainInjectionsIntoHistory(
 			schedule: "onNextTurn",
 			locale,
 		});
-		if (turnText) parts.push(turnText);
+		if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 	}
 
 	// The fence goes out on its own cadence, or alongside a tasks reminder when the
 	// narrator is configured to attach the two.
 	if (atFenceCadence || (!!active._fenceAttach && !!tasksBody)) {
-		const fenceBody = await buildBehaviorFenceBody(narratorId);
+		const fenceBody = await (await getTaskSource()).behaviorFence().catch(() => null);
 		if (fenceBody) {
 			const { body, content } = sideCarBodyWithText("behavior_fence", fenceBody, locale);
-			const { turnText } = await deliverInjection(narratorId, {
+			const { messageId, turnText } = await deliverInjection(narratorId, {
 				subagent,
 				content,
 				body,
@@ -2418,13 +2781,13 @@ export async function drainInjectionsIntoHistory(
 				schedule: "onNextTurn",
 				locale,
 			});
-			if (turnText) parts.push(turnText);
+			if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 		}
 	}
 
 	// Background completions + `Send({ id: "parent" })` reports, in the order they
 	// actually happened. See `deliverPendingInjectionsInOrder`.
-	const eventText = await deliverPendingInjectionsInOrder(
+	await deliverPendingInjectionsInOrder(
 		narratorId,
 		locale,
 		"busy",
@@ -2432,24 +2795,8 @@ export async function drainInjectionsIntoHistory(
 		adoptedMailbox,
 		subagent,
 		active,
+		parts,
 	);
-	if (eventText) parts.push(eventText);
-	if (subagent) {
-		const { consumeBufferedSubagentMessageInPass } = await import("./subagent-executor");
-		const consumed = await consumeBufferedSubagentMessageInPass({
-			narratorId,
-			parentNarratorId: subagent.parentNarratorId,
-			toolUseId: subagent.parentToolUseId,
-			cwd: active.cwd,
-			currentUserId: active._currentUserId,
-		});
-		if (consumed) {
-			parts.push(consumed.text);
-			if (consumed.buffered.delivery) adoptedDeliveries.push(consumed.buffered.delivery);
-			if (consumed.buffered._mailboxConsumption)
-				adoptedMailbox.push(consumed.buffered._mailboxConsumption);
-		}
-	}
 
 	// Spec files the user edited through the UI.
 	//
@@ -2473,7 +2820,7 @@ export async function drainInjectionsIntoHistory(
 			},
 			locale,
 		);
-		const { turnText } = await deliverInjection(narratorId, {
+		const { messageId, turnText } = await deliverInjection(narratorId, {
 			subagent,
 			content,
 			body,
@@ -2481,11 +2828,15 @@ export async function drainInjectionsIntoHistory(
 			schedule: "onNextTurn",
 			locale,
 		});
-		if (turnText) parts.push(turnText);
+		if (turnText) parts.push({ text: turnText, messageId: messageId ?? undefined });
 	}
 
 	return {
-		text: parts.join("\n\n"),
+		text: parts.map((part) => part.text).join("\n\n"),
+		parts,
+		lastInputWasMailbox: adoptedDeliveries.some(
+			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
+		),
 		onConsumed: () => {
 			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
 			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
@@ -2544,77 +2895,20 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
 }
 
 /**
- * Text of a trailing `role: "user"` row that a pass with no prompt of its own must resend.
- *
- * Every provider's history builder POPS the last top-level user row and expects the
- * caller to send it as the current turn (`buildAnthropicHistory` line ~2832 and the
- * same three lines in openai/gemini). That contract holds for an ordinary user
- * message, because whoever wrote the row also passes its text into `runAgentLoop`.
- *
- * It does NOT hold for a row written by a producer that then starts a bare
- * `runAgentLoop(active, "")` — the review conclusion written by
- * `review-event-handler` is the first such producer. The row was popped as "the
- * current turn" and the current turn was empty, so the conclusion reached the model
- * in NEITHER place: `pushUserTurn` pushes nothing for empty content, and history no
- * longer contains the row. The reviewer's findings simply were not in the request.
- *
- * Nothing reports that. The turn runs, the model answers something generic about the
- * previous context, and the transcript still shows the conclusion sitting there — so
- * it reads as the model ignoring it rather than never receiving it.
- *
- * Recovered here rather than at the producer because the gap belongs to this seam:
- * any future producer that persists a user row and starts an empty pass inherits the
- * same bug, and a fix at one call site would not cover it. `sys` rows need none of
- * this — the builders lift those into `trailingUserText` themselves.
- */
-export function resolvePoppedTrailingUserText(
-	messages: ContinuableTopLevelMessage[],
-): string | null {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (!msg || msg.parentToolUseId) continue;
-		// Mirrors the builders' filter: they only consider user/assistant/sys, and only
-		// a trailing `user` row is popped. A trailing `sys` run is lifted by the builder
-		// itself, so reaching one means there is nothing for this helper to recover.
-		if (msg.role === "sys") return null;
-		if (msg.role !== "user") return null;
-		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-		const text = blocks
-			.filter(
-				(block: { type?: string; text?: unknown }) =>
-					block?.type === "text" && typeof block.text === "string" && block.text.trim(),
-			)
-			.map((block: { text?: unknown }) => String(block.text))
-			.join("\n");
-		// Snapshot-only inputs are real turns too. Prefer contentText for the old
-		// uploaded-file hint when references are present, just as history projection does.
-		const flat = typeof msg.contentText === "string" ? msg.contentText : "";
-		const snapshots = getFileReferenceSnapshots(blocks);
-		const projected = projectFileReferenceText(
-			snapshots.length ? flat || text : text || flat,
-			snapshots,
-		);
-		return projected.trim() ? projected : null;
-	}
-	return null;
-}
-
-/**
  * Does model-visible history end on a server-authored injection?
  *
  * `resolveContinuationTail` walks PAST `sys` rows by design — it answers "what turn can
  * a continuation build on", and an injection is not a turn. But its absence from that
  * answer must not be read as "history ends on the row underneath": an injection sitting
  * last is the freshest thing the narrator was handed, and every provider's history
- * builder already sends a trailing `sys` run as the CURRENT turn
- * (`buildAnthropicHistory`'s `trailingUserText`).
+ * already ends with it as the latest input, so it IS the current turn.
  *
  * So a continuation whose tail is an injection has its content already in place and needs
  * nothing but a loop — the same `runAgentLoop(active, "")` that
  * `startInjectionContinuationIfPossible` uses. Appending a synthetic "please continue"
  * user row instead would be actively wrong, not merely redundant: it displaces the
- * injection from the trailing position, so the builder stops lifting it and the model
- * reads it as background while being asked to continue something unnamed.
+ * injection from the trailing position, and the model reads it as background while
+ * being asked to continue something unnamed.
  */
 export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -2626,39 +2920,42 @@ export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]):
 	return false;
 }
 
-export async function getLatestSubagentParentToolUseId(
-	narratorId: string,
-): Promise<string | undefined> {
-	const latestSubMsg = await db.query.narratorMessages.findFirst({
-		where: and(
-			eq(narratorMessages.narratorId, narratorId),
-			eq(narratorMessages.role, "user"),
-			isNotNull(narratorMessages.parentToolUseId),
-		),
-		columns: { parentToolUseId: true },
-		orderBy: [desc(narratorMessages.createdAt)],
-	});
-	return latestSubMsg?.parentToolUseId ?? undefined;
-}
-
 // === Shared context management hooks ===
 
 export interface ContextManagementOptions {
 	narratorId: string;
 	locale: Locale;
+	getReplyContext?: () => ReplyContext;
+	ensureRequestIdentity?: () => Promise<void>;
 	/** Dynamic getter for the current model (supports mid-loop model switching) */
 	getModel: () => string;
 	/** Dynamic getter for the current provider (supports mid-loop model switching) */
 	getProvider: () => string;
-	/** Whether this narrator is a subagent (all messages have parentToolUseId) */
-	isSubagent?: boolean;
-	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
+	/** Server-local cwd for restoring model-visible attachment copies. */
+	getAttachmentCwd?: () => string | undefined;
+	/** Optional tool loading input for rebuilt histories (see `RuntimeHistoryOptions`). */
+	getToolLoading?: (
+		identity: RequestModelIdentity,
+	) => import("./agent-runtime/history").RuntimeHistoryOptions["toolLoading"];
+	/** Refresh registry membership and explicit MCP server grants before every request. */
+	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
+	attachmentSignal?: AbortSignal;
+	/** Called after compact completes (e.g. mark transport restart without rotating cache identity). */
 	onCompactDone?: () => void;
 	/** Check whether a compact just finished and the next turn needs a full rebuild */
 	isCompactDone?: () => boolean;
 	/** Clear the compact-done flag after the rebuild has been applied */
 	clearCompactDone?: () => void;
-	/** Rebuild the system prompt with the latest contextSummary from DB */
+	/** Collect current dynamic parts before each provider request; reconcile freezes the baseline. */
+	buildPrefixPrompt?: (
+		identity: RequestModelIdentity,
+		replyContext: ReplyContext,
+	) => Promise<{
+		contract: string;
+		parts: import("../../shared/prefix-context").PromptPart[];
+		compactMessageId?: string | null;
+	}>;
+	/** Compatibility path for callers not yet supplying named prompt parts. */
 	rebuildSystemPrompt?: () => Promise<string | null>;
 }
 
@@ -2666,11 +2963,13 @@ export interface ContextManagementOptions {
  * Build reusable context management hooks (compact) for both
  * main narrators and subagents.
  *
- * Returns an `onContextUsage` EventHook and an `onBeforeTurn` AgentConfig callback.
+ * Returns an `onContextUsage` EventHook, an `onBeforeTurn` AgentConfig callback and the
+ * per-request history rebuild.
  */
 export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	onContextUsage: NonNullable<EventHooks["onContextUsage"]>;
 	onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]>;
+	rebuildRequestHistory: NonNullable<import("../lib/agent").AgentConfig["rebuildRequestHistory"]>;
 	onReasoningOnlyHighContext: NonNullable<
 		import("../lib/agent").AgentConfig["onReasoningOnlyHighContext"]
 	>;
@@ -2680,7 +2979,6 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		locale,
 		getModel,
 		getProvider,
-		isSubagent: isSubagentNarrator,
 		onCompactDone,
 		isCompactDone,
 		clearCompactDone,
@@ -2715,23 +3013,53 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
-		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
+		const signal = opts.attachmentSignal;
+		const preparedPrefix = await preparePrefixRequest({
+			narratorId,
+			locale,
+			getReplyContext: opts.getReplyContext,
+			ensureRequestIdentity: opts.ensureRequestIdentity,
+			getModel,
+			getProvider,
+			signal,
+			getToolLoading: opts.getToolLoading,
+			refreshToolLoading: opts.refreshToolLoading,
+			buildPrefixPrompt: opts.buildPrefixPrompt,
+		});
+		const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
+		let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
 		const result = await buildRuntimeHistory({
 			narratorId,
-			model: getModel(),
-			provider: getProvider(),
-			profile: isSubagentNarrator ? "subagent" : "primary",
+			model: preparedPrefix.model,
+			provider: preparedPrefix.provider,
 			sourceMessages: rawMsgs,
+			attachmentCwd: opts.getAttachmentCwd?.(),
+			attachmentSignal: signal,
+			toolLoading,
 		});
-		const systemPrompt = includeSystemPrompt
-			? ((await rebuildSystemPrompt?.()) ?? undefined)
-			: undefined;
+		if (result.toolLoading && !result.toolCandidates) {
+			throw new Error("A tool-loading history rebuild must include tool candidates");
+		}
+		if (!prefixPrompt && includeSystemPrompt) {
+			systemPrompt = (await rebuildSystemPrompt?.()) ?? undefined;
+		}
+		signal?.throwIfAborted();
 		return {
 			history: result.history,
-			pendingToolResults: result.trailingToolResults,
+			rows: result.modelMessages,
+			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+			...(result.mediaFallbackWarnings?.length
+				? { mediaFallbackWarnings: result.mediaFallbackWarnings }
+				: {}),
+			...(result.toolLoading
+				? {
+						toolLoading: result.toolLoading,
+						...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
+					}
+				: {}),
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
 		};
 	};
@@ -2829,84 +3157,114 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		return rebuildHistoryForCurrentContext(true);
 	};
 
-	return { onContextUsage, onBeforeTurn, onReasoningOnlyHighContext };
+	// Same rows, same projection as a pass start; the system prompt stays the pass's own.
+	// A compact that finished since `onBeforeTurn` looked moves its summary into the
+	// system prompt, so that case rebuilds both, as `onBeforeTurn` would.
+	const rebuildRequestHistory = async () => {
+		if ((isCompactDone?.() ?? false) || hasPendingHistoryCompact(narratorId)) {
+			clearCompactDone?.();
+			return rebuildHistoryForCurrentContext(true);
+		}
+		return rebuildHistoryForCurrentContext(false);
+	};
+
+	return { onContextUsage, onBeforeTurn, rebuildRequestHistory, onReasoningOnlyHighContext };
 }
 
 /**
- * Build AgentConfig, start the agent loop via executeAgentLoop(), and handle chained messages.
- * Runs in the background — kicked off by feedMessage().
+ * Session catch for a thrown run. `executeRun` already settles a foreground failure
+ * (idle, and error / interrupted / timeout). Writing again would replace that
+ * classification and broadcast a second `narrator_error`. Throws that never reached
+ * the finalizer — registration rejected, or the run still working/waiting — still
+ * report here.
+ */
+async function reportUnsettledRunLoopError(
+	narratorId: string,
+	err: unknown,
+	diagnostics?: ReturnType<typeof diagnosticsFromError>,
+): Promise<void> {
+	const current = await narratorService.getById(narratorId).catch(() => null);
+	if (!current || (current.status !== "working" && current.status !== "waiting")) return;
+	await narratorService.updateStatus(narratorId, "idle", {
+		substatus: ["error"],
+		errorMessage: String(err),
+		...(diagnostics ? { diagnostics } : {}),
+	});
+	broadcastToNarrator(narratorId, {
+		type: "narrator_error",
+		narratorId,
+		error: String(err),
+		...(diagnostics ? { diagnostics } : {}),
+	});
+}
+
+/**
+ * Start a run of this prepared session through the single run service.
  *
- * Returns `{ started: false }` when a loop is already running for this narrator.
- * The shared execution epoch is claimed in short start admission, before async
- * preparation. Both main and child entry adapters use this gate, including when
- * DB status went stale to idle while an earlier execution was still draining.
+ * Returns `{ started: false }` when another execution owns the narrator. Every
+ * session — however it was created — runs here; relations (result destination,
+ * caller cancellation, deadline, principal) come from the run registration.
  */
 export async function runAgentLoop(
 	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
+	{
+		recoveryStart,
+		...options
+	}: Omit<
+		import("./agent-runtime/run").StartNarratorRunRequest,
+		"narratorId" | "locale" | "text" | "images" | "active" | "admission"
+	> & { recoveryStart?: RecoveryContinuationStart } = {},
 ): Promise<{ started: boolean }> {
 	const narratorId = active.narratorId;
 	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
+		recoveryStart?.resolveAdmission(false);
 		return { started: false };
 	}
+	const { startNarratorRun } = await import("./agent-runtime/run");
 	try {
-		const launch = await withNarratorStartAdmission(narratorId, async () => {
-			if (
-				narratorLoopAdmissions.has(narratorId) ||
-				narratorToolExecutionAdmissions.has(narratorId)
-			) {
-				return null;
-			}
-			const owner = tryClaimExecution(narratorId, "primary");
-			if (!owner) return null;
-			// Release and the final mailbox check form one synchronous owner transition.
-			let allowInboxWake = false;
-			const completion = withNarratorWorkAdmission(narratorId, () =>
-				runAgentLoopUnlocked(active, owner, text, images),
-			)
-				.then((result) => {
-					allowInboxWake = result.allowInboxWake ?? false;
-					return { started: result.started };
-				})
-				.finally(() => {
-					if (owner.release() && allowInboxWake)
-						void (async () => {
-							await retryDeferredQuestionAnswerDeliveries(narratorId, active.locale);
-							if (await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"]))
-								await wakeInboxIfEligible(narratorId, active.locale);
-						})().catch((error) => {
-							logger.warn("Inbox wake check deferred after loop release", {
-								narratorId,
-								error: String(error),
-							});
-						});
-				});
-			return { completion };
+		const handle = await startNarratorRun({
+			narratorId,
+			locale: active.locale,
+			text,
+			images,
+			active,
+			...options,
+			...(recoveryStart ? { admission: recoveryStart } : {}),
 		});
-		return launch ? await launch.completion : { started: false };
+		if (!handle.started) return { started: false };
+		await handle.completion;
+		return { started: true };
 	} catch (error) {
+		if (recoveryStart?.cancelled()) return { started: false };
 		if (!narratorLoopAdmissions.has(narratorId)) {
 			active._loopRunning = false;
 			active.alive = false;
 		}
 		throw error;
 	} finally {
-		if (active._resumeBufferedAfterLoop) {
-			active._resumeBufferedAfterLoop = false;
-			void wakeInboxIfEligible(narratorId, active.locale).catch((error) => {
-				if (!isNarratorRevertAdmissionBlocked(narratorId)) {
-					logger.warn("Could not resume queued messages after finalization", {
-						narratorId,
-						error: String(error),
-					});
-				}
-			});
-		}
+		recoveryStart?.resolveAdmission(false);
 	}
 }
 
 // === Message feeding ===
+
+/** Where a session's current (or last) run delivers its result, if anywhere. */
+export async function readSessionDeliverTo(
+	narratorId: string,
+): Promise<import("../lib/validators/runtime-registration").RunDeliverTo | undefined> {
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { runtimeRegistrationJson: true },
+	});
+	return row ? runDeliverToOf(row) : undefined;
+}
+
+/** Historical transcript ownership is independent of whether any run still delivers there. */
+export async function readSessionOwnTurnPlacement(narratorId: string): Promise<OwnTurnPlacement> {
+	return narratorService.ownTurnPlacement(narratorId);
+}
 
 /**
  * Persist a user message and kick off the agent loop in the background.
@@ -2929,6 +3287,7 @@ async function feedMessageUnlocked(
 	rawTextFiles?: File[],
 	preBashCommand?: string | null,
 	internalOptions?: {
+		humanReplyContext?: ReplyContext;
 		preserveTurnStart?: boolean;
 		turnStartedAt?: string;
 		/** A buffered message may be restored only before its user row is committed. */
@@ -2936,18 +3295,40 @@ async function feedMessageUnlocked(
 		bufferedId?: string;
 		bufferedRow?: RuntimeMailboxRow;
 		bufferedOwner?: ExecutionOwner;
+		/** Prepare a fresh pass of the already-owned run without starting another run. */
+		prepareOnly?: boolean;
+		/** Run relations for a recovered/continued run (see StartNarratorRunRequest). */
+		run?: Pick<
+			import("./agent-runtime/run").StartNarratorRunRequest,
+			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "principal" | "binding"
+		>;
+		recoveryStart?: RecoveryContinuationStart;
 	},
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
 	userBroadcasted?: boolean;
+	/** Settles when the started run reaches its terminal. */
+	terminal?: Promise<unknown>;
+	/** Input for a fresh pass; ownership and terminal promises remain with run.ts. */
+	preparedInput?: {
+		text: string;
+		images?: ImageRef[];
+		media?: MediaRef[];
+		prePromptBashCommand?: string;
+	};
 	/** The message is durable, but a later dispatch step failed and was reported. */
 	postCommitError?: unknown;
 }> {
+	const recoveryStart = internalOptions?.recoveryStart;
+	recoveryStart?.check();
 	let acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	recoveryStart?.check();
 	// Final guard against a concurrent loop slipping past the route-level admission
 	// check (which should have buffered this message). ensureNarrator reuses the live
 	// `active`, so starting a second runAgentLoop here would corrupt the shared session.
@@ -2966,7 +3347,7 @@ async function feedMessageUnlocked(
 	active._continuationStallCount = 0;
 	active._continuationStallKey = undefined;
 	// Record the user who triggered this turn → flows into ToolContext.userId for knowledge ACL.
-	active._currentUserId = userId ?? null;
+	if (userId !== undefined) active._currentUserId = userId;
 	// Open the one-shot behavior-fence edit window for this user turn. It is consumed by the
 	// first behavior_fence write and cleared once the first tool call completes, so the agent
 	// can only record a fence on its first tool call and only when the user asked for it.
@@ -2977,6 +3358,7 @@ async function feedMessageUnlocked(
 		throw new ValidationError("Narrator input is already being adopted");
 	let claimedInput: RuntimeMailboxRow | undefined;
 	let stagingId: string | undefined;
+	let acceptedInputId: string | undefined;
 	let userMsg: typeof narratorMessages.$inferSelect;
 	let effectivePrompt: string;
 	try {
@@ -2986,6 +3368,7 @@ async function feedMessageUnlocked(
 		// The shared barrier honors the facade's sync API and a wired service's Promise
 		// shape alike.
 		await flushInboxPublicationBarrier(narratorId);
+		recoveryStart?.check();
 		// An idle narrator may still have earlier agent/task mailbox work that deliberately
 		// does not auto-wake it (notably cancellation notices). Consume that non-user work
 		// before appending this new user input, otherwise the exact claim below reports that
@@ -2994,6 +3377,7 @@ async function feedMessageUnlocked(
 		// it cannot start a second loop or skip an earlier user_input row.
 		if (!internalOptions?.bufferedId && !internalOptions?.bufferedRow)
 			await drainAndPersistPendingInjections(active);
+		recoveryStart?.check();
 		const acceptedId =
 			internalOptions?.bufferedId ??
 			(
@@ -3008,8 +3392,16 @@ async function feedMessageUnlocked(
 					"back",
 					preBashCommand,
 					acceptedReferences,
+					undefined,
+					undefined,
+					undefined,
+					composerDocument,
+					media,
+					internalOptions?.humanReplyContext,
 				)
 			).id;
+		acceptedInputId = acceptedId;
+		recoveryStart?.check();
 		claimedInput =
 			internalOptions?.bufferedRow ??
 			(await claimInboxHead(
@@ -3024,20 +3416,25 @@ async function feedMessageUnlocked(
 		)
 			throw new ValidationError("Buffered input claim does not match its owner");
 		if (!claimedInput) throw new ValidationError("Input is queued behind earlier mailbox work");
+		recoveryStart?.check();
 		const accepted = projectMailboxUserMessage(claimedInput);
 		prompt = accepted.text;
 		images = accepted.images;
+		media = accepted.media;
 		commandText = accepted.commandText;
-		userId = accepted.createdBy;
+		// A mailbox null means no known principal, not permission to erase the
+		// session's identity. Preserve an explicit null only on this direct call.
+		userId = accepted.createdBy ?? userId;
 		rawTextFiles = accepted.textFiles;
 		preBashCommand = accepted.bashCommand;
 		acceptedReferences = accepted.fileReferences ?? [];
 		stagingId = accepted._stagingId;
-		active._currentUserId = userId ?? null;
+		if (userId !== undefined) active._currentUserId = userId;
 		// Save text files to worktree only after the durable claim freezes accepted bytes.
 		const savedTextFiles: TextFileRef[] = [];
 		if (rawTextFiles?.length) {
 			for (const file of rawTextFiles) {
+				recoveryStart?.check();
 				savedTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
 			}
 		}
@@ -3045,6 +3442,7 @@ async function feedMessageUnlocked(
 		const persistBlocks: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| MediaContentBlock
 			| FileReferenceSnapshot
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 		> = [];
@@ -3053,6 +3451,7 @@ async function feedMessageUnlocked(
 				persistBlocks.push(imageRefToContentBlock(img));
 			}
 		}
+		for (const item of media ?? []) persistBlocks.push(mediaRefToContentBlock(item, narratorId));
 		if (savedTextFiles.length > 0) {
 			for (const tf of savedTextFiles) {
 				persistBlocks.push({
@@ -3072,11 +3471,18 @@ async function feedMessageUnlocked(
 
 		// When the user sends images without text, inject a placeholder so that
 		// providers that gate on non-empty content still include the image blocks.
-		const effectiveText = !prompt.trim() && images?.length ? "[user sent image(s)]" : prompt;
+		const effectiveText =
+			!prompt.trim() && media?.length
+				? "[user sent media]"
+				: !prompt.trim() && images?.length
+					? "[user sent image(s)]"
+					: prompt;
 
 		// Build the effective prompt with attached file hints
 		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
 
+		const deliverTo = await readSessionDeliverTo(narratorId);
+		recoveryStart?.check();
 		userMsg = (await persistClaimedUserInput({
 			claim: inboxClaim(claimedInput),
 			reservedMessageId: claimedInput.recipientMessageId,
@@ -3086,15 +3492,33 @@ async function feedMessageUnlocked(
 			commandText,
 			createdBy: userId,
 			origin,
+			// Placed under the tool call the session delivers to (display adapter only).
+			parentToolUseId: deliverTo?.toolUseId,
+			composerDocument: accepted.composerDocument,
 		})) as unknown as typeof narratorMessages.$inferSelect;
+		// Display adapter: the destination's tool card shows the placed turn, exactly as
+		// the in-pass consumer does. The session's own frame is sent by the caller.
+		if (deliverTo)
+			broadcastToNarrator(deliverTo.narratorId, {
+				type: "user_message",
+				narratorId: deliverTo.narratorId,
+				message: fileReferenceMessageForDisplay(userMsg),
+			});
 		if (accepted.executionIntent?.modelOverride) {
 			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
 		}
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
+		if (
+			recoveryStart &&
+			acceptedInputId &&
+			!internalOptions?.bufferedId &&
+			!internalOptions?.bufferedRow
+		)
+			await removeBufferedMessage(narratorId, acceptedInputId);
 		throw error;
 	} finally {
-		inputOwner.release();
+		if (!internalOptions?.prepareOnly) inputOwner.release();
 	}
 	if (stagingId) {
 		// The mailbox row is durable at this point. Await backend-neutral cleanup, but do not
@@ -3117,44 +3541,8 @@ async function feedMessageUnlocked(
 			? (internalOptions.turnStartedAt ?? new Date().toISOString())
 			: new Date().toISOString();
 
-		// --- Resolve manual_override if active (legacy implicit path) ---
-		// When the user sends a message directly on a subagent page while the parent
-		// narrator is blocked in waitForManualOverride, we must resolve that Promise
-		// first. Otherwise the parent stays blocked forever while the subagent runs
-		// independently via narrator-session. We also register a ConclusionWatcher so
-		// the parent's tool_call result is updated when this independent run finishes.
-		//
-		// EXCEPTION — explicit takeover: while taken over, the parent intentionally
-		// stays blocked for the entire takeover. The user can send/interrupt/continue
-		// freely; the result is only handed back when the user stops takeover. So we
-		// do NOT resolve the override or register a watcher here.
 		const narrator = await narratorService.getById(narratorId);
-		if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
-			const currentSubstatus = parseSubstatus(narrator.substatus);
-			const takenOver = isTakenOver(narratorId);
-			if (takenOver) {
-				// Parent stays blocked — do not resolve, do not register a watcher.
-			} else if (currentSubstatus.includes("manual_override")) {
-				const overrideEntry = getManualOverrideMap().get(narratorId);
-				if (overrideEntry) {
-					const currentFinalText = await getSubagentFinalText(narratorId);
-
-					const origin = await narratorPersistence.resolveSubagentConclusionReference(
-						narratorId,
-						overrideEntry.parentNarratorId,
-						overrideEntry.toolUseId,
-					);
-					registerConclusionWatcher(
-						narratorId,
-						overrideEntry.parentNarratorId,
-						overrideEntry.toolUseId,
-						origin.originToolCallId,
-					);
-					resolveManualOverride(narratorId, currentFinalText, false);
-				}
-			}
-		}
-
+		recoveryStart?.check();
 		await narratorService.updateStatus(
 			narratorId,
 			"working",
@@ -3165,19 +3553,31 @@ async function feedMessageUnlocked(
 					}
 				: { setTurnStart: true },
 		);
+		recoveryStart?.check();
 		// The user message above is already persisted, so "first turn" means exactly one
 		// user message exists. `messageCount` cannot answer this any more — it now counts
 		// every message, not finished turns.
 		if (!narrator.title && (await isFirstUserTurn(narratorId))) {
+			recoveryStart?.check();
 			active._provisionalTitle =
 				(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
+			recoveryStart?.check();
 			generateQuickTitle(narratorId, prompt, locale).catch(() => {});
 		}
 
-		// runBashFirst flow: after persisting the user message, run the Bash command as
-		// an assistant tool card, then start the loop with empty text. buildHistory
+		recoveryStart?.check();
+		// runBashFirst flow: the run executes the accepted Bash command as an assistant
+		// tool card before its first model pass, then starts with empty text. buildHistory
 		// reconstructs the Bash tool_result as the current user turn, so the model sees
-		// the order: user prompt → Bash tool call/result → model reply.
+		// the order: user prompt → Bash tool call/result → model reply. The runtime owns
+		// the command (and its cancellation), so no admission waits on a long Bash.
+		const input = {
+			text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
+			images: preBashCommand ? undefined : images,
+			media: preBashCommand ? undefined : media,
+			...(preBashCommand ? { prePromptBashCommand: preBashCommand } : {}),
+		};
+		if (internalOptions?.prepareOnly) return { active, userMsg, preparedInput: input };
 		if (preBashCommand) {
 			// Broadcast the persisted user message before Bash starts. In chunk mode the
 			// frontend renders directly from WS events (not the query optimistic cache),
@@ -3187,60 +3587,22 @@ async function feedMessageUnlocked(
 				narratorId,
 				message: fileReferenceMessageForDisplay(userMsg),
 			});
-			await handleBashCommand(
-				narratorId,
-				preBashCommand,
-				`/bash ${preBashCommand}`,
-				userId ?? undefined,
-				{
-					skipUserMessage: true,
-					signal: active.abortController.signal,
-				},
-			);
-			runAgentLoop(active, "", undefined).catch(async (err) => {
-				const diagnostics = diagnosticsFromError(err);
-				logger.error("runAgentLoop unhandled error", {
-					narratorId,
-					error: String(err),
-					diagnostics,
-				});
-				await narratorService.updateStatus(narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: String(err),
-					diagnostics,
-				});
-				broadcastToNarrator(narratorId, {
-					type: "narrator_error",
-					narratorId,
-					error: String(err),
-					diagnostics,
-				});
-			});
-			return { active, userMsg, userBroadcasted: true };
 		}
-
 		// Start agent loop in background
-		runAgentLoop(
-			active,
-			projectFileReferenceText(effectivePrompt, acceptedReferences),
-			images,
-		).catch(async (err) => {
+		const terminal = runAgentLoop(active, input.text, input.images, {
+			...internalOptions?.run,
+			...(userId !== undefined ? { principal: userId } : {}),
+			prePromptBashCommand: input.prePromptBashCommand,
+			media,
+			recoveryStart,
+		});
+		terminal.catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-				diagnostics,
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-				diagnostics,
-			});
+			await reportUnsettledRunLoopError(narratorId, err, diagnostics);
 		});
 
-		return { active, userMsg };
+		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
 	} catch (error) {
 		if (!internalOptions?.bufferedDelivery) throw error;
 		logger.error("Buffered message committed but could not start", {
@@ -3252,6 +3614,98 @@ async function feedMessageUnlocked(
 			.catch(() => {});
 		broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: String(error) });
 		return { active, userMsg, postCommitError: error };
+	}
+}
+
+/** Adopt queued input after the previous session finalized, without replacing its run. */
+export async function prepareQueuedRunInput(
+	active: ActiveNarrator,
+	owner: ExecutionOwner,
+	run: import("./agent-runtime/ownership").RunControl,
+): Promise<
+	| { text: string; images?: ImageRef[]; media?: MediaRef[]; prePromptBashCommand?: string }
+	| undefined
+> {
+	const id = active.narratorId;
+	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
+	const delivered = await drainAndPersistPendingInjections(active);
+	if (delivered) return { text: "" };
+	const row = await claimInboxHead(id, (candidate) => candidate.kind === "user_input");
+	if (!row) return;
+	const first = projectMailboxUserMessage(row);
+	try {
+		if (first.executionIntent?.controlCommand) {
+			const message = await persistClaimedUserInput({
+				claim: inboxClaim(row),
+				reservedMessageId: row.recipientMessageId,
+				narratorId: id,
+				text: first.text,
+				contentBlocks: [{ type: "text", text: first.text }],
+				commandText: first.commandText,
+				createdBy: first.createdBy,
+				parentToolUseId: run.binding?.deliverTo?.toolUseId,
+			});
+			broadcastToNarrator(id, {
+				type: "user_message",
+				narratorId: id,
+				message: fileReferenceMessageForDisplay(message),
+			});
+			if (first.createdBy && run.logicalRunId) {
+				const { registerRunPrincipal } = await import("./narrator-runtime-registration");
+				await registerRunPrincipal(id, run.logicalRunId, first.createdBy);
+				run.principal = first.createdBy;
+				if (run.binding) run.binding.principal = { userId: first.createdBy };
+			}
+			await executeQueuedControlCommand(id, first, active.locale, run.cancel.signal);
+			await cleanupBufferedTextFilesAsync(first.id);
+			return;
+		}
+		const result = await feedMessageUnlocked(
+			id,
+			first.text,
+			first.images,
+			active.locale,
+			active._replyInUserLanguage ?? false,
+			first.commandText,
+			first.createdBy ?? undefined,
+			first.textFiles,
+			first.bashCommand,
+			{
+				bufferedDelivery: true,
+				bufferedId: first.id,
+				bufferedRow: row,
+				bufferedOwner: owner,
+				prepareOnly: true,
+			},
+			undefined,
+			first.fileReferences,
+			first.composerDocument,
+			first.media,
+		);
+		if (result.postCommitError) throw result.postCommitError;
+		if (first.createdBy != null) {
+			if (run.logicalRunId) {
+				const { registerRunPrincipal } = await import("./narrator-runtime-registration");
+				await registerRunPrincipal(id, run.logicalRunId, first.createdBy);
+			}
+			run.principal = first.createdBy;
+			if (run.binding) run.binding = { ...run.binding, principal: { userId: first.createdBy } };
+		}
+		broadcastToNarrator(id, {
+			type: "user_message",
+			narratorId: id,
+			message: fileReferenceMessageForDisplay(result.userMsg),
+		});
+		await cleanupBufferedTextFilesAsync(first.id);
+		return result.preparedInput;
+	} finally {
+		await releaseInboxClaim(row, "Fresh input did not commit");
+		broadcastToNarrator(id, {
+			type: "buffer_consumed",
+			narratorId: id,
+			messageId: first.id,
+			remaining: toBufferSummary(await getBufferedMessagesAsync(id)),
+		});
 	}
 }
 
@@ -3449,7 +3903,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 	const resultRow = resultRows[0];
 	const timing = refreshTiming ? resolveToolCallConclusionTiming(resultRow) : undefined;
 
-	await narratorService.updateToolCallResult(
+	await narratorStore.settleTool(
 		toolUseId,
 		{
 			output,
@@ -3477,7 +3931,11 @@ async function updateToolCallConclusionUnlocked(opts: {
 // === Public API ===
 
 export interface UserMessageAdmissionOptions {
+	/** Set only by authenticated human input endpoints; absent for agent/plugin traffic. */
+	humanReplyContext?: ReplyContext;
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	locale?: Locale;
 	replyInUserLanguage?: boolean;
 	commandText?: string | null;
@@ -3521,7 +3979,7 @@ async function executeQueuedControlCommand(
 	} else if ("loadTool" in result || "loadToolNotFound" in result) {
 		await handlers.handleLoadToolCommand(narratorId, result, locale, userId);
 	} else if ("unloadTool" in result || "unloadToolNotFound" in result) {
-		await handlers.handleUnloadToolCommand(narratorId, result, locale);
+		await handlers.handleUnloadToolCommand(narratorId, result, locale, userId);
 	} else if ("blockSkill" in result) {
 		await handlers.handleBlockSkillCommand(narratorId, result, locale);
 	} else if ("blockAllSkills" in result) {
@@ -3549,15 +4007,13 @@ export async function acceptUserMessage(
 	prompt: string,
 	options: UserMessageAdmissionOptions = {},
 ): Promise<UserMessageAdmissionResult> {
+	const humanReplyContext = parseReplyContext(options.humanReplyContext) ?? undefined;
 	const locale = options.locale ?? "en";
 	const queueMode =
 		options.queueMode ?? (options.interrupt ? "interrupt" : options.priority ? "tool" : "turn");
 	const result = await withNarratorStartAdmission(
 		narratorId,
 		async (): Promise<UserMessageAdmissionResult> => {
-			const narrator = await narratorService.getById(narratorId);
-			if (isSubagentVariant(narrator.variant))
-				throw new ValidationError("Subagent messages must be sent through resumeSubagent");
 			const oldOwner = getExecutionOwner(narratorId);
 			const oldController = activeNarrators.get(narratorId)?.abortController;
 			const oldRecovery = plannedUpdateRecoveryControls.get(narratorId);
@@ -3579,6 +4035,9 @@ export async function acceptUserMessage(
 					"fifo",
 					options.executionIntent,
 					queueMode,
+					options.composerDocument,
+					options.media,
+					humanReplyContext,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3596,7 +4055,7 @@ export async function acceptUserMessage(
 							activeNarrators.get(narratorId)?.abortController === oldController;
 						const recoveryUnchanged = plannedUpdateRecoveryControls.get(narratorId) === oldRecovery;
 						if (ownerUnchanged && controllerUnchanged && recoveryUnchanged)
-							interruptNarrator(narratorId);
+							requestUrgentBufferedGuidance(narratorId);
 					} else if (queueMode === "tool" && busy) {
 						requestBufferedMessageSoftStop(narratorId);
 					}
@@ -3609,8 +4068,18 @@ export async function acceptUserMessage(
 						// exits. Leave it to the command-aware buffered consumer, not feedMessage.
 						const queuedCommand =
 							options.executionIntent?.controlCommand ||
-							parseQueuedNewCommand(prompt, options.commandText) ||
-							parseQueuedGoalCommand(prompt, options.commandText);
+							parseQueuedNewCommand(
+								prompt,
+								options.commandText,
+								options.composerDocument,
+								options.executionIntent,
+							) ||
+							parseQueuedGoalCommand(
+								prompt,
+								options.commandText,
+								options.composerDocument,
+								options.executionIntent,
+							);
 						claimed = queuedCommand
 							? undefined
 							: await claimInboxHead(
@@ -3618,7 +4087,7 @@ export async function acceptUserMessage(
 									(row) => row.id === accepted.id && row.kind === "user_input",
 								);
 						if (claimed) {
-							const { userMsg, userBroadcasted } = await feedMessage(
+							const { userMsg, userBroadcasted } = await feedMessageUnlocked(
 								narratorId,
 								prompt,
 								options.images,
@@ -3636,6 +4105,8 @@ export async function acceptUserMessage(
 								},
 								undefined,
 								options.fileReferences,
+								options.composerDocument,
+								options.media,
 							);
 							if (!userBroadcasted)
 								broadcastToNarrator(narratorId, {
@@ -3713,12 +4184,12 @@ export async function sendMessage(
 	preBashCommand?: string | null,
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
+	humanReplyContext?: ReplyContext,
 ): Promise<typeof narratorMessages.$inferSelect> {
+	const frozenHumanReplyContext = parseReplyContext(humanReplyContext) ?? undefined;
 	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
-	const narrator = await narratorService.getById(narratorId);
-	if (isSubagentVariant(narrator.variant)) {
-		throw new ValidationError("Subagent messages must be sent through resumeSubagent");
-	}
 	const { userMsg, userBroadcasted } = await feedMessage(
 		narratorId,
 		prompt,
@@ -3729,9 +4200,11 @@ export async function sendMessage(
 		userId,
 		textFiles,
 		preBashCommand,
-		undefined,
+		{ humanReplyContext: frozenHumanReplyContext },
 		origin,
 		acceptedReferences,
+		composerDocument,
+		media,
 	);
 	if (!userBroadcasted) {
 		broadcastToNarrator(narratorId, {
@@ -3741,6 +4214,12 @@ export async function sendMessage(
 		});
 	}
 	return userMsg;
+}
+
+/** Trusted human entry; automation must use sendMessage without this wrapper. */
+export function sendHumanMessage(...args: Parameters<typeof sendMessage>) {
+	args[13] = { locale: args[3] ?? "en", replyInUserLanguage: args[4] ?? false };
+	return sendMessage(...args);
 }
 
 export interface SendSubagentMessageInput {
@@ -3762,79 +4241,39 @@ export interface SendSubagentMessageResult {
 }
 
 /**
- * Deliver a message to a subagent narrator and get it to act on it.
- *
- * Subagents have no independent message channel: a running subagent consumes
- * buffered messages at its next safe boundary (soft stop), while an idle
- * subagent is resumed in-place with a follow-up turn. This is the counterpart
- * of {@link sendMessage} for primary narrators — the REST layer already routes
- * subagent messages through `resumeSubagent`; this function centralizes the
- * same decision (running → buffer, idle → resume) behind one callable.
+ * Deliver a user/plugin message to a delegated session through the same admission as
+ * any session: queued while it runs, starting a run when idle, waking a held run.
  */
 export async function sendSubagentMessage(
 	input: SendSubagentMessageInput,
 ): Promise<SendSubagentMessageResult> {
-	input = { ...input, fileReferences: freezeFileReferenceSnapshots(input.fileReferences) };
 	const narrator = await narratorService.getById(input.subagentId);
-	if (!isSubagentVariant(narrator.variant)) {
-		throw new ValidationError("Target narrator is not a subagent");
-	}
 	if (narrator.status === "archived") {
 		throw new ValidationError("Archived subagents cannot receive messages");
 	}
-	const { resumeSubagent, resolveSubagentOriginToolUseId } = await import("./subagent-resume");
-	// Never-started subagents (e.g. a team temp worker recruited directly through
-	// the plugin API) carry a stale "working" status but have no real runner —
-	// buffering would strand the message forever. Route them to resume instead,
-	// which synthesizes a standalone origin tool-use id and starts them in place.
-	const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(() => null));
-	const running = narrator.status === "working" || narrator.status === "waiting";
-	if (running && !neverStarted) {
-		const { bufferSubagentUserMessage } = await import("./subagent-executor");
-		const { isTakenOver } = await import("./subagent-takeover");
-		const result = await bufferSubagentUserMessage(input.subagentId, input.message, {
-			createdBy: input.createdBy ?? null,
-			fileReferences: input.fileReferences,
-			priority: input.priority ?? false,
-			requestSoftStop: !isTakenOver(input.subagentId),
-		});
-		if (!result.ok) {
-			if (result.full) throw new ValidationError("Subagent message queue is full");
-			throw new ValidationError("Subagent is not running; it cannot be buffered right now");
-		}
+	const accepted = await acceptUserMessage(input.subagentId, input.message, {
+		locale: input.locale ?? "en",
+		userId: input.createdBy ?? null,
+		fileReferences: input.fileReferences,
+		queueMode: input.priority ? "tool" : "turn",
+	});
+	if (accepted.buffered) {
+		const { wakeHeldRun } = await import("./agent-runtime/run");
+		const resumedSuspendedRunner = wakeHeldRun(input.subagentId);
 		return {
 			delivered: "buffered",
-			messageId: result.id,
-			bufferedAt: result.bufferedAt,
+			messageId: accepted.id,
+			bufferedAt: accepted.bufferedAt,
+			...(resumedSuspendedRunner ? { resumedSuspendedRunner } : {}),
 		};
 	}
-	// Idle (or never-started) subagent: resume in-place with a follow-up turn.
-	// Tool-created subagents resolve their originating Agent call internally. Plugin
-	// workers carry explicit durable standalone provenance and can start without one;
-	// their synthesized tool-use id groups messages only.
-	const resumed = await resumeSubagent({
-		subagentId: input.subagentId,
-		intent: "follow_up",
-		actor: "parent_agent",
-		prompt: input.message,
-		fileReferences: input.fileReferences,
-		locale: input.locale ?? "en",
-		createdBy: input.createdBy ?? null,
-		signal: input.signal,
-	});
-	return {
-		delivered: "started",
-		started: resumed.started,
-		resumedSuspendedRunner: resumed.resumedSuspendedRunner,
-		messageId: resumed.userMessage?.id ?? undefined,
-	};
+	return { delivered: "started", started: true, messageId: accepted.userMsg.id };
 }
 
 export interface CreateNarratorForPluginInput {
 	title?: string;
 	model?: string;
 	cwd?: string;
-	chapterId?: string | null;
 	permissionMode?: string;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	/** "subagent" creates a team temp worker owned by `parentNarratorId`. */
@@ -3892,12 +4331,15 @@ export async function createNarratorForPlugin(
 		};
 	}
 	const narrator = await narratorService.create({
-		chapterId: input.chapterId ?? null,
 		title: input.title,
 		model: input.model,
 		cwd: input.cwd,
 		permissionMode: input.permissionMode,
 		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+		// The recruiting plugin drives its members through the Dynamic Spec commands (dispatch,
+		// read, write), which an outline session refuses; members stay spec until the block-based
+		// commands exist (plan PR 12, D27d), as OAuth-provisioned sessions do.
+		taskBackend: "spec",
 	});
 	return {
 		narratorId: narrator.id,
@@ -3920,6 +4362,10 @@ export async function deleteNarratorForPlugin(narratorId: string): Promise<void>
  * to track the shared task queue it maintains for each member.
  */
 export async function readSpecTasksForPlugin(narratorId: string) {
+	// An outline session's tasks are not in Dynamic Spec: an empty list would read as an idle
+	// member to a plugin that then dispatches to it (refused too). Refused like the writes.
+	const { assertSpecTasksUsed } = await import("./task-source/backend");
+	await assertSpecTasksUsed(narratorId);
 	const { readTasksFileForNarrator } = await import("./spec-vfs-service");
 	const { parseSpecTasksDocument, compileSpecTasks } = await import("./spec-task-service");
 	const file = await readTasksFileForNarrator(narratorId);
@@ -3965,13 +4411,6 @@ export async function addSpecTaskForPlugin(
 	};
 }
 
-/** Marker that scopes plugin-written team-SOP sections inside spec://behavior_fence. */
-const TEAM_SOP_MARKER = "team-sop:com.whisent.narrator-team";
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 /**
  * Upsert or clear a plugin-managed team-SOP section inside a narrator's
  * `spec://behavior_fence`.
@@ -3996,24 +4435,25 @@ export async function setSpecBehaviorFenceForPlugin(
 	} catch {
 		// Fence may not exist yet; treat as empty.
 	}
-	const openTag = `<!-- ${TEAM_SOP_MARKER} -->`;
-	const closeTag = `<!-- /${TEAM_SOP_MARKER} -->`;
-	const sopPattern = new RegExp(
-		`\\s*${escapeRegExp(openTag)}[\\s\\S]*?${escapeRegExp(closeTag)}\\s*`,
+	const { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, fenceWithoutFirstPluginSop } = await import(
+		"./behavior-fence-sop"
 	);
-	const withoutSop = current.replace(sopPattern, "").trim();
+	const withoutSop = fenceWithoutFirstPluginSop(current);
 	const body = text.trim();
 	let next: string;
 	if (mode === "clear" || !body) {
 		next = withoutSop;
 	} else {
-		const section = `${openTag}\n${body}\n${closeTag}`;
+		const section = `${TEAM_SOP_OPEN}\n${body}\n${TEAM_SOP_CLOSE}`;
 		next = withoutSop ? `${withoutSop}\n\n${section}` : section;
 	}
+	// `pluginSop`: in an outline session the old fence is closed to everyone but this channel
+	// (the plugin's SOP, until its block commands exist, outline plan PR 12).
 	const written = await writeSpecFile(narratorId, "spec://behavior_fence", next, {
 		actor: "agent",
 		allowFenceMutation: true,
 		createdBy: "assistant",
+		pluginSop: true,
 	});
 	return { updated: true, revisionId: written.revisionId ?? null };
 }
@@ -4123,20 +4563,12 @@ export async function startSpecContinuationIfPossible(
 		if (!prompt) return { started: false };
 
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "").catch(async (err) => {
+		runAgentLoop(active, "", undefined, { principal: userId }).catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (spec continuation)", {
 				narratorId,
 				error: String(err),
 			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
+			await reportUnsettledRunLoopError(narratorId, err);
 		});
 		return { started: true };
 	});
@@ -4147,49 +4579,8 @@ export async function startBackgroundCompletionContinuationIfPossible(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
-	return continuationStartLock.acquire(narratorId, async () => {
-		if (isLoopRunning(narratorId)) return { started: false };
-
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.status !== "idle") return { started: false };
-		// Plan-mode narrators are not auto-woken, matching goal and inbound continuation.
-		// This check was missing here while the other three entries had it, so a finished
-		// background task could pull a narrator out of planning and into execution.
-		// Declining to wake loses nothing: the notification stays queued for the next
-		// drain (the queue is only emptied by a path that delivers it).
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
-
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
-
-		const prompt = await drainAndPersistPendingInjections(active);
-		if (!prompt) return { started: false };
-
-		active._continuationSuppressed = false;
-		active._continuationStallCount = 0;
-		active._continuationStallKey = undefined;
-		active._lastTokenUsage = undefined;
-		active._ttftMs = undefined;
-		active._turnStartedAt = new Date().toISOString();
-
-		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "").catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (background completion)", {
-				narratorId,
-				error: String(err),
-			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
-		});
-		return { started: true };
-	});
+	// Background results and Send(parent) share one mailbox and the same wake policy.
+	return startParentInboundContinuationIfPossible(narratorId, locale, replyInUserLanguage);
 }
 
 /**
@@ -4247,22 +4638,88 @@ export function isQuestionAnswerWakeEligible(recipient: {
 	);
 }
 
+/**
+ * The answer is already in the transcript and a later assistant turn actually
+ * replied. Empty shells (`createPartialAssistantMessage`) and reasoning-only
+ * tails are not replies: a crash can leave them after the answer without the
+ * model having continued, and treating them as delivered would drop the wake
+ * forever. Text or a tool call is enough; other non-reasoning bodies count too.
+ */
+function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
+	const substantive = db
+		.select({ id: narratorMessageRefs.id })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessages.role, "assistant"),
+				gt(narratorMessageRefs.seq, answerSeq),
+				or(
+					sql`length(trim(coalesce(${narratorMessages.contentText}, ''))) > 0`,
+					exists(
+						db
+							.select({ one: sql`1` })
+							.from(narratorToolCalls)
+							.where(eq(narratorToolCalls.messageId, narratorMessages.id)),
+					),
+				),
+			),
+		)
+		.limit(1)
+		.get();
+	if (substantive) return true;
+
+	let cursor = answerSeq;
+	for (;;) {
+		// Body bytes and the body itself go through the block-aware readers. The column
+		// is only a projection once rows are current, and a direct read is refused.
+		const bodies = fillBodies(
+			db
+				.select({
+					id: narratorMessages.id,
+					seq: narratorMessageRefs.seq,
+					contentJson: contentJsonSql(),
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessages.role, "assistant"),
+						gt(narratorMessageRefs.seq, cursor),
+						sql`coalesce(${storedBodyBytesSql()}, 0) > 2`,
+					),
+				)
+				.orderBy(asc(narratorMessageRefs.seq))
+				.limit(8)
+				.all(),
+		);
+		if (!bodies.length) return false;
+		for (const body of bodies) {
+			if (
+				!isDanglingReasoningOnlyAssistantMessage({
+					role: "assistant",
+					contentJson: body.contentJson,
+					contentText: null,
+					toolCalls: [],
+				})
+			)
+				return true;
+		}
+		const next = bodies[bodies.length - 1]?.seq;
+		if (next == null || next <= cursor || bodies.length < 8) return false;
+		cursor = next;
+	}
+}
+
 async function canWakeQuestionAnswer(
 	recipient: Pick<
 		Awaited<ReturnType<typeof narratorService.getById>>,
-		"status" | "lastStopReason" | "substatus" | "chapterId"
+		"status" | "lastStopReason" | "substatus"
 	>,
 ): Promise<boolean> {
-	if (!isQuestionAnswerWakeEligible(recipient)) return false;
-	if (recipient.chapterId) {
-		const chapter = db
-			.select({ status: chapters.status })
-			.from(chapters)
-			.where(eq(chapters.id, recipient.chapterId))
-			.get();
-		if (!chapter || chapter.status !== "active") return false;
-	}
-	return true;
+	return isQuestionAnswerWakeEligible(recipient);
 }
 
 export async function recoverPendingQuestionAnswerDeliveries(
@@ -4298,7 +4755,6 @@ export async function recoverPendingQuestionAnswerDeliveries(
 			.select({
 				cursor: narratorRowid,
 				id: narrators.id,
-				chapterId: narrators.chapterId,
 				status: narrators.status,
 				lastStopReason: narrators.lastStopReason,
 				substatus: narrators.substatus,
@@ -4341,6 +4797,22 @@ export async function recoverPendingQuestionAnswerDeliveries(
 					options.signal?.throwIfAborted();
 					if (!question.messageId) continue;
 					try {
+						// `resolution_json` 是模型写的「解决备注」，不是送达凭据。回答已经在
+						// refs 里、并且后面有一次真正的 assistant 回复，才说明会话继续过。
+						// 没有 ref 时仍交给下面的 schedule：它会抛出并记
+						// "Pending question recovery deferred"，下一次启动再试。
+						const answerRef = db
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, recipient.id),
+									eq(narratorMessageRefs.messageId, question.messageId),
+								),
+							)
+							.limit(1)
+							.get();
+						if (answerRef && assistantReplyFollowsAnswer(recipient.id, answerRef.seq)) continue;
 						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
 						if (!principal) continue;
 						const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
@@ -4608,14 +5080,6 @@ export async function startInjectionContinuationIfPossible(
 	// with a concurrent primary-narrator continuation.
 	const recipient = await narratorService.getById(narratorId);
 	if (executionPrincipal && !(await canWakeQuestionAnswer(recipient))) return { started: false };
-	if (isSubagentVariant(recipient.variant)) {
-		return startSubagentInjectionContinuation(
-			recipient,
-			locale,
-			replyInUserLanguage,
-			executionPrincipal,
-		);
-	}
 	return continuationStartLock.acquire(narratorId, async () => {
 		if (isLoopRunning(narratorId)) return { started: false };
 
@@ -4625,7 +5089,7 @@ export async function startInjectionContinuationIfPossible(
 		if (executionPrincipal && !(await canWakeQuestionAnswer(narrator))) return { started: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
+		if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
 		if (
 			executionPrincipal &&
 			db
@@ -4645,21 +5109,15 @@ export async function startInjectionContinuationIfPossible(
 		active._turnStartedAt = new Date().toISOString();
 
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "").catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (injection)", {
-				narratorId,
-				error: String(err),
-			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
-		});
+		runAgentLoop(active, "", undefined, { principal: executionPrincipal?.userId }).catch(
+			async (err) => {
+				logger.error("runAgentLoop unhandled error (injection)", {
+					narratorId,
+					error: String(err),
+				});
+				await reportUnsettledRunLoopError(narratorId, err);
+			},
+		);
 		return { started: true };
 	});
 }
@@ -4687,48 +5145,6 @@ export async function startInjectionContinuationIfPossible(
  * `started` therefore keeps its documented meaning for the caller: a turn is now
  * running because of this row.
  */
-async function startSubagentInjectionContinuation(
-	recipient: Awaited<ReturnType<typeof narratorService.getById>>,
-	locale: Locale,
-	replyInUserLanguage: boolean,
-	executionPrincipal?: QuestionExecutionPrincipal,
-): Promise<{ started: boolean }> {
-	const narratorId = recipient.id;
-	if (!recipient.parentNarratorId) return { started: false };
-	if (isPlanModeTrait(recipient.traits)) return { started: false };
-	// A live runtime owner will pick the row up on its next pass; starting a second
-	// run would be the race `resumeSubagent` refuses anyway, just reported worse.
-	if (isNarratorRuntimeBusy(narratorId)) return { started: false };
-	const { hasActiveSubagentResumeRun, resumeSubagent } = await import("./subagent-resume");
-	if (hasActiveSubagentResumeRun(narratorId)) return { started: false };
-
-	try {
-		const resumed = await resumeSubagent({
-			subagentId: narratorId,
-			intent: "continue_tool_results",
-			// `parent_agent`, not `user`: nobody typed this. The actor decides whether the
-			// resumed run may report back to the parent, which is right for a row the
-			// server authored on the parent's behalf.
-			actor: "parent_agent",
-			locale,
-			replyInUserLanguage,
-			executionPrincipal,
-		});
-		return { started: resumed.started };
-	} catch (err) {
-		// Every refusal `resumeSubagent` makes is a ValidationError (archived, already
-		// running, not resumable). Logged rather than propagated for the same reason the
-		// injection module swallows wake failures: the row is persisted, so the content
-		// waits for the next request instead of being lost — and a producer notifying a
-		// subagent must not fail because the subagent could not be woken.
-		logger.warn("Injection delivered but resuming the subagent failed", {
-			narratorId,
-			error: String(err),
-		});
-		return { started: false };
-	}
-}
-
 /**
  * Drain a narrator's queued messages once no runtime owner is left to consume them.
  *
@@ -4763,7 +5179,6 @@ export async function resumeBufferedMessagesIfIdle(
 		await reconcileRunningStatus(narratorId);
 
 		const narrator = await narratorService.getById(narratorId);
-		if (isSubagentVariant(narrator.variant)) return { resumed: false };
 		if (narrator.status !== "idle") return { resumed: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
@@ -4780,8 +5195,8 @@ export async function resumeBufferedMessagesIfIdle(
  * Wake an idle parent narrator to consume progress reports sent by its child
  * subagents via Send({ id: "parent" }). A working/waiting parent drains the
  * queue at its next after_tools sidecar boundary, so this only acts on idle
- * narrators. Plan-mode narrators are not auto-woken (mirrors goal continuation)
- * — the message stays queued until their next activity.
+ * narrators, including plan-mode parents gathering delegated research. Delivering
+ * a report does not approve/exit plan mode; the resumed loop retains its plan gates.
  *
  * Reuses continuationStartLock so it cannot race the background-task
  * completion continuation into starting two concurrent loops.
@@ -4790,17 +5205,39 @@ export async function startParentInboundContinuationIfPossible(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	options: InboxWakeOptions = {},
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
-		if (isLoopRunning(narratorId)) return { started: false };
+		// Recheck inside start admission: publication may have observed an idle
+		// recipient before an approval, compaction, or another owner took over.
+		if (
+			isNarratorRuntimeBusy(narratorId) ||
+			compactLocks.has(narratorId) ||
+			isNarratorRevertAdmissionBlocked(narratorId)
+		)
+			return { started: false };
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
-		// Plan-mode narrators are not auto-woken; leave the report queued.
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
+		if (
+			(narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error") &&
+			!options.resumeStopped?.includes(narrator.lastStopReason)
+		)
+			return { started: false };
 
+		// Restore the recipient's own identity before touching its inbox. Unknown is
+		// not anonymous: a later human input can establish it without losing this queue.
+		const principal = executionPrincipalOf(narrator);
+		if (!principal) {
+			logger.warn("Run not started: execution principal is unknown", {
+				narratorId,
+				entrySource: "inbound_wake",
+			});
+			return { started: false };
+		}
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
+		active._currentUserId = principal.userId;
 
 		const delivered = await drainAndPersistPendingInjections(active);
 		if (!delivered) return { started: false };
@@ -4813,20 +5250,12 @@ export async function startParentInboundContinuationIfPossible(
 		active._turnStartedAt = new Date().toISOString();
 
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "").catch(async (err) => {
+		runAgentLoop(active, "", undefined, { principal: principal.userId }).catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (subagent message)", {
 				narratorId,
 				error: String(err),
 			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
+			await reportUnsettledRunLoopError(narratorId, err);
 		});
 		return { started: true };
 	});
@@ -4856,10 +5285,17 @@ const RETRY_TAIL_SCAN_LIMIT = 10;
  */
 function messageRefExists(opts: {
 	roles?: readonly ("user" | "assistant")[];
-	requireTopLevel?: boolean;
+	/**
+	 * Restrict to the session's own turns: no placement, or under its durable historical
+	 * transcript mount. Same rule for every session.
+	 */
+	topLevel?: { ownTurnPlacement: OwnTurnPlacement | undefined };
 }) {
 	const conditions = [eq(narratorMessages.id, narratorMessageRefs.messageId)];
-	if (opts.requireTopLevel) conditions.push(isNull(narratorMessages.parentToolUseId));
+	if (opts.topLevel) {
+		const topLevel = ownTurnSql(opts.topLevel.ownTurnPlacement ?? null);
+		if (topLevel) conditions.push(topLevel);
+	}
 	if (opts.roles) conditions.push(inArray(narratorMessages.role, [...opts.roles]));
 	return exists(
 		db
@@ -4928,6 +5364,7 @@ export function resolveRetryTarget<T extends RetryCandidateMessage>(
 export async function retryLastMessage(
 	...args: Parameters<typeof retryLastMessageUnlocked>
 ): ReturnType<typeof retryLastMessageUnlocked> {
+	args[4] = parseReplyContext(args[4]) ?? undefined;
 	return withNarratorStartAdmission(args[0], () => retryLastMessageUnlocked(...args));
 }
 
@@ -4936,8 +5373,8 @@ async function retryLastMessageUnlocked(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
+	humanReplyContext?: ReplyContext,
 ): Promise<{ ok: boolean }> {
-	const narrator = await narratorService.getById(narratorId);
 	// Guard before any destructive work (deleteMessagesAfter below): if a loop is
 	// already running, refuse rather than mutate history under a live session.
 	if (isLoopRunning(narratorId)) {
@@ -4946,14 +5383,13 @@ async function retryLastMessageUnlocked(
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
 	}
-	if (isSubagentVariant(narrator.variant)) {
-		throw new ValidationError("Subagent retries must be sent through resumeSubagent");
-	}
 
 	// Read a short tail of top-level messages (newest first) so the retry target
 	// can be resolved past empty assistant placeholders. A handful of rows is
 	// enough: a real assistant reply stops the walk immediately, and consecutive
-	// placeholders are rare.
+	// placeholders are rare. "Top level" is the session's own turns, including those
+	// placed under the call its run delivers to.
+	const ownTurnPlacement = await readSessionOwnTurnPlacement(narratorId);
 	const tailRefs = await db
 		.select({
 			messageId: narratorMessageRefs.messageId,
@@ -4964,7 +5400,7 @@ async function retryLastMessageUnlocked(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
 				isNull(narratorMessageRefs.segmentCompactId),
-				messageRefExists({ roles: ["user", "assistant"], requireTopLevel: true }),
+				messageRefExists({ roles: ["user", "assistant"], topLevel: { ownTurnPlacement } }),
 			),
 		)
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -4978,13 +5414,16 @@ async function retryLastMessageUnlocked(
 		throw new ValidationError("No messages to retry");
 	}
 
-	const tailMessages = await db.query.narratorMessages.findMany({
-		where: inArray(
-			narratorMessages.id,
-			tailRefs.map((ref) => ref.messageId),
-		),
-		with: { toolCalls: { columns: { id: true } } },
-	});
+	const tailMessages = fillBodies(
+		await db.query.narratorMessages.findMany({
+			where: inArray(
+				narratorMessages.id,
+				tailRefs.map((ref) => ref.messageId),
+			),
+			...bodyColumns(),
+			with: { toolCalls: { columns: { id: true } } },
+		}),
+	);
 	const tailById = new Map(tailMessages.map((msg) => [msg.id, msg]));
 	// resolveRetryTarget expects oldest → newest; tailRefs is newest first.
 	const orderedTail = tailRefs
@@ -5040,25 +5479,24 @@ async function retryLastMessageUnlocked(
 	}
 
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
+	const mediaRefs = (Array.isArray(lastMsg.contentJson) ? lastMsg.contentJson : [])
+		.filter(isMediaContentBlock)
+		.map((item) => mediaRefToContentBlock(item, lastMsg.narratorId));
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	// Product exposure may have moved on (binding, workflow step) since the session was built.
 	active._productRuntimeToolNames = await resolveProductRuntimeToolNames(narratorId);
+	if (humanReplyContext) await adoptHumanReplyContext(narratorId, humanReplyContext);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
-	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
+	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined, {
+		principal: userId,
+		media: mediaRefs.length > 0 ? mediaRefs : undefined,
+	}).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true };
@@ -5068,17 +5506,90 @@ async function retryLastMessageUnlocked(
  * Continue the agent loop.
  *
  * If the last top-level message is a tool-call assistant turn, resumes by
- * reconstructing the tool-result upload packet (buildHistory produces
- * trailingToolResults).
+ * re-sending the history, which ends with that step's tool results.
  *
  * Otherwise (e.g. the assistant's text reply was truncated), sends a
  * locale-aware "please continue" user message via feedMessage so the
  * model receives a properly localised prompt.
  */
 export async function continueNarrator(
-	...args: Parameters<typeof continueNarratorUnlocked>
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+	userId?: string | null,
+	run?: NonNullable<Parameters<typeof continueNarratorUnlocked>[4]>["run"],
+	humanReplyContext?: ReplyContext,
 ): ReturnType<typeof continueNarratorUnlocked> {
-	return withNarratorStartAdmission(args[0], () => continueNarratorUnlocked(...args));
+	const frozenHumanReplyContext = parseReplyContext(humanReplyContext) ?? undefined;
+	return withNarratorStartAdmission(narratorId, () =>
+		continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
+			run,
+			humanReplyContext: frozenHumanReplyContext,
+		}),
+	);
+}
+
+interface RecoveryContinuationStart {
+	cancelled: () => boolean;
+	check: () => void;
+	onAdmitted: () => void;
+	resolveAdmission: (started: boolean) => void;
+}
+
+/** Token-scoped recovery only: never relax the public continue/runtime-busy guard. */
+export async function continueNarratorAfterPlannedUpdate(
+	narratorId: string,
+	recoveryToken: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+	userId?: string | null,
+	run?: NonNullable<Parameters<typeof continueNarratorUnlocked>[4]>["run"],
+): Promise<{ ok: boolean }> {
+	return withNarratorStartAdmission(narratorId, async () => {
+		const control = plannedUpdateRecoveryControls.get(narratorId);
+		if (!control || control.token !== recoveryToken || control.controller.signal.aborted)
+			return { ok: false };
+		const admission = Promise.withResolvers<boolean>();
+		const start: RecoveryContinuationStart = {
+			cancelled: () => control.controller.signal.aborted,
+			check() {
+				control.controller.signal.throwIfAborted();
+				if (plannedUpdateRecoveryControls.get(narratorId) !== control)
+					throw new Error("Recovery continuation owner was replaced");
+			},
+			onAdmitted() {
+				// No await separates this from the actual execution-owner claim. Interrupts
+				// now target the published active runtime, not the old recovery owner.
+				plannedUpdateRecoveryControls.delete(narratorId);
+				admission.resolve(true);
+			},
+			resolveAdmission: admission.resolve,
+		};
+		// The start mutex prevents a user run taking the released slot. The controller
+		// remains registered across ALL asynchronous history/session/input preparation.
+		control.releaseRuntimeClaim();
+		try {
+			await ensureReplyContext(narratorId, { locale, replyInUserLanguage });
+			const result = await continueNarratorUnlocked(
+				narratorId,
+				locale,
+				replyInUserLanguage,
+				userId,
+				{ run, recoveryStart: start },
+			);
+			const admitted = result.ok ? { ok: await admission.promise } : result;
+			if (control.controller.signal.aborted) await control.interruptFinalizer;
+			return admitted;
+		} catch (error) {
+			if (control.controller.signal.aborted) {
+				// Do not admit a newer user run before the old owner's idle/cancellation
+				// finalizer settles; its delayed writes must not land on the new turn.
+				await control.interruptFinalizer;
+				return { ok: false };
+			}
+			throw error;
+		}
+	});
 }
 
 async function continueNarratorUnlocked(
@@ -5086,14 +5597,24 @@ async function continueNarratorUnlocked(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	userId?: string | null,
-): Promise<{ ok: boolean }> {
+	options: {
+		humanReplyContext?: ReplyContext;
+		/** Recovery: re-enter a persisted run (deadline kept) and whether it delivers. */
+		run?: Pick<
+			import("./agent-runtime/run").StartNarratorRunRequest,
+			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "binding"
+		>;
+		recoveryStart?: RecoveryContinuationStart;
+	} = {},
+): Promise<{ ok: boolean; terminal?: Promise<unknown> }> {
+	const { run, recoveryStart } = options;
+	recoveryStart?.check();
 	const narrator = await narratorService.getById(narratorId);
-	if (isSubagentVariant(narrator.variant)) {
-		throw new ValidationError("Subagent continuation must be sent through resumeSubagent");
-	}
+	recoveryStart?.check();
 	// If the last top-level message is a tool-call assistant turn, replay the
 	// tool-result request packet instead of appending a textual "continue".
 	const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId);
+	recoveryStart?.check();
 
 	const continueTiming = resolveContinueTurnTiming({
 		substatus: parseSubstatus(narrator.substatus),
@@ -5124,6 +5645,7 @@ async function continueNarratorUnlocked(
 	if (shouldReplayToolResults && danglingReasoningIds.length > 0) {
 		const deletedMessageIds: string[] = [];
 		for (const messageId of danglingReasoningIds) {
+			recoveryStart?.check();
 			try {
 				const removed = await narratorService.deleteDanglingReasoningMessage(narratorId, messageId);
 				if (removed) deletedMessageIds.push(messageId);
@@ -5157,7 +5679,11 @@ async function continueNarratorUnlocked(
 	if (!shouldReplayToolResults && !trailingInjection) {
 		// No pending tool calls and no fresh injection — send a simple "continue" user message.
 		const continueText = getToolMessage("userContinue", locale);
-		const { userMsg } = await feedMessage(
+		// A user queued this input while recovery held the runtime claim. Adopt it
+		// instead of appending a synthetic Continue behind an unclaimable mailbox head.
+		const queuedInput = recoveryStart ? (await getBufferedMessagesAsync(narratorId))[0] : undefined;
+		recoveryStart?.check();
+		const { userMsg, terminal } = await feedMessage(
 			narratorId,
 			continueText,
 			undefined,
@@ -5167,22 +5693,29 @@ async function continueNarratorUnlocked(
 			userId,
 			undefined,
 			undefined,
-			continueTiming.preserveTurnStart
-				? {
-						preserveTurnStart: true,
-						turnStartedAt: continueTiming.turnStartedAt,
-					}
-				: undefined,
+			{
+				recoveryStart,
+				humanReplyContext: options.humanReplyContext,
+				bufferedId: queuedInput?.id,
+				...(continueTiming.preserveTurnStart
+					? { preserveTurnStart: true, turnStartedAt: continueTiming.turnStartedAt }
+					: {}),
+				...(run ? { run } : {}),
+			},
 		);
 		broadcastToNarrator(narratorId, {
 			type: "user_message",
 			narratorId,
 			message: fileReferenceMessageForDisplay(userMsg),
 		});
-		return { ok: true };
+		return { ok: true, terminal };
 	}
 
+	recoveryStart?.check();
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	recoveryStart?.check();
+	if (options.humanReplyContext)
+		await adoptHumanReplyContext(narratorId, options.humanReplyContext);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild
 	// (interrupt may have destroyed the prior active, leaving _currentUserId unset).
 	active._currentUserId = userId ?? active._currentUserId ?? null;
@@ -5202,20 +5735,18 @@ async function continueNarratorUnlocked(
 	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
 	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
 	// the current turn.
-	runAgentLoop(active, "", undefined).catch(async (err) => {
+	recoveryStart?.check();
+	const terminal = runAgentLoop(active, "", undefined, {
+		...run,
+		...(userId !== undefined ? { principal: userId } : {}),
+		recoveryStart,
+	});
+	terminal.catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
-	return { ok: true };
+	return { ok: true, terminal };
 }
 
 /**
@@ -5250,14 +5781,11 @@ export type ReExecuteDeniedResult =
 
 function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrator): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-	if (active._worktreePath) {
-		worktreeWatcher.unwatch(active._worktreePath, narratorId);
-	}
-	persistConversationIdIfUnchanged(narratorId, active, "inactive narrator session");
 	active._preparedPlanModes?.clear();
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
+	retireSubagentOutputCharCount(narratorId);
 	active.abortController.abort();
 	active.events.emit("event", { type: "done", data: null });
 	active.events.removeAllListeners();
@@ -5428,15 +5956,20 @@ async function reExecuteDeniedToolCallUnlocked(
 	}
 
 	// The tool call must belong to the latest top-level assistant message so
-	// re-running it does not reorder history relative to later turns.
-	const isSubagent = isSubagentVariant(narrator.variant);
+	// re-running it does not reorder history relative to later turns. Top level is
+	// the session's own turns, including those placed under its run's destination.
+	const deliverTo = await readSessionDeliverTo(narratorId);
+	const ownTurnPlacement = await readSessionOwnTurnPlacement(narratorId);
 	const lastRef = await db
 		.select({ messageId: narratorMessageRefs.messageId })
 		.from(narratorMessageRefs)
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
-				messageRefExists({ roles: ["user", "assistant"], requireTopLevel: !isSubagent }),
+				messageRefExists({
+					roles: ["user", "assistant"],
+					topLevel: { ownTurnPlacement },
+				}),
 			),
 		)
 		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
@@ -5510,7 +6043,7 @@ async function reExecuteDeniedToolCallUnlocked(
 		async (): Promise<ReExecuteDeniedResult> => {
 			try {
 				await options?.onAdmitted?.();
-				const preparedAttempt = await narratorPersistence.prepareToolCallAttempt(
+				const preparedAttempt = await narratorStore.retryTool(
 					narratorId,
 					sourceToolCall.id,
 					restoringPersistedCall,
@@ -5524,6 +6057,7 @@ async function reExecuteDeniedToolCallUnlocked(
 				);
 				const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 				const isProductNarrator = hasProductNarratorProfile(narrator.traits);
+				const isSubagent = isSubagentVariant(narrator.variant);
 				// Product exposure may have moved on (binding, workflow step) since the session was built.
 				active._productRuntimeToolNames = await resolveProductRuntimeToolNames(narratorId);
 				// Restore the triggering user so knowledge-base ACL works after a rebuild.
@@ -5541,8 +6075,17 @@ async function reExecuteDeniedToolCallUnlocked(
 					input: toolInput,
 				});
 
-				const { executeTool } = await import("../lib/agent/tool-executor");
+				const { createDurableMediaReferences, executePersistedToolAfterReflections } = await import(
+					"../lib/agent/loop"
+				);
 				const toolName = toolCall.toolName;
+				const reflectionHistory = await buildRuntimeHistory({
+					narratorId,
+					model: active.model,
+					provider: active.provider,
+					ownTurnPlacement,
+					sourceMessages: await narratorService.getModelHistorySinceLastCompact(narratorId),
+				});
 
 				// Reuse the same runtime/device ACL ceiling as the ordinary loop, including recovery.
 				const oauthRuntime = await assertOAuthNarratorRuntimeActive(
@@ -5554,22 +6097,46 @@ async function reExecuteDeniedToolCallUnlocked(
 					where: eq(narratorMessages.id, toolCall.messageId),
 					columns: { parentToolUseId: true },
 				});
-				const parentNarratorId = isSubagent ? (narrator.parentNarratorId ?? undefined) : undefined;
-				const parentToolUseId = isSubagent
-					? (rerunMessage?.parentToolUseId ?? undefined)
-					: undefined;
+				// Placement of the replayed transcript: the run's registered destination, when the
+				// call being replayed is one of the session's own turns placed under it.
+				const placed = !!deliverTo && rerunMessage?.parentToolUseId === deliverTo.toolUseId;
+				const parentNarratorId = placed ? deliverTo.narratorId : undefined;
+				const parentToolUseId = placed ? deliverTo.toolUseId : undefined;
+				const { resolveEffectiveRelaxedPlan } = await import("../lib/permission-modes");
+				const { resolveNarratorRuntimePolicy } = await import("./trait-layer-service");
+				const runtimePolicy = await resolveNarratorRuntimePolicy(
+					narratorId,
+					active._currentUserId ?? null,
+				);
 				const config: import("../lib/agent").AgentConfig = {
 					narratorId,
+					runtimePolicy,
+					taskBackend: await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+					systemPrompt: active.systemPrompt ?? undefined,
+					permissionMode: oauthRuntime?.permissionMode ?? narrator.permissionMode ?? "default",
+					planMode: !oauthRuntime && isPlanModeTrait(narrator.traits),
+					relaxedPlan:
+						!oauthRuntime &&
+						resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
+					planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
+					planReflectionAutoApproveOverride: normalizeBooleanOverride(
+						narrator.planReflectionAutoApproveOverride,
+					),
 					conversationId: active.conversationId,
+					beforeProviderRequest: async () => {
+						const { ensureConversationIdentityPersisted } = await import(
+							"./narrator-conversation-identity"
+						);
+						await ensureConversationIdentityPersisted(narratorId, active);
+					},
 					model: active.model,
 					provider: active.provider,
 					cwd: active.cwd,
 					locale,
 					signal: active.abortController.signal,
-					chapterId: active._chapterId,
 					parentNarratorId,
 					parentToolUseId,
-					reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
+					reviewReadOnlyBash: runtimePolicy.readOnlyGitShell,
 					allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
 					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
 					onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
@@ -5577,7 +6144,6 @@ async function reExecuteDeniedToolCallUnlocked(
 						cwd: active.cwd,
 						signal: active.abortController.signal,
 						userId: active._currentUserId,
-						reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
 					}),
 					runtimeAuthorizationGuard: oauthRuntime
 						? async () => {
@@ -5738,11 +6304,13 @@ async function reExecuteDeniedToolCallUnlocked(
 				const preFrozenTarget = reconstructToolExecutionTarget(sourceToolCall);
 
 				try {
-					const result = await executeTool(
+					const result = await executePersistedToolAfterReflections(
 						{ name: toolName, input: toolInput, toolUseId },
 						config,
+						reflectionHistory.modelMessages,
 						{
 							toolCallBinding,
+							recoveryGate: restoringPersistedCall ? sourceToolCall : undefined,
 							...(options?.permissionMode === "normal" ||
 							preparedAttempt.requiresFreshPermission ||
 							!!oauthRuntime ||
@@ -5753,29 +6321,61 @@ async function reExecuteDeniedToolCallUnlocked(
 						},
 					);
 
-					await narratorService.updateToolCallResult(
+					const mediaRefs = result.mediaRefs?.length
+						? result.mediaRefs
+						: result.media?.length
+							? await createDurableMediaReferences(config)(result.media)
+							: undefined;
+
+					if (!result.isError && toolName === "ExitPlanMode") {
+						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
+						const planState = await exitNarratorPlanMode(narratorId);
+						active._preparedPlanModes?.clear();
+						active._planFileId = undefined;
+						active._planFilePath = undefined;
+						active._previousPermissionMode = undefined;
+						active._planModeLive = undefined;
+						active._relaxedPlanLive = undefined;
+						planModeAskedOnce.delete(narratorId);
+						if (planState.wasPlanMode)
+							broadcastToNarrator(narratorId, {
+								type: "plan_mode_changed",
+								narratorId,
+								planMode: false,
+								traits: redactDraftTraits(planState.traits),
+							});
+						if (pendingPlanCompact.delete(narratorId)) {
+							const planText =
+								typeof result.updatedInput?.plan === "string"
+									? result.updatedInput.plan
+									: typeof toolInput.plan === "string"
+										? toolInput.plan
+										: null;
+							if (planText) {
+								const { runPlanCompact } = await import("./narrator-compact");
+								await runPlanCompact(narratorId, planText);
+								broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+							}
+						}
+					}
+					await narratorStore.settleTool(
 						toolUseId,
 						{
-							output: result.metadata
-								? { _text: result.output, _metadata: result.metadata }
-								: result.output,
+							output: encodeToolOutput(result.output, {
+								metadata: result.metadata,
+								media: mediaRefs,
+							}),
 							status: result.isError ? "fail" : "success",
 							errorMessage: result.isError ? result.output : undefined,
 							durationMs: result.durationMs,
 							permissionStartedAt: result.permissionStartedAt,
 							executionStartedAt: result.executionStartedAt,
 							completedAt: result.completedAt,
+							...(result.updatedInput ? { input: result.updatedInput } : {}),
 						},
 						toolCall.messageId,
 						toolCall.id,
 					);
-					if (result.updatedInput) {
-						await narratorService.overwriteToolCallInput(
-							toolUseId,
-							result.updatedInput,
-							toolCall.id,
-						);
-					}
 
 					broadcastToNarrator(narratorId, {
 						type: "tool_completed",
@@ -5784,9 +6384,10 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						toolName,
 						status: result.isError ? "fail" : "success",
-						output: result.metadata
-							? { _text: result.output, _metadata: result.metadata }
-							: result.output,
+						output: encodeToolOutput(result.output, {
+							metadata: result.metadata,
+							media: mediaRefs,
+						}),
 						durationMs: result.durationMs,
 						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
 						...(result.metadata ? { metadata: result.metadata } : {}),
@@ -5799,8 +6400,8 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						error: message,
 					});
-					await narratorService
-						.updateToolCallResult(
+					await narratorStore
+						.settleTool(
 							toolUseId,
 							{
 								output: `Re-execution failed: ${message}`,
@@ -5925,8 +6526,8 @@ async function rollbackToBlockUnlocked(
 	narratorId: string,
 	messageId: string,
 	blockIndex: number,
-	opts?: { skipRevert?: boolean; scope?: RevertScope },
-): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
+	opts?: ScopedRevertOptions & { skipRevert?: boolean; scope?: RevertScope },
+): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -5935,9 +6536,12 @@ async function rollbackToBlockUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 
 	const blocks = Array.isArray(targetMsg.contentJson)
@@ -5957,17 +6561,31 @@ async function rollbackToBlockUnlocked(
 		blocks.length,
 	);
 
-	// Step 1: Delete all messages after the target message (includes file revert
-	// unless skipRevert requests a history-only rollback).
-	const { deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
-		narratorId,
-		messageId,
-		{
+	if (!opts?.skipRevert) {
+		if (opts?.scope === "workspace") {
+			assertSnapshotRevertComplete(
+				unavailableSnapshotRevert("Workspace restore requires verified per-file evidence."),
+			);
+		}
+		// The target message's suffix and its later messages are one fixed selection.
+		// The executor commits their COW/history changes only after every necessary file succeeds.
+		const revertResult = await revertNarratorScopedToBlock(
+			narratorId,
+			messageId,
+			effectiveBlockIndex,
+			opts,
+		);
+		assertSnapshotRevertComplete(revertResult);
+		return { ok: true, revertResult };
+	}
+
+	// History-only rollback preserves the existing bounded deletion/COW path.
+	const { deletedMessageIds, revertWarnings, revertResult } =
+		await narratorService.deleteMessagesAfter(narratorId, messageId, {
 			preserveConversationId: true,
 			skipRevert: opts?.skipRevert,
 			...(opts?.scope ? { scope: opts.scope } : {}),
-		},
-	);
+		});
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",
@@ -6009,9 +6627,12 @@ async function rollbackToBlockUnlocked(
 			});
 		} else {
 			// Broadcast the updated message
-			const updatedMsg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-			});
+			const updatedMsg = fillBody(
+				await db.query.narratorMessages.findFirst({
+					...bodyColumns(),
+					where: eq(narratorMessages.id, messageId),
+				}),
+			);
 			if (updatedMsg) {
 				broadcastToNarrator(narratorId, {
 					type: "message_updated",
@@ -6025,7 +6646,27 @@ async function rollbackToBlockUnlocked(
 	// Advisory only: the rollback already happened. Surfacing it lets the caller (and
 	// the model, via the tool result) verify the workspace instead of assuming the
 	// restored state contained only its own changes.
-	return revertWarnings?.length ? { ok: true, warnings: revertWarnings } : { ok: true };
+	return {
+		ok: true,
+		...(revertWarnings?.length ? { warnings: revertWarnings } : {}),
+		...(revertResult ? { revertResult } : {}),
+	};
+}
+
+/**
+ * Rollback to blocks named by id (docs/BLOCK_STORAGE-DESIGN.md §5.5): every target block
+ * stays whole and what follows the last of them is deleted. A reasoning run is the ids of
+ * all its blocks, so none of it is cut; an input block is its whole message.
+ */
+export async function rollbackToBlocks(
+	narratorId: string,
+	blockIds: string[],
+	opts?: ScopedRevertOptions & { skipRevert?: boolean; scope?: RevertScope },
+): ReturnType<typeof rollbackToBlockUnlocked> {
+	return withNarratorStartAdmission(narratorId, () => {
+		const boundary = lastTargetElement(resolveBlockTargets(narratorId, blockIds));
+		return rollbackToBlockUnlocked(narratorId, boundary.messageId, boundary.blockIndex, opts);
+	});
 }
 
 /** Extract image refs from a message's contentJson. */
@@ -6054,6 +6695,10 @@ function extractImageRefs(
 					imageId: block.imageId as string,
 					filename: block.filename as string,
 					mediaType: block.mediaType as string,
+					...(typeof block.size === "number" ? { size: block.size } : {}),
+					...(typeof block.sourceMimeType === "string"
+						? { sourceMimeType: block.sourceMimeType }
+						: {}),
 					...dimensions,
 					...(uploadNarratorId ? { uploadNarratorId } : {}),
 				});
@@ -6077,6 +6722,7 @@ type EditableUserContentBlock =
 	| { type: "text"; text: string }
 	| FileReferenceSnapshot
 	| PersistedUserImageBlock
+	| MediaContentBlock
 	// `fileId` is optional: legacy uploads stored files under
 	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
 	// filePath, while newer uploads live in the worktree and omit fileId.
@@ -6134,6 +6780,8 @@ function buildEditedUserContentJson(
 	opts?: {
 		fallbackUploadNarratorId?: string | null;
 		keepImageIds?: string[];
+		keepMediaIds?: string[];
+		newMedia?: MediaRef[];
 		newImages?: ImageRef[];
 		keepTextFilePaths?: string[];
 		newTextFiles?: TextFileRef[];
@@ -6148,9 +6796,19 @@ function buildEditedUserContentJson(
 	const seenImageIds = new Set<string>();
 	const seenTextFilePaths = new Set<string>();
 	const imageBlocks: EditableUserContentBlock[] = [];
+	const mediaBlocks: MediaContentBlock[] = [];
+	const keepMediaSet = opts?.keepMediaIds === undefined ? null : new Set(opts.keepMediaIds);
+	const seenMediaIds = new Set<string>();
 	const textFileBlocks: EditableUserContentBlock[] = [];
 
 	for (const block of blocks) {
+		if (isMediaContentBlock(block)) {
+			if (keepMediaSet && !keepMediaSet.has(block.mediaId)) continue;
+			if (!seenMediaIds.has(block.mediaId))
+				mediaBlocks.push(mediaRefToContentBlock(block, fallbackUploadNarratorId));
+			seenMediaIds.add(block.mediaId);
+			continue;
+		}
 		if (
 			block.type === "image" &&
 			typeof block.imageId === "string" &&
@@ -6227,19 +6885,23 @@ function buildEditedUserContentJson(
 	const references = freezeFileReferenceSnapshots(
 		opts?.fileReferences ?? getFileReferenceSnapshots(contentJson),
 	);
-	return [...imageBlocks, ...textFileBlocks, ...references, { type: "text", text: newContent }];
+	return [
+		...imageBlocks,
+		...mediaBlocks,
+		...(opts?.newMedia ?? []).map((item) => mediaRefToContentBlock(item, fallbackUploadNarratorId)),
+		...textFileBlocks,
+		...references,
+		{ type: "text", text: newContent },
+	];
 }
 
 /**
  * Edit a user message and regenerate the response.
  * Updates the message content, deletes everything after it, and re-runs the agent loop.
  *
- * `opts.revertFiles` (default true) decides whether the file changes the deleted
- * messages made are rolled back, and `opts.revertScope` how wide that rollback
- * reaches — the same two choices the rollback dialog offers. They are options, not
- * a fixed behaviour, because "edit this message again" and "undo what the assistant
- * wrote to my files" are separate intents that used to be welded together: the old
- * `rollback` flag was accepted and then ignored, so every edit reverted files.
+ * `opts.revertFiles` (default true) selects file recovery or history-only editing.
+ * File recovery requires `opts.revertPlan`: the exact plan reviewed by the user.
+ * The fixed target and history version are checked before any file or history write.
  *
  * `opts.keepImageIds` / `opts.newImages` let the caller manage attached images during
  * editing (keep a subset of existing images, drop the rest, and/or append new uploads).
@@ -6254,16 +6916,31 @@ export async function editAndRegenerate(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	opts?: EditAndRegenerateOptions,
-): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
+): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
+	const acceptedOptions = opts
+		? { ...opts, humanReplyContext: parseReplyContext(opts.humanReplyContext) ?? undefined }
+		: undefined;
 	return continuationStartLock.acquire(narratorId, () =>
-		editAndRegenerateUnlocked(narratorId, messageId, newContent, locale, replyInUserLanguage, opts),
+		editAndRegenerateUnlocked(
+			narratorId,
+			messageId,
+			newContent,
+			locale,
+			replyInUserLanguage,
+			acceptedOptions,
+		),
 	);
 }
 
 export interface EditAndRegenerateOptions {
+	humanReplyContext?: ReplyContext;
+	revertPlan?: ScopedRevertOptions["revertPlan"];
+	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
 	fileReferences?: FileReferenceSnapshot[];
 	keepImageIds?: string[];
+	keepMediaIds?: string[];
+	newMedia?: File[];
 	newImages?: File[];
 	keepTextFilePaths?: string[];
 	newTextFiles?: File[];
@@ -6285,7 +6962,7 @@ async function editAndRegenerateUnlocked(
 	locale: Locale,
 	replyInUserLanguage: boolean,
 	opts?: EditAndRegenerateOptions,
-): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
+): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
 	// Every admission and attachment check must finish before the first file write.
 	if (isLoopRunning(narratorId)) {
 		logger.warn("editAndRegenerate blocked: loop already running", { narratorId });
@@ -6300,9 +6977,12 @@ async function editAndRegenerateUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "user") {
 		// The message was found; the request is what is wrong. As a NotFoundError this
@@ -6312,9 +6992,6 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const narrator = await narratorService.getById(narratorId);
-	if (isSubagentVariant(narrator.variant) && !opts?.deferContinuation) {
-		throw new ValidationError("Subagent regeneration must be sent through resumeSubagent");
-	}
 	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(narratorId)) {
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
@@ -6326,6 +7003,12 @@ async function editAndRegenerateUnlocked(
 	const selectedReferences = freezeFileReferenceSnapshots(
 		opts?.fileReferences ?? getFileReferenceSnapshots(originalBlocks),
 	);
+	const document = parseOptionalComposerDocument(opts?.composerDocument);
+	validateComposerProjection(
+		document,
+		newContent,
+		selectedReferences.map((snapshot) => snapshot.reference),
+	);
 	const actualImageIds = originalBlocks
 		.filter((block) => block.type === "image" && typeof block.imageId === "string")
 		.map((block) => block.imageId as string);
@@ -6333,17 +7016,82 @@ async function editAndRegenerateUnlocked(
 		.filter((block) => block.type === "text_file" && typeof block.filePath === "string")
 		.map((block) => block.filePath as string);
 	const keepImageIds = resolveRequestedAttachmentKeys(actualImageIds, opts?.keepImageIds);
+	const actualMedia = originalBlocks.filter(
+		(block): block is Record<string, unknown> & MediaContentBlock => isMediaContentBlock(block),
+	);
+	const keepMediaIds = resolveRequestedAttachmentKeys(
+		actualMedia.map((item) => item.mediaId),
+		opts?.keepMediaIds,
+	);
+	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
+		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	let retainedAttachmentBytes = 0;
+	const countedMediaIds = new Set<string>();
+	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
+		const owner = item.uploadNarratorId || targetMsg.narratorId;
+		const mediaPath = getMediaPath(owner, item.mediaId);
+		if (!mediaPath) throw new ValidationError(`Attached media not found: ${item.filename}`);
+		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
+		if (!countedMediaIds.has(mediaKey)) {
+			countedMediaIds.add(mediaKey);
+			retainedAttachmentBytes += Bun.file(mediaPath).size;
+		}
+	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
 		actualTextFilePaths,
 		opts?.keepTextFilePaths,
 	);
 
+	if (document && targetMsg.composerDocument) {
+		validateComposerAssets(
+			document,
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "image")
+					.filter((_, index) => keepImageIds.includes(actualImageIds[index])),
+				...(opts?.newImages ?? []),
+			],
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "textFile")
+					.filter((_, index) => keepTextFilePaths.includes(actualTextFilePaths[index])),
+				...(opts?.newTextFiles ?? []),
+			],
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "audio" || asset.kind === "video")
+					.filter((_, index) => keepMediaIds.includes(actualMedia[index]?.mediaId)),
+				...(opts?.newMedia ?? []),
+			],
+		);
+	}
+	validateComposerAssets(
+		document,
+		[
+			...extractImageRefs(originalBlocks, targetMsg.narratorId).filter((image) =>
+				keepImageIds.includes(image.imageId),
+			),
+			...(opts?.newImages ?? []),
+		],
+		[
+			...extractTextFileRefs(originalBlocks).filter((file) =>
+				keepTextFilePaths.includes(file.filePath),
+			),
+			...(opts?.newTextFiles ?? []),
+		],
+		[
+			...actualMedia.filter((item) => keepMediaIds.includes(item.mediaId)),
+			...(opts?.newMedia ?? []),
+		],
+	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])].reduce(
-		(total, file) => total + file.size,
-		0,
-	);
+	const uploadBytes = [
+		...(opts?.newImages ?? []),
+		...(opts?.newTextFiles ?? []),
+		...(opts?.newMedia ?? []),
+	].reduce((total, file) => total + file.size, 0);
 	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 	}
@@ -6359,15 +7107,15 @@ async function editAndRegenerateUnlocked(
 	if (
 		!newContent.trim() &&
 		keepImageIds.length === 0 &&
+		keepMediaIds.length === 0 &&
 		keepTextFilePaths.length === 0 &&
 		selectedReferences.length === 0 &&
-		!(opts?.newImages?.length || opts?.newTextFiles?.length)
+		!(opts?.newImages?.length || opts?.newTextFiles?.length || opts?.newMedia?.length)
 	) {
 		throw new ValidationError("content is required");
 	}
 
-	// Resolve the live cwd only after DB/input validation. Deferred subagent regeneration
-	// must not create a generic narrator session; resumeSubagent starts its dedicated runner.
+	// Resolve the live cwd only after DB/input validation.
 	const active = opts?.deferContinuation
 		? undefined
 		: await ensureNarrator(narratorId, locale, replyInUserLanguage);
@@ -6376,7 +7124,6 @@ async function editAndRegenerateUnlocked(
 	const keepTextFileSet = new Set(keepTextFilePaths);
 	const countedImageIds = new Set<string>();
 	const countedTextFilePaths = new Set<string>();
-	let retainedAttachmentBytes = 0;
 	const textFilesToCopy = new Map<string, TextFileRef>();
 	for (const block of originalBlocks) {
 		if (
@@ -6447,26 +7194,40 @@ async function editAndRegenerateUnlocked(
 		return { ok: false };
 	}
 
-	// Truncate (and optionally roll the files back) BEFORE materialising this edit's
-	// attachments. A workspace-scoped tree rollback deletes whatever the target tree
-	// does not contain, and files just written into `.narrafork/attached/` are exactly
-	// that — so writing them first meant the rollback silently ate the user's new
-	// uploads. The boundary is the ORIGINAL message id: copy-on-write below may hand
-	// the row a new id, but the ref keeps its `seq`, which is what selects the tail.
+	// Settle the confirmed file/history plan BEFORE materialising this edit's
+	// attachments. The boundary is the original message ID, before the user-input COW.
 	//
 	// The cost of this order is that a failure in the attachment/copy-on-write steps
 	// leaves the history truncated while the edit is unsaved. That is recoverable —
 	// the request fails, the client keeps the draft, and the user can resubmit —
 	// whereas destroying an attachment the user just added is not.
-	const { deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
-		narratorId,
-		messageId,
-		{
-			preserveConversationId: true,
-			skipRevert: opts?.revertFiles === false,
-			...(opts?.revertScope ? { scope: opts.revertScope } : {}),
-		},
-	);
+	if (opts?.revertScope === "workspace") throw new ValidationError("Workspace restore is retired");
+	let revertResult: RevertResult | undefined;
+	let revertWarnings: RevertWarning[] | undefined;
+	let deletedMessageIds: string[] = [];
+	if (opts?.revertFiles === false) {
+		({ deletedMessageIds, revertWarnings } = await narratorService.deleteMessagesAfter(
+			narratorId,
+			messageId,
+			{
+				preserveConversationId: true,
+				skipRevert: true,
+			},
+		));
+	} else {
+		revertResult = await revertNarratorScopedForEdit(
+			narratorId,
+			messageId,
+			Array.isArray(targetMsg.contentJson) ? targetMsg.contentJson.length - 1 : -1,
+			{
+				principal: await revertPrincipalForUser(opts?.userId),
+				revertPlan: opts?.revertPlan,
+			},
+		);
+		assertSnapshotRevertComplete(revertResult);
+		if (!revertResult.historyCommitted) throw new SnapshotRevertError(revertResult);
+		revertWarnings = revertResult.warnings;
+	}
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",
@@ -6476,19 +7237,31 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const createdImageIds: string[] = [];
+	const createdMediaIds: string[] = [];
 	const createdFilePaths: string[] = [];
 	let copyOnWriteSucceeded = false;
 	let privateMessageId: string;
 	let newContentJson: EditableUserContentBlock[];
 	let existingImages: ImageRef[];
+	let existingMedia: MediaRef[];
 	let existingTextFiles: TextFileRef[];
 	let effectivePrompt: string;
 	try {
+		const savedNewMedia: MediaRef[] = [];
+		for (const file of opts?.newMedia ?? []) {
+			const item = await saveUploadedMedia(narratorId, file);
+			createdMediaIds.push(item.mediaId);
+			savedNewMedia.push(item);
+		}
 		const savedNewImages: ImageRef[] = [];
 		for (const file of opts?.newImages ?? []) {
 			const ref = await saveUploadedImage(narratorId, file);
 			createdImageIds.push(ref.imageId);
-			savedNewImages.push({ ...ref, uploadNarratorId: narratorId });
+			savedNewImages.push({
+				...ref,
+				uploadNarratorId: narratorId,
+				...(document ? { size: file.size, sourceMimeType: file.type } : {}),
+			});
 		}
 
 		const savedNewTextFiles: TextFileRef[] = [];
@@ -6517,14 +7290,21 @@ async function editAndRegenerateUnlocked(
 			fallbackUploadNarratorId: targetMsg.narratorId,
 			keepImageIds,
 			newImages: savedNewImages,
+			keepMediaIds,
+			newMedia: savedNewMedia,
 			keepTextFilePaths: relocatedKeepTextFilePaths,
 			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
 			fileReferences: selectedReferences,
 		});
 		existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
+		existingMedia = newContentJson.filter(isMediaContentBlock);
 		existingTextFiles = extractTextFileRefs(newContentJson);
 		const effectiveText =
-			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
+			!newContent.trim() && newContentJson.some(isMediaContentBlock)
+				? "[user sent media]"
+				: !newContent.trim() && existingImages.length > 0
+					? "[user sent image(s)]"
+					: newContent;
 		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
 
 		// A loop may have started while the files were being materialized (the route
@@ -6537,13 +7317,30 @@ async function editAndRegenerateUnlocked(
 				"This narrator did not stop after being interrupted; try again in a moment",
 			);
 		}
-		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
-			contentText: effectivePrompt,
-			contentJson: newContentJson,
-		});
+		privateMessageId = await narratorService.copyOnWriteMessage(
+			narratorId,
+			messageId,
+			{
+				contentText: effectivePrompt,
+				contentJson: newContentJson,
+				composerDocument: document ?? null,
+			},
+			{
+				afterWrite: opts?.humanReplyContext
+					? (tx) => {
+							tx.update(narrators)
+								.set({ replyContext: opts.humanReplyContext })
+								.where(eq(narrators.id, narratorId))
+								.run();
+						}
+					: undefined,
+			},
+		);
 		copyOnWriteSucceeded = true;
+		if (opts?.humanReplyContext) syncActiveReplyContext(narratorId, opts.humanReplyContext);
 	} catch (error) {
 		if (!copyOnWriteSucceeded) {
+			for (const mediaId of createdMediaIds) deleteUploadedMedia(narratorId, mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(narratorId, imageId);
 			deleteCreatedAttachmentFiles(createdFilePaths);
 		}
@@ -6552,9 +7349,12 @@ async function editAndRegenerateUnlocked(
 
 	// Broadcast the updated message.  If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
-	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, privateMessageId),
-	});
+	const updatedMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, privateMessageId),
+			...bodyColumns(),
+		}),
+	);
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -6567,9 +7367,11 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const imageRefs = existingImages;
-	// Surfaced so the caller can pass the advice on: a rollback can reach past the
-	// chosen scope (subagent writes, a workspace restore).
-	const warnings = revertWarnings?.length ? { warnings: revertWarnings } : {};
+	// Preserve file/history recording advisories through primary and subagent callers.
+	const warnings = {
+		...(revertWarnings?.length ? { warnings: revertWarnings } : {}),
+		...(revertResult ? { revertResult } : {}),
+	};
 
 	if (opts?.deferContinuation) {
 		await narratorService.updateStatus(narratorId, "idle", { substatus: [] });
@@ -6591,20 +7393,13 @@ async function editAndRegenerateUnlocked(
 		active,
 		projectFileReferenceText(effectivePrompt, selectedReferences),
 		imageRefs.length > 0 ? imageRefs : undefined,
+		{ principal: opts?.userId, media: existingMedia.length > 0 ? existingMedia : undefined },
 	).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
 			narratorId,
 			error: String(err),
 		});
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true, ...warnings };
@@ -6675,9 +7470,12 @@ async function editAssistantMessageUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
 		throw new ValidationError("Can only edit assistant messages");
@@ -6706,9 +7504,12 @@ async function editAssistantMessageUnlocked(
 
 	// Broadcast the updated message. If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
-	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, privateMessageId),
-	});
+	const updatedMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, privateMessageId),
+		}),
+	);
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -6750,9 +7551,12 @@ async function restoreAssistantMessageUnlocked(
 	});
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-	});
+	const targetMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, messageId),
+		}),
+	);
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
 		throw new ValidationError("Can only restore assistant messages");
@@ -6783,11 +7587,24 @@ async function restoreAssistantMessageUnlocked(
 		narratorId,
 		messageId,
 		overrides,
+		{
+			// The whole original is back: no block keeps a pre-edit body of its own.
+			afterWrite: (_tx, id) => {
+				sqlite
+					.prepare(
+						"UPDATE narrator_blocks SET original_payload = NULL WHERE message_id = ? AND original_payload IS NOT NULL",
+					)
+					.run(id);
+			},
+		},
 	);
 
-	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, privateMessageId),
-	});
+	const updatedMsg = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, privateMessageId),
+		}),
+	);
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
 			type: "message_updated",
@@ -6803,8 +7620,209 @@ async function restoreAssistantMessageUnlocked(
 }
 
 /**
+ * An edited output block's elements (§5.5): its text element holds the new text, keeps
+ * its identity (rows are matched by it, so the block keeps its id), keeps only the
+ * citations whose span still reads the same at the same place, and loses its upstream
+ * item metadata, translation and streaming bookkeeping, so the block projects as plain
+ * text from now on. Elements riding with the text (display-only ones) stay.
+ */
+export function editedOutputElements(
+	elements: ReadonlyArray<Record<string, unknown>>,
+	text: string,
+): Array<Record<string, unknown>> {
+	const index = elements.findIndex((element) => element?.type === "text");
+	if (index < 0) throw new ValidationError("This block has no text to edit");
+	const before = typeof elements[index].text === "string" ? (elements[index].text as string) : "";
+	const citations = Array.isArray(elements[index].citations)
+		? (elements[index].citations as Array<{ startIndex?: unknown; endIndex?: unknown }>).filter(
+				(citation) =>
+					Number.isSafeInteger(citation?.startIndex) &&
+					Number.isSafeInteger(citation?.endIndex) &&
+					(citation.startIndex as number) <= (citation.endIndex as number) &&
+					before.slice(citation.startIndex as number, citation.endIndex as number) ===
+						text.slice(citation.startIndex as number, citation.endIndex as number),
+			)
+		: [];
+	const { id, completed } = elements[index];
+	const edited = {
+		type: "text",
+		...(id !== undefined ? { id } : {}),
+		text,
+		...(citations.length ? { citations } : {}),
+		...(completed !== undefined ? { completed } : {}),
+	};
+	return elements.map((element, position) => (position === index ? edited : element));
+}
+
+function broadcastEditedMessage(
+	narratorId: string,
+	messageId: string,
+	privateMessageId: string,
+): void {
+	const updated = fillBody(
+		db.query.narratorMessages
+			.findFirst({ ...bodyColumns(), where: eq(narratorMessages.id, privateMessageId) })
+			.sync(),
+	);
+	if (!updated) return;
+	broadcastToNarrator(narratorId, {
+		type: "message_updated",
+		narratorId,
+		message: fileReferenceMessageForDisplay(updated),
+	});
+	// A copy replaced the shared row for this narrator only: reload its view.
+	if (privateMessageId !== messageId)
+		broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+}
+
+/**
+ * Edit the text of one output block (docs/BLOCK_STORAGE-DESIGN.md §5.5), without touching
+ * the envelope's other blocks or regenerating. The block's body before its first edit is
+ * kept on its row (`original_payload`) for `restoreOutputBlock`; a shared envelope is
+ * copied for this narrator first. Returns the edited block's id, which a copy changes.
+ */
+export async function editOutputBlock(
+	...args: Parameters<typeof editOutputBlockUnlocked>
+): ReturnType<typeof editOutputBlockUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => editOutputBlockUnlocked(...args));
+}
+
+async function editOutputBlockUnlocked(
+	narratorId: string,
+	blockId: string,
+	text: string,
+	editedBy?: string | null,
+): Promise<{ ok: true; messageId: string; blockId: string }> {
+	const [target] = resolveBlockTargets(narratorId, [blockId]);
+	if (target.kind !== "output") throw new ValidationError("Only an output block can be edited");
+	// The original payload lives on the block's row: an unconverted envelope gets its rows.
+	if (!target.rowId) materializeEnvelope(target.messageId);
+	const row = rowAt(target.messageId, target.from);
+	if (!row)
+		throw new AppError("Message history changed; reload and retry", 409, "BLOCK_TARGET_STALE");
+	const before = sqlite.prepare("SELECT payload FROM narrator_blocks WHERE id = ?").get(row.id) as {
+		payload: string;
+	};
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, target.messageId),
+		}),
+	);
+	if (!message) throw new NotFoundError("Message", target.messageId);
+	const elements = Array.isArray(message.contentJson)
+		? (message.contentJson as Array<Record<string, unknown>>)
+		: [];
+	const contentJson = [
+		...elements.slice(0, target.from),
+		...editedOutputElements(elements.slice(target.from, target.to), text),
+		...elements.slice(target.to),
+	];
+	let editedBlockId = row.id;
+	const privateMessageId = await narratorService.copyOnWriteMessage(
+		narratorId,
+		target.messageId,
+		{
+			contentJson,
+			contentText: modelTextFromContentBlocks(contentJson) || null,
+			editedAt: new Date().toISOString(),
+			editedBy: editedBy ?? null,
+			...(message.editedAt ? {} : { originalContentJson: message.contentJson }),
+		},
+		{
+			afterWrite: (_tx, messageId) => {
+				const edited = rowAt(messageId, target.from);
+				if (!edited)
+					throw new AppError(
+						"Message history changed; reload and retry",
+						409,
+						"BLOCK_TARGET_STALE",
+					);
+				editedBlockId = edited.id;
+				sqlite
+					.prepare(
+						"UPDATE narrator_blocks SET original_payload = coalesce(original_payload, ?) WHERE id = ?",
+					)
+					.run(before.payload, edited.id);
+			},
+		},
+	);
+	broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
+	return { ok: true, messageId: privateMessageId, blockId: editedBlockId };
+}
+
+/**
+ * Put one edited output block back to its body before its first edit (§5.5), leaving the
+ * envelope's other blocks as they are. The envelope stays marked edited while another of
+ * its blocks still is.
+ */
+export async function restoreOutputBlock(
+	...args: Parameters<typeof restoreOutputBlockUnlocked>
+): ReturnType<typeof restoreOutputBlockUnlocked> {
+	return withNarratorWorkAdmission(args[0], () => restoreOutputBlockUnlocked(...args));
+}
+
+async function restoreOutputBlockUnlocked(
+	narratorId: string,
+	blockId: string,
+): Promise<{ ok: true; messageId: string; blockId: string }> {
+	const [target] = resolveBlockTargets(narratorId, [blockId]);
+	if (target.kind !== "output") throw new ValidationError("Only an output block can be restored");
+	const original = target.rowId
+		? (sqlite
+				.prepare("SELECT original_payload AS originalPayload FROM narrator_blocks WHERE id = ?")
+				.get(target.rowId) as { originalPayload: string | null } | null)
+		: null;
+	const raw = (parseStored(original?.originalPayload ?? null) as { raw?: unknown } | null)?.raw;
+	// Never edited by block: nothing to restore.
+	if (!target.rowId || !Array.isArray(raw))
+		return { ok: true, messageId: target.messageId, blockId: target.blockId };
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			...bodyColumns(),
+			where: eq(narratorMessages.id, target.messageId),
+		}),
+	);
+	if (!message) throw new NotFoundError("Message", target.messageId);
+	const elements = Array.isArray(message.contentJson) ? (message.contentJson as unknown[]) : [];
+	const contentJson = [...elements.slice(0, target.from), ...raw, ...elements.slice(target.to)];
+	const othersEdited = !!sqlite
+		.prepare(
+			"SELECT 1 FROM narrator_blocks WHERE message_id = ? AND id <> ? AND original_payload IS NOT NULL",
+		)
+		.get(target.messageId, target.rowId);
+	let restoredBlockId = target.rowId;
+	const privateMessageId = await narratorService.copyOnWriteMessage(
+		narratorId,
+		target.messageId,
+		{
+			contentJson,
+			contentText: modelTextFromContentBlocks(contentJson) || null,
+			...(othersEdited ? {} : { editedAt: null, editedBy: null, originalContentJson: null }),
+		},
+		{
+			afterWrite: (_tx, messageId) => {
+				const restored = rowAt(messageId, target.from);
+				if (!restored)
+					throw new AppError(
+						"Message history changed; reload and retry",
+						409,
+						"BLOCK_TARGET_STALE",
+					);
+				restoredBlockId = restored.id;
+				sqlite
+					.prepare("UPDATE narrator_blocks SET original_payload = NULL WHERE id = ?")
+					.run(restored.id);
+			},
+		},
+	);
+	broadcastEditedMessage(narratorId, target.messageId, privateMessageId);
+	return { ok: true, messageId: privateMessageId, blockId: restoredBlockId };
+}
+
+/**
  * Start or feed a message into a narrator.
- * Yields NarratorEvent objects for consumption (used by chapter-merge).
+ * Yields NarratorEvent objects for consumption.
  */
 export async function* startSession(
 	narratorId: string,
@@ -6965,12 +7983,14 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 			// meaningful text/reasoning content that should be preserved
 			// (e.g. user interrupted while the model was streaming a long text block).
 			const hasContent = db.transaction((tx) => {
-				const msg = tx.query.narratorMessages
-					.findFirst({
-						where: eq(narratorMessages.id, partialId),
-						columns: { contentJson: true },
-					})
-					.sync();
+				const msg = fillBody(
+					tx.query.narratorMessages
+						.findFirst({
+							where: eq(narratorMessages.id, partialId),
+							...bodyColumns({ id: true, contentJson: true }),
+						})
+						.sync(),
+				);
 				const blocks = Array.isArray(msg?.contentJson)
 					? (msg.contentJson as Array<Record<string, unknown>>)
 					: [];
@@ -6988,24 +8008,22 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 				// Note: since executed.length === 0, toolCalls here are all unexecuted.
 				if (toolCalls.length > 0) {
 					const toolUseIds = new Set(toolCalls.map((tc) => tc.toolUseId));
-					tx.delete(narratorToolCalls)
-						.where(
-							inArray(
-								narratorToolCalls.id,
-								toolCalls.map((tc) => tc.id),
-							),
-						)
-						.run();
 					const filtered = blocks.filter(
 						(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
 					);
-					tx.update(narratorMessages)
-						.set({
-							contentJson: filtered,
-							contextCharsJson: measureMessageCharacters("assistant", filtered),
-						})
-						.where(eq(narratorMessages.id, partialId))
-						.run();
+					writeEnvelopeBody(tx, partialId, filtered, {
+						set: { contextCharsJson: measureMessageCharacters("assistant", filtered) },
+						rows: () =>
+							tx
+								.delete(narratorToolCalls)
+								.where(
+									inArray(
+										narratorToolCalls.id,
+										toolCalls.map((tc) => tc.id),
+									),
+								)
+								.run(),
+					});
 				}
 
 				logger.info("Preserved partial message with streamed content (no tool execution)", {
@@ -7017,7 +8035,11 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 				return true;
 			});
 
-			if (hasContent) queueContextCharacterRefresh(narratorId, partialId);
+			if (hasContent) {
+				// The kept partial is a finished step whose incomplete items were interrupted.
+				narratorStore.sealStep(partialId);
+				queueContextCharacterRefresh(narratorId, partialId);
+			}
 			if (!hasContent) {
 				// Truly empty — safe to delete
 				await cleanupPartialMessage(partialId, narratorId);
@@ -7031,6 +8053,8 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 		const unexecutedToolUseIds = new Set(unexecuted.map((tc) => tc.toolUseId));
 
 		db.transaction((tx) => {
+			// The body is read before the ledger writes, which queue the envelope for a sync.
+			const body = unexecutedToolUseIds.size > 0 ? readEnvelopeBody(tx, partialId) : undefined;
 			// Delete unexecuted tool_call records
 			if (unexecuted.length > 0) {
 				tx.delete(narratorToolCalls)
@@ -7060,29 +8084,18 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 					.run();
 			}
 
-			// Remove unexecuted tool_use blocks from contentJson
-			if (unexecutedToolUseIds.size > 0) {
-				const msg = tx.query.narratorMessages
-					.findFirst({
-						where: eq(narratorMessages.id, partialId),
-						columns: { contentJson: true },
-					})
-					.sync();
-				if (msg && Array.isArray(msg.contentJson)) {
-					const filtered = (msg.contentJson as Array<Record<string, unknown>>).filter(
-						(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
-					);
-					tx.update(narratorMessages)
-						.set({
-							contentJson: filtered,
-							contextCharsJson: measureMessageCharacters("assistant", filtered),
-						})
-						.where(eq(narratorMessages.id, partialId))
-						.run();
-				}
+			// Remove unexecuted tool_use blocks from the body
+			if (Array.isArray(body)) {
+				const filtered = (body as Array<Record<string, unknown>>).filter(
+					(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
+				);
+				writeEnvelopeBody(tx, partialId, filtered, {
+					set: { contextCharsJson: measureMessageCharacters("assistant", filtered) },
+				});
 			}
 		});
 
+		narratorStore.sealStep(partialId);
 		queueContextCharacterRefresh(narratorId, partialId);
 		logger.info("Finalized partial message with executed tool calls", {
 			narratorId,
@@ -7208,35 +8221,30 @@ export function abortActiveNarratorLoopForPlannedUpdateRecovery(
 }
 
 export function interruptNarrator(narratorId: string): boolean {
+	invalidateRecoveryTarget(narratorId);
 	// Persist before aborting: the finalizer and answer wake may race this call.
 	db.update(narrators)
 		.set({ lastStopReason: "user_interrupt" })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	if (cancelModelTrace(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
 	if (!active && !recovery.interrupted) return false;
 	active?.abortController.abort();
-	// Stopping this narrator cancels the Agent tool calls of its current turn, and the
-	// subagents those calls own must stop with them. The fan-out is what settles their
-	// DB/UI state; membership is decided inside, per aborted tool call, so a subagent the
-	// user is driving from its own panel (independent run signal, nobody's pending tool
-	// call) is not swept up. A recovered Send await owns only the parent-side wait, so it
-	// contributes no ids; a recovered foreground Agent names the subagent it re-drove,
-	// because that continuation's signal is deliberately not this narrator's.
-	if (active || recovery.foregroundSubagentIds.length > 0) {
-		const explicitSubagentIds = recovery.foregroundSubagentIds;
-		import("./narrator-subagent")
-			.then(({ interruptForegroundSubagentsForParent }) =>
-				interruptForegroundSubagentsForParent(narratorId, explicitSubagentIds),
-			)
-			.catch((err) => {
-				logger.warn("Failed to interrupt foreground subagents", {
+	// Stopping this narrator cancels the tool attempts of its current turn; exactly the
+	// runs registered to be cancelled with this narrator's attempts end with them.
+	// Nothing is found by walking a parent tree: a session driven from its own page,
+	// a detached run and a mere subscriber registered no such relation.
+	if (active || recovery.interrupted)
+		void import("./agent-runtime/run")
+			.then(({ cancelRunsBoundTo }) => cancelRunsBoundTo(narratorId, "Caller interrupted"))
+			.catch((err) =>
+				logger.warn("Failed to cancel runs bound to the interrupted narrator", {
 					narratorId,
 					error: err instanceof Error ? err.message : String(err),
-				});
-			});
-	}
+				}),
+			);
 	// Cleanup is handled by the agent loop's onErrorCleanup callback
 	// when it detects the "Aborted" error — no need to duplicate here.
 	logger.info("Narrator interrupted", { narratorId });
@@ -7245,12 +8253,15 @@ export function interruptNarrator(narratorId: string): boolean {
 
 /** Gracefully close a narrator. */
 export function closeNarrator(narratorId: string): void {
+	cancelModelTrace(narratorId);
+	forgetModelTraceRequest(narratorId);
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
 	active.alive = false;
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	active.abortController.abort();
 	clearStreamingSnapshot(narratorId);
+	retireSubagentOutputCharCount(narratorId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,
@@ -7342,11 +8353,7 @@ export async function acquireNarratorRevertAdmission(
 	};
 	try {
 		if (interrupt) {
-			const {
-				getBackgroundAbortControllers,
-				getForegroundAbortControllers,
-				interruptForegroundSubagent,
-			} = await import("./subagent-detach");
+			const { getRunControl } = await import("./agent-runtime/ownership");
 			const interrupted = new Set<AbortController>();
 			interruptPlannedUpdateRecovery(narratorId);
 			// No start mutex is held here. Starting work may not have mounted its abort
@@ -7354,14 +8361,13 @@ export async function acquireNarratorRevertAdmission(
 			while (busy() || hasNarratorAdmissionWork(narratorId)) {
 				signal.throwIfAborted();
 				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
-					// A soft foreground abort suspends for manual input; a revert needs
-					// the real terminal boundary, including an already-suspended runner.
-					if (owner !== narratorId || isSubagent)
-						interruptForegroundSubagent(owner, { hard: true });
+					// A revert needs the real terminal boundary, including a held run: cancel
+					// the run itself, not only its current turn.
+					const run = getRunControl(owner);
+					run?.wake?.("cancel");
 					const controllers = [
 						activeNarrators.get(owner)?.abortController,
-						getBackgroundAbortControllers().get(owner),
-						getForegroundAbortControllers().get(owner),
+						run?.cancel,
 						compactLocks.get(owner)?.abortController,
 					];
 					for (const controller of controllers) {
@@ -7531,6 +8537,58 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
 }
 
 /**
+ * Fail only this startup's discovered recovery targets, never a process-wide scan.
+ * Parallel recovery queues and human approvals retain their runtime ownership;
+ * their failure/finalization paths must release that ownership before calling here.
+ * Admission serializes the owner check and terminal CAS against new starts.
+ */
+export async function failUnownedStartupRecovery(
+	narratorIds: Iterable<string>,
+	error: unknown,
+): Promise<number> {
+	const errorMessage = `Startup recovery failed: ${
+		error instanceof Error ? error.message : String(error)
+	}`.slice(0, 4_000);
+	let changed = 0;
+	let visited = 0;
+	for (const narratorId of new Set(narratorIds)) {
+		try {
+			// Root admission is team-wide: a live background child's work must not keep an
+			// unowned parent working. Only this narrator's own start/finalization protects it.
+			if (
+				!listNarratorAdmissionOwners(narratorId).includes(narratorId) &&
+				!isNarratorRuntimeBusy(narratorId)
+			) {
+				await withNarratorStartAdmission(narratorId, async () => {
+					if (isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId)) return;
+					if (
+						await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
+							substatus: ["error", "interrupted"],
+							errorMessage,
+						})
+					) {
+						changed++;
+						broadcastToNarrator(narratorId, {
+							type: "narrator_error",
+							narratorId,
+							error: errorMessage,
+						});
+					}
+				});
+			}
+		} catch (cleanupError) {
+			// A reserved revert or one unavailable row must not prevent other targets settling.
+			logger.error("Failed to settle unowned startup recovery narrator", {
+				narratorId,
+				error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+			});
+		}
+		if (++visited % 100 === 0) await Bun.sleep(0);
+	}
+	return changed;
+}
+
+/**
  * Whether a soft-stop for queued input still has something to deliver.
  *
  * A soft stop is only worth taking at a tool boundary when the work that
@@ -7611,6 +8669,36 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 	return true;
 }
 
+/**
+ * Urgent (interrupt) input, for any session: cancel the current activity — provider
+ * request and tool IO, through the pass's urgent guidance signal — and adopt the input
+ * next, inside the same run. It neither ends the run nor records a user interrupt;
+ * ending a run is an explicit Stop/cancel (`controlRun`).
+ */
+export function requestUrgentBufferedGuidance(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive) {
+		// No live turn: an in-flight planned-update recovery is the current activity.
+		return interruptPlannedUpdateRecovery(narratorId).interrupted;
+	}
+	requestBufferedMessageSoftStop(narratorId);
+	// Every current activity — a model pass, its tool IO, or a pre-command/queued
+	// command run outside a pass — listens on this one channel (`urgentActivitySignal`).
+	active._urgentGuidanceAbortController?.abort(new Error("Urgent guidance requested"));
+	return true;
+}
+
+/**
+ * Cancellation for an activity run outside a model pass (a pre-command, a queued
+ * control command): the turn's own signal plus a fresh urgent channel, so urgent
+ * input cancels exactly this activity without ending the turn or the run.
+ */
+export function urgentActivitySignal(active: ActiveNarrator, turnSignal: AbortSignal): AbortSignal {
+	const urgent = new AbortController();
+	active._urgentGuidanceAbortController = urgent;
+	return AbortSignal.any([turnSignal, urgent.signal]);
+}
+
 export function applyBufferedQueueModeControl(
 	narratorId: string,
 	mode: "turn" | "tool" | "interrupt",
@@ -7625,7 +8713,7 @@ export function applyBufferedQueueModeControl(
 		return;
 	}
 	if (!isNarratorRuntimeBusy(narratorId) && !isLoopRunning(narratorId)) return;
-	if (mode === "interrupt") interruptNarrator(narratorId);
+	if (mode === "interrupt") requestUrgentBufferedGuidance(narratorId);
 	else requestBufferedMessageSoftStop(narratorId);
 }
 
@@ -7679,7 +8767,7 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 	readNarrator: (id) =>
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, id),
-			columns: { model: true, parentNarratorId: true, subagentType: true, reasoningEffort: true },
+			columns: { ...RUNTIME_SOURCE_COLUMNS, model: true, reasoningEffort: true },
 		}),
 	resolve: async (narrator, actingUserId, stickyProvider) => {
 		const settingsRevision = getSettingsRevision();
@@ -7694,7 +8782,7 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 		active.provider = resolveProvider(resolved.model);
 		active._settingsRevision = resolved.settingsRevision;
 		active._inheritedReasoningEffort = resolved.reasoningEffort;
-		active._parentReasoningEffort = resolved.parentReasoningEffort;
+		active._sourceReasoningEffort = resolved.parentReasoningEffort;
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
 			active.model,
@@ -7738,13 +8826,18 @@ export async function settleNarratorRuntimeModel(active: ActiveNarrator): Promis
 	}
 }
 
+/**
+ * Apply a stored model change to the live session, at its next model request. One
+ * path for every session: a delegated run has the same ActiveNarrator record as any
+ * other, so there is no second settings map to update.
+ */
 export function updateNarratorModel(narratorId: string, model: string): void {
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive) {
 		inheritedModelRuntime.select(active, model || FOLLOW_DEFAULT_MODEL);
 		if (model === FOLLOW_PARENT_MODEL) {
 			inheritedModelRuntime.refresh(active);
-			inheritedModelRuntime.parentChanged(narratorId);
+			inheritedModelRuntime.sourceChanged(narratorId);
 			return;
 		}
 		active._modelRef = model || FOLLOW_DEFAULT_MODEL;
@@ -7771,23 +8864,8 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
-	} else if (
-		model !== FOLLOW_PARENT_MODEL &&
-		updateActiveSubagentModel(narratorId, resolveEffectiveModel(model))
-	) {
-		// Subagent: update lightweight settings map; loop picks it up via getRuntimeSettingsOverride
-		const effectiveModel = resolveEffectiveModel(model);
-		const sa = activeSubagentSettings.get(narratorId);
-		broadcastToNarrator(narratorId, {
-			type: "model_settings_changed",
-			narratorId,
-			model: effectiveModel,
-			reasoningEffort: sa?.reasoningEffort ?? null,
-			status: "pending",
-			applyAt: "next_model_request",
-		});
 	}
-	inheritedModelRuntime.parentChanged(narratorId);
+	inheritedModelRuntime.sourceChanged(narratorId);
 }
 
 export function updateNarratorReasoningEffort(
@@ -7803,7 +8881,7 @@ export function updateNarratorReasoningEffort(
 			subagentRunReasoningEffort(
 				{
 					reasoningEffort: active._inheritedReasoningEffort,
-					parentReasoningEffort: active._parentReasoningEffort,
+					parentReasoningEffort: active._sourceReasoningEffort,
 				},
 				reasoningEffort,
 			),
@@ -7816,20 +8894,9 @@ export function updateNarratorReasoningEffort(
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
-	} else if (updateActiveSubagentReasoningEffort(narratorId, reasoningEffort)) {
-		// Subagent: update lightweight settings map; loop picks it up via getRuntimeSettingsOverride
-		const sa = activeSubagentSettings.get(narratorId);
-		broadcastToNarrator(narratorId, {
-			type: "model_settings_changed",
-			narratorId,
-			model: sa?.model ?? "",
-			reasoningEffort,
-			status: "pending",
-			applyAt: "next_model_request",
-		});
 	}
-	// Children with no override of their own follow this narrator's tier.
-	inheritedModelRuntime.parentChanged(narratorId);
+	// Followers with no override of their own follow this narrator's tier.
+	inheritedModelRuntime.sourceChanged(narratorId);
 }
 
 /** Apply only after the input owns execution and its predecessor has finalized. */
@@ -7892,14 +8959,6 @@ export async function restorePendingModelOverrides(): Promise<void> {
 			narratorId: n.id,
 			restoreModel: n.pendingModelRestore,
 		});
-	}
-}
-
-/** Update the cached chapter role for a live narrator (e.g. after promote). */
-export function updateNarratorChapterRole(narratorId: string, role: string): void {
-	const active = activeNarrators.get(narratorId);
-	if (active) {
-		active._chapterRole = role;
 	}
 }
 
@@ -8041,11 +9100,6 @@ export async function recoverOnStartup(
 	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
 	(globalThis as any)[HOT_RELOAD_GUARD] = true;
 
-	// Clean up any residual worktree watchers from a previous server run.
-	// On restart (or hot reload), old fs.watch handles may leak if the previous
-	// process didn't shut down cleanly, causing phantom CPU usage from inotify.
-	worktreeWatcher.shutdown();
-
 	// A restart invalidates attempt-bound approval authority, including approved
 	// rows whose tool had not reached consume. Never apply yesterday's receipt.
 	await recoverPermissionRuleRequestAuditsOnStartup();
@@ -8090,6 +9144,21 @@ export async function recoverOnStartup(
 		});
 	}
 
+	// A user's hold on a run survives the restart: it is restored from its durable
+	// `taken_over` mirror before any status is rewritten, and the mirror is kept.
+	const { protectHeldRunFacts } = await import("./restart-recovery-service");
+	const protectedFacts = {
+		narratorIds: new Set(protection.narratorIds),
+		toolCallIds: new Set(protection.toolCallIds),
+		backgroundTaskIds: new Set(protection.backgroundTaskIds),
+	};
+	const held = await protectHeldRunFacts(protectedFacts);
+	protection = protectedFacts;
+	for (const id of held)
+		await db
+			.update(narrators)
+			.set({ status: "idle", updatedAt: now })
+			.where(and(eq(narrators.id, id), inArray(narrators.status, ["working", "waiting"])));
 	// Active narrators interrupted by an ordinary restart are marked interrupted. Narrators
 	// covered by the planned-update manifest stay active until their continuations reattach.
 	for (const activeStatus of ["working", "waiting"] as const) {
@@ -8100,11 +9169,20 @@ export async function recoverOnStartup(
 		const interruptedIds = activeRows
 			.map((row) => row.id)
 			.filter((id) => !protection.narratorIds?.has(id));
-		if (interruptedIds.length > 0) {
+		const heldIds = interruptedIds.filter((id) => held.has(id));
+		const plainIds = interruptedIds.filter((id) => !held.has(id));
+		if (heldIds.length > 0)
 			await db
 				.update(narrators)
-				.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
-				.where(inArray(narrators.id, interruptedIds));
+				.set({ status: "idle", substatus: '["interrupted","taken_over"]', updatedAt: now })
+				.where(inArray(narrators.id, heldIds));
+		if (interruptedIds.length > 0) {
+			if (plainIds.length > 0)
+				await db
+					.update(narrators)
+					.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
+					.where(inArray(narrators.id, plainIds));
+			backgroundOccupancyStore.refreshNarrators(interruptedIds);
 			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
 				count: interruptedIds.length,
 			});
@@ -8236,10 +9314,17 @@ export async function recoverOnStartup(
 	// Preserve modern compact lifecycle records across restarts. Running attempts
 	// become failed audit entries; only legacy placeholders with no attempt/retry
 	// history are removed.
-	const staleCompactRecovery = await recoverStaleCompactingMessages();
-	if (staleCompactRecovery.preserved > 0 || staleCompactRecovery.deleted > 0) {
-		logger.info("Stale compacting messages recovered on startup", staleCompactRecovery);
-	}
+	await recoverStaleCompactingMessages();
+	const interruptedBlocks = recoverBlockStorage();
+	if (interruptedBlocks)
+		logger.info("Interrupted streaming blocks marked aborted on startup", {
+			count: interruptedBlocks,
+		});
+	const interruptedTurns = recoverInterruptedTurns();
+	if (interruptedTurns)
+		logger.info("Runs cut off by the previous process marked interrupted", {
+			count: interruptedTurns,
+		});
 
 	const transientCompactRows = await db.query.narrators.findMany({
 		columns: { id: true, substatus: true },
@@ -8320,10 +9405,11 @@ async function loadNarratorRoutineContext(narratorId: string) {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: {
+			id: true,
 			enabledTools: true,
 			traits: true,
-			chapterId: true,
 			contextProjectId: true,
+			...RUNTIME_SOURCE_COLUMNS,
 		},
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
@@ -8404,6 +9490,7 @@ export async function resolveOptionalToolState(
 		narratorTraits: narrator.traits,
 		projectId: narratorProjectId,
 		actingUserId: actingUserId ?? null,
+		policySourceId: policySourceIdOf(narrator),
 	});
 	if (getDisabledToolSet(stateTraits.traits).has(toolName)) {
 		return { state: "disabled_by_trait", globallyEnabled, ...(mode ? { mode } : {}) };
@@ -8433,30 +9520,19 @@ export async function loadOptionalTool(
 ): Promise<"loaded" | "already_loaded" | "unknown_tool"> {
 	if (!isOptionalTool(toolName)) return "unknown_tool";
 
-	// Read current enabled tools from DB
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
-	});
-	if (!narrator || !(await canManageProductRuntimeTool(toolName, narratorId)))
-		return "unknown_tool";
-	const current: string[] = (narrator.enabledTools as string[] | null) ?? [];
-	if (current.includes(toolName)) return "already_loaded";
+	if (!(await canManageProductRuntimeTool(toolName, narratorId))) return "unknown_tool";
 
-	// Persist
-	await db
-		.update(narrators)
-		.set({ enabledTools: [...current, toolName] })
-		.where(eq(narrators.id, narratorId));
-
-	// Also update in-memory session if active
-	const active = activeNarrators.get(narratorId);
-	if (active) {
-		active._enabledOptionalTools.add(toolName);
-	}
-
-	logger.info("Optional tool loaded", { narratorId, toolName });
-	return "loaded";
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const result = await changeLoadedToolGroup(
+		narratorId,
+		{ id: toolName, description: toolName, toolNames: [toolName] },
+		true,
+	);
+	return result === "loaded"
+		? "loaded"
+		: result === "already_loaded"
+			? "already_loaded"
+			: "unknown_tool";
 }
 
 /**
@@ -8469,34 +9545,31 @@ export async function unloadOptionalTool(
 ): Promise<"unloaded" | "not_loaded" | "unknown_tool"> {
 	if (!isOptionalTool(toolName)) return "unknown_tool";
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
-	});
-	if (!narrator || !(await canManageProductRuntimeTool(toolName, narratorId)))
-		return "unknown_tool";
-	const current: string[] = (narrator.enabledTools as string[] | null) ?? [];
-	const next = current.filter((name) => name !== toolName);
-	const wasPersisted = next.length !== current.length;
+	if (!(await canManageProductRuntimeTool(toolName, narratorId))) return "unknown_tool";
 
-	const active = activeNarrators.get(narratorId);
-	const wasActive = active?._enabledOptionalTools.has(toolName) ?? false;
-
-	if (!wasPersisted && !wasActive) return "not_loaded";
-
-	if (wasPersisted) {
-		await db.update(narrators).set({ enabledTools: next }).where(eq(narrators.id, narratorId));
-	}
-
-	if (active) {
-		active._enabledOptionalTools.delete(toolName);
-	}
-
-	logger.info("Optional tool unloaded", { narratorId, toolName });
-	return "unloaded";
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const result = await changeLoadedToolGroup(
+		narratorId,
+		{ id: toolName, description: toolName, toolNames: [toolName] },
+		false,
+	);
+	return result === "unloaded" ? "unloaded" : "not_loaded";
 }
 
 /** Get the set of enabled optional tool names for a narrator session. */
+export function updateActiveLoadedTools(
+	narratorId: string,
+	toolNames: Iterable<string>,
+	loaded = true,
+): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	for (const name of toolNames) {
+		if (loaded) active._enabledOptionalTools.add(name);
+		else active._enabledOptionalTools.delete(name);
+	}
+}
+
 export function getEnabledOptionalTools(narratorId: string): Set<string> {
 	const active = activeNarrators.get(narratorId);
 	return active?._enabledOptionalTools ?? new Set();
@@ -8545,6 +9618,7 @@ export async function listSessionOptionalTools(
 		narratorTraits: narrator.traits,
 		projectId: narratorProjectId,
 		actingUserId: actingUserId ?? null,
+		policySourceId: policySourceIdOf(narrator),
 	});
 	const disabled = getDisabledToolSet(traits.traits);
 

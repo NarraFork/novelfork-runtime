@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { sharesParallelGroup } from "@shared/tool-parallel-groups";
 import {
 	groupToolExecutions,
 	isAgentDependentToolExecutionGroup,
@@ -15,6 +16,36 @@ function tool(name: string, input: Record<string, unknown> = {}) {
 }
 
 describe("tool execution grouping", () => {
+	test("explicit and legacy worktree tools remain strict serial barriers", () => {
+		for (const name of [
+			"Worktree",
+			"ListWorktrees",
+			"CreateWorktree",
+			"AttachWorktree",
+			"GetWorktreeOperation",
+		]) {
+			const item = tool(name, { parallel: true });
+			expect(isStrictSerialToolExecution(item)).toBe(true);
+			expect(
+				groupToolExecutions([tool("Read"), item, tool("Grep")]).map((group) =>
+					group.map((member) => member.name),
+				),
+			).toEqual([["Read"], [name], ["Grep"]]);
+		}
+	});
+	test("Stop is a serial barrier even with parallel opt-in and waits for preceding admission", () => {
+		for (const type of ["bash", "agent"]) {
+			const stop = tool("Stop", { type, id: "owned-task", parallel: true });
+			expect(isStrictSerialToolExecution(stop)).toBe(true);
+			expect(isParallelSafeToolExecution(stop)).toBe(false);
+			expect(
+				groupToolExecutions([tool("Agent"), stop, tool("Read")]).map((group) =>
+					group.map(({ name }) => name),
+				),
+			).toEqual([["Agent"], ["Stop"], ["Read"]]);
+		}
+	});
+
 	test("matches loop ordering, parallel runs, and serial barriers", () => {
 		const tools = [
 			tool("Write"),
@@ -53,6 +84,21 @@ describe("tool execution grouping", () => {
 			groupToolExecutions(recoveryItems).map((group) => group.map((item) => item.toolName)),
 		).toEqual([["Read", "Agent"], ["Await"], ["Bash"], ["Agent"]]);
 		expect(isStrictSerialToolExecution(recoveryItems[3])).toBe(true);
+	});
+
+	test("ContextAsk calls share a parallel group with each other and read-only peers", () => {
+		// ContextAsk is read-only against persisted subagent context; several lookups
+		// against different subagents in one turn must start together instead of
+		// queueing behind each other.
+		expect(
+			groupToolExecutions([
+				tool("ContextAsk", { id: "one", questions: ["q1"] }),
+				tool("ContextAsk", { id: "two", questions: ["q2"] }),
+				tool("Read"),
+			]).map((group) => group.map(({ name }) => name)),
+		).toEqual([["ContextAsk", "ContextAsk", "Read"]]);
+		expect(isParallelSafeToolExecution(tool("ContextAsk", { id: "one" }))).toBe(true);
+		expect(isStrictSerialToolExecution(tool("ContextAsk", { id: "one" }))).toBe(false);
 	});
 
 	describe("Bash defaults to serial", () => {
@@ -140,17 +186,33 @@ describe("tool execution grouping", () => {
 		});
 
 		test("barrier is driven by the Agent member, not the adjacent tool", () => {
-			// Read joins the Agent batch first, so Send (barrier-dependent) splits off. Await
+			// Read joins the Agent batch first, so Send (barrier-dependent) splits off. Read
 			// then joins Send because that fresh group has no Agent — the barrier only triggers
 			// while the current group actually contains an Agent.
 			expect(
-				groupToolExecutions([tool("Read"), tool("Agent"), tool("Send"), tool("Await")]).map(
+				groupToolExecutions([tool("Read"), tool("Agent"), tool("Send"), tool("Read")]).map(
 					(group) => group.map(({ name }) => name),
 				),
 			).toEqual([
 				["Read", "Agent"],
-				["Send", "Await"],
+				["Send", "Read"],
 			]);
+		});
+
+		test("Await after a Send in the same batch opens a new group", () => {
+			// Send wakes the idle subagent before returning; a concurrent Await would read
+			// the previous run's terminal result.
+			expect(
+				groupToolExecutions([tool("Send"), tool("Read"), tool("Await")]).map((group) =>
+					group.map(({ name }) => name),
+				),
+			).toEqual([["Send", "Read"], ["Await"]]);
+		});
+
+		test("sharesParallelGroup follows the Send barrier past an intervening call", () => {
+			expect(sharesParallelGroup([tool("Send"), tool("Read")])).toBe(true);
+			expect(sharesParallelGroup([tool("Send"), tool("Read"), tool("Await")])).toBe(false);
+			expect(sharesParallelGroup([tool("Await"), tool("Send")])).toBe(true);
 		});
 
 		test("Agent + Agent stays parallel", () => {
@@ -302,7 +364,7 @@ describe("selectStreamingToolExecutions", () => {
 		expect(selectStreamingToolExecutions(items)).toEqual([]);
 	});
 
-	test("disabled members block even later members of the same parallel group", () => {
+	test("non-executable members block even later members of the same parallel group", () => {
 		const read = tool("Read");
 		const disabled = tool("Agent");
 		const items = [
@@ -316,13 +378,11 @@ describe("selectStreamingToolExecutions", () => {
 		expect(selectStreamingToolExecutions(items)).toEqual([]);
 	});
 
-	test("deferred Agent blocks Await and Send until it is allowed and settled", () => {
+	test("an Agent blocks Await and Send until it has settled", () => {
 		const agent = tool("Agent");
 		const awaitTool = tool("Await");
 		const send = tool("Send");
-		const items = [entry(agent, { allowed: false }), entry(awaitTool), entry(send)];
-		expect(selectStreamingToolExecutions(items)).toEqual([]);
-		items[0].allowed = true;
+		const items = [entry(agent), entry(awaitTool), entry(send)];
 		expect(selectStreamingToolExecutions(items)).toEqual([agent]);
 		items[0].started = true;
 		expect(selectStreamingToolExecutions(items)).toEqual([]);

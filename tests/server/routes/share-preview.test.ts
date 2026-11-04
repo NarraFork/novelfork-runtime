@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,8 +12,9 @@ process.env.NARRAFORK_HOME = home;
 const { shareRoutes } = await import("../../../server/routes/shares");
 const { createShare, revokeShareRegistry } = await import("../../../server/lib/shares");
 const { AppError } = await import("../../../server/lib/errors");
+const { narraforkDir } = await import("../../../server/lib/settings");
 const { shareFileTool } = await import("../../../server/lib/agent/tools/share-file");
-const { renderShareHtml, shareHtmlWorkerEntry, shareHtmlWorkerSpecifiers } = await import(
+const { renderShareHtml, shareHtmlWorkerSpecifiers } = await import(
 	"../../../server/lib/share-preview-html"
 );
 const app = new Hono();
@@ -55,6 +56,26 @@ afterAll(async () => {
 });
 
 describe("share preview HTTP", () => {
+	test.each([
+		"request-recordings",
+		"saved-request-recordings",
+	])("all public share routes hide %s even after a registry path changes", async (directory) => {
+		const f = await fixture("ordinary.json", "public workspace evidence");
+		const privateDir = join(narraforkDir, directory, `share-privacy-${f.id}`);
+		await mkdir(privateDir, { recursive: true });
+		const privateFile = join(privateDir, "request.json");
+		await writeFile(privateFile, "private-recording-marker");
+		try {
+			f.record.storagePath = privateFile;
+			for (const ending of ["", "/preview", "/preview-info"]) {
+				const response = await app.request(`/api/shares/${f.id}${ending}`);
+				expect(response.status).toBe(404);
+				expect(await response.text()).not.toContain("private-recording-marker");
+			}
+		} finally {
+			await rm(privateDir, { recursive: true, force: true });
+		}
+	});
 	test("video and audio have correct MIME and do not require authentication", async () => {
 		for (const [name, mime] of [
 			["x.mp4", "video/mp4"],
@@ -182,14 +203,10 @@ describe("share preview HTTP", () => {
 });
 
 describe("compiled HTML preview", () => {
-	test("resolves compiled worker entries and preserves Windows virtual paths", () => {
+	test("resolves compiled worker entries", () => {
 		expect(shareHtmlWorkerSpecifiers(true, "file:///$bunfs/root/app")[0]).toBe(
 			"file:///$bunfs/root/lib/share-preview-worker.js",
 		);
-		expect(shareHtmlWorkerEntry("file:///C:/%7EBUN/root/server/lib/share-preview-worker.js")).toBe(
-			"C:/~BUN/root/server/lib/share-preview-worker.js",
-		);
-		expect(shareHtmlWorkerEntry("file:///C:/work/share-preview-worker.ts")).toBeInstanceOf(URL);
 	});
 	test("worker is embedded and usable from a compiled Bun binary", async () => {
 		const { safeSpawn } = await import("../../../server/lib/spawn");

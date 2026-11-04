@@ -13,7 +13,7 @@ NarraFork 的 Codex WebSocket 传输基于 Responses WebSocket。
 - `server/lib/agent/codex-websocket.ts` — Responses WebSocket 连接与 session cache
 - `server/lib/agent/codex-provider.ts` — Codex provider，负责在 WS / HTTP 之间切换
 - `server/lib/agent/openai-provider.ts` — 复用 Responses request 构建与事件解析
-- `scripts/test-codex-websocket.ts` — 手动验证脚本
+- 单元测试：`server/lib/agent/__tests__/codex-websocket*.test.ts`
 
 ## 协议特征
 
@@ -118,7 +118,9 @@ call——JSON.parse 直接失败，且这个失败离真正的原因已经很�
 和上游那句"请新建连接继续"的指示恰好相反。
 
 `resumable` 字段区分两种恢复语义：已经有输出流给调用方时（调用方已持久化该部分轮次）
-重发会重复输出，必须由 agent loop 从部分轮次续跑；没有输出时才可以整体重放。
+重发会重复输出，必须由 agent loop 从部分轮次续跑；没有输出时也**不是**整体重放——
+loop 统一结束当前 pass，由调用方按最新状态重新组装下一趟请求（`resumable_error` 续跑），
+半截 reasoning 会先丢弃再交接。
 
 对应地，`codex-provider.ts` 收到这个类型会**原样抛出**，不走 failover 分支——那条路会
 `reportFailure()` 惩罚一个完全健康的 credential，累积到 `too_many_failures` 甚至把它禁用。
@@ -179,18 +181,6 @@ RFC 6455 限制 close reason 最长 123 字节，而上游放进去的 JSON 约 
 看起来像模型选择了什么都不说。
 
 ## 测试
-
-### 手动测试
-
-```bash
-bun scripts/test-codex-websocket.ts
-```
-
-可选代理：
-
-```bash
-bun scripts/test-codex-websocket.ts --proxy=http://proxy.example.com:8080
-```
 
 ### 单元测试
 

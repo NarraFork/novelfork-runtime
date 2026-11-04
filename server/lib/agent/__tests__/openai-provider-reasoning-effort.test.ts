@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { type OpenAIProviderConfig, settings } from "../../settings";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+	bindModelCatalogSettings,
+	getEffectiveModelProfile,
+	getModelCardSnapshot,
+	mutateModelCard,
+} from "../../model-catalog";
+import { type OpenAIProviderConfig, saveSettings, settings } from "../../settings";
+import type { NarraForkSettings } from "../../settings/types";
 import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams } from "../provider";
 
@@ -68,7 +75,47 @@ async function sendAndCaptureBody(
 afterEach(() => {
 	globalThis.fetch = originalFetch;
 	capturedBody = null;
+	bindModelCatalogSettings(settings, () => saveSettings(settings));
 });
+
+function installReasoningLevels(): void {
+	bindModelCatalogSettings(
+		{
+			openaiProviders: [config({})],
+			agent: {
+				modelCatalog: {
+					schemaVersion: 2,
+					migrationVersion: 2,
+					local: { revision: 0 },
+					autoApply: false,
+					pinnedVersion: null,
+				},
+			},
+		} as NarraForkSettings,
+		() => {},
+	);
+	mutateModelCard({
+		baseRevision: getModelCardSnapshot().local.revision,
+		action: "upsert-model",
+		model: {
+			id: "glm-5.1",
+			matches: { aliases: ["responses:glm-5.1", "openai:glm-5.1"] },
+			metadata: {
+				supports_reasoning: true,
+				reasoning_effort_levels: ["low", "medium", "high", "max"],
+				can_disable_reasoning: true,
+			},
+		},
+	});
+	for (const model of ["p1:glm-5.1", "p1:responses:glm-5.1"]) {
+		expect(getEffectiveModelProfile(model).reasoning.levels).toEqual([
+			"low",
+			"medium",
+			"high",
+			"max",
+		]);
+	}
+}
 
 describe("OpenAIProvider completions-compatible reasoning effort", () => {
 	test("sends reasoning_effort for a third-party model", async () => {
@@ -80,7 +127,15 @@ describe("OpenAIProvider completions-compatible reasoning effort", () => {
 		expect(body.thinking).toBeUndefined();
 	});
 
-	test("clamps xhigh onto the generic ladder", async () => {
+	test("preserves xhigh when the model declares no tier table", async () => {
+		mockFetchCapturingBody();
+		const provider = new OpenAIProvider(config({ apiMode: "completions" }));
+		const body = await sendAndCaptureBody(provider, chatParams({ reasoningEffort: "xhigh" }));
+		expect(body.reasoning_effort).toBe("xhigh");
+	});
+
+	test("maps xhigh to max when metadata declares low/medium/high/max", async () => {
+		installReasoningLevels();
 		mockFetchCapturingBody();
 		const provider = new OpenAIProvider(config({ apiMode: "completions" }));
 		const body = await sendAndCaptureBody(provider, chatParams({ reasoningEffort: "xhigh" }));
@@ -97,8 +152,7 @@ describe("OpenAIProvider completions-compatible reasoning effort", () => {
 			chatParams({ model: "p1:deepseek-v4-pro", reasoningEffort: "low" }),
 		);
 		expect(body.thinking).toEqual({ type: "enabled" });
-		// DeepSeek accepts only high/max, so low clamps up to high.
-		expect(body.reasoning_effort).toBe("high");
+		expect(body.reasoning_effort).toBe("low");
 	});
 
 	test("DeepSeek none disables thinking outright", async () => {
@@ -123,7 +177,72 @@ describe("OpenAIProvider completions-compatible reasoning effort", () => {
 	});
 });
 
-describe("OpenAIProvider responses-compatible reasoning effort", () => {
+describe("DeepSeek metadata reaches every OpenAI request path", () => {
+	beforeEach(() => {
+		bindModelCatalogSettings(
+			{
+				openaiProviders: [config({})],
+				agent: {
+					modelCatalog: {
+						schemaVersion: 2,
+						migrationVersion: 2,
+						local: { revision: 0 },
+						autoApply: false,
+						pinnedVersion: null,
+					},
+				},
+			} as NarraForkSettings,
+			() => {},
+		);
+	});
+	for (const apiMode of ["completions", "responses"] as const) {
+		for (const path of ["chat", "generate", "history"] as const) {
+			test.each([
+				["none", "none"],
+				["low", "low"],
+				["medium", "high"],
+				["high", "high"],
+				["xhigh", "high"],
+				["max", "max"],
+			] as const)(`${apiMode} ${path}: %s resolves to %s`, async (effort, expected) => {
+				const model = "p1:deepseek-v4-pro";
+				const provider = new OpenAIProvider(config({ apiMode, defaultModel: "deepseek-v4-pro" }));
+				mockFetchCapturingBody();
+				let body: Record<string, unknown>;
+				if (path === "chat") {
+					body = await sendAndCaptureBody(provider, chatParams({ model, reasoningEffort: effort }));
+				} else {
+					const request =
+						path === "generate"
+							? provider.generateWithMeta("hi", model, undefined, { reasoningEffort: effort })
+							: provider.generateWithHistoryWithMeta("sys", "hi", model, undefined, {
+									reasoningEffort: effort,
+								});
+					await expect(request).rejects.toThrow();
+					expect(capturedBody).not.toBeNull();
+					body = capturedBody as Record<string, unknown>;
+				}
+				if (apiMode === "responses") {
+					expect(body.reasoning).toEqual({ effort: expected, summary: "auto" });
+				} else {
+					expect(body.thinking).toEqual({ type: effort === "none" ? "disabled" : "enabled" });
+					expect(body.reasoning_effort).toBe(effort === "none" ? undefined : expected);
+				}
+			});
+		}
+	}
+
+	test("unknown DeepSeek-like models preserve an undeclared effort", async () => {
+		mockFetchCapturingBody();
+		const body = await sendAndCaptureBody(
+			new OpenAIProvider(config({ apiMode: "completions" })),
+			chatParams({ model: "p1:deepseek-future-unknown", reasoningEffort: "xhigh" }),
+		);
+		expect(body.reasoning_effort).toBe("xhigh");
+	});
+});
+
+describe("OpenAIProvider plain responses (apiMode) reasoning effort", () => {
 	test("sends reasoning.effort for a third-party model", async () => {
 		mockFetchCapturingBody();
 		const provider = new OpenAIProvider(config({ apiMode: "responses" }));
@@ -150,6 +269,62 @@ describe("OpenAIProvider effort blocklist through a routing channel", () => {
 
 	afterEach(() => {
 		if (settings.agent) settings.agent.reasoningEffortBlocklist = originalBlocklist;
+	});
+
+	test.each([
+		"completions",
+		"responses",
+	] as const)("metadata tiers cannot bypass deny on %s chat/generate/history", async (apiMode) => {
+		installReasoningLevels();
+		if (settings.agent) settings.agent.reasoningEffortBlocklist = [{ pattern: "/^glm/" }];
+		const provider = new OpenAIProvider(config({ apiMode }));
+		const model = "p1:responses:glm-5.1";
+		mockFetchCapturingBody();
+		const body = await sendAndCaptureBody(provider, chatParams({ model, reasoningEffort: "high" }));
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.reasoning).toBeUndefined();
+		for (const history of [false, true]) {
+			mockFetchCapturingBody();
+			const request = history
+				? provider.generateWithHistoryWithMeta("sys", "hi", model, undefined, {
+						reasoningEffort: "high",
+					})
+				: provider.generateWithMeta("hi", model, undefined, { reasoningEffort: "high" });
+			await expect(request).rejects.toThrow();
+			expect(capturedBody).not.toBeNull();
+			expect(capturedBody?.reasoning_effort).toBeUndefined();
+			expect(capturedBody?.reasoning).toBeUndefined();
+		}
+	});
+
+	test.each([
+		"high",
+		"none",
+	] as const)("DeepSeek deny omits effort but preserves %s thinking control", async (reasoningEffort) => {
+		if (settings.agent) settings.agent.reasoningEffortBlocklist = [{ pattern: "/^deepseek/" }];
+		mockFetchCapturingBody();
+		const provider = new OpenAIProvider(config({ apiMode: "completions" }));
+		const body = await sendAndCaptureBody(
+			provider,
+			chatParams({
+				model: "p1:deepseek-v4-pro",
+				reasoningEffort,
+			}),
+		);
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.thinking).toEqual({ type: reasoningEffort === "none" ? "disabled" : "enabled" });
+	});
+
+	test("disabled blocklist entry still permits declared metadata tiers", async () => {
+		installReasoningLevels();
+		if (settings.agent)
+			settings.agent.reasoningEffortBlocklist = [{ pattern: "/^glm/", enabled: false }];
+		mockFetchCapturingBody();
+		const body = await sendAndCaptureBody(
+			new OpenAIProvider(config({ apiMode: "responses" })),
+			chatParams({ model: "p1:responses:glm-5.1", reasoningEffort: "high" }),
+		);
+		expect(body.reasoning).toEqual({ effort: "high", summary: "auto" });
 	});
 
 	test("excludes a channel-prefixed model on the completions path", async () => {

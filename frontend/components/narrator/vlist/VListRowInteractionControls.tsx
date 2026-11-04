@@ -1,9 +1,11 @@
 /** Deferred menus, navigation and inspector state; the shell owns the first gesture. */
+
+import { useClipboard } from "@frontend/hooks/useClipboard";
 import { usePlatform } from "@frontend/hooks/usePlatform";
 import type { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
-import { useClipboard } from "@mantine/hooks";
+import type { FileTarget } from "@shared/file-reference";
 import {
 	IconArrowBackUp,
 	IconArrowsMaximize,
@@ -25,19 +27,18 @@ import {
 import { lazy, Suspense, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { CompactMenuSub } from "../compact/CompactMenuSub";
+import { FileLinkMenuItems } from "../message/FileLinkMenuItems";
+import { openHostedToolCallInspector } from "../tool-call/tool-call-inspector-host";
+import { useToolFileNavigation } from "../tool-call/useToolFileNavigation";
 import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { VListRowInteractionProps } from "./VListRowInteraction";
 
-// The inspector / file preview are only ever needed once a user picks the menu
-// item, so both are lazy: a scrolling list never pays for their module graph
-// (ToolCallInspector pulls ContentViewer + Timeline; FilePreviewModal pulls the
-// fs-preview fetch path and Shiki language resolution).
+// Inspectors are lazy: a scrolling list never pays for their module graphs.
+// File navigation uses the existing authorized device-qualified panel chain.
 const ToolCallInspector = lazy(() =>
 	import("../tool-call/ToolCallInspector").then((m) => ({ default: m.ToolCallInspector })),
-);
-const FilePreviewModal = lazy(() =>
-	import("../file-panel/FilePreviewModal").then((m) => ({ default: m.FilePreviewModal })),
 );
 const ContentInspector = lazy(() =>
 	import("../content/ContentInspector").then((m) => ({ default: m.ContentInspector })),
@@ -49,7 +50,11 @@ const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 type VListRowInteractionControlsProps = Omit<
 	VListRowInteractionProps,
 	"children" | "blockId" | "messageId" | "selected" | "onToggleSelect"
-> & { swipe: ReturnType<typeof useSwipeMenu> };
+> & {
+	swipe: ReturnType<typeof useSwipeMenu>;
+	/** File behind this row's context-menu gesture (file links only). */
+	fileLinkTarget: FileTarget | null;
+};
 
 export function VListRowInteractionControls({
 	blockIndex,
@@ -64,17 +69,27 @@ export function VListRowInteractionControls({
 	onViewOriginal,
 	onOpenFullscreen,
 	inspectContent,
+	fileLinkTarget,
 	swipe,
 }: VListRowInteractionControlsProps) {
 	const { t } = useTranslation("common");
 	const { t: tNarrator } = useTranslation("narrator");
 	const platform = usePlatform();
 	const filePathClipboard = useClipboard({ timeout: 1500 });
-	// Both modals stay unmounted until their menu item fires (and are torn down
+	// Inspector modals stay unmounted until their menu item fires (and are torn down
 	// on close), so an idle row carries no modal cost.
 	const [inspectorOpened, setInspectorOpened] = useState(false);
-	const [previewOpened, setPreviewOpened] = useState(false);
+	const openToolFile = useToolFileNavigation(toolMeta?.fileTarget, toolMeta?.fileNarratorId);
+	// A bare string action must never reinterpret historical file identity.
+	const requiresFileTarget =
+		toolMeta?.isFileTool || toolMeta?.toolName === "Read" || toolMeta?.toolName === "Write";
+	const openFile = requiresFileTarget ? openToolFile : toolActions?.onOpenFilePanel;
 	const [contentInspectorOpened, setContentInspectorOpened] = useState(false);
+	// A file link in this row's body answers the context menu with file actions. Only the local
+	// device can: the file lives on the server host, so nothing here could reach another device.
+	// Gated on the context menu too — a touch swipe cannot name a file, so a target left over from
+	// an earlier right-click must not follow the menu into the swipe reveal.
+	const hasFileLinkActions = swipe.ctxMenuOpened && fileLinkTarget?.deviceId === "local";
 	const editNavigation = useToolEditNavigation({
 		toolName: toolMeta?.toolName,
 		narratorId,
@@ -159,7 +174,20 @@ export function VListRowInteractionControls({
 				<Menu.Item
 					leftSection={<IconInfoCircle size={14} />}
 					onClick={() => {
-						setInspectorOpened(true);
+						// The list shell owns the dialog. A virtual row is evicted once it
+						// leaves the overscan window, and a modal mounted here would go with it.
+						const id = toolDetailRef?.toolUseId ?? toolUseId;
+						const hosted =
+							narratorId != null &&
+							id != null &&
+							openHostedToolCallInspector({
+								narratorId,
+								toolUseId: id,
+								toolCallId: toolDetailRef?.toolCallId,
+								messageId: toolDetailRef?.messageId,
+								executionAttempt: toolDetailRef?.executionAttempt,
+							});
+						if (!hosted) setInspectorOpened(true);
 						swipe.closeSwipe();
 					}}
 				>
@@ -177,23 +205,29 @@ export function VListRowInteractionControls({
 					{filePathClipboard.copied ? t("copied") : tNarrator("contextMenu_copyFilePath")}
 				</Menu.Item>
 			)}
-			{filePath && toolMeta?.isReadTool && (
+			{filePath &&
+				requiresFileTarget &&
+				!editNavigation.open &&
+				(!toolMeta?.fileTarget || !toolMeta.fileNarratorId) && (
+					<Menu.Item disabled>{tNarrator("fileReferences.missingContext")}</Menu.Item>
+				)}
+			{openToolFile && toolMeta?.isReadTool && (
 				<Menu.Item
 					leftSection={<IconEye size={14} />}
 					onClick={() => {
-						setPreviewOpened(true);
+						void openToolFile();
 						swipe.closeSwipe();
 					}}
 				>
 					{tNarrator("contextMenu_viewFile")}
 				</Menu.Item>
 			)}
-			{(editNavigation.open || toolActions?.onOpenFilePanel) && (
+			{(editNavigation.open || openFile) && (
 				<Menu.Item
 					leftSection={<IconFileText size={14} />}
 					onClick={() => {
 						if (editNavigation.open) editNavigation.open();
-						else toolActions?.onOpenFilePanel?.();
+						else void openFile?.();
 						swipe.closeSwipe();
 					}}
 				>
@@ -203,7 +237,8 @@ export function VListRowInteractionControls({
 		</>
 	) : null;
 
-	const hasViewActions = copyText != null || onOpenFullscreen != null || inspectContent != null;
+	const hasViewActions =
+		copyText != null || onOpenFullscreen != null || inspectContent != null || hasFileLinkActions;
 
 	const menuItemsNode = showMenuItems ? (
 		<>
@@ -222,12 +257,15 @@ export function VListRowInteractionControls({
 				<Menu.Item
 					leftSection={<IconCopy size={14} />}
 					onClick={() => {
-						navigator.clipboard.writeText(copyText);
+						void copyTextToClipboard(copyText);
 						swipe.closeSwipe();
 					}}
 				>
 					{t("copy")}
 				</Menu.Item>
+			)}
+			{hasFileLinkActions && (
+				<FileLinkMenuItems target={fileLinkTarget} onClose={() => swipe.closeSwipe()} />
 			)}
 			{inspectContent && (
 				<Menu.Item
@@ -467,17 +505,8 @@ export function VListRowInteractionControls({
 				</Suspense>
 			)}
 
-			{/* File preview (Read tool) — mounted only while open (lazy chunk). */}
+			{/* Historical Edit preview stays mounted only while open. */}
 			{editNavigation.modal}
-			{previewOpened && filePath && (
-				<Suspense fallback={null}>
-					<FilePreviewModal
-						filePath={filePath}
-						opened={previewOpened}
-						onClose={() => setPreviewOpened(false)}
-					/>
-				</Suspense>
-			)}
 		</>
 	);
 }

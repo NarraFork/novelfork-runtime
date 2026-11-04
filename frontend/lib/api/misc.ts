@@ -3,13 +3,23 @@ import type {
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
+import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
-import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
+import {
+	ApiError,
+	apiBase,
+	authorizedFetch,
+	pickRequestOptions,
+	readFetchError,
+	request,
+} from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
+	BlockBackfillStatus,
 	ChangelogEntry,
 	CodexCredentialEntry,
 	CodexLoadBalancingMode,
@@ -23,21 +33,26 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
+	DeepSeekBalanceCache,
 	HookApiRecord,
 	KimiUsageCache,
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
+	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
+	OpencodeUsageCache,
+	PromptLibraryEntryData,
+	PromptLibraryInputData,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
-	SearchResponse,
+	SearchRequest,
+	SearchSectionName,
+	SearchSectionsResponse,
+	SessionHitsResponse,
+	StorageCategoryKey,
 	StorageScanJobState,
 	StorageScanResult,
-	WorkspaceBarrier,
-	WorkspaceBarrierObservationResult,
-	WorkspaceBarrierRecoveryResult,
-	WorkspaceBarrierVerdict,
 } from "./types";
 
 /**
@@ -56,6 +71,22 @@ export interface WorkspaceDetail extends ApiEntity {
 }
 
 /** Server code for a layout save that lost a race against another session. */
+/** Query string for a global-search request; empty and default values stay out of it. */
+export function searchParams(query: SearchRequest): URLSearchParams {
+	const params = new URLSearchParams({ q: query.q });
+	if (query.sort === "time") params.set("sort", "time");
+	if (query.include?.length) params.set("include", query.include.join(","));
+	if (query.projectId) params.set("projectId", query.projectId);
+	if (query.from) params.set("from", query.from);
+	if (query.to) params.set("to", query.to);
+	if (query.mine) params.set("mine", "1");
+	if (query.fullHistory) params.set("history", "all");
+	if (query.cursor) params.set("cursor", query.cursor);
+	if (query.page && query.page > 1) params.set("page", String(query.page));
+	if (query.limit) params.set("limit", String(query.limit));
+	return params;
+}
+
 export const WORKSPACE_LAYOUT_CONFLICT_CODE = "WORKSPACE_LAYOUT_CONFLICT";
 
 /**
@@ -102,14 +133,20 @@ export const miscApi = {
 		),
 
 	// Search
-	search: (
-		q: string,
-		entities = "chapters,messages",
-		sort?: "time" | "relevance",
+	/** Sectioned global search; a cursor continues one section, so pass exactly one. */
+	searchSections: (
+		query: SearchRequest,
+		sections: readonly SearchSectionName[],
 		signal?: AbortSignal,
-	) =>
-		request<SearchResponse>(
-			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}`,
+	) => {
+		const params = searchParams(query);
+		params.set("sections", sections.join(","));
+		return request<SearchSectionsResponse>(`/search?${params}`, { signal });
+	},
+	/** More hits of one session, for expanding its result card. */
+	searchSessionHits: (narratorId: string, query: SearchRequest, signal?: AbortSignal) =>
+		request<SessionHitsResponse>(
+			`/search/sessions/${encodeURIComponent(narratorId)}/hits?${searchParams(query)}`,
 			{ signal },
 		),
 
@@ -294,6 +331,37 @@ export const miscApi = {
 			method: "DELETE",
 		}),
 
+	// Prompt library
+	listPromptLibrary: () => request<PromptLibraryEntryData[]>("/prompt-library"),
+	getPromptLibraryEntry: (id: string) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`),
+	createPromptLibraryEntry: (data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>("/prompt-library", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updatePromptLibraryEntry: (id: string, data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
+	deletePromptLibraryEntry: (id: string) =>
+		request<{ ok: boolean }>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "DELETE",
+		}),
+	/**
+	 * One-line description for a prompt body, from the summary model.
+	 *
+	 * Stateless on purpose: the caller may be describing text it has not saved yet,
+	 * which is why the body carries `content` instead of an entry id.
+	 */
+	summarizePromptLibraryContent: (content: string, options?: { signal?: AbortSignal }) =>
+		request<{ summary: string }>("/prompt-library/summarize", {
+			method: "POST",
+			body: JSON.stringify({ content }),
+			signal: options?.signal,
+		}),
+
 	// OpenAI-compatible models
 	openaiListModels: () =>
 		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
@@ -304,13 +372,16 @@ export const miscApi = {
 			"/openai/models/refresh",
 			{ method: "POST" },
 		),
-	openaiRefreshProviderModels: (providerId: string) =>
+	openaiRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{ id: string; owned_by?: string }>;
 			fromCache: boolean;
 			resolvedBaseUrl?: string;
 			resolvedModelsUrl?: string;
-		}>(`/openai/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/openai/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 
 	// External MCP server management
 	mcpListServers: () =>
@@ -325,6 +396,7 @@ export const miscApi = {
 				url?: string;
 				envKeys: string[];
 				headerKeys: string[];
+				mode?: McpLoadingMode;
 				enabled: boolean;
 				defaultBehavior?: string;
 				toolPermissions?: Array<{
@@ -351,11 +423,6 @@ export const miscApi = {
 		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
 	mcpConnectServer: (id: string) =>
 		request<Record<string, unknown>>(`/mcp/servers/${id}/connect`, { method: "POST" }),
-	// Returns the server's status projection (like connect), not a bare ack:
-	// disconnecting now persists `enabled: false`, and the caller needs the
-	// authoritative post-change state rather than having to infer it.
-	mcpDisconnectServer: (id: string) =>
-		request<Record<string, unknown>>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
 	// Re-fetch one server's tool list (reconnects only if the live connection is gone).
 	mcpRefreshServer: (id: string) =>
 		request<{
@@ -538,7 +605,10 @@ export const miscApi = {
 			"/codex/credentials/unhealthy",
 			{ method: "DELETE" },
 		),
-	codexCredentialUpdate: (id: string, data: { displayName?: string; priority?: number }) =>
+	codexCredentialUpdate: (
+		id: string,
+		data: { displayName?: string; priority?: number; useCreditQuota?: boolean },
+	) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
 			method: "PATCH",
 			body: JSON.stringify(data),
@@ -642,12 +712,15 @@ export const miscApi = {
 		request<{ ok: boolean }>("/codex/usage-queue/clear", { method: "POST" }),
 
 	// Anthropic models
-	anthropicRefreshProviderModels: (providerId: string) =>
+	anthropicRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{ id: string; display_name?: string }>;
 			fromCache: boolean;
 			resolvedBaseUrl?: string;
-		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/anthropic/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 
 	// NUG
 	nugLogin: (providerId: string, body: { username: string; password: string }) =>
@@ -685,10 +758,41 @@ export const miscApi = {
 			>
 		>("/nug/relay-status"),
 
+	providerGetBalances: (options?: { providerId?: string; signal?: AbortSignal }) =>
+		request<Record<string, ProviderBalanceSnapshot>>(
+			`/provider-balances${options?.providerId ? `?providerId=${encodeURIComponent(options.providerId)}` : ""}`,
+			pickRequestOptions(options),
+		),
+	providerProbeBalance: (providerId: string) =>
+		request<ProviderBalanceSnapshot>(`/provider-balances/${encodeURIComponent(providerId)}/probe`, {
+			method: "POST",
+		}),
+	providerRefreshBalance: (providerId: string) =>
+		request<ProviderBalanceSnapshot>(
+			`/provider-balances/${encodeURIComponent(providerId)}/refresh`,
+			{ method: "POST" },
+		),
+
+	deepseekGetBalances: (options?: object) =>
+		request<Record<string, DeepSeekBalanceCache>>(
+			"/deepseek/balances",
+			pickRequestOptions(options),
+		),
+	deepseekRefreshBalances: () =>
+		request<Record<string, DeepSeekBalanceCache>>("/deepseek/balances/refresh", { method: "POST" }),
+
 	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
 	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
 	kimiRefreshUsages: () =>
 		request<Record<string, KimiUsageCache>>("/kimi/usages/refresh", { method: "POST" }),
+
+	// OpenCode Go plan allowance — per-provider server-side cache
+	opencodeGetUsages: (options?: object) =>
+		request<Record<string, OpencodeUsageCache>>("/opencode/usages", pickRequestOptions(options)),
+	opencodeRefreshUsages: () =>
+		request<Record<string, OpencodeUsageCache>>("/opencode/usages/refresh", {
+			method: "POST",
+		}),
 	nugGetBillingConfig: (providerId: string) =>
 		request<{
 			enabled: boolean;
@@ -820,7 +924,7 @@ export const miscApi = {
 			refreshed: boolean;
 			cooldownMs: number;
 		}>("/nug/models/refresh-if-stale", { method: "POST" }),
-	nugRefreshProviderModels: (providerId: string) =>
+	nugRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{
 				id: string;
@@ -830,21 +934,25 @@ export const miscApi = {
 			}>;
 			fromCache: boolean;
 			modelHash?: string;
-			modelContextWindows?: Record<string, number>;
-		}>(`/nug/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/nug/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 	nugOAuthStart: (providerId: string) =>
 		request<{ authorizeUrl: string; state: string }>(`/nug/providers/${providerId}/oauth/start`),
 
 	// Gemini (Google Generative Language API) — per-provider model refresh.
 	// Gemini is configured via the unified custom-API protocol ("gemini-compatible");
 	// this refresh endpoint mirrors the openai/anthropic per-provider refresh.
-	geminiRefreshProviderModels: (providerId: string) =>
+	geminiRefreshProviderModels: (providerId: string, options?: object) =>
 		request<{
 			models: Array<{ id: string; name?: string; contextLength?: number }>;
 			count: number;
 			fromCache: boolean;
-			modelContextWindows?: Record<string, number>;
-		}>(`/gemini/providers/${providerId}/models/refresh`, { method: "POST" }),
+		}>(`/gemini/providers/${providerId}/models/refresh`, {
+			method: "POST",
+			...pickRequestOptions(options),
+		}),
 
 	// Health / platform
 	health: () =>
@@ -948,16 +1056,71 @@ export const miscApi = {
 			drives?: Array<{ name: string; path: string }>;
 			sep: string;
 		}>("/fs/shortcuts"),
+	/** Whether the instance's default project directory is set and exists. */
+	fsProjectDirStatus: () =>
+		request<{
+			configured: string;
+			path: string | null;
+			state: "valid" | "unset" | "missing" | "not_directory";
+		}>("/fs/project-dir"),
+	/** Existing folders under home that look like where the user keeps code. */
+	fsProjectDirCandidates: () =>
+		request<{
+			candidates: Array<{ path: string; repoCount: number; conventional: boolean }>;
+		}>("/fs/project-dir/candidates"),
+	/**
+	 * The project instruction file (AGENTS.md & friends) for one directory.
+	 *
+	 * `filename` is the file to edit — an existing candidate, or the one a save would
+	 * create; `hash` is the optimistic lock for {@link saveProjectPrompt}.
+	 */
+	getProjectPrompt: (cwd: string) =>
+		request<{
+			cwd: string;
+			filename: string;
+			path: string;
+			exists: boolean;
+			content: string;
+			truncated: boolean;
+			totalBytes: number | null;
+			hash: string | null;
+			candidates: string[];
+		}>(`/fs/project-prompt?cwd=${encodeURIComponent(cwd)}`),
+	/**
+	 * Save the project instruction file.
+	 *
+	 * `baseHash` is the hash of the content that was loaded; the server refuses the save
+	 * with 409 STALE_WRITE when the file moved on, rather than overwriting an agent's edit.
+	 */
+	saveProjectPrompt: (input: {
+		cwd: string;
+		filename: string;
+		content: string;
+		baseHash?: string | null;
+	}) =>
+		request<{ ok: true; path: string; filename: string; hash: string }>("/fs/project-prompt", {
+			method: "PUT",
+			body: JSON.stringify(input),
+		}),
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",
 			body: JSON.stringify({ parent, name }),
 		}),
-	fsReveal: (path: string) =>
-		request<{ ok: true }>("/fs/reveal", {
+	/**
+	 * Open a directory in the server host's file manager.
+	 *
+	 * On Windows the server answers with a one-time `narrafork://` URI instead of launching Explorer
+	 * itself; opening it from the page lets Explorer come to the foreground.
+	 */
+	fsReveal: async (path: string) => {
+		const result = await request<{ ok: true; protocolUrl?: string }>("/fs/reveal", {
 			method: "POST",
 			body: JSON.stringify({ path }),
-		}),
+		});
+		if (result.protocolUrl) window.location.href = result.protocolUrl;
+		return result;
+	},
 	/**
 	 * Fetch a file for saving to disk.
 	 *
@@ -1054,6 +1217,37 @@ export const miscApi = {
 		};
 	},
 
+	/**
+	 * Mint a short-lived ticket that lets the BROWSER download `path` itself.
+	 *
+	 * The alternative — `fsDownload` — fetches the bytes into a Blob, which copies the whole
+	 * file into page memory and cannot show progress. The caller opens a tab in the click
+	 * turn, then navigates it to the ticket URL (`navigateDownloadTab`).
+	 *
+	 * The path is validated server-side while the session is present, so a refused path, an
+	 * over-limit file or a vanished file still comes back here as a readable error the caller
+	 * can put in a notification. The ticket — not the path — is the credential, because the
+	 * URL ends up in history and proxy logs.
+	 */
+	fsDownloadTicket: (path: string) =>
+		request<{ ticket: string; expiresInMs: number }>("/fs/download-ticket", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
+
+	/**
+	 * Put a file on the clipboard of the machine running NarraFork.
+	 *
+	 * Not the browser's clipboard: a page cannot place an arbitrary file there, so the server
+	 * does it on its own desktop. Meaningful only from a browser on that machine — the server
+	 * refuses anyone else with 403.
+	 */
+	fsCopyFileToClipboard: (path: string) =>
+		request<{ ok: true }>("/fs/copy-file-to-clipboard", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
+
 	// Routines
 	getRoutines: () =>
 		request<{
@@ -1142,15 +1336,41 @@ export const miscApi = {
 		}),
 
 	// Update
+	getUpdateNotes: (
+		identity: {
+			version: string;
+			sha512: string;
+			sourceIdentity: import("@shared/update-identity").UpdateSourceIdentity;
+		},
+		signal?: AbortSignal,
+	) =>
+		request<{ notes: string | Record<string, string> | null }>("/update/notes", {
+			method: "POST",
+			body: JSON.stringify(identity),
+			signal,
+		}),
 	checkUpdate: () =>
 		request<{
 			updateAvailable: boolean;
 			currentVersion: string;
+			sourceIdentity?: import("@shared/update-identity").UpdateSourceIdentity;
+			source?: "github" | "update-server";
+			repository?: string;
+			error?: string;
+			errorCode?: string;
+			retryAfter?: number;
 			latestVersion?: string;
+			notesDeferred?: boolean;
+			notesAvailable?: boolean;
 			releaseInfo?: {
+				sourceIdentity?: import("@shared/update-identity").UpdateSourceIdentity;
+				source?: "github" | "update-server";
+				repository?: string;
 				version: string;
 				releaseDate: string;
 				releaseNotes?: string | Record<string, string>;
+				notesDeferred?: boolean;
+				notesAvailable?: boolean;
 				path: string;
 				sha512: string;
 				files: Array<{ url: string; size: number; sha512: string }>;
@@ -1163,7 +1383,7 @@ export const miscApi = {
 			downloadSize?: number;
 			totalSize?: number;
 			zstdPatchSize?: number;
-			strategy?: "zstd";
+			strategy?: "full" | "zstd";
 			patchChain?: Array<{
 				fromVersion: string;
 				toVersion: string;
@@ -1204,7 +1424,7 @@ export const miscApi = {
 			cancelledSchedule: boolean;
 			newBinaryPath?: string;
 		}>("/update/shutdown", { method: "POST" }),
-	applyUpdate: (version?: string) =>
+	applyUpdate: (version?: string, preparedId?: string) =>
 		request<{
 			success: boolean;
 			error?: string;
@@ -1223,7 +1443,7 @@ export const miscApi = {
 			replacementPid?: number;
 		}>("/update/apply", {
 			method: "POST",
-			body: version ? JSON.stringify({ version }) : undefined,
+			body: JSON.stringify({ version, preparedId }),
 		}),
 
 	// Workspaces
@@ -1283,14 +1503,18 @@ export const miscApi = {
 
 	// Storage
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
-	startStorageScan: () =>
+	startStorageScan: (categories?: StorageCategoryKey[]) =>
 		request<{ started: boolean; state: StorageScanJobState }>("/storage/scan/start", {
 			method: "POST",
+			body: JSON.stringify(categories ? { categories } : {}),
 		}),
 	getStorageScanStatus: (signal?: AbortSignal) =>
 		request<{ state: StorageScanJobState }>("/storage/scan/status", { signal }),
-	cancelStorageScan: () =>
-		request<{ state: StorageScanJobState }>("/storage/scan/cancel", { method: "POST" }),
+	cancelStorageScan: (categories?: StorageCategoryKey[]) =>
+		request<{ state: StorageScanJobState }>("/storage/scan/cancel", {
+			method: "POST",
+			body: JSON.stringify(categories ? { categories } : {}),
+		}),
 	cleanupStorage: (target: "uploads" | "chatAttachments" | "shares" | "worktrees" | "containers") =>
 		request<{
 			ok: boolean;
@@ -1317,70 +1541,26 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
+	clearLegacyRequestDumps: () =>
+		request<LegacyRequestDumpClearResult>("/storage/database/legacy-request-dumps/clear", {
+			method: "POST",
+		}),
 	vacuumDatabase: () =>
 		request<DatabaseVacuumResult>("/storage/database/vacuum", {
 			method: "POST",
 		}),
-
-	// Workspace write barriers (human-driven external recovery, admin only)
-	retryWorkspaceRecoveryPersistence: (scopeId: string) =>
-		request<{ retried: number; remaining: number }>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/retry-persistence`,
-			{ method: "POST" },
-		),
-	beginWorkspaceMaintenance: (
-		scopeId: string,
-		data: { leaseId?: string; acknowledgeWritersStopped: true; operatorReason: string },
-	) =>
-		request<{ maintenanceToken: string; expiresAt: string; generation: string }>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/begin`,
-			{ method: "POST", body: JSON.stringify(data) },
-		),
-	observeWorkspaceMaintenance: (scopeId: string, maintenanceToken: string, signal?: AbortSignal) =>
-		request<WorkspaceBarrierObservationResult>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/observe`,
-			{ method: "POST", body: JSON.stringify({ maintenanceToken }), signal },
-		),
-	cancelWorkspaceMaintenance: (scopeId: string, maintenanceToken: string) =>
-		request<{ cancelled: boolean }>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/cancel`,
-			{ method: "POST", body: JSON.stringify({ maintenanceToken }) },
-		),
-	commitWorkspaceMaintenance: (
-		scopeId: string,
-		data: {
-			maintenanceToken: string;
-			confirmationToken: string;
-			acknowledgements: { effectId: string; verdict: WorkspaceBarrierVerdict }[];
-			acknowledgeInspected?: boolean;
-		},
-	) =>
-		request<WorkspaceBarrierRecoveryResult>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/maintenance/commit`,
-			{ method: "POST", body: JSON.stringify(data) },
-		),
-	getWorkspaceBarriers: (cursor?: string) =>
-		request<{ items: WorkspaceBarrier[]; nextCursor: string | null }>(
-			`/storage/workspace-barriers${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
-		),
-	observeWorkspaceBarrier: (scopeId: string, leaseId?: string | null, signal?: AbortSignal) =>
-		request<WorkspaceBarrierObservationResult>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/observe${leaseId ? `?leaseId=${encodeURIComponent(leaseId)}` : ""}`,
-			{ method: "POST", signal },
-		),
-	recoverWorkspaceBarrier: (
-		scopeId: string,
-		data: {
-			leaseId?: string;
-			confirmationToken: string;
-			acknowledgements: { effectId: string; verdict: WorkspaceBarrierVerdict }[];
-			acknowledgeInspected?: boolean;
-		},
-	) =>
-		request<WorkspaceBarrierRecoveryResult>(
-			`/storage/workspace-barriers/${encodeURIComponent(scopeId)}/recover`,
-			{ method: "POST", body: JSON.stringify(data) },
-		),
+	getBlockBackfillStatus: () =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill"),
+	setBlockBackfillPaused: (paused: boolean) =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill/pause", {
+			method: "POST",
+			body: JSON.stringify({ paused }),
+		}),
+	runBlockProjectionAction: (action: "clear" | "restore" | "stop") =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/projection", {
+			method: "POST",
+			body: JSON.stringify({ action }),
+		}),
 
 	// Runtime Resources
 	scanRuntime: () => request<RuntimeScanResult>("/runtime/scan"),

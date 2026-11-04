@@ -1,4 +1,9 @@
 import {
+	type ComposerDocument,
+	composerDocumentTextCandidates,
+	readComposerDocument,
+} from "@shared/composer-document";
+import {
 	type FileReference,
 	type FileReferenceCandidate,
 	type FileReferenceEditorSelection,
@@ -14,6 +19,24 @@ import {
 export interface FileReferenceInput {
 	text: string;
 	fileReferences: FileReference[];
+	composerDocument?: ComposerDocument;
+}
+
+/** Discard stale sidecars rather than letting a legacy text mutation restore an old layout. */
+export function readInputComposerDocument(
+	value: unknown,
+	text: string,
+	fileReferences: FileReference[],
+): ComposerDocument | undefined {
+	const document = readComposerDocument(value);
+	if (!document) return undefined;
+	const references = JSON.stringify(fileReferences);
+	return composerDocumentTextCandidates(document).some(
+		(projection) =>
+			projection.text === text && JSON.stringify(projection.fileReferences) === references,
+	)
+		? document
+		: undefined;
 }
 
 export interface FileReferenceQuery {
@@ -55,10 +78,12 @@ export function getFileReferenceQuery(
 	value: string,
 	caret: number,
 	references: readonly FileReference[] = [],
+	/** Start of the current contiguous text run; atoms are hard query boundaries. */
+	textStart = 0,
 ): FileReferenceQuery | null {
 	if (caret <= 0 || caret > value.length) return null;
 	const start = value.lastIndexOf("#", caret - 1);
-	if (start < 0 || (start > 0 && !BOUNDARY.test(value[start - 1]))) return null;
+	if (start < textStart || (start > textStart && !BOUNDARY.test(value[start - 1]))) return null;
 	if (
 		references.some(
 			(ref) => ref.inputRange && start >= ref.inputRange[0] && start < ref.inputRange[1],
@@ -190,7 +215,20 @@ export function readFileReferences(value: unknown, text?: string): FileReference
 }
 
 export function sameFileReferenceInput(a: FileReferenceInput, b: FileReferenceInput): boolean {
-	return a.text === b.text && JSON.stringify(a.fileReferences) === JSON.stringify(b.fileReferences);
+	return (
+		a.text === b.text &&
+		JSON.stringify(a.fileReferences) === JSON.stringify(b.fileReferences) &&
+		JSON.stringify(
+			a.composerDocument
+				? (readComposerDocument(a.composerDocument) ?? a.composerDocument)
+				: undefined,
+		) ===
+			JSON.stringify(
+				b.composerDocument
+					? (readComposerDocument(b.composerDocument) ?? b.composerDocument)
+					: undefined,
+			)
+	);
 }
 
 /** A single browser edit moves disjoint tokens and invalidates every touched occurrence. */
@@ -231,11 +269,54 @@ export function editFileReferenceInput(
 		if (start >= b) return [ref];
 		return [];
 	});
-	return { text, fileReferences };
+	let composerDocument: ComposerDocument | undefined;
+	const document = input.composerDocument;
+	if (document) {
+		// Quote blocks and attachment placeholders are projection-only; map edits only into a
+		// single real text node, in whichever projection the current text was written with.
+		const projection = composerDocumentTextCandidates(document).find(
+			(candidate) => candidate.text === input.text,
+		);
+		for (const span of projection?.spans ?? []) {
+			const node = document.paragraphs[span.paragraph].children[span.node];
+			// An escaped text node no longer maps 1:1 onto its projected characters.
+			if (
+				node.type !== "text" ||
+				node.text.length !== span.end - span.start ||
+				start < span.start ||
+				end > span.end
+			)
+				continue;
+			const replacement = {
+				...node,
+				text:
+					node.text.slice(0, start - span.start) +
+					text.slice(start, nextEnd) +
+					node.text.slice(end - span.start),
+			};
+			const candidate: ComposerDocument = {
+				...document,
+				paragraphs: document.paragraphs.map((paragraph, pi) =>
+					pi === span.paragraph
+						? {
+								children: paragraph.children.map((child, ni) =>
+									ni === span.node ? replacement : child,
+								),
+							}
+						: paragraph,
+				),
+			};
+			composerDocument = readInputComposerDocument(candidate, text, fileReferences);
+			if (composerDocument) break;
+		}
+	}
+	return { text, fileReferences, ...(composerDocument ? { composerDocument } : {}) };
 }
 
 /** Trim the two edges separately: a single broad diff could swallow otherwise intact tokens. */
 export function trimFileReferenceInput(input: FileReferenceInput): FileReferenceInput {
+	// The structured projection owns UTF-16 ranges, including its edge whitespace.
+	if (input.composerDocument) return input;
 	const leftTrimmed = editFileReferenceInput(input, input.text.trimStart());
 	return editFileReferenceInput(leftTrimmed, leftTrimmed.text.trimEnd());
 }

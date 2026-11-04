@@ -1,11 +1,19 @@
 import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
 import { db } from "../db";
-import { aclGrants, chapters, narrators, narratorToolCalls, projects, users } from "../db/schema";
+import {
+	aclGrants,
+	narratorProjectLinks,
+	narrators,
+	narratorToolCalls,
+	projects,
+	users,
+} from "../db/schema";
 import type { AgentConfig, ToolCallBinding } from "../lib/agent/types";
 import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { loadNarratorForAccess, NARRATOR_ACL_COLUMNS } from "./narrator-acl";
 
 /** Trusted permission-time canonicalization belongs to the exact unstarted receipt.
@@ -61,27 +69,27 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 			: row;
 	if (!judged) throw new Error("Final authorization ACL root no longer exists");
 	const rows = row.id === judged.id ? [row] : [row, judged];
-	const chapterIds = rows.flatMap((entry) => (entry.chapterId ? [entry.chapterId] : []));
-	const chapterRows = chapterIds.length
-		? db
-				.select({ id: chapters.id, projectId: chapters.projectId, role: chapters.role })
-				.from(chapters)
-				.where(inArray(chapters.id, chapterIds))
-				.orderBy(asc(chapters.id))
-				.limit(3)
-				.all()
-		: [];
+	// Same rule as `resolveNarratorProjectId`, read synchronously: the explicit project,
+	// else the primary link of the project index.
+	const projectIdOf = (entry: (typeof rows)[number]): string | null =>
+		entry.contextProjectId ??
+		db
+			.select({ projectId: narratorProjectLinks.projectId })
+			.from(narratorProjectLinks)
+			.where(
+				and(
+					eq(narratorProjectLinks.narratorId, entry.id),
+					eq(narratorProjectLinks.role, "primary"),
+				),
+			)
+			.get()?.projectId ??
+		null;
 	const projectIds = [
 		...new Set(
-			rows.flatMap((entry) =>
-				entry.chapterId
-					? chapterRows
-							.filter((chapter) => chapter.id === entry.chapterId)
-							.map((chapter) => chapter.projectId)
-					: entry.contextProjectId
-						? [entry.contextProjectId]
-						: [],
-			),
+			rows.flatMap((entry) => {
+				const projectId = projectIdOf(entry);
+				return projectId ? [projectId] : [];
+			}),
 		),
 	];
 	const projectRows = projectIds.length
@@ -97,7 +105,7 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 				.limit(3)
 				.all()
 		: [];
-	// Two narrator/chapter/project scopes plus global, two principals and three
+	// Two narrator/project scopes plus global, two principals and three
 	// capabilities are bounded by the ACL unique indexes (at most 42 rows).
 	const grants = db
 		.select({
@@ -125,9 +133,6 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 							rows.map((entry) => entry.id),
 						),
 					),
-					chapterIds.length
-						? and(eq(aclGrants.scopeType, "chapter"), inArray(aclGrants.scopeId, chapterIds))
-						: undefined,
 					projectIds.length
 						? and(eq(aclGrants.scopeType, "project"), inArray(aclGrants.scopeId, projectIds))
 						: undefined,
@@ -141,13 +146,17 @@ function actorAuthorizationSnapshot(narratorId: string, userId: string) {
 		throw new Error("Final ACL authorization scope exceeds its bounded budget");
 	return {
 		isAdmin: user.role === "admin",
-		revision: JSON.stringify({ user, rows, chapterRows, projectRows, grants }),
+		revision: JSON.stringify({ user, rows, projectRows, grants }),
 	};
 }
 
-/** One real final-start gate shared by primary/child loops and persisted recovery runners. */
+/**
+ * One real final-start gate shared by every runtime and persisted recovery runner. The
+ * capability ceiling is re-resolved here, for this narrator and actor, so an approval or
+ * tool history from before a source tightened cannot start a now-excluded tool.
+ */
 export function buildFinalToolStartAuthorization(
-	config: Pick<AgentConfig, "narratorId" | "cwd" | "signal" | "userId" | "reviewReadOnlyBash">,
+	config: Pick<AgentConfig, "narratorId" | "cwd" | "signal" | "userId">,
 ): NonNullable<AgentConfig["onToolExecutionFinalAuthorization"]> {
 	return async (context) => {
 		config.signal.throwIfAborted();
@@ -166,7 +175,20 @@ export function buildFinalToolStartAuthorization(
 				{ userId: actorId, isAdmin: actorBefore.isAdmin },
 				"write",
 			);
-		const { recheckFinalToolExecutionPermission } = await import("./narrator-permission");
+		const [{ recheckFinalToolExecutionPermission }, { resolveNarratorCapabilities }] =
+			await Promise.all([import("./narrator-permission"), import("./trait-layer-service")]);
+		const { policy: runtimePolicy, traits } = await resolveNarratorCapabilities(
+			config.narratorId,
+			actorId ?? null,
+		);
+		if (getDisabledToolSet(traits.traits).has(context.toolUse.name))
+			throw new Error(`Tool disabled by the current effective traits: ${context.toolUse.name}`);
+		if (context.toolUse.name === "Skill") {
+			const blocked = getBlockedSkills(traits.traits);
+			const requested = context.effectiveInput.skill ?? context.effectiveInput.name;
+			if (blocked.all || (typeof requested === "string" && blocked.names.has(requested)))
+				throw new Error("Skill blocked by the current effective traits");
+		}
 		const policyFence = await recheckFinalToolExecutionPermission({
 			narratorId: config.narratorId,
 			toolName: context.toolUse.name,
@@ -188,7 +210,8 @@ export function buildFinalToolStartAuthorization(
 						grantId: runtime.grantId,
 					}
 				: undefined,
-			reviewReadOnlyBash: config.reviewReadOnlyBash,
+			runtimePolicy,
+			actingUserId: actorId ?? null,
 			signal: config.signal,
 		});
 		const runtimeAfter = await assertOAuthNarratorRuntimeActive(config.narratorId, config.userId);

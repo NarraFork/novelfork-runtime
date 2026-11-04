@@ -9,7 +9,7 @@
  * the buttons simply were not rendered.
  *
  * The panel CONTENT components were already independent of dockview: each takes
- * a `narratorId` (or `chapterId`) and most accept `chromeless`. Only the dock's
+ * a `narratorId` and most accept `chromeless`. Only the dock's
  * `ToolPanelShell` needed `props.api`. So the fix is a second host for the same
  * content, not a second implementation of it — this Drawer is that host.
  *
@@ -29,8 +29,9 @@ import {
 	safeAreaDrawerHeaderHeight,
 	safeAreaDrawerHeaderPaddingTop,
 } from "../../lib/safe-area";
+import type { ScrollToMessageFn } from "./message/message-list-handle";
 
-const GitPanel = lazy(() => import("../chapter/GitPanel").then((m) => ({ default: m.GitPanel })));
+const GitPanel = lazy(() => import("../git/GitPanel").then((m) => ({ default: m.GitPanel })));
 const NarratorSearchPanel = lazy(() =>
 	import("./NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
 );
@@ -40,13 +41,25 @@ const BrowserPanel = lazy(() =>
 const NarratorUserChatPanel = lazy(() =>
 	import("../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),
 );
+const FileTreePanel = lazy(() =>
+	import("./file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
+);
+const NarratorTimelinePanel = lazy(() =>
+	import("./timeline/NarratorTimelinePanel").then((m) => ({ default: m.NarratorTimelinePanel })),
+);
 
 /**
  * Tool panels this host can present. A subset of the dock's panel kinds on
  * purpose — `details` already has its own drawer in
  * `NarratorPanel`, and `terminal` / `spec` are hosted by the route.
  */
-export type MobileToolPanelKind = "git" | "search" | "browser" | "userchat";
+export type MobileToolPanelKind =
+	| "git"
+	| "search"
+	| "browser"
+	| "userchat"
+	| "filetree"
+	| "timeline";
 
 const MOBILE_DRAWER_HEADER_HEIGHT = 45;
 
@@ -90,8 +103,6 @@ export interface MobileToolPanelHostProps {
 	kind: MobileToolPanelKind | null;
 	onClose: () => void;
 	narratorId: string;
-	/** Optional legacy chapter association; Git resolves the narrator's actual workspace. */
-	chapterId?: string | null;
 	/** Live browser session count, forwarded so the panel matches the dock's props. */
 	browserSessionCount?: number;
 	browserVisualChange?: { sessionId: string; seq: number } | null;
@@ -100,9 +111,15 @@ export interface MobileToolPanelHostProps {
 	 * `scrollToMessage` bridge, which does not exist off-dock. Closing the drawer
 	 * is the caller's job: the target is behind it.
 	 */
-	onJumpToMessage?: (messageId: string) => void;
+	onJumpToMessage?: ScrollToMessageFn;
 	/** Submit text to the narrator's composer, replacing the dock's submit bridge. */
 	onForwardToNarrator?: (text: string) => void;
+	/**
+	 * Open a file picked in the file tree. Off-dock this is the panel's internal
+	 * file-viewer Drawer, which sits UNDER this one — so the tree drawer closes
+	 * first, same contract as `onJumpToMessage`.
+	 */
+	onOpenFile?: (absolutePath: string, fileName: string) => void;
 }
 
 export function MobileToolPanelHost({
@@ -113,6 +130,7 @@ export function MobileToolPanelHost({
 	browserVisualChange,
 	onJumpToMessage,
 	onForwardToNarrator,
+	onOpenFile,
 }: MobileToolPanelHostProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tGit } = useTranslation("git");
@@ -128,7 +146,11 @@ export function MobileToolPanelHost({
 					? t("browser.title")
 					: kind === "userchat"
 						? tChat("panelTitle")
-						: "";
+						: kind === "filetree"
+							? t("fileTree.title")
+							: kind === "timeline"
+								? t("timeline.title")
+								: "";
 
 	return (
 		<Drawer
@@ -162,9 +184,9 @@ export function MobileToolPanelHost({
 						// underneath it, so leaving it open would look like nothing happened.
 						onJumpToMessage={
 							onJumpToMessage
-								? (messageId) => {
+								? (messageId, options) => {
 										onClose();
-										onJumpToMessage(messageId);
+										onJumpToMessage(messageId, options);
 									}
 								: undefined
 						}
@@ -186,6 +208,27 @@ export function MobileToolPanelHost({
 					<NarratorUserChatPanel
 						narratorId={narratorId}
 						onForwardToNarrator={onForwardToNarrator}
+					/>
+				</PanelBoundary>
+			) : null}
+			{kind === "timeline" ? (
+				<Box style={{ height: "100%" }}>
+					<PanelBoundary>
+						<NarratorTimelinePanel narratorId={narratorId} />
+					</PanelBoundary>
+				</Box>
+			) : null}
+			{kind === "filetree" ? (
+				<PanelBoundary>
+					<FileTreePanel
+						narratorId={narratorId}
+						onOpenFile={(absolutePath, fileName) => {
+							// No viewer to land on: keep the tree open rather than close into nothing.
+							if (!onOpenFile) return;
+							// The viewer drawer is underneath this one; see onOpenFile's contract.
+							onClose();
+							onOpenFile(absolutePath, fileName);
+						}}
 					/>
 				</PanelBoundary>
 			) : null}

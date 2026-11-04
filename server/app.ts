@@ -1,18 +1,20 @@
-import { SESSION_RENEWAL_HEADER } from "@shared/session-auth";
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import type { UnofficialStatusCode } from "hono/utils/http-status";
 import { db } from "./db";
 import { users } from "./db/schema";
 import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "./lib/cors-origin";
 import { DiskSpaceError, isDiskFullError } from "./lib/disk-safety";
 import { catalogError } from "./lib/errors";
+import { stallTimeBetween, trackInFlight } from "./lib/event-loop-monitor";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
 import { getRuntimeProductIntegration } from "./lib/product-host";
+import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
@@ -23,12 +25,13 @@ import { authRoutes } from "./routes/auth";
 import { benchmarkRoutes } from "./routes/benchmarks";
 import brandingRoutes from "./routes/branding";
 import changelogRoutes from "./routes/changelog";
-import chapterEdgeRoutes from "./routes/chapter-edges";
-import { chapterRoutes } from "./routes/chapters";
 import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
+import { commandCodeRoutes } from "./routes/commandcode";
+import { containerRoutes } from "./routes/containers";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
+import { deepseekRoutes } from "./routes/deepseek";
 import { dependencyRoutes } from "./routes/dependencies";
 import { deviceRoutes } from "./routes/devices";
 import { editorDocumentRoutes } from "./routes/editor-documents";
@@ -36,12 +39,12 @@ import executionLogRoutes from "./routes/execution-log";
 import { executorBootstrapRoutes } from "./routes/executor-bootstrap";
 import { externalV1Routes } from "./routes/external-v1";
 import { favoriteRoutes } from "./routes/favorites";
-import { fsRoutes } from "./routes/fs";
+import { fsPublicDownloadRoutes, fsRoutes } from "./routes/fs";
 import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
 import { geminiRoutes } from "./routes/gemini";
-import { gitRoutes, narratorGitRoutes } from "./routes/git";
+import { genUiRoutes } from "./routes/gen-ui";
+import { narratorGitRoutes } from "./routes/git";
 import { grammarRoutes } from "./routes/grammars";
-import { graphRoutes } from "./routes/graph";
 import { hookRoutes } from "./routes/hooks";
 import { integrationRoutes } from "./routes/integrations";
 import { kimiRoutes } from "./routes/kimi";
@@ -50,8 +53,8 @@ import { knowledgePackRoutes } from "./routes/knowledge-packs";
 import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
-import { modelCardRoutes } from "./routes/model-cards";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { narratorTimelineRoutes } from "./routes/narrator-timeline";
 import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
@@ -61,43 +64,51 @@ import { oauthRoutes } from "./routes/oauth";
 import { oauthAppRoutes } from "./routes/oauth-apps";
 import { oauthGrantRoutes } from "./routes/oauth-grants";
 import { openaiRoutes } from "./routes/openai";
+import { opencodeRoutes } from "./routes/opencode";
+import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
-import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
+import { promptLibraryRoutes } from "./routes/prompt-library";
+import { promptOptimizeRoutes } from "./routes/prompt-optimize";
+import { providerBalanceRoutes } from "./routes/provider-balances";
+import { providerImportRoutes } from "./routes/provider-import";
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
 } from "./routes/public-narrator-shares";
-import { reviewsRouter } from "./routes/reviews";
 import { routineRoutes } from "./routes/routines";
-import { rulerRoutes } from "./routes/ruler";
 import { runtimeRoutes } from "./routes/runtime";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks";
 import { searchRoutes } from "./routes/search";
+import { sessionInterchangeRoutes } from "./routes/session-interchange";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
 import { specRoutes } from "./routes/spec";
+import { speechRoutes } from "./routes/speech";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
-import { systemLifecycleRoutes } from "./routes/system-lifecycle";
+import { exportTicketDownloadRoutes, storageTransferRoutes } from "./routes/storage-transfer";
+import { managerLifecycleRoutes, systemLifecycleRoutes } from "./routes/system-lifecycle";
 import { terminalRoutes } from "./routes/terminals";
 import { tlsRoutes } from "./routes/tls";
+import { tokendanceRoutes } from "./routes/tokendance";
 import { traitLayerRoutes } from "./routes/trait-layers";
 import { tutorialRoutes } from "./routes/tutorial";
-import { updateRoutes } from "./routes/update";
+import { localPeerUpdateRoutes, updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
-import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
 
 export interface AppEnv {
 	Bindings: {
 		clientIp?: string;
+		/** TCP 对端，未经 X-Forwarded-For 改写。管理器令牌只认这个地址。 */
+		peerIp?: string;
 		trustedProxy?: boolean;
 	};
 }
@@ -106,6 +117,42 @@ const app = new Hono();
 const productIntegration = getRuntimeProductIntegration();
 
 const SLOW_API_REQUEST_MS = 1_000;
+
+/*
+ * `frame-ancestors` for the SPA shell — who may embed this app in a frame.
+ *
+ * The VS Code embed bridge (`frontend/lib/host-bridge.ts`) hands the session token to the
+ * origin that embeds it, so a page that could frame `…/?nfEmbed` and win the bridge could
+ * steal the token. The bridge now refuses to pin an unapproved origin, and this header is
+ * the paired browser-enforced control: it stops an arbitrary site from framing the app at
+ * all. `frame-ancestors` ONLY restricts being framed, so top-level loading is unaffected.
+ *
+ * Approved framers: the app's own origin (same-origin framing is not the threat), the VS
+ * Code desktop/code-server webview scheme, and any operator-configured embed origins —
+ * the same list trusted for CORS. Any other origin falls through to "not listed", i.e.
+ * refused.
+ *
+ * The SPA shell is served from `main.ts` (a `text/html` response); this middleware is
+ * registered before that catch-all, so its `await next()` sees the finished response and
+ * appends the directive. Scoped to `text/html` so API/JSON and the sanitized-SVG preview
+ * (which carries its own CSP) are left untouched, and merged onto any existing CSP rather
+ * than written as a second header.
+ */
+function spaFrameAncestors(): string {
+	const configured = normalizeConfiguredOrigins(settings.server.allowedOrigins);
+	return ["'self'", "vscode-webview:", ...configured].join(" ");
+}
+
+app.use("*", async (c, next) => {
+	await next();
+	const contentType = c.res.headers.get("Content-Type") ?? "";
+	if (!contentType.includes("text/html")) return;
+	const existing = c.res.headers.get("Content-Security-Policy");
+	// A policy that already constrains framing is left as-is rather than fought with.
+	if (existing && /frame-ancestors/i.test(existing)) return;
+	const directive = `frame-ancestors ${spaFrameAncestors()}`;
+	c.res.headers.set("Content-Security-Policy", existing ? `${existing}; ${directive}` : directive);
+});
 
 /*
  * Cross-origin policy for `/api/*`.
@@ -173,38 +220,36 @@ app.use(
 				}) ?? undefined
 			);
 		},
-		// The sliding-renewal token rides on a custom response header, which is
-		// invisible to cross-origin readers unless explicitly exposed.
-		exposeHeaders: [SESSION_RENEWAL_HEADER],
+		// The session export download carries its resume command and warnings in
+		// headers so the body stays a plain file.
+		exposeHeaders: [
+			"Content-Disposition",
+			"X-Session-Id",
+			"X-Resume-Command",
+			"X-Session-Warnings",
+			"X-Session-Path",
+		],
 	}),
 );
 
-// A 401 must never carry a renewed session token. Auth middleware sets the
-// header before the route runs, so a later 401 (a failed second factor, an
-// OAuth-only boundary, a vanished user) would otherwise ship a fresh credential
-// alongside the rejection — and the client would race between storing it and
-// clearing the session it belongs to.
-app.use("/api/*", async (c, next) => {
-	await next();
-	if (c.res.status === 401) {
-		// `c.header(name, undefined)` is the supported delete path and also handles
-		// an already-finalized response.
-		c.header(SESSION_RENEWAL_HEADER, undefined);
-	}
-});
-
 app.use("/api/*", async (c, next) => {
 	const startedAt = performance.now();
+	const done = trackInFlight(`${c.req.method} ${c.req.path}`);
 	try {
 		await next();
 	} finally {
-		const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+		done();
+		const endedAt = performance.now();
+		const durationMs = Math.round((endedAt - startedAt) * 100) / 100;
 		if (durationMs >= SLOW_API_REQUEST_MS) {
+			// stalledMs ≈ durationMs: the main thread was blocked (by this request or another, see
+			// "Event loop lag detected"). stalledMs ≈ 0: the request itself awaited slow work.
 			logger.warn("Slow API request", {
 				method: c.req.method,
 				path: c.req.path,
 				status: c.res.status,
 				durationMs,
+				...stallTimeBetween(startedAt, endedAt),
 			});
 		}
 	}
@@ -310,6 +355,31 @@ app.route("/api/external/v1", externalV1Routes);
 // Anonymous sharing is a closed, Share-token-only prefix, never a login bypass.
 app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
 
+// Claimed by the `narrafork://` protocol client, which has no session: the one-time token is the
+// credential (see lib/reveal-protocol.ts).
+app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
+	const path = claimRevealToken(c.req.param("token"));
+	return path ? c.json({ path }) : c.json({ error: "Unknown or expired reveal token" }, 404);
+});
+
+// 管理器面板的更新与停止：凭本机回环 + 进程令牌，因此必须注册在全局会话认证之前。
+// Hono 按注册顺序匹配，挂载点晚于 requireSessionAuth 就永远轮不到这里。
+app.route("/api/update", localPeerUpdateRoutes);
+app.route("/api/system/lifecycle", managerLifecycleRoutes);
+
+// 导出包可能有数 GB。没有 File System Access API 的浏览器只能用普通导航下载，
+// `<a href>` 带不上 Authorization，所以这张一次性票据必须挂在会话认证之前。
+// 票据由已登录的管理员签发，本身就是凭证。
+app.route("/api/storage/export/download", exportTicketDownloadRoutes);
+
+// Public: the browser's own file download, authorized by a short-lived ticket minted from
+// the authenticated `POST /api/fs/download-ticket`. A navigation cannot carry the session's
+// `Authorization` header, so this is what lets the browser stream a download to disk
+// instead of the client buffering it into a Blob. Registered BEFORE the session gate:
+// Hono matches in registration order, so a mount below `requireSessionAuth` would never be
+// reached. Only that one path is public — the rest of /api/fs stays behind the gate.
+app.route("/api/fs", fsPublicDownloadRoutes);
+
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
@@ -329,22 +399,6 @@ type GitRequiredRule = {
 const GIT_REQUIRED_RULES: readonly GitRequiredRule[] = [
 	// Creating a project invokes git init/clone/repository detection.
 	{ methods: ["POST"], pattern: /^\/api\/projects$/ },
-	// Ruler/NarraFlow routes are backed by git log/rev-list/rebase operations.
-	{ pattern: /^\/api\/projects\/[^/]+\/ruler(?:\/|$)/ },
-	// Chapter lifecycle and merge operations create/remove branches and worktrees.
-	{ methods: ["POST"], pattern: /^\/api\/chapters$/ },
-	{ methods: ["DELETE"], pattern: /^\/api\/chapters\/[^/]+$/ },
-	{ methods: ["POST"], pattern: /^\/api\/chapters\/(?:cleanup|batch-merge)$/ },
-	{
-		methods: ["GET", "POST"],
-		pattern:
-			/^\/api\/chapters\/[^/]+\/(?:fork|review|merge-check|merge|ai-resolve|unmerge|dormant|wake|git-status)(?:\/|$)/,
-	},
-	// Git panel endpoints are explicitly git-backed.
-	{ pattern: /^\/api\/chapters\/[^/]+\/git(?:\/|$)/ },
-	// Commit file diff endpoints need git diff-tree. Commit list/details can fall
-	// back to database records, so they are intentionally not blocked here.
-	{ methods: ["GET"], pattern: /^\/api\/chapters\/[^/]+\/commits\/[^/]+\/files(?:\/|$)/ },
 ];
 
 function requiresGit(method: string, path: string): boolean {
@@ -365,13 +419,12 @@ app.use("/api/*", async (c, next) => {
 });
 
 app.route("/api/projects", projectRoutes);
-app.route("/api/chapters", chapterRoutes);
-app.route("/api/chapters", gitRoutes);
-app.route("/api/chapter-edges", chapterEdgeRoutes);
+app.route("/api/containers", containerRoutes);
 productIntegration.mountAuthenticatedRoutes?.(app);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
+app.route("/api/narrators", genUiRoutes);
 // Worktree paths must precede the generic Git router's workspace middleware.
 app.route(
 	"/api/narrators",
@@ -380,15 +433,17 @@ app.route(
 app.route("/api/narrators", narratorGitRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);
+app.route("/api/narrators", narratorTimelineRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
+app.route("/api/tokendance", tokendanceRoutes);
 app.route("/api/settings/tls", tlsRoutes);
 app.route("/api/learning", learningRoutes);
 app.route("/api/tutorial", tutorialRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
+app.route("/api/session-interchange", sessionInterchangeRoutes);
 app.route("/api/mcp", mcpRoutes);
-app.route("/api/model-cards", modelCardRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
 app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
@@ -400,12 +455,19 @@ app.route("/api/integrations", integrationRoutes);
 app.route("/api/oauth-apps", oauthAppRoutes);
 app.route("/api/oauth/grants", oauthGrantRoutes);
 app.route("/api/fs", fsRoutes);
+app.route("/api/prompt-optimize", promptOptimizeRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
+app.route("/api/speech", speechRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/kimi", kimiRoutes);
+app.route("/api/deepseek", deepseekRoutes);
+app.route("/api/provider-balances", providerBalanceRoutes);
+app.route("/api/provider-import", providerImportRoutes);
 app.route("/api/openai", openaiRoutes);
+app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nug", nugRoutes);
@@ -413,14 +475,16 @@ app.route("/api/skills", skillRoutes);
 app.route("/api/grammars", grammarRoutes);
 app.route("/api/knowledge/packs", knowledgePackRoutes);
 app.route("/api/knowledge", knowledgeRoutes);
+app.route("/api/outline", outlineRoutes);
 app.route("/api/storage", storageRoutes);
+app.route("/api/storage", storageTransferRoutes);
 app.route("/api/runtime", runtimeRoutes);
 productIntegration.mountRuntimeBindingRoutes?.(app);
 app.route("/api/custom-subagents", customSubagentRoutes);
+app.route("/api/prompt-library", promptLibraryRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/scheduled-tasks", scheduledTaskRoutes);
 app.route("/api/hooks", hookRoutes);
-app.route("/api/reviews", reviewsRouter);
 app.route("/api/update", updateRoutes);
 app.route("/api/system/lifecycle", systemLifecycleRoutes);
 app.route("/api/vnet", vnetRoutes);
@@ -433,22 +497,18 @@ app.route("/api/dashboard", dashboardRoutes);
 // IM Gateway management routes (status, sessions, etc.)
 app.route("/api/gateway", gatewayRoutes);
 
-// Graph routes are nested under projects for RESTful consistency
-app.route("/api/projects", graphRoutes);
-// Ruler routes (new NarraFlow) nested under projects
-app.route("/api/projects", rulerRoutes);
-// Project DB backup/import routes
-app.route("/api/projects", projectDbRoutes);
-// Volume snapshot routes (nested under projects for list/create, standalone for single-item ops)
-app.route("/api/projects", volumeSnapshotRoutes);
-app.route("/api/volume-snapshots", volumeSnapshotRoutes);
-
 app.onError((err, c) => {
 	const storageError = isDiskFullError(err)
 		? new DiskSpaceError("request storage", null, undefined, true)
 		: err;
 	const knownErrorResponse = buildAppErrorResponse(storageError, c);
 	if (knownErrorResponse) return knownErrorResponse;
+	// The client went away (closed the page, switched narrators) and the abort surfaced from
+	// whatever the handler awaited. Not a server fault, and nobody receives this response.
+	if (c.req.raw.signal.aborted && (err as Error).name === "AbortError") {
+		logger.debug("Request aborted by client", { path: c.req.path, error: String(err) });
+		return c.body(null, 499 as UnofficialStatusCode);
+	}
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
 	// The message stays deliberately generic (an unhandled error may quote internals), but it
 	// still carries a code so the client can localize it rather than print English.

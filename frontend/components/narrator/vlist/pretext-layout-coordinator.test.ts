@@ -1,25 +1,51 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { clearToken, setToken } from "@frontend/lib/api/client";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import type { MessageSegmentationCache } from "../message/message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { peekCachedPretextDocument } from "./pretext-document-cache";
 import { captureCoordinatorAnchor, PretextLayoutCoordinator } from "./pretext-layout-coordinator";
+import type { StreamingBlockCache } from "./streaming-block-cache";
 
+const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 beforeAll(() => {
 	installCanvasStub();
+	if (!previousStorage) {
+		const values = new Map<string, string>();
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: {
+				getItem: (key: string) => values.get(key) ?? null,
+				setItem: (key: string, value: string) => {
+					values.set(key, value);
+				},
+				removeItem: (key: string) => {
+					values.delete(key);
+				},
+			},
+		});
+	}
+});
+afterAll(() => {
+	if (!previousStorage) Reflect.deleteProperty(globalThis, "localStorage");
 });
 
 function message(seq: number, text: string): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text }],
+	) as TreeMessage;
 }
 
 function page(): PretextDocumentPageResult {
@@ -56,6 +82,101 @@ const COMPACT_LABELS = {
 const compactBuildOptions = { ...buildOptions, labels: COMPACT_LABELS };
 
 describe("PretextLayoutCoordinator", () => {
+	it("shares one canonical refresh between warm and Ask-in-Passing consumers", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		let release = () => {};
+		let queries = 0;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await coordinator.load("refresh-shared", buildOptions, {
+			locateMessage: async () => ({ seq: 0 }),
+			fetchPage: async (_id, options) => {
+				if (options.afterSeq === undefined) return page();
+				queries++;
+				await gate;
+				return { ...page(), messageVersion: 4 };
+			},
+		});
+		const view = () => ({ scrollTop: 0, viewportHeight: 720, pinnedToBottom: true });
+		const first = coordinator.refreshCurrentWindow(view);
+		expect(coordinator.refreshAskInPassing(view)).toBe(first);
+		release();
+		expect(await first).toBe(true);
+		expect(queries).toBe(1);
+		expect(coordinator.getSnapshot().input?.messageVersion).toBe(4);
+	});
+
+	for (const boundary of ["reset", "cancel", "generation", "narrator", "session"] as const) {
+		it(`${boundary} cancels canonical transport and rejects a late commit`, async () => {
+			if (boundary === "session") setToken("canonical-window-first-principal");
+			const coordinator = new PretextLayoutCoordinator();
+			let release = () => {};
+			let started = () => {};
+			let signal: AbortSignal | undefined;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const opened = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			await coordinator.load(`refresh-${boundary}`, buildOptions, {
+				locateMessage: async () => ({ seq: 0 }),
+				fetchPage: async (_id, options) => {
+					if (options.afterSeq === undefined) return page();
+					signal = options.signal;
+					started();
+					await gate;
+					return { ...page(), messageVersion: 999 };
+				},
+			});
+			const outcome = coordinator
+				.refreshCurrentWindow(() => ({ scrollTop: 0, viewportHeight: 720, pinnedToBottom: true }))
+				.catch((error: Error) => error);
+			await opened;
+			expect(signal?.aborted).toBe(false);
+			if (boundary === "reset") coordinator.reset();
+			if (boundary === "cancel") coordinator.cancel();
+			if (boundary === "generation") coordinator.rebuild({ ...buildOptions, contentWidth: 900 });
+			if (boundary === "narrator")
+				await coordinator.load("replacement-scope", buildOptions, {
+					fetchPage: async () => ({ ...page(), messageVersion: 12 }),
+				});
+			if (boundary === "session") setToken("canonical-window-second-principal");
+			expect(signal?.aborted).toBe(true);
+			expect(((await outcome) as Error).name).toBe("AbortError");
+			release();
+			for (let turn = 0; turn < 6; turn++) await Promise.resolve();
+			expect(coordinator.getSnapshot().input?.messageVersion).not.toBe(999);
+			if (boundary === "narrator") expect(coordinator.getSnapshot().input?.messageVersion).toBe(12);
+			if (boundary === "session") {
+				coordinator.publishDocumentSnapshot();
+				expect(peekCachedPretextDocument("refresh-session")).toBeNull();
+				clearToken();
+			}
+		});
+	}
+
+	it("an unpositioned restore never evicts a valid input or invents a one-pixel layout", async () => {
+		const first = new PretextLayoutCoordinator();
+		await first.load("restore-geometry", buildOptions, { fetchPage: async () => page() });
+		first.publishDocumentSnapshot();
+		const cached = peekCachedPretextDocument("restore-geometry");
+		if (!cached) throw new Error("Expected the valid input to remain cached");
+		const next = new PretextLayoutCoordinator();
+		for (const width of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(next.restore("restore-geometry", { ...buildOptions, contentWidth: width })).toBe(
+				false,
+			);
+			expect(next.getSnapshot().status).toBe("idle");
+			expect(next.getSnapshot().index).toBeUndefined();
+			expect(peekCachedPretextDocument("restore-geometry")).toBe(cached);
+		}
+		expect(next.restore("restore-geometry", buildOptions)).toBe(true);
+		expect(next.getSnapshot().input).toBe(cached);
+		expect(next.getSnapshot().index).toBeDefined();
+	});
+
 	it("keeps the old document unavailable until the complete input is laid out", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		const states: string[] = [];
@@ -198,18 +319,19 @@ describe("PretextLayoutCoordinator", () => {
 	it("re-measures a compact marker whose body text changed at an UNCHANGED status", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		const failedMarker = (error: string): TreeMessage =>
-			({
-				id: "seg-compact-1",
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "user",
-				contentJson: [{ type: "segment_compact", status: "failed", error, messageCount: 4 }],
-				contentText: "[Segment compact failed]",
-				toolCalls: [],
-				createdAt: "2026-07-23T00:00:00.000Z",
-				children: [],
-				seq: 0,
-			}) as unknown as TreeMessage;
+			rowWithElements(
+				{
+					id: "seg-compact-1",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "user",
+					contentText: "[Segment compact failed]",
+					toolCalls: [],
+					createdAt: "2026-07-23T00:00:00.000Z",
+					seq: 0,
+				},
+				[{ type: "segment_compact", status: "failed", error, messageCount: 4 }],
+			) as unknown as TreeMessage;
 		// A short one-line failure, then a long one that must wrap to more lines.
 		const short = "timeout";
 		const long = "压缩失败，模型返回了一段很长的错误说明。".repeat(12);
@@ -722,31 +844,30 @@ describe("PretextLayoutCoordinator", () => {
 
 /** An assistant message with one tool call, enriched exactly as the API does. */
 function toolMessage(seq: number, toolUseId: string, status: string): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [
-			{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} },
-		],
-		contentText: null,
-		toolCalls: [
-			{
-				id: `tc-${toolUseId}`,
-				narratorId: "n1",
-				messageId: `m-${seq}`,
-				toolUseId,
-				toolName: "Bash",
-				status,
-				inputJson: {},
-				createdAt: "2026-07-23T00:00:00.000Z",
-			},
-		],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [
+				{
+					id: `tc-${toolUseId}`,
+					narratorId: "n1",
+					messageId: `m-${seq}`,
+					toolUseId,
+					toolName: "Bash",
+					status,
+					inputJson: {},
+					createdAt: "2026-07-23T00:00:00.000Z",
+				},
+			],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} }],
+	) as unknown as TreeMessage;
 }
 
 function toolPage(status: string): PretextDocumentPageResult {
@@ -761,7 +882,7 @@ function toolPage(status: string): PretextDocumentPageResult {
 }
 
 function loadedToolStatus(snapshot: { input?: { messages: TreeMessage[] } }): string | undefined {
-	const block = snapshot.input?.messages[0]?.contentJson?.find((b) => b.type === "tool_use");
+	const block = messageBody(snapshot.input?.messages[0])?.find((b) => b.type === "tool_use");
 	return (block as { status?: string } | undefined)?.status;
 }
 
@@ -778,12 +899,16 @@ describe("PretextLayoutCoordinator.applyLivePatch", () => {
 		expect(loadedToolStatus(coordinator.getSnapshot())).toBe("running");
 
 		const applied = coordinator.applyLivePatch((messages) => ({
-			messages: messages.map((msg) => ({
-				...msg,
-				contentJson: msg.contentJson.map((block) =>
-					block.type === "tool_use" ? { ...block, status: "success" } : block,
+			messages: messages.map((msg) =>
+				rowWithElements(
+					{
+						...msg,
+					},
+					messageBody(msg).map((block) =>
+						block.type === "tool_use" ? { ...block, status: "success" } : block,
+					),
 				),
-			})) as TreeMessage[],
+			) as TreeMessage[],
 			changed: true,
 		}));
 
@@ -841,14 +966,18 @@ describe("PretextLayoutCoordinator.applyLivePatch", () => {
 		);
 		const applied = coordinator.applyLivePatch(
 			(messages) => ({
-				messages: messages.map((msg) => ({
-					...msg,
-					contentJson: msg.contentJson.map((block) =>
-						block.type === "tool_use"
-							? { ...block, status: "success", outputJson: "line\nline\nline" }
-							: block,
+				messages: messages.map((msg) =>
+					rowWithElements(
+						{
+							...msg,
+						},
+						messageBody(msg).map((block) =>
+							block.type === "tool_use"
+								? { ...block, status: "success", outputJson: "line\nline\nline" }
+								: block,
+						),
 					),
-				})) as TreeMessage[],
+				) as TreeMessage[],
 				changed: true,
 			}),
 			() => ({ scrollTop: 0, pinnedToBottom: true, viewportHeight: 720 }),
@@ -905,12 +1034,16 @@ describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
 		await coordinator.load("n1", buildOptions, { fetchPage: async () => toolPage("running") });
 		coordinator.applyLivePatch(
 			(messages) => ({
-				messages: messages.map((msg) => ({
-					...msg,
-					contentJson: msg.contentJson.map((block) =>
-						block.type === "tool_use" ? { ...block, status: "success" } : block,
+				messages: messages.map((msg) =>
+					rowWithElements(
+						{
+							...msg,
+						},
+						messageBody(msg).map((block) =>
+							block.type === "tool_use" ? { ...block, status: "success" } : block,
+						),
 					),
-				})) as TreeMessage[],
+				) as TreeMessage[],
 				changed: true,
 			}),
 			pinnedView,
@@ -983,5 +1116,108 @@ describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
 		const removed = coordinator.removeMessages(["m-1"], pinnedView);
 		expect(removed).toBe(true);
 		expect(coordinator.getSnapshot().scrollTopSmoothFollow).toBeUndefined();
+	});
+});
+
+describe("streaming preparation ownership", () => {
+	it("reuses each pane's settled blocks when synthetic row keys collide", async () => {
+		const a = new PretextLayoutCoordinator();
+		const b = new PretextLayoutCoordinator();
+		const emptyPage = async (): Promise<PretextDocumentPageResult> => ({
+			messages: [],
+			minSeq: -1,
+			maxSeq: -1,
+			hasNext: false,
+			hasPrev: false,
+			messageVersion: 0,
+		});
+		await a.load("stream-pane-a", buildOptions, { fetchPage: emptyPage });
+		await b.load("stream-pane-b", buildOptions, { fetchPage: emptyPage });
+		const live = (narratorId: string, text: string): TreeMessage => ({
+			...message(0, text),
+			id: "__streaming__",
+			narratorId,
+		});
+		const firstBlock = (coordinator: PretextLayoutCoordinator) =>
+			coordinator.getSnapshot().items?.find((item) => item.spec.kind === "markdown")?.measured
+				.blocks[0];
+		a.setStreamingMessage(live("stream-pane-a", "A首段\n\n中间段\n\n末段"));
+		const initial = firstBlock(a);
+		expect(initial).toBeDefined();
+		b.setStreamingMessage(live("stream-pane-b", "B首段\n\n不同中间段\n\n不同末段"));
+		a.setStreamingMessage(live("stream-pane-a", "A首段\n\n中间段\n\n末段追加"));
+		expect(firstBlock(a)).toBe(initial);
+		b.reset();
+		a.setStreamingMessage(live("stream-pane-a", "A首段\n\n中间段\n\n末段追加继续"));
+		expect(firstBlock(a)).toBe(initial);
+		a.reset();
+	});
+});
+
+describe("transient preparation lifecycle", () => {
+	function caches(coordinator: PretextLayoutCoordinator) {
+		// Inspect the actual owned instances: a separate standalone cache would
+		// not prove that the production build/resize/teardown path uses them.
+		return {
+			streaming: Reflect.get(coordinator, "streamingBlockCache") as StreamingBlockCache,
+			segments: Reflect.get(coordinator, "segmentationCache") as MessageSegmentationCache,
+		};
+	}
+
+	it("keeps resize scoped and retires rows on handoff, release and narrator switch", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("cache-lifecycle", buildOptions, { fetchPage: async () => page() });
+		const live = { ...message(2, "settled first\n\nmiddle\n\nlive tail"), id: "__streaming__" };
+		coordinator.setStreamingMessage(live);
+		const owned = caches(coordinator);
+		expect(owned.streaming.size).toBe(1);
+		expect(owned.segments.size).toBe(2);
+		const first = coordinator
+			.getSnapshot()
+			.items?.find((item) => item.spec.key.includes("__streaming__"))?.measured.blocks[0];
+		expect(first).toBeDefined();
+		coordinator.previewWidth(420, () => ({
+			scrollTop: 0,
+			viewportHeight: 720,
+			pinnedToBottom: false,
+		}));
+		const resized = coordinator
+			.getSnapshot()
+			.items?.find((item) => item.spec.key.includes("__streaming__"))?.measured.blocks[0];
+		expect(resized).toBe(first);
+		expect(owned.streaming.size).toBe(1);
+		coordinator.setStreamingMessage(null);
+		expect(owned.streaming.size).toBe(0);
+		coordinator.setStreamingMessage(live);
+		coordinator.releaseTransientCaches();
+		expect(owned.streaming.size).toBe(0);
+		expect(owned.segments.size).toBe(0);
+		// Cleanup is idempotent and does not dispose the loaded document.
+		coordinator.releaseTransientCaches();
+		expect(coordinator.getSnapshot().status).toBe("ready");
+		coordinator.setStreamingMessage({ ...live });
+		expect(owned.streaming.size).toBe(1);
+		coordinator.reset();
+		expect(owned.streaming.size).toBe(0);
+		expect(owned.segments.size).toBe(0);
+	});
+
+	it("reuses historical materials only for stream updates and invalidates for rebuilds", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("segment-lifecycle", buildOptions, { fetchPage: async () => page() });
+		const owned = caches(coordinator);
+		const historical = coordinator.getSnapshot().input?.messages[0] as unknown as NarratorMsg;
+		const initial = owned.segments.getMaterials(historical);
+		for (let i = 0; i < 5; i++) {
+			coordinator.setStreamingMessage({ ...message(2, `stream ${i}`), id: "__streaming__" });
+			expect(owned.segments.getMaterials(historical)).toBe(initial);
+		}
+		expect(owned.segments.size).toBe(2);
+		// An in-place edit keeps the message/array identity; a non-stream rebuild
+		// must invalidate rather than trusting reference equality.
+		(messageBody(historical) as ReadonlyArray<{ text: string }>)[0].text = "edited historical text";
+		coordinator.rebuild(buildOptions);
+		expect(owned.segments.getMaterials(historical)).not.toBe(initial);
+		coordinator.reset();
 	});
 });

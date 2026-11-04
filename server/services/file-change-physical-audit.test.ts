@@ -1,5 +1,14 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	spyOn,
+	test,
+} from "bun:test";
 import { randomUUID } from "node:crypto";
 import { chmodSync, renameSync, symlinkSync, utimesSync } from "node:fs";
 import {
@@ -17,7 +26,6 @@ import {
 	unlink,
 	writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FileChangeBlobRef } from "@shared/file-change-protocol";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -44,12 +52,6 @@ let store: FileChangeBlobStore;
 const namespaceKey = "isolated-audit-namespace";
 const generation = 1;
 const timers = new Set<ReturnType<typeof setInterval>>();
-const verification = {
-	namespaceIdentityVerified: true,
-	writersQuiescent: true,
-	physicalInventoryComplete: true,
-	catalogMatchesInventory: true,
-} as const;
 
 beforeAll(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
@@ -58,7 +60,10 @@ beforeAll(() => {
 	migrated.sqlite.close();
 });
 beforeEach(async () => {
-	sandbox = await mkdtemp(join(await realpath(tmpdir()), "physical-audit-test-"));
+	// The worker pins every absolute ancestor. Parallel suites legitimately mutate
+	// shared /tmp, so valid-state fixtures need a parent owned by this checkout.
+	// This preserves the production object_changed guard instead of retrying it.
+	sandbox = await mkdtemp(join(await realpath(process.cwd()), ".physical-audit-test-"));
 	databasePath = join(sandbox, "source.sqlite");
 	blobRoot = join(sandbox, "blobs");
 	await writeFile(databasePath, template, { mode: 0o600 });
@@ -67,13 +72,13 @@ beforeEach(async () => {
 	sqlite.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
 	catalog = new FileChangeBlobCatalog({ db: drizzle(sqlite), namespaceKey });
 	catalog.initializeNamespace({ expectedGeneration: null });
-	catalog.beginReconciliation({ expectedGeneration: 0 });
-	// Empty, privately owned test namespace: fixture setup only, never an audit outcome.
-	catalog.completeReconciliation({
-		expectedGeneration: generation,
-		verifiedUsedBytes: 0,
-		verification,
-	});
+	// Seed archived v2 metadata directly. The read-only audit still checks this
+	// snapshot; new captures have no maintenance admission state machine.
+	sqlite
+		.query(
+			"UPDATE file_change_storage_budgets SET status = 'ready', generation = ? WHERE id = 'file-change-blobs'",
+		)
+		.run(generation);
 	store = new FileChangeBlobStore({
 		root: blobRoot,
 		minimumFreeBytes: 0,
@@ -89,6 +94,21 @@ afterEach(async () => {
 afterAll(() => {
 	template = new Uint8Array();
 });
+
+function insertLegacyReservation(size: number, ownerEpoch = "archived-writer"): void {
+	sqlite.transaction(() => {
+		sqlite
+			.query(
+				"INSERT INTO file_change_blob_reservations (id,budget_id,owner_epoch,generation,expected_size,created_at) VALUES (?, 'file-change-blobs', ?, ?, ?, ?)",
+			)
+			.run(randomUUID(), ownerEpoch, generation, size, new Date().toISOString());
+		sqlite
+			.query(
+				"UPDATE file_change_storage_budgets SET reserved_bytes = reserved_bytes + ? WHERE id = 'file-change-blobs'",
+			)
+			.run(size);
+	})();
+}
 
 async function identity(path: string): Promise<FileChangeAuditIdentity> {
 	const info = await lstat(path, { bigint: true });
@@ -123,6 +143,200 @@ async function put(bytes: Uint8Array | string): Promise<FileChangeBlobRef> {
 	const value = typeof bytes === "string" ? Buffer.from(bytes) : bytes;
 	return store.putBytes(value, { expectedSize: value.byteLength });
 }
+// Pause only this real audit worker after its start snapshot and first reservation
+// page. IPC progress is advisory, not an awaited write barrier: without this gate
+// the end snapshot can race the writer's SQLite lock (busy_timeout stays zero).
+// The preload wraps process.send, not hashing, metadata, budgets or summaries.
+async function auditDuringMetadataMutation(
+	mutate: () => void | Promise<void>,
+	budget: FileChangePhysicalAuditOptions["budget"],
+): Promise<FileChangePhysicalAuditSummary> {
+	const preload = join(sandbox, "metadata-barrier.ts");
+	await writeFile(
+		preload,
+		`import { readFileSync } from "node:fs";
+const send = process.send.bind(process);
+let paused = false;
+process.send = (message) => {
+	const data = typeof message === "string" ? JSON.parse(message) : undefined;
+	send(message);
+	if (!paused && data?.type === "progress" && data.value.phase === "reservations") {
+		paused = true;
+		if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test metadata barrier");
+	}
+};
+`,
+		{ mode: 0o600 },
+	);
+	const realSpawn = Bun.spawn;
+	let worker: Bun.Subprocess<"pipe", "ignore", "ignore"> | undefined;
+	// Adapt Bun's overloaded API only for runWorker's verified (command, options)
+	// call. The returned process is real; no IPC result or metadata is fabricated.
+	const spawnWithBarrier = ((command: string[], config?: Parameters<typeof Bun.spawn>[1]) => {
+		if (!command[1]?.endsWith("/file-change-physical-audit-worker.ts"))
+			throw new Error("Metadata barrier must only wrap its own audit worker");
+		worker = realSpawn<"pipe", "ignore", "ignore">(
+			[command[0], "--preload", preload, ...command.slice(1)],
+			{
+				...config,
+				stdio: ["pipe", "ignore", "ignore"],
+				stdin: "pipe",
+				stdout: "ignore",
+				stderr: "ignore",
+			},
+		);
+		return worker;
+	}) as typeof Bun.spawn;
+	const spawn = spyOn(Bun, "spawn").mockImplementation(spawnWithBarrier);
+	let released = false;
+	const release = () => {
+		if (!worker || released) return;
+		released = true;
+		worker.stdin.write("release");
+		worker.stdin.end();
+	};
+	const controller = new AbortController();
+	let mutation: Promise<void> | undefined;
+	let mutationError: unknown;
+	let catalogRowsAtMutation: number | undefined;
+	let readBytesAtMutation: number | undefined;
+	let running: Promise<FileChangePhysicalAuditSummary> | undefined;
+	try {
+		running = auditFileChangePhysical(
+			await options({
+				budget,
+				signal: controller.signal,
+				onProgress(progress) {
+					if (mutation || progress.phase !== "reservations") return;
+					catalogRowsAtMutation = progress.catalogRows;
+					readBytesAtMutation = progress.readBytes;
+					mutation = Promise.resolve()
+						.then(mutate)
+						.catch((error) => {
+							mutationError = error;
+							controller.abort();
+						})
+						.finally(release);
+				},
+			}),
+		);
+		const summary = await running;
+		await mutation;
+		if (mutationError) throw mutationError;
+		expect(mutation).toBeDefined();
+		expect(catalogRowsAtMutation).toBe(0);
+		expect(readBytesAtMutation).toBe(0);
+		expect(summary.start?.generation).toBe(generation);
+		expect(summary.start?.pendingReservations).toBe("none_observed");
+		expect(summary.end).toBeDefined();
+		expect(summary.end).not.toBeNull();
+		expect(codes(summary)).not.toContain("sqlite_busy");
+		expect(codes(summary)).not.toContain("deadline");
+		return summary;
+	} finally {
+		release();
+		controller.abort();
+		try {
+			await running;
+		} finally {
+			spawn.mockRestore();
+		}
+	}
+}
+
+/**
+ * Deterministic hold inside the PHYSICAL phase, for tests that must act while an object hash is
+ * in flight. Progress is throttled to one event per 250 ms in the worker AND again in the parent,
+ * so on a loaded runner a 2 MiB hash can finish, or its physical event be dropped, before a test's
+ * onProgress mutation ever runs. Instead, the worker's preload pauses right after it emits its
+ * first physical progress with readBytes > 0 (object handle open mid-hash) and records that in an
+ * atomically published marker file. `held` resolves from the marker, independent of the parent's
+ * progress throttle; it must never observe an empty file between creation and writing its bytes.
+ * Hashing, metadata, budgets and the summary are untouched; only the emission is gated, like the
+ * metadata barrier above. Once released, every later worker runs free.
+ */
+async function withPhysicalBarrier<T>(
+	body: (barrier: { held: Promise<number>; release: () => void }) => Promise<T>,
+): Promise<T> {
+	const preload = join(sandbox, "physical-barrier.ts");
+	const marker = join(sandbox, "physical-barrier.held");
+	await rm(marker, { force: true });
+	await writeFile(
+		preload,
+		`import { readFileSync, renameSync, writeFileSync } from "node:fs";
+const send = process.send.bind(process);
+const pendingMarker = ${JSON.stringify(`${marker}.pending-`)} + process.pid;
+let paused = false;
+process.send = (message) => {
+	const data = typeof message === "string" ? JSON.parse(message) : undefined;
+	send(message);
+	if (!paused && data?.type === "progress" && data.value.phase === "physical" && data.value.readBytes > 0) {
+		paused = true;
+		// Publish only complete bytes: the parent's concurrent read must not see Number("") === 0.
+		writeFileSync(pendingMarker, String(data.value.readBytes), { mode: 0o600 });
+		renameSync(pendingMarker, ${JSON.stringify(marker)});
+		if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test physical barrier");
+	}
+};
+`,
+		{ mode: 0o600 },
+	);
+	const realSpawn = Bun.spawn;
+	const pending: Bun.Subprocess<"pipe", "ignore", "ignore">[] = [];
+	let open = false;
+	const flush = () => {
+		for (const worker of pending.splice(0)) {
+			try {
+				worker.stdin.write("release");
+				worker.stdin.end();
+			} catch {
+				/* already exited */
+			}
+		}
+	};
+	const spawnWithBarrier = ((command: string[], config?: Parameters<typeof Bun.spawn>[1]) => {
+		if (!command[1]?.endsWith("/file-change-physical-audit-worker.ts"))
+			throw new Error("Physical barrier must only wrap its own audit worker");
+		const worker = realSpawn<"pipe", "ignore", "ignore">(
+			[command[0], "--preload", preload, ...command.slice(1)],
+			{
+				...config,
+				stdio: ["pipe", "ignore", "ignore"],
+				stdin: "pipe",
+				stdout: "ignore",
+				stderr: "ignore",
+			},
+		);
+		pending.push(worker);
+		if (open) flush();
+		return worker;
+	}) as typeof Bun.spawn;
+	const spawn = spyOn(Bun, "spawn").mockImplementation(spawnWithBarrier);
+	const release = () => {
+		open = true;
+		flush();
+	};
+	let stopPolling = false;
+	const held = (async () => {
+		while (!stopPolling) {
+			try {
+				return Number(await readFile(marker, "utf8"));
+			} catch {
+				await Bun.sleep(5);
+			}
+		}
+		throw new Error("Physical barrier was never reached");
+	})();
+	held.catch(() => {});
+	try {
+		return await body({ held, release });
+	} finally {
+		stopPolling = true;
+		release();
+		spawn.mockRestore();
+	}
+}
+
 function pathFor(ref: FileChangeBlobRef): string {
 	return join(blobRoot, "sha256", ref.digest.slice(0, 2), ref.digest);
 }
@@ -235,13 +449,7 @@ describe("physical audit: actual migrated file DB and BlobStore/Catalog", () => 
 	});
 
 	test("pending zero-byte and nonzero reservations are observed, never refunded or settled", async () => {
-		for (const size of [0, 7])
-			catalog.reserve({
-				expectedGeneration: generation,
-				ownerEpoch: "test-writer",
-				expectedSize: size,
-				signal: new AbortController().signal,
-			});
+		for (const size of [0, 7]) insertLegacyReservation(size);
 		const original = await readFile(databasePath);
 		const summary = await auditFileChangePhysical(await options());
 		expect(summary.start?.pendingReservations).toBe("present");
@@ -349,10 +557,19 @@ describe("physical audit: fail-closed paths and metadata", () => {
 			renameSync(target, moved);
 			await symlink(where === "object" ? secret : moved, target);
 		}
+		// Re-pin the root identity after the swap. Replacing a child (shard, .tmp, the object)
+		// changes the root's ctime, so a stale identity is rejected as root_identity_mismatch
+		// before the replaced entry is ever reached. On a coarse/stale timestamp the test then
+		// passed only by that accident; with a fresh pin it proves the symlink itself refused.
+		if (where !== "root" && where !== "ancestor")
+			request = { ...request, rootIdentity: await identity(blobRoot) };
 		const summary = await auditFileChangePhysical(request);
 		expect(summary.full).toBe(false);
 		expect(summary.metrics.readBytes).toBe(0);
-		expect(codes(summary).some((code) => /unsafe|identity/.test(code))).toBe(true);
+		// A symlinked .tmp is never followed; lstat sees a link, not a 0700 directory.
+		expect(codes(summary).some((code) => /unsafe|identity|non_private_mode/.test(code))).toBe(true);
+		expect(codes(summary)).not.toContain("root_identity_mismatch");
+		expect(JSON.stringify(summary)).not.toContain("outside-raw-secret");
 		expect(JSON.stringify(summary)).not.toContain("outside-raw-secret");
 		expect(await readFile(secret)).toEqual(Buffer.from("outside-raw-secret"));
 	});
@@ -512,31 +729,31 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 		const controller = new AbortController();
 		const events: { phase: string; at: number }[] = [];
 		const request = await options({ budget: { chunkBytes: 256 } });
-		let startedResolve: () => void = () => {};
-		const started = new Promise<void>((resolve) => {
-			startedResolve = resolve;
-		});
-		const running = auditFileChangePhysical({
-			...request,
-			signal: controller.signal,
-			onProgress(progress) {
-				events.push({ phase: progress.phase, at: performance.now() });
-				if (progress.phase === "physical") {
-					startedResolve();
-					controller.abort();
-				}
-			},
-		});
-		await started;
 		let nextStarted = false;
-		const queued = auditFileChangePhysical({
-			...request,
-			budget: { readBytes: 0 },
-			onProgress() {
-				nextStarted = true;
-			},
+		let queued: Promise<FileChangePhysicalAuditSummary> | undefined;
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical({
+				...request,
+				signal: controller.signal,
+				onProgress(progress) {
+					events.push({ phase: progress.phase, at: performance.now() });
+				},
+			});
+			// The worker is held mid-hash: cancel it there, and admit the queued job while the
+			// first one still owns the scope; only then may the cancelled worker continue.
+			expect(await held).toBeGreaterThan(0);
+			controller.abort();
+			queued = auditFileChangePhysical({
+				...request,
+				budget: { readBytes: 0 },
+				onProgress() {
+					nextStarted = true;
+				},
+			});
+			release();
+			return running;
 		});
-		const summary = await running;
+		if (!queued) throw new Error("fixture");
 		expect(codes(summary)).toContain("cancelled");
 		expect(summary.full).toBe(false);
 		expect(nextStarted).toBe(false);
@@ -550,20 +767,12 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("same-generation concurrent DB writes and zero-byte reservations are not quiescence", async () => {
 		await put(Buffer.alloc(1024 * 1024, 19));
 		let changed = false;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 1024 },
-				onProgress() {
-					if (changed) return;
-					changed = true;
-					catalog.reserve({
-						expectedGeneration: generation,
-						ownerEpoch: "late-writer",
-						expectedSize: 0,
-						signal: new AbortController().signal,
-					});
-				},
-			}),
+		const summary = await auditDuringMetadataMutation(
+			() => {
+				changed = true;
+				insertLegacyReservation(0, "late-legacy-writer");
+			},
+			{ chunkBytes: 1024 },
 		);
 		expect(changed).toBe(true);
 		expect(summary.full).toBe(false);
@@ -575,18 +784,37 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	}, 10_000);
 
 	test("generation changes during a scan are fenced without updating the catalog", async () => {
-		await put(Buffer.alloc(512 * 1024, 7));
+		// A bounded streamed hash spans progress publication; the generation change
+		// is triggered by observed physical work, never by a guessed timer.
+		await put(Buffer.alloc(2 * 1024 * 1024, 7));
 		let changed = false;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 1024 },
-				onProgress() {
-					if (changed) return;
-					changed = true;
-					catalog.beginReconciliation({ expectedGeneration: generation });
-				},
-			}),
-		);
+		let mutationObservedAt: number | undefined;
+		let generationBeforeMutation: number | undefined;
+		const request = await options({ budget: { chunkBytes: 128 } });
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical(request);
+			// Mutate exactly while the worker is held mid-hash, after observed physical reads.
+			mutationObservedAt = await held;
+			changed = true;
+			try {
+				const currentBudget = catalog.getBudget();
+				if (!currentBudget) throw new Error("Observed hash progress has no catalog budget");
+				generationBeforeMutation = currentBudget.generation;
+				sqlite
+					.query(
+						"UPDATE file_change_storage_budgets SET status = 'reconciling', generation = generation + 1 WHERE id = 'file-change-blobs'",
+					)
+					.run();
+			} finally {
+				release();
+			}
+			return running;
+		});
+		expect(changed).toBe(true);
+		expect(mutationObservedAt).toBeGreaterThan(0);
+		expect(generationBeforeMutation).toBe(1);
+		expect(summary.start?.generation).toBe(1);
+		expect(summary.full).toBe(false);
 		expect(codes(summary)).toContain("generation_changed");
 		expect(summary.end?.generation).toBe(2);
 		expect(catalog.getBudget()).toMatchObject({ status: "reconciling", generation: 2 });
@@ -596,16 +824,25 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("object ctime/mtime drift during hashing never counts it as a verified object", async () => {
 		const ref = await put(Buffer.alloc(2 * 1024 * 1024, 31));
 		let changed = false;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 128 },
-				onProgress(progress) {
-					if (changed || progress.phase !== "physical") return;
-					changed = true;
-					utimesSync(pathFor(ref), new Date(), new Date(Date.now() + 5000));
-				},
-			}),
-		);
+		const request = await options({ budget: { chunkBytes: 128 } });
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical(request);
+			const readBytes = await held;
+			expect(readBytes).toBeGreaterThan(0);
+			expect(readBytes).toBeLessThan(ref.sizeBytes);
+			try {
+				const before = await identity(pathFor(ref));
+				utimesSync(pathFor(ref), new Date(), new Date(Date.now() + 5000));
+				const after = await identity(pathFor(ref));
+				expect(after.ino).toBe(before.ino);
+				expect(after.sizeBytes).toBe(before.sizeBytes);
+				expect(after.mtimeNs).not.toBe(before.mtimeNs);
+				changed = true;
+			} finally {
+				release();
+			}
+			return running;
+		});
 		expect(changed).toBe(true);
 		expect(summary.full).toBe(false);
 		expect(summary.metrics.verifiedObjects).toBe(0);
@@ -687,18 +924,18 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("new real publication while scanning cannot produce full even in the same generation", async () => {
 		await put(Buffer.alloc(2 * 1024 * 1024, 71));
 		let publication: Promise<FileChangeBlobRef> | undefined;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 512 },
-				onProgress() {
-					publication ??= put("published-during-scan");
-				},
-			}),
+		const summary = await auditDuringMetadataMutation(
+			async () => {
+				publication = put("published-during-scan");
+				await publication;
+			},
+			{ chunkBytes: 512 },
 		);
 		const ref = await publication;
 		expect(ref).toBeDefined();
 		expect(summary.full).toBe(false);
 		expect(summary.start?.generation).toBe(summary.end?.generation);
+		expect(summary.start?.dataVersion).not.toBe(summary.end?.dataVersion);
 		expect(
 			codes(summary).some((code) =>
 				["scan_changed", "shard_changed", "concurrent_publication"].includes(code),
@@ -713,16 +950,18 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("mode changes after opening cannot be certified by a successful content hash", async () => {
 		const ref = await put(Buffer.alloc(2 * 1024 * 1024, 73));
 		let changed = false;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 128 },
-				onProgress(progress) {
-					if (changed || progress.phase !== "physical") return;
-					changed = true;
-					chmodSync(pathFor(ref), 0o644);
-				},
-			}),
-		);
+		const request = await options({ budget: { chunkBytes: 128 } });
+		const summary = await withPhysicalBarrier(async ({ held, release }) => {
+			const running = auditFileChangePhysical(request);
+			expect(await held).toBeGreaterThan(0);
+			changed = true;
+			try {
+				chmodSync(pathFor(ref), 0o644);
+			} finally {
+				release();
+			}
+			return running;
+		});
 		expect(changed).toBe(true);
 		expect(summary.full).toBe(false);
 		expect(summary.metrics.verifiedObjects).toBe(0);

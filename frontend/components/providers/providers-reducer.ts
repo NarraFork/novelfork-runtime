@@ -1,10 +1,12 @@
 import { useCallback, useMemo } from "react";
+import type { ProxyOverride } from "../../lib/proxy";
 import type { NUGProviderState } from "./NUGProvidersSection";
 import type {
 	AnthropicProviderState,
 	CustomApiProtocol,
 	CustomApiProviderState,
 	OpenAIProviderState,
+	UserAgentMode,
 } from "./types";
 
 // ── Types ──────────────────────────────────────────────
@@ -15,14 +17,45 @@ export interface CustomModelEntry {
 	provider?: string;
 }
 
+/** Command Code 平台 provider 的草稿（settings.commandCode 的镜像）。 */
+export interface CommandCodeState {
+	apiKey: string;
+	/** 后端据此把该 provider 从可用候选里剔除，所以必须跟着草稿一起保存。 */
+	disabled: boolean;
+	proxy?: ProxyOverride;
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
+}
+
+/**
+ * 平台集成（codex / Command Code / TokenDance）的前缀清单。
+ *
+ * 约定：**平台 provider 的启用开关一律写成这里的草稿**，由页面底部的保存条统一提交，
+ * 「放弃更改」随快照回滚。UI 里不允许直接调用后端接口去改启用状态 —— 新增平台 provider
+ * 时把它加进这个数组，`SET_PLATFORM_DISABLED` 会强制你在这里落地对应字段。
+ */
+export const PLATFORM_PROVIDER_PREFIXES = ["codex", "CommandCode", "tokendance"] as const;
+
+export type PlatformProviderPrefix = (typeof PLATFORM_PROVIDER_PREFIXES)[number];
+
+/** 判断某个 prefix 是不是平台 provider（决定开关走草稿还是普通 provider 的 toggle）。 */
+export function isPlatformProviderPrefix(prefix: string): prefix is PlatformProviderPrefix {
+	return (PLATFORM_PROVIDER_PREFIXES as readonly string[]).includes(prefix);
+}
+
 export interface ProvidersState {
 	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
 	nugProviders: NUGProviderState[];
+	commandCode: CommandCodeState;
+	/** TokenDance 的连接开关草稿（它存在自己的连接记录里，保存时单独提交）。 */
+	tokenDanceDisabled: boolean;
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
-	modelContextWindows: Record<string, number>;
+	/** 逐模型协议覆盖（`agent.modelProtocols`），键是带前缀的完整模型 ID。 */
+	modelProtocols: Record<string, CustomApiProtocol>;
 	providerOrder: string[];
 	disabledProviders: Set<string>;
 	initialized: boolean;
@@ -33,9 +66,11 @@ export interface SavedSnapshot {
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
 	nugProviders: NUGProviderState[];
+	commandCode: CommandCodeState;
+	tokenDanceDisabled: boolean;
 	hiddenModels: string[];
 	customModels: CustomModelEntry[];
-	modelContextWindows: Record<string, number>;
+	modelProtocols: Record<string, CustomApiProtocol>;
 	providerOrder: string[];
 	disabledProviders: string[];
 }
@@ -50,13 +85,14 @@ export type ProvidersAction =
 	| { type: "SET_OPENAI_PROVIDERS"; providers: Updater<OpenAIProviderState[]> }
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
 	| { type: "SET_NUG_PROVIDERS"; providers: Updater<NUGProviderState[]> }
+	| { type: "SET_COMMAND_CODE"; config: CommandCodeState }
+	| { type: "SET_PLATFORM_DISABLED"; prefix: PlatformProviderPrefix; disabled: boolean }
 	| { type: "TOGGLE_HIDDEN"; modelVal: string }
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
 	| { type: "SET_CUSTOM_MODELS"; models: CustomModelEntry[] }
-	| { type: "SET_CONTEXT_WINDOW"; modelVal: string; size: number | null }
+	| { type: "SET_MODEL_PROTOCOL"; modelVal: string; protocol: CustomApiProtocol | null }
 	| { type: "SET_PROVIDER_ORDER"; order: string[] }
 	| { type: "TOGGLE_PROVIDER_DISABLED"; prefix: string }
-	| { type: "MERGE_CONTEXT_WINDOWS"; windows: Record<string, number> }
 	| { type: "MARK_SAVED" }
 	| { type: "RESTORE_FROM_SNAPSHOT"; snapshot: SavedSnapshot }
 	| { type: "RESET_FOR_REINIT" };
@@ -69,29 +105,25 @@ function resolveUpdater<T>(prev: T, updater: Updater<T>): T {
 
 function protocolFromOpenAI(provider: OpenAIProviderState): CustomApiProtocol {
 	switch (provider.apiMode) {
-		case "codex":
-			return "codex-native";
 		case "completions":
 			return "completions-compatible";
-		case "responses":
-			return "responses-compatible";
 		default:
-			return provider.responsesApi === false ? "completions-compatible" : "responses-compatible";
+			// codex / responses / unset all fold into the unified Responses protocol.
+			return provider.responsesApi === false ? "completions-compatible" : "openai-responses";
 	}
 }
 
-function protocolFromAnthropic(officialApi?: boolean): CustomApiProtocol {
-	return officialApi ? "anthropic-official" : "anthropic-compatible";
+function protocolFromAnthropic(_officialApi?: boolean): CustomApiProtocol {
+	return "anthropic-messages";
 }
 
 function isAnthropicProtocol(protocol: CustomApiProtocol): boolean {
-	return protocol === "anthropic-official" || protocol === "anthropic-compatible";
+	return protocol === "anthropic-messages";
 }
 
 function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderState | null {
 	let apiMode: NonNullable<OpenAIProviderState["apiMode"]> | null = null;
-	if (provider.protocol === "codex-native") apiMode = "codex";
-	else if (provider.protocol === "responses-compatible") apiMode = "responses";
+	if (provider.protocol === "openai-responses") apiMode = "codex";
 	else if (provider.protocol === "completions-compatible") apiMode = "completions";
 	if (!apiMode) return null;
 	return {
@@ -125,9 +157,8 @@ function customApiToAnthropic(provider: CustomApiProviderState): AnthropicProvid
 		defaultModel: provider.defaultModel,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
-		officialApi: provider.protocol === "anthropic-official",
-		nativeSearch:
-			provider.protocol === "anthropic-official" ? (provider.nativeSearch ?? true) : false,
+		officialApi: true,
+		nativeSearch: provider.nativeSearch ?? true,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -161,7 +192,7 @@ function normalizeCustomApiProvider(
 		apiKey: provider.apiKey ?? "",
 		baseUrl: provider.baseUrl ?? "",
 		defaultModel: provider.defaultModel ?? "",
-		protocol: provider.protocol ?? "responses-compatible",
+		protocol: provider.protocol ?? "openai-responses",
 		geminiTransport:
 			provider.protocol === "gemini-compatible"
 				? (provider.geminiTransport ?? "generate-content")
@@ -170,7 +201,7 @@ function normalizeCustomApiProvider(
 		defaultReasoningEffort: provider.defaultReasoningEffort,
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
-		nativeSearch: provider.nativeSearch ?? provider.protocol === "anthropic-official",
+		nativeSearch: provider.nativeSearch ?? provider.protocol === "anthropic-messages",
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
@@ -187,6 +218,10 @@ function deriveCustomApiProvidersFromLegacy(
 	anthropicProviders: AnthropicProviderState[],
 	geminiProviders: Array<Partial<CustomApiProviderState>> = [],
 ): CustomApiProviderState[] {
+	// Only reached when the server returned no customApiProviders at all. The
+	// server's normalize (custom-api-providers.ts) is authoritative for legacy
+	// migration pins (native tools/search off, UA); this path just reconstructs
+	// a displayable state for very old responses.
 	const byId = new Map<string, CustomApiProviderState>();
 	for (const provider of openaiProviders) {
 		byId.set(
@@ -247,9 +282,11 @@ export const initialProvidersState: ProvidersState = {
 	openaiProviders: [],
 	anthropicProviders: [],
 	nugProviders: [],
+	commandCode: { apiKey: "", disabled: false },
+	tokenDanceDisabled: false,
 	hiddenModels: new Set(),
 	customModels: [],
-	modelContextWindows: {},
+	modelProtocols: {},
 	providerOrder: [],
 	disabledProviders: new Set(),
 	initialized: false,
@@ -372,7 +409,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				provider: m.provider,
 			}));
 
-			const windows = (agent.modelContextWindows as Record<string, number>) ?? {};
+			const modelProtocols = (agent.modelProtocols as Record<string, CustomApiProtocol>) ?? {};
 
 			const providerOrder: string[] = (agent.providerOrder as string[]) ?? [];
 			const disabledProviders = new Set<string>((agent.disabledProviders as string[]) ?? []);
@@ -391,9 +428,18 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				openaiProviders: splitCustomApiProviders.openai,
 				anthropicProviders: splitCustomApiProviders.anthropic,
 				nugProviders: nug,
+				commandCode: {
+					apiKey: s.commandCode?.apiKey ?? "",
+					disabled: s.commandCode?.disabled === true,
+					proxy: s.commandCode?.proxy,
+					userAgentMode: s.commandCode?.userAgentMode,
+					customUserAgent: s.commandCode?.customUserAgent,
+					extraHeaders: s.commandCode?.extraHeaders,
+				},
+				tokenDanceDisabled: s.tokendance?.disabled === true,
 				hiddenModels: new Set(hidden),
 				customModels: custom,
-				modelContextWindows: windows,
+				modelProtocols,
 				providerOrder,
 				disabledProviders,
 				initialized: true,
@@ -424,6 +470,30 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				nugProviders: resolveUpdater(state.nugProviders, action.providers),
 			};
 
+		case "SET_COMMAND_CODE":
+			return { ...state, commandCode: action.config };
+
+		case "SET_PLATFORM_DISABLED": {
+			// 平台 provider 的启用开关只有这一个写入点：它只改草稿，绝不碰后端接口。
+			// 保存条是唯一的提交点，「放弃更改」时随快照一起回滚。
+			switch (action.prefix) {
+				case "codex": {
+					const next = new Set(state.disabledProviders);
+					if (action.disabled) next.add("codex");
+					else next.delete("codex");
+					return { ...state, disabledProviders: next };
+				}
+				case "CommandCode":
+					return {
+						...state,
+						commandCode: { ...state.commandCode, disabled: action.disabled },
+					};
+				case "tokendance":
+					return { ...state, tokenDanceDisabled: action.disabled };
+			}
+			return state;
+		}
+
 		case "TOGGLE_HIDDEN": {
 			const next = new Set(state.hiddenModels);
 			if (next.has(action.modelVal)) next.delete(action.modelVal);
@@ -444,36 +514,15 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 		case "SET_CUSTOM_MODELS":
 			return { ...state, customModels: action.models };
 
-		case "SET_CONTEXT_WINDOW": {
-			if (action.size == null) {
-				const next = { ...state.modelContextWindows };
-				delete next[action.modelVal];
-				return { ...state, modelContextWindows: next };
-			}
-			return {
-				...state,
-				modelContextWindows: {
-					...state.modelContextWindows,
-					[action.modelVal]: action.size,
-				},
-			};
+		case "SET_MODEL_PROTOCOL": {
+			const next = { ...state.modelProtocols };
+			if (action.protocol) next[action.modelVal] = action.protocol;
+			else delete next[action.modelVal];
+			return { ...state, modelProtocols: next };
 		}
 
 		case "SET_PROVIDER_ORDER":
 			return { ...state, providerOrder: action.order };
-
-		case "MERGE_CONTEXT_WINDOWS": {
-			// Merge server-side context windows into local state without overwriting user edits
-			const merged = { ...state.modelContextWindows };
-			let changed = false;
-			for (const [key, value] of Object.entries(action.windows)) {
-				if (!(key in merged)) {
-					merged[key] = value;
-					changed = true;
-				}
-			}
-			return changed ? { ...state, modelContextWindows: merged } : state;
-		}
 
 		case "TOGGLE_PROVIDER_DISABLED": {
 			if (!action.prefix) return state;
@@ -529,9 +578,11 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				openaiProviders: snap.openaiProviders.map((p) => ({ ...p })),
 				anthropicProviders: snap.anthropicProviders.map((p) => ({ ...p })),
 				nugProviders: snap.nugProviders.map((p) => ({ ...p })),
+				commandCode: { ...snap.commandCode },
+				tokenDanceDisabled: snap.tokenDanceDisabled,
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
-				modelContextWindows: { ...snap.modelContextWindows },
+				modelProtocols: { ...snap.modelProtocols },
 				providerOrder: [...snap.providerOrder],
 				disabledProviders: new Set(snap.disabledProviders),
 			};
@@ -559,6 +610,15 @@ export function providersStateFromSettings(settings: Record<string, unknown>): P
 export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot): boolean {
 	return useMemo(() => {
 		if (!state.initialized) return false;
+		if (JSON.stringify(state.commandCode) !== JSON.stringify(savedSnapshot.commandCode))
+			return true;
+		if (state.tokenDanceDisabled !== savedSnapshot.tokenDanceDisabled) return true;
+		// Key order is not meaningful here, so compare sorted entries rather than the raw objects.
+		if (
+			JSON.stringify(Object.entries(state.modelProtocols).sort()) !==
+			JSON.stringify(Object.entries(savedSnapshot.modelProtocols).sort())
+		)
+			return true;
 		// Fast path: array length comparison
 		if (state.customApiProviders.length !== savedSnapshot.customApiProviders.length) return true;
 		if (state.nugProviders.length !== savedSnapshot.nugProviders.length) return true;
@@ -588,11 +648,6 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 			JSON.stringify([...savedSnapshot.disabledProviders].sort())
 		)
 			return true;
-		if (
-			JSON.stringify(state.modelContextWindows) !==
-			JSON.stringify(savedSnapshot.modelContextWindows)
-		)
-			return true;
 
 		return false;
 	}, [state, savedSnapshot]);
@@ -605,9 +660,11 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		openaiProviders: state.openaiProviders.map((p) => ({ ...p })),
 		anthropicProviders: state.anthropicProviders.map((p) => ({ ...p })),
 		nugProviders: state.nugProviders.map((p) => ({ ...p })),
+		commandCode: { ...state.commandCode },
+		tokenDanceDisabled: state.tokenDanceDisabled,
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
-		modelContextWindows: { ...state.modelContextWindows },
+		modelProtocols: { ...state.modelProtocols },
 		providerOrder: [...state.providerOrder],
 		disabledProviders: [...state.disabledProviders],
 	};
@@ -645,6 +702,18 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
+	const setCommandCode = useCallback(
+		(config: CommandCodeState) => dispatch({ type: "SET_COMMAND_CODE", config }),
+		[dispatch],
+	);
+
+	/** 平台 provider 启用开关的唯一入口（只改草稿，保存条统一提交）。 */
+	const setPlatformDisabled = useCallback(
+		(prefix: PlatformProviderPrefix, disabled: boolean) =>
+			dispatch({ type: "SET_PLATFORM_DISABLED", prefix, disabled }),
+		[dispatch],
+	);
+
 	const toggleHidden = useCallback(
 		(modelVal: string) => dispatch({ type: "TOGGLE_HIDDEN", modelVal }),
 		[dispatch],
@@ -661,9 +730,9 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
-	const handleContextWindowChange = useCallback(
-		(modelVal: string, size: number | null) =>
-			dispatch({ type: "SET_CONTEXT_WINDOW", modelVal, size }),
+	const setModelProtocol = useCallback(
+		(modelVal: string, protocol: CustomApiProtocol | null) =>
+			dispatch({ type: "SET_MODEL_PROTOCOL", modelVal, protocol }),
 		[dispatch],
 	);
 
@@ -677,37 +746,34 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
-	const mergeContextWindows = useCallback(
-		(windows: Record<string, number>) => dispatch({ type: "MERGE_CONTEXT_WINDOWS", windows }),
-		[dispatch],
-	);
-
 	return useMemo(
 		() => ({
 			setCustomApiProviders,
 			setOpenaiProviders,
 			setAnthropicProviders,
 			setNugProviders,
+			setCommandCode,
+			setPlatformDisabled,
 			toggleHidden,
 			batchToggleHidden,
 			setCustomModels,
-			handleContextWindowChange,
+			setModelProtocol,
 			setProviderOrder,
 			toggleProviderDisabled,
-			mergeContextWindows,
 		}),
 		[
 			setCustomApiProviders,
 			setOpenaiProviders,
 			setAnthropicProviders,
 			setNugProviders,
+			setCommandCode,
+			setPlatformDisabled,
 			toggleHidden,
 			batchToggleHidden,
 			setCustomModels,
-			handleContextWindowChange,
+			setModelProtocol,
 			setProviderOrder,
 			toggleProviderDisabled,
-			mergeContextWindows,
 		],
 	);
 }

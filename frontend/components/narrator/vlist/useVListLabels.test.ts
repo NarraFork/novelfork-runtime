@@ -19,6 +19,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { DANGER_COPY_KEYS } from "@shared/danger-copy";
 import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
@@ -59,6 +60,7 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	"system-simple": "card text composed by the adapter (ctx.labels)",
 	"system-text": "card text composed by the adapter (ctx.labels)",
 	"knowledge-hint": "entry titles come from measured content",
+	"modeltrace-result": "renderer localizes footnote and empty fallback with useTranslation",
 	// Localized through a dedicated shell branch instead of a `labels` bundle.
 	"plan-card": "shell injects extra.label",
 	// Header chrome (verdict / revision / action label) is composed by the adapter
@@ -117,6 +119,23 @@ describe("renderLabelsForKind — every chrome-painting kind is localizable", ()
 });
 
 describe("adapter chrome keys — every fallback has an injected translation", () => {
+	it("keeps translation out of the per-tool summary resolver", () => {
+		// This integration shell also owns queries, scrolling and subscriptions; the
+		// real hook/summary behavior is exercised in useVListLabels.hook.test.tsx.
+		const source = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"), "utf8");
+		const start = source.indexOf("const resolveExactToolSummary = useCallback(");
+		const end = source.indexOf("const resolveExactSubagentRecentSummary", start);
+		expect(start).toBeGreaterThan(0);
+		expect(end).toBeGreaterThan(start);
+		const resolver = source.slice(start, end);
+		expect(resolver).not.toMatch(/\bt\(/);
+		expect(resolver).toContain(
+			"getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels)",
+		);
+		expect(resolver).toContain("[vlistLabels]");
+		expect(source.indexOf("= useVListLabels()")).toBeLessThan(start);
+	});
+
 	it("forwards communication chrome and receipt labels through adapter data", () => {
 		const keys = [
 			"sendAwaitReply",
@@ -176,7 +195,10 @@ describe("adapter chrome keys — every fallback has an injected translation", (
 			adapterSrc.indexOf("const SYSTEM_LABEL_FALLBACKS"),
 			adapterSrc.indexOf("/** Resolve a system-card chrome label"),
 		);
-		const fallbackKeys = [...table.matchAll(/^\t([A-Za-z][A-Za-z0-9]*):/gm)].map((m) => m[1]);
+		// Underscored keys (`reviewVerdict_*`, `communicationWarning_*`, `status_*`) are
+		// matched too: they are built by concatenation in the adapter, which makes a
+		// dropped injection MORE likely to go unnoticed, not less.
+		const fallbackKeys = [...table.matchAll(/^\t([A-Za-z][A-Za-z0-9_]*):/gm)].map((m) => m[1]);
 		// Sanity-check the extraction itself before asserting on it.
 		expect(fallbackKeys.length).toBeGreaterThan(20);
 		expect(fallbackKeys).toContain("activityTraceCount");
@@ -186,14 +208,19 @@ describe("adapter chrome keys — every fallback has an injected translation", (
 			hookSrc.indexOf("const adapterLabels"),
 			hookSrc.indexOf("const renderLabels"),
 		);
-		// The reflection titles are injected as a generated MATRIX rather than 24
-		// literal entries, so ask the real generator which keys it covers. A kind or
-		// status dropped from that matrix still fails this guard.
+		// The reflection titles and danger assessment copy are injected as generated
+		// matrices rather than one literal entry each, so ask the real generators
+		// which keys they cover. A key dropped from those matrices still fails this
+		// guard via the literal-entry check below.
 		const generated = new Set(Object.keys(reflectionTitleLabels((key) => key)));
+		for (const key of DANGER_COPY_KEYS) generated.add(key);
 		const missing = fallbackKeys.filter(
 			(key) => !generated.has(key) && !new RegExp(`\\b${key}:`).test(injected),
 		);
 		expect(missing).toEqual([]);
+		// Generated matrices must actually be spread into the hook, not merely defined.
+		expect(hookSrc).toContain("...dangerCopyLabels(t)");
+		expect(hookSrc).toContain("...reflectionTitleLabels(t)");
 	});
 
 	it("generates a title for every reflection kind × status the adapter can request", () => {

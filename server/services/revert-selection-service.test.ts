@@ -14,7 +14,7 @@ const DDL = `
 CREATE TABLE narrators (
  id TEXT PRIMARY KEY, owner_user_id TEXT, visibility TEXT NOT NULL DEFAULT 'private',
  write_audience TEXT NOT NULL DEFAULT 'owner', type TEXT NOT NULL DEFAULT 'primary',
- acl_root_narrator_id TEXT, chapter_id TEXT, context_project_id TEXT, message_version INTEGER NOT NULL DEFAULT 7,
+ acl_root_narrator_id TEXT, context_project_id TEXT, message_version INTEGER NOT NULL DEFAULT 7,
  refs_inherited_from TEXT, status TEXT NOT NULL DEFAULT 'idle', parent_narrator_id TEXT, origin_tool_call_id TEXT,
  fork_message_id TEXT
 );
@@ -52,7 +52,7 @@ CREATE TABLE file_change_scopes (
 );
 INSERT INTO file_change_scopes VALUES('scope','installation','local','workspace','posix','/repo','active');
 CREATE TABLE file_change_operations (
- id TEXT PRIMARY KEY, execution_segment_id TEXT, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
+ id TEXT PRIMARY KEY, journal_seq INTEGER NOT NULL DEFAULT 1, execution_segment_id TEXT, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
  source_kind TEXT NOT NULL DEFAULT 'tool', source_id TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
  tool_call_id TEXT, narrator_id TEXT, project_id TEXT, request_digest TEXT,
  execution_binding_json TEXT DEFAULT '{"deviceId":"local","runtimeEpoch":"test","runtimeGeneration":1,"fencingToken":0}',
@@ -65,7 +65,7 @@ CREATE TABLE file_change_operations (
 CREATE TABLE file_change_effects (
  id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, scope_id TEXT NOT NULL, file_key TEXT NOT NULL, scope_revision INTEGER NOT NULL DEFAULT 1,
  mutation_id TEXT NOT NULL, request_digest TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'apply',
- outcome TEXT NOT NULL DEFAULT 'changed', settlement TEXT NOT NULL DEFAULT 'settled', attribution_grade TEXT NOT NULL DEFAULT 'measured',
+ outcome TEXT NOT NULL DEFAULT 'changed', disk_outcome TEXT, settlement TEXT NOT NULL DEFAULT 'settled', attribution_grade TEXT NOT NULL DEFAULT 'measured',
  execution_confirmed INTEGER NOT NULL DEFAULT 1, lines_added INTEGER, lines_removed INTEGER,
  before_blob_digest TEXT, intended_after_blob_digest TEXT, observed_after_blob_digest TEXT,
  identity_json TEXT NOT NULL, before_state_json TEXT NOT NULL, intended_after_state_json TEXT NOT NULL, observed_after_state_json TEXT NOT NULL, execution_receipt_json TEXT
@@ -73,8 +73,6 @@ CREATE TABLE file_change_effects (
 CREATE UNIQUE INDEX idx_fc_effect_operation_file ON file_change_effects(operation_id,file_key,phase);
 CREATE TABLE file_change_execution_segments (id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_segment_id TEXT);
 CREATE INDEX idx_fc_segment_parent ON file_change_execution_segments(parent_segment_id);
-CREATE TABLE chapter_commits (id TEXT PRIMARY KEY, narrator_message_id TEXT);
-CREATE INDEX idx_chapter_commits_narrator_message ON chapter_commits(narrator_message_id);
 CREATE TABLE spec_file_revisions (id TEXT PRIMARY KEY, source_message_id TEXT);
 CREATE INDEX idx_spec_file_revisions_source_message ON spec_file_revisions(source_message_id);
 CREATE TABLE narrator_patches (id TEXT PRIMARY KEY, message_id TEXT);
@@ -456,17 +454,16 @@ describe("stable block boundary and COW history manifest", () => {
 		expect(result.history.budget.messageRefChanges).toBe(1);
 		expect(result.history.toolChanges[0].action).toBe("retain");
 	});
-	test("potential cascades and SET NULL rows include question/continuation/spec/commit/API pointers", async () => {
+	test("potential cascades and SET NULL rows include question/continuation/spec/API pointers", async () => {
 		const t = tool(1, "Read");
 		sqlite.query("INSERT INTO narrator_questions VALUES('q',?)").run(t.id);
 		sqlite.query("INSERT INTO narrator_tool_continuations VALUES('continue',?)").run(t.id);
 		sqlite.query("INSERT INTO knowledge_injection_events VALUES('k',?,?)").run(t.messageId, t.id);
 		sqlite.query("INSERT INTO spec_file_revisions VALUES('s',?)").run(t.messageId);
-		sqlite.query("INSERT INTO chapter_commits VALUES('c',?)").run(t.messageId);
 		sqlite.query("INSERT INTO api_requests VALUES('a',?)").run(t.messageId);
 		const result = await collect();
-		expect(result.history.associations).toHaveLength(7);
-		expect(result.history.budget.relatedRows).toBe(7); // one deleted call + 6 distinct dependent rows
+		expect(result.history.associations).toHaveLength(6);
+		expect(result.history.budget.relatedRows).toBe(6); // one deleted call + 5 distinct dependent rows
 	});
 });
 
@@ -616,18 +613,23 @@ describe("complete mutation candidates, not just successful writes", () => {
 			reason: "non_file_change",
 		});
 	});
-	test("an active file tool is deferred without vetoing settled earlier effects", async () => {
-		const write = tool(1, "Write");
-		journal(write);
-		const active = tool(2, "Write");
-		sqlite.query("UPDATE narrator_tool_calls SET status='running' WHERE id=?").run(active.id);
+	for (const status of ["initializing", "pending", "running"])
+		for (const identityVersion of [0, 1])
+			test(`${status} file attempt v${identityVersion} leaves settled effects available with partial coverage`, async () => {
+				const write = tool(1, "Write");
+				journal(write);
+				const active = tool(2, "Write");
+				sqlite
+					.query("UPDATE narrator_tool_calls SET status=?,execution_identity_version=? WHERE id=?")
+					.run(status, identityVersion, active.id);
 
-		const result = await collect({ kind: "from_seq", minSeq: 1 });
-		expect(result.evidenceComplete).toBe(true);
-		expect(result.issues).toEqual([]);
-		expect(result.effects).toHaveLength(1);
-		expect(result.noDiskTools).toContainEqual({ toolCallId: active.id, reason: "pending" });
-	});
+				const result = await collect({ kind: "from_seq", minSeq: 1 });
+				expect(result.selectionComplete).toBe(true);
+				expect(result.evidenceComplete).toBe(false);
+				expect(result.issues).toEqual([{ code: "FILE_TOOL_PENDING", toolCallId: active.id }]);
+				expect(result.effects).toHaveLength(1);
+				expect(result.noDiskTools.some((row) => row.toolCallId === active.id)).toBe(false);
+			});
 });
 
 for (const selector of [
@@ -682,6 +684,23 @@ test("spec writes and real read-only tools are excluded independently of unknown
 	]);
 	expect(result.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: disk.id });
 });
+test("GenUI show is read-only while create without a journal is an explicit gap", async () => {
+	const show = tool(1, "GenUI");
+	const create = tool(2, "GenUI");
+	sqlite
+		.query("UPDATE narrator_tool_calls SET input_json=? WHERE id=?")
+		.run(JSON.stringify({ action: "show", path: "/repo/ui" }), show.id);
+	sqlite
+		.query("UPDATE narrator_tool_calls SET input_json=? WHERE id=?")
+		.run(JSON.stringify({ action: "create", prefix: "demo" }), create.id);
+	const result = await collect();
+	expect(result.noDiskTools).toContainEqual({ toolCallId: show.id, reason: "read_only" });
+	expect(result.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: create.id });
+	expect(result.noDiskTools).not.toContainEqual({
+		toolCallId: create.id,
+		reason: "non_file_change",
+	});
+});
 test("Bash background initial success does not settle a live or missing background task", async () => {
 	const t = tool(1, "Bash");
 	sqlite.query("UPDATE narrator_tool_calls SET is_background=1 WHERE id=?").run(t.id);
@@ -714,7 +733,7 @@ test("operation binding/expected count and reverse pins are not silently trusted
 	expect(hasIssue(result, "OPERATION_UNRESOLVED")).toBe(true);
 	expect(hasIssue(result, "EFFECT_PIN_MISSING")).toBe(true);
 });
-test("active read tools and retired/mismatched scopes do not authorize history execution", async () => {
+test("read tools and retired scope metadata preserve settled historical evidence", async () => {
 	const read = tool(1, "Read");
 	const write = tool(2);
 	journal(write);
@@ -722,8 +741,10 @@ test("active read tools and retired/mismatched scopes do not authorize history e
 	sqlite.query("UPDATE file_change_scopes SET status='retired'").run();
 	const result = await collect();
 	expect(hasIssue(result, "TOOL_ACTIVE_OR_UNKNOWN")).toBe(false);
-	expect(hasIssue(result, "EFFECT_SCOPE_UNVERIFIED")).toBe(true);
-	expect(result.evidenceComplete).toBe(false);
+	expect(hasIssue(result, "EFFECT_SCOPE_UNVERIFIED")).toBe(false);
+	expect(result.evidenceComplete).toBe(true);
+	sqlite.query("UPDATE file_change_scopes SET workspace_instance_id='changed'").run();
+	expect(hasIssue(await collect(), "EFFECT_SCOPE_UNVERIFIED")).toBe(true);
 });
 
 test("a receipt from another runtime generation is not the selected attempt's evidence", async () => {

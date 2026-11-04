@@ -104,7 +104,7 @@ export class RateLimitError extends AppError {
 /**
  * The signature is unchanged on purpose: attaching the catalog entry here localizes all ~319
  * call sites at once, without editing any of them. `entity` stays a plain English label
- * (`Chapter`, `Narrator`, `Knowledge entry`) — the frontend looks it up under
+ * (`Project`, `Narrator`, `Knowledge entry`) — the frontend looks it up under
  * `errors:entity.<Entity>` and falls back to showing it verbatim, so an unlisted entity
  * degrades to today's wording instead of breaking the sentence.
  */
@@ -182,6 +182,21 @@ export class ContainerError extends AppError {
 export class GitError extends AppError {
 	constructor(message: string) {
 		super(message, 422, "GIT_ERROR");
+	}
+}
+
+/**
+ * HEAD does not name a commit yet.
+ *
+ * `git init` leaves HEAD as a symbolic ref with no object behind it. Asking
+ * `rev-parse` for that name exits 128 and prints an "ambiguous argument" fatal,
+ * which is the ordinary empty-repository state, not a broken worktree.
+ */
+export class UnbornHeadError extends GitError {
+	constructor() {
+		super("Repository has no commits yet");
+		this.name = "UnbornHeadError";
+		this.code = "GIT_UNBORN_HEAD";
 	}
 }
 

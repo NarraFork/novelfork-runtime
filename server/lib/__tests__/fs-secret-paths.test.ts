@@ -7,7 +7,8 @@
  * filesystem. What must not follow is an escalation from "logged-in reader" to
  * "platform operator", which is exactly what serving three specific files does:
  *
- *   - `settings.json` holds `auth.jwtSecret`, so its bytes forge any user's session;
+ *   - `settings.json` holds `auth.jwtSecret`, whose bytes forge MFA challenges and
+ *     internal signatures;
  *   - `narrafork.db` (and its WAL) holds every password hash and OAuth grant;
  *   - `~/.ssh` holds keys that are not even NarraFork's to leak.
  *
@@ -17,8 +18,14 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isSecretPlatformPath, isSecretUserPath } from "../fs-secret-paths";
+import {
+	isPrivateRequestRecordingPath,
+	isSecretPlatformPath,
+	isSecretUserPath,
+} from "../fs-secret-paths";
 
 const HOME = "/home/tester/.narrafork";
 const USER_HOME = "/home/tester";
@@ -51,9 +58,100 @@ describe("platform credential files", () => {
 	});
 });
 
+describe("private request recording directories", () => {
+	test.each([
+		"request-recordings",
+		"saved-request-recordings",
+		"token-repair-jobs",
+	])("refuses %s root and every descendant", (name) => {
+		for (const suffix of [
+			"",
+			"request/record.json",
+			"narrator/save/chunks/stream.jsonl",
+			".exports/capture.zip",
+		]) {
+			expect(isSecretPlatformPath(join(HOME, name, suffix), HOME)).toBe(true);
+		}
+		expect(isSecretPlatformPath(join(HOME, `${name}-other`, "notes.json"), HOME)).toBe(false);
+		expect(isSecretPlatformPath(join("/tmp/project", name, "notes.json"), HOME)).toBe(false);
+	});
+	test("sharing ancestor directories is refused without blocking ordinary sibling files", () => {
+		expect(isPrivateRequestRecordingPath(HOME, HOME, true)).toBe(true);
+		expect(isPrivateRequestRecordingPath(USER_HOME, HOME, true)).toBe(true);
+		expect(
+			isPrivateRequestRecordingPath(join(HOME, "malformed-request-dumps", "dump.json"), HOME, true),
+		).toBe(false);
+	});
+	test.each([
+		"saved-request-recordings",
+		"token-repair-jobs",
+	])("symlinks cannot reveal private %s", (name) => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-private-recording-path-"));
+		const home = join(temporary, "platform");
+		const root = join(home, name);
+		mkdirSync(root, { recursive: true });
+		const file = join(root, "manifest.json");
+		writeFileSync(file, "private recording");
+		const fileLink = join(temporary, "ordinary.json");
+		const directoryLink = join(temporary, "ordinary-dir");
+		const homeLink = join(temporary, "home-alias");
+		try {
+			symlinkSync(file, fileLink, "file");
+			symlinkSync(root, directoryLink, "dir");
+			symlinkSync(home, homeLink, "dir");
+			expect(isSecretPlatformPath(fileLink, home)).toBe(true);
+			expect(isSecretPlatformPath(join(directoryLink, "manifest.json"), home)).toBe(true);
+			expect(isSecretPlatformPath(file, homeLink)).toBe(true);
+			expect(isPrivateRequestRecordingPath(homeLink, home, true)).toBe(true);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("private editor protocol state", () => {
+	test.each([
+		"editor-transfers",
+		"editor-native",
+		"editor-native-operations",
+	])("protects %s contents, roots, ancestors and physical aliases", (name) => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-private-editor-path-"));
+		const home = join(temporary, "platform"),
+			root = join(home, name);
+		mkdirSync(root, { recursive: true });
+		const file = join(root, "operation.json");
+		writeFileSync(file, "private");
+		const fileLink = join(temporary, "file-alias"),
+			dirLink = join(temporary, "dir-alias"),
+			homeLink = join(temporary, "home-alias");
+		try {
+			symlinkSync(file, fileLink, "file");
+			symlinkSync(root, dirLink, "dir");
+			symlinkSync(home, homeLink, "dir");
+			for (const path of [
+				root,
+				file,
+				fileLink,
+				dirLink,
+				join(dirLink, "operation.json"),
+				join(homeLink, name, "missing.json"),
+			])
+				expect(isSecretPlatformPath(path, home)).toBe(true);
+			expect(isSecretPlatformPath(file, homeLink)).toBe(true);
+			expect(isPrivateRequestRecordingPath(root, home, true)).toBe(true);
+			expect(isPrivateRequestRecordingPath(homeLink, home, true)).toBe(true);
+			expect(isSecretPlatformPath(join(temporary, name, "ordinary.json"), home)).toBe(false);
+			expect(isSecretPlatformPath(join(home, `${name}-ordinary`, "file.json"), home)).toBe(false);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("platform files the viewer must keep opening", () => {
 	test.each([
 		["malformed-request-dumps/dump.json", "a request dump the viewer links to"],
+		["request-dumps/spill.json", "a legacy usage-history dump"],
 		["provider-dumps/capture.json", "a provider capture"],
 		["conclusions/abc.md", "a subagent conclusion"],
 		["model-cache.json", "a non-secret cache"],
@@ -90,6 +188,52 @@ describe("escaping the home with traversal", () => {
 	});
 });
 
+describe("Windows / edge-case spellings of a secret filename", () => {
+	test.each([
+		["SETTINGS.JSON", "an all-uppercase spelling"],
+		["Settings.Json", "a mixed-case spelling"],
+		["settings.json.", "a trailing dot the Win32 layer discards"],
+		["settings.json ", "a trailing space the Win32 layer discards"],
+		["settings.json::$DATA", "the default NTFS data stream"],
+		["settings.json:hidden", "a named alternate data stream"],
+	])("refuses %s (%s)", (name) => {
+		expect(isSecretPlatformPath(join(HOME, name), HOME)).toBe(true);
+	});
+
+	test.each([
+		["NARRAFORK.DB", "an uppercase database spelling"],
+		["narrafork.db-wal::$DATA", "a WAL alternate data stream"],
+		["Narrafork.Db.bak", "a mixed-case backup"],
+	])("refuses %s (%s)", (name) => {
+		expect(isSecretPlatformPath(join(HOME, name), HOME)).toBe(true);
+	});
+
+	test("still allows an ordinary file whose name merely starts like a secret", () => {
+		// `settings.jsonc` is not `settings.json`; stripping must not fold it onto the secret.
+		expect(isSecretPlatformPath(join(HOME, "settings.jsonc"), HOME)).toBe(false);
+		expect(isSecretPlatformPath(join(HOME, "settings.json.backup-notes.md"), HOME)).toBe(false);
+	});
+});
+
+describe("symlinks whose real target is a credential file", () => {
+	test("a link that resolves into ~/.narrafork is caught by its real path", () => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-secret-symlink-"));
+		const home = join(temporary, "platform");
+		mkdirSync(home, { recursive: true });
+		const secret = join(home, "settings.json");
+		writeFileSync(secret, '{"auth":{"jwtSecret":"x"}}');
+		const innocentLink = join(temporary, "harmless-config.json");
+		try {
+			symlinkSync(secret, innocentLink, "file");
+			// Lexically the link is outside the home and innocuously named; the physical
+			// (realpath-resolved) check is what refuses it.
+			expect(isSecretPlatformPath(innocentLink, home)).toBe(true);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("third-party credential stores in the user's home", () => {
 	test.each([
 		".ssh/id_rsa",
@@ -113,5 +257,25 @@ describe("third-party credential stores in the user's home", () => {
 
 	test("allows paths outside the home", () => {
 		expect(isSecretUserPath("/etc/hosts", USER_HOME)).toBe(false);
+	});
+
+	test("a symlink outside the home whose target is inside ~/.ssh is refused", () => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-user-secret-symlink-"));
+		const home = join(temporary, "home");
+		const key = join(home, ".ssh", "id_rsa");
+		mkdirSync(join(home, ".ssh"), { recursive: true });
+		writeFileSync(key, "secret-key");
+		const notes = join(home, "notes.txt");
+		writeFileSync(notes, "hi");
+		const keyLink = join(temporary, "notes.txt");
+		const notesLink = join(temporary, "alias.txt");
+		try {
+			symlinkSync(key, keyLink, "file");
+			symlinkSync(notes, notesLink, "file");
+			expect(isSecretUserPath(keyLink, home)).toBe(true);
+			expect(isSecretUserPath(notesLink, home)).toBe(false);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
 	});
 });

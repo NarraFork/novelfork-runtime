@@ -61,18 +61,14 @@ import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { getSubagentType, isSubagentVariant } from "../lib/narrator-utils";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { sideCarBodyWithText } from "../lib/sidecar-templates";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import {
-	assertRuntimeCanAskQuestion,
-	type RuntimePolicy,
-	resolveRuntimePolicy,
-} from "./agent-runtime/policy";
+import { assertRuntimeCanAskQuestion, type RuntimePolicy } from "./agent-runtime/policy";
 import { coerceAskQuestions } from "./ask-user-question-coerce";
-import { customSubagentService } from "./custom-subagent-service";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
+import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
 
 /** One question as the tool defined it. Header + description only. */
@@ -405,24 +401,10 @@ async function broadcastChange(
 // Creation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Resolve question authority from persisted identity, never a model-supplied parent hint. */
+/** Resolve question authority from the narrator's stored ceiling, never a model-supplied hint. */
 export async function resolveNarratorQuestionPolicy(narratorId: string): Promise<RuntimePolicy> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { variant: true },
-	});
-	if (!narrator) throw new Error("Question narrator not found.");
-	const subagentType = getSubagentType(narrator.variant);
-	const builtin = ["explore", "plan", "review", "search", "general"];
-	const customDefinition =
-		subagentType && !builtin.includes(subagentType)
-			? await customSubagentService.loadByName(subagentType)
-			: undefined;
-	return resolveRuntimePolicy({
-		variant: isSubagentVariant(narrator.variant) ? "subagent" : "primary",
-		subagentType: subagentType ?? undefined,
-		customDefinition,
-	});
+	const { resolveNarratorRuntimePolicy } = await import("./trait-layer-service");
+	return resolveNarratorRuntimePolicy(narratorId);
 }
 
 export async function assertNarratorCanAskQuestion(narratorId: string): Promise<RuntimePolicy> {
@@ -786,6 +768,19 @@ export async function getBoundedQuestionDetail(
 	return { ...detail, ...events };
 }
 
+/**
+ * A receipt's supplement, from its block's payload when its rows are current (block reads
+ * on), else from content_json; either way size-capped before any JSON is parsed.
+ */
+function receiptSupplementSql() {
+	const expression = storedElementsSql(
+		"narrator_messages",
+		(json, root) =>
+			`case when length(cast(${json} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${json}, '${root}[0].body.supplement'), json_extract(${json}, '${root}[1].body.supplement'), '') else null end`,
+	);
+	return sql<string | null>`${sql.raw(expression)}`;
+}
+
 /** Event payloads are bounded in SQL, before fetching or parsing legacy JSON. */
 export async function listQuestionEvents(
 	id: string,
@@ -808,9 +803,11 @@ export async function listQuestionEvents(
 			>`case when length(cast(${narratorQuestionEvents.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestionEvents.resolutionJson} else null end`,
 			kind: narratorQuestionEvents.kind,
 			createdAt: narratorQuestionEvents.createdAt,
-			text: sql<
-				string | null
-			>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
+			text: blockReadsEnabled()
+				? receiptSupplementSql()
+				: sql<
+						string | null
+					>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
 			actor: narratorMessages.createdBy,
 		})
 		.from(narratorQuestionEvents)
@@ -875,7 +872,6 @@ export async function listQuestionSummaries(args: {
 			resolved: sql<boolean>`${narratorQuestions.resolutionJson} is not null`,
 			questions: sql<string>`case when length(cast(${narratorQuestions.summaryJson} as blob)) <= 16384 and json_valid(${narratorQuestions.summaryJson}) then ${narratorQuestions.summaryJson} when length(cast(${narratorQuestions.questionsJson} as blob)) <= ${QUESTION_SNAPSHOT_MAX_BYTES} and json_valid(${narratorQuestions.questionsJson}) then (select json_group_array(json_object('id', json_extract(value, '$.id'), 'header', substr(json_extract(value, '$.header'), 1, 120))) from json_each(${narratorQuestions.questionsJson}) where key < 4) else '[]' end`,
 			narratorTitle: narrators.title,
-			chapterId: narrators.chapterId,
 		})
 		.from(narratorQuestions)
 		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
@@ -897,7 +893,6 @@ export async function listQuestionSummaries(args: {
 					writeAudience: true,
 					type: true,
 					aclRootNarratorId: true,
-					chapterId: true,
 					contextProjectId: true,
 				},
 			});
@@ -1121,7 +1116,6 @@ export async function supplementAsyncQuestion(
 /** An open question plus the narrator context the global inbox needs to label it. */
 export interface AsyncQuestionWithContext extends AsyncQuestionRecord {
 	narratorTitle: string | null;
-	chapterId: string | null;
 }
 
 /**
@@ -1148,7 +1142,6 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 		.select({
 			question: narratorQuestions,
 			narratorTitle: narrators.title,
-			chapterId: narrators.chapterId,
 			// The ACL columns, so the filter below needs no second query per row.
 			narratorId: narrators.id,
 			ownerUserId: narrators.ownerUserId,
@@ -1175,7 +1168,6 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 				writeAudience: row.writeAudience,
 				type: row.type,
 				aclRootNarratorId: row.aclRootNarratorId,
-				chapterId: row.chapterId,
 				contextProjectId: row.contextProjectId,
 			},
 			principal,
@@ -1184,7 +1176,6 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 		visible.push({
 			...toRecord(row.question),
 			narratorTitle: row.narratorTitle,
-			chapterId: row.chapterId,
 		});
 	}
 

@@ -25,9 +25,12 @@
  * (messageId, blockIndex) pair.
  */
 
+import type { FileTarget } from "@shared/file-reference";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { extractField, isTruncated, resolveDisplayText } from "@shared/pretext-layout/tool-detail";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { isRunningForegroundBash } from "../tool-call/tool-display";
+import { toolExecutionFallback, toolFileTarget } from "../tool-call/tool-file-target";
 import { runningSendTargetNarratorId } from "../trace/trace-row-identity";
 
 /** Tools whose input carries a file path worth offering in the menu. */
@@ -65,7 +68,10 @@ export interface VListToolMeta {
 	sendTargetNarratorId?: string;
 	/** File-oriented tools: the input file path (copy path / view file). */
 	filePath?: string;
-	/** Read tool → the file can be previewed inline (modal). */
+	/** Frozen tool execution target; absent history must not inherit current context. */
+	fileTarget?: FileTarget;
+	fileNarratorId?: string;
+	/** Read tool → offers the authorized file viewer action. */
 	isReadTool?: boolean;
 	/**
 	 * Any file-oriented tool (Read / Write / Edit) with a path → the file can be
@@ -199,6 +205,12 @@ export function deriveSendTargetNarratorId(
  * the `<subagent_id>` tag in its output, and only then the server's live
  * resolution of the selector — which is the only source that exists while the wait
  * is still running.
+ *
+ * ⚠️ The tag is wider than the card's identity row: it holds a LABEL (a valid
+ * selector), not the real narrator id. A legacy row whose metadata lacks the id
+ * (predating its introduction) still offers the menu jump through this fallback,
+ * but its card shows no identity row — classifyAwait deliberately refuses the tag,
+ * since printing a selector as if it were the id would mislead copy-paste.
  */
 export function deriveAwaitAgentNarratorId(
 	block: ContentBlock,
@@ -218,7 +230,7 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 	if (block.type !== "tool_use") return null;
 	const record = block as unknown as Record<string, unknown>;
 	const toolName = nonEmpty(block.name) ?? nonEmpty(record.toolName);
-	const input = record.input ?? record.inputJson;
+	const input = record.inputJson ?? record.input;
 	const inputRecord = asRecord(input);
 	const metadata = readMetadata(block);
 	const activity = asRecord(record._subagentActivity);
@@ -231,7 +243,11 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 	const toolUseId = nonEmpty(record.id) ?? nonEmpty(record.toolUseId);
 	if (toolUseId) meta.toolUseId = toolUseId;
 	if (isRunningForegroundBash(toolName, inputRecord, status, metadata)) meta.isRunningBash = true;
-	if (toolName === "Await" && inputRecord.type === "question" && status === "running") {
+	if (
+		toolName === "Await" &&
+		inputRecord.type === "question" &&
+		(status === "running" || status === "executing")
+	) {
 		meta.awaitQuestionId = nonEmpty(inputRecord.id);
 		const seq = record.seq ?? record.messageSeq;
 		if (typeof seq === "number" && Number.isFinite(seq)) meta.awaitQuestionSeq = seq;
@@ -253,6 +269,8 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 	if (sendTargetNarratorId) meta.sendTargetNarratorId = sendTargetNarratorId;
 	if (filePath) {
 		meta.filePath = filePath;
+		const target = toolFileTarget(block, filePath);
+		if (target) meta.fileTarget = target;
 		meta.isFileTool = true;
 		if (toolName === "Read") meta.isReadTool = true;
 	}
@@ -273,16 +291,44 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 export function buildToolMetaIndex(messages: readonly NarratorMsg[]): Map<string, VListToolMeta> {
 	const index = new Map<string, VListToolMeta>();
 	for (const msg of messages) {
-		if (!Array.isArray(msg?.contentJson)) continue;
-		for (const raw of msg.contentJson as ContentBlock[]) {
+		const body = messageBody(msg);
+		if (!body.length) continue;
+		const calls = new Map(msg.toolCalls?.map((call) => [call.toolUseId, call]));
+		for (const raw of body) {
 			if (!raw || typeof raw !== "object" || raw.type !== "tool_use") continue;
 			const toolUseId = typeof raw.id === "string" ? raw.id : undefined;
 			if (!toolUseId) continue;
+			const call = calls.get(toolUseId);
+			const execution = toolExecutionFallback(raw, call);
+			// Non-file live lifecycle projections do not grant file identity. Keep
+			// their existing input/status updates when streaming blocks lack row refs.
+			const liveNonFileCall =
+				call &&
+				!FILE_TOOLS.has(call.toolName ?? raw.name ?? "") &&
+				raw.tcId == null &&
+				raw.executionAttempt == null;
 			const meta = deriveToolMeta({
 				...raw,
+				executionDeviceId: raw.executionDeviceId ?? execution?.executionDeviceId,
+				executionCwd: raw.executionCwd ?? execution?.executionCwd,
+				resolvedFilePath: raw.resolvedFilePath ?? execution?.resolvedFilePath,
+				executionTarget: raw.executionTarget ?? execution?.executionTarget,
+				// Streaming blocks may still carry empty input and no lifecycle status.
+				// The matching tool-call record is the authoritative live projection.
+				...(call && (execution || liveNonFileCall)
+					? {
+							name: call.toolName,
+							input: call.inputJson ?? raw.input,
+							inputJson: call.inputJson ?? raw.inputJson,
+							status: call.status,
+						}
+					: {}),
 				seq: typeof raw.seq === "number" ? raw.seq : msg.seq,
 			} as ContentBlock);
-			if (meta) index.set(toolUseId, meta);
+			if (meta) {
+				if (meta.fileTarget) meta.fileNarratorId = msg.narratorId;
+				index.set(toolUseId, meta);
+			}
 		}
 	}
 	return index;
