@@ -24,6 +24,7 @@ import {
 
 const PRODUCT_SKILL = `novelfork-home-probe-${process.pid}`;
 const LEGACY_SKILL = `narrafork-legacy-probe-${process.pid}`;
+const AGENT_SKILL = `coding-agent-probe-${process.pid}`;
 
 const cleanup: string[] = [];
 let novelForkHome: string;
@@ -103,6 +104,44 @@ describe("global skill scanning inside the NovelFork product", () => {
 		expect(found?.location).toBe(location);
 	});
 
+	it("ignores coding-agent skill directories under the home root", async () => {
+		const codexHome = await mkdtemp(join(tmpdir(), "skill-nf-codex-home-"));
+		cleanup.push(codexHome);
+		const originalCodexHome = process.env.CODEX_HOME;
+		process.env.CODEX_HOME = codexHome;
+		try {
+			await writeSkillUnder(join(homedir(), ".claude", "skills"), `${AGENT_SKILL}-claude`);
+			await writeSkillUnder(join(homedir(), ".agents", "skills"), `${AGENT_SKILL}-agents`);
+			await writeSkillUnder(join(homedir(), ".codex", "skills"), `${AGENT_SKILL}-codex`);
+			await writeSkillUnder(join(codexHome, "skills"), `${AGENT_SKILL}-codex-home`);
+			await writeSkillUnder(join(novelForkHome, "skills"), PRODUCT_SKILL);
+
+			const names = new Set((await loadGlobalSkills()).map((s) => s.name));
+			expect(names.has(PRODUCT_SKILL)).toBe(true);
+			for (const suffix of ["claude", "agents", "codex", "codex-home"]) {
+				expect(names.has(`${AGENT_SKILL}-${suffix}`)).toBe(false);
+			}
+			const { skills } = await loadSkillSummariesForContext({}, { forceRefresh: true });
+			expect(skills.some((s) => s.name.startsWith(AGENT_SKILL))).toBe(false);
+		} finally {
+			if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+			else process.env.CODEX_HOME = originalCodexHome;
+		}
+	});
+
+	it("scans only <project>/.novelfork/skills for a project root", async () => {
+		const projectRoot = await mkdtemp(join(tmpdir(), "skill-nf-project-"));
+		cleanup.push(projectRoot);
+		const location = await writeSkillUnder(join(projectRoot, ".novelfork", "skills"), PRODUCT_SKILL);
+		await writeSkillUnder(join(projectRoot, ".claude", "skills"), `${AGENT_SKILL}-claude`);
+		await writeSkillUnder(join(projectRoot, ".agents", "skills"), `${AGENT_SKILL}-agents`);
+		await writeSkillUnder(join(projectRoot, ".codex", "skills"), `${AGENT_SKILL}-codex`);
+
+		const skills = await loadProjectSkills(projectRoot);
+		expect(skills.find((s) => s.name === PRODUCT_SKILL)?.location).toBe(location);
+		expect(skills.some((s) => s.name.startsWith(AGENT_SKILL))).toBe(false);
+	});
+
 	it("does not scan $NOVELFORK_HOME/skills for a project root", async () => {
 		await writeSkillUnder(join(novelForkHome, "skills"), PRODUCT_SKILL);
 		const projectRoot = await mkdtemp(join(tmpdir(), "skill-nf-project-"));
@@ -120,6 +159,14 @@ describe("global skill scanning without a hosting product", () => {
 		const location = await writeSkillUnder(join(homedir(), ".narrafork", "skills"), LEGACY_SKILL);
 
 		const found = (await loadGlobalSkills()).find((s) => s.name === LEGACY_SKILL);
+		expect(found?.location).toBe(location);
+	});
+
+	it("keeps coding-agent skill directories readable for a standalone Runtime", async () => {
+		delete process.env.NOVELFORK_HOME;
+		const location = await writeSkillUnder(join(homedir(), ".claude", "skills"), AGENT_SKILL);
+
+		const found = (await loadGlobalSkills()).find((s) => s.name === AGENT_SKILL);
 		expect(found?.location).toBe(location);
 	});
 });

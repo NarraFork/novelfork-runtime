@@ -327,16 +327,24 @@ function getNovelForkHome(): string | null {
 function getSkillSearchDirs(basePath: string): string[] {
 	const isHome = resolve(basePath) === getHomeDir();
 	const isHomeRoot = isHome || canonical(basePath) === getHomeDir();
-	// Inside the product, the home root's Skill directory is the product's global one, which
-	// NOVELFORK_HOME may relocate off the user profile. `~/.narrafork` then belongs to a
-	// standalone NarraFork install on the same machine, so its skills must not leak in.
-	const novelForkHome = isHomeRoot ? getNovelForkHome() : null;
+	// Inside the product only the product's own `.novelfork` roots are scanned: the global
+	// `$NOVELFORK_HOME/skills` (relocatable off the user profile, plus `$NARRAFORK_HOME/skills`,
+	// which the product keeps under `$NOVELFORK_HOME/.runtime`) and a project's
+	// `<project>/.novelfork/skills`. `~/.narrafork` belongs to a standalone NarraFork install, and
+	// `.claude` / `.agents` / `.codex` hold the user's coding-agent skills; listing either as
+	// writing skills put dozens of unrelated entries in front of authors and narrators.
+	const novelForkHome = getNovelForkHome();
+	if (novelForkHome) {
+		if (!isHomeRoot) return [join(basePath, ".novelfork", "skills")];
+		const productDirs = [join(novelForkHome, "skills")];
+		const narraforkSkills = join(getNarraforkHome(), "skills");
+		if (!productDirs.includes(narraforkSkills)) productDirs.push(narraforkSkills);
+		return productDirs;
+	}
 	const dirs = [
-		// NovelFork product projects use this path as the only canonical project Skill root.
-		novelForkHome ? join(novelForkHome, "skills") : join(basePath, ".novelfork", "skills"),
-		...(isHome && !novelForkHome
+		join(basePath, ".novelfork", "skills"),
+		...(isHome
 			? [
-				// Keep Runtime's legacy global locations readable when no product hosts the Runtime.
 				join(basePath, ".narrafork", "skills"),
 				join(basePath, ".narrafork", "skill"),
 			]
@@ -369,6 +377,14 @@ function getSkillSearchDirs(basePath: string): string[] {
 	}
 
 	return dirs;
+}
+
+/**
+ * The directories the global (user-level) scan reads, in priority order, so the UI can
+ * name the real locations instead of a hardcoded list that is wrong inside a hosting product.
+ */
+export function getGlobalSkillSearchDirs(): string[] {
+	return getSkillSearchDirs(homedir());
 }
 
 /**
@@ -1418,6 +1434,7 @@ export const skillService = {
 	loadProjectSkills,
 	loadProjectSkillByName,
 	loadGlobalSkills,
+	getGlobalSkillSearchDirs,
 	loadAllSkills,
 	loadSkillByName,
 	loadSkillSummariesForContext,

@@ -265,6 +265,7 @@ export const miscApi = {
 				disabled: boolean;
 			}>
 		>("/skills/global"),
+	listGlobalSkillSearchDirs: () => request<{ dirs: string[] }>("/skills/global-search-dirs"),
 	getGlobalSkill: (name: string) =>
 		request<{
 			name: string;

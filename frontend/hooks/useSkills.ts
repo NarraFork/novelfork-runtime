@@ -83,6 +83,17 @@ export function useGlobalSkills(enabled = true) {
 	});
 }
 
+/** Directories the server's global skill scan actually reads (differs when a product hosts it). */
+export function useGlobalSkillSearchDirs(enabled = true) {
+	return useQuery({
+		queryKey: ["global-skill-search-dirs"],
+		queryFn: () => api.listGlobalSkillSearchDirs(),
+		enabled,
+		staleTime: Number.POSITIVE_INFINITY,
+		gcTime: SKILL_QUERY_GC_TIME_MS,
+	});
+}
+
 export function useGlobalSkill(name: string, enabled = true) {
 	return useQuery({
 		queryKey: ["global-skill", name],

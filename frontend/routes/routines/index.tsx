@@ -98,6 +98,7 @@ import {
 import {
 	useCreateGlobalSkill,
 	useDeleteGlobalSkill,
+	useGlobalSkillSearchDirs,
 	useGlobalSkills,
 	useGlobalSkillsRefresh,
 	useToggleGlobalSkill,
@@ -911,6 +912,7 @@ function GlobalSkillsTab() {
 		: (skillsCapability.reason ?? t("globalSkillsUnsupportedDesc"));
 	const canManageGlobalSkills = skillsCapability.supported;
 	const { data: skills, isLoading } = useGlobalSkills(canManageGlobalSkills);
+	const { data: searchDirs } = useGlobalSkillSearchDirs(canManageGlobalSkills);
 	const createMutation = useCreateGlobalSkill();
 	const updateMutation = useUpdateGlobalSkill();
 	const deleteMutation = useDeleteGlobalSkill();
@@ -996,7 +998,9 @@ function GlobalSkillsTab() {
 		<Stack>
 			<Group justify="space-between">
 				<Text size="sm" c="dimmed" style={{ flex: 1 }}>
-					{t("globalSkillsDesc")}
+					{searchDirs?.dirs.length
+						? t("globalSkillsDescWithDirs", { dirs: searchDirs.dirs.join(t("globalSkillsDirSeparator")) })
+						: t("globalSkillsDesc")}
 				</Text>
 				{skillsUnsupportedReason && (
 					<Alert color="yellow" variant="light" title={t("globalSkillsUnsupportedTitle")}>

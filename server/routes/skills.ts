@@ -56,6 +56,15 @@ skillRoutes.get("/global", async (c) => {
 });
 
 /**
+ * GET /api/skills/global-search-dirs
+ * Directories the global scan reads, in priority order. Registered as its own path, not
+ * under `/global/`, so it can never be mistaken for a skill named "search-dirs".
+ */
+skillRoutes.get("/global-search-dirs", (c) => {
+	return c.json({ dirs: skillService.getGlobalSkillSearchDirs() });
+});
+
+/**
  * GET /api/skills/global/:name
  * Get a single global skill's full content.
  */

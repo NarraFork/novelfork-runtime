@@ -12,6 +12,8 @@
 	"commandBashCommand": "Bash 指令",
 	"commandBashCommandPlaceholder": "例如 git status --short。支持 {{input}} 和参数占位符。",
 	"globalSkillsDesc": "对所有项目可用的技能。扫描自 ~/.narrafork/skills/、~/.claude/skills/、~/.agents/skills/。",
+	"globalSkillsDescWithDirs": "对所有项目可用的技能。扫描自 {{dirs}}。",
+	"globalSkillsDirSeparator": "、",
 	"globalSkillsUnsupportedTitle": "全局技能不可用",
 	"globalSkillsUnsupportedDesc": "当前后端运行时不支持全局技能。",
 	"projectSkillsDesc": "限定于特定项目的技能。可以在页面中创建、编辑和删除，内容会写入项目 git 仓库。",
