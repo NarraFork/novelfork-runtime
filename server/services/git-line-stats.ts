@@ -100,6 +100,9 @@ async function gitOutput(cwd: string, args: string[], signal: AbortSignal): Prom
 			maxBytes: GIT_LINE_STATS_OUTPUT_BYTES,
 			onChunk(chunk) {
 				chunks.push(chunk.slice());
+				// Fork layer: tsc 5.9 rejects a void-returning method where the contract is
+				// `boolean | undefined`; returning undefined keeps the stream reading.
+				return undefined;
 			},
 		},
 	});
