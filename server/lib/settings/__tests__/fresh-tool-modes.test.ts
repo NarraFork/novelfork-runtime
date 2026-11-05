@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getBuiltinToolRoutines } from "../../builtin-routines";
+import { getBuiltinToolRoutines, getRuntimeOwnToolRoutines } from "../../builtin-routines";
+import type { RuntimeProductIntegration } from "../../product-host/contracts";
+import {
+	registerRuntimeProductIntegration,
+	resetRuntimeProductIntegrationForTests,
+} from "../../product-host/registry";
 import { narraforkDir, reloadSettings } from "../index";
 
 const path = join(narraforkDir, "settings.json");
@@ -23,6 +28,26 @@ describe("fresh optional-tool defaults", () => {
 		expect(Object.keys(fresh.routines.toolModes ?? {}).sort()).toEqual(ids.sort());
 		expect(Object.values(fresh.routines.toolModes ?? {})).toEqual(ids.map(() => "auto"));
 		writeFileSync(path, original);
+	});
+
+	test("a fresh install does not lock the product registry before a product registers", () => {
+		// Fork layer: settings load while the product entry is still importing Runtime
+		// modules. Writing fresh defaults must not read product routines, or the later
+		// registerRuntimeProductIntegration() call is rejected and the product cannot start.
+		original = readFileSync(path, "utf8");
+		renameSync(path, backup);
+		resetRuntimeProductIntegrationForTests();
+		try {
+			const fresh = reloadSettings();
+			const ownIds = getRuntimeOwnToolRoutines().map((routine) => routine.id);
+			expect(Object.keys(fresh.routines.toolModes ?? {}).sort()).toEqual(ownIds.sort());
+			expect(() =>
+				registerRuntimeProductIntegration({ id: "fresh-settings-probe" } as RuntimeProductIntegration),
+			).not.toThrow();
+		} finally {
+			resetRuntimeProductIntegrationForTests();
+			writeFileSync(path, original);
+		}
 	});
 
 	test("does not merge fresh defaults into an existing configuration", () => {

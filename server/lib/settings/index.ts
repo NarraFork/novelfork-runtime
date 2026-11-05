@@ -18,7 +18,7 @@ import { resolve } from "node:path";
 import { normalizeMcpLoadingConfig } from "@shared/mcp-loading-mode";
 import { normalizeProxyUrl } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
-import { getBuiltinToolRoutines } from "../builtin-routines";
+import { getRuntimeOwnToolRoutines } from "../builtin-routines";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { generateShortId } from "../id";
@@ -361,12 +361,15 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (!existsSync(settingsPath)) {
 		// Only a new installation opts into discovery. Merging these into DEFAULTS
 		// would silently change every existing user's explicit manual/resident choices.
+		// Fork layer: Runtime-own routines only. Settings load before a product registers,
+		// so reading product routines here would lock the product registry; product
+		// routines keep their declared defaultMode instead.
 		const initial = {
 			...DEFAULTS,
 			routines: {
 				...DEFAULTS.routines,
 				toolModes: Object.fromEntries(
-					getBuiltinToolRoutines().map((routine) => [routine.id, "auto"]),
+					getRuntimeOwnToolRoutines().map((routine) => [routine.id, "auto"]),
 				),
 			},
 		};

@@ -486,6 +486,15 @@ export function getBuiltinToolRoutines(): BuiltinRoutine[] {
 	return getAllBuiltinRoutines().filter((r) => r.type === "tool");
 }
 
+/**
+ * Fork layer: only the Runtime's own tool routines, without product contributions.
+ * For callers that run while settings first load (before a product registers): reading
+ * product routines there would lock the product registry and reject the registration.
+ */
+export function getRuntimeOwnToolRoutines(): BuiltinRoutine[] {
+	return BUILTIN_ROUTINES.filter((r) => r.type === "tool");
+}
+
 /** Return every registry tool controlled by one built-in tool routine. */
 export function getBuiltinToolNames(tool: BuiltinToolDef): string[] {
 	return [...new Set([tool.toolName, ...(tool.toolNames ?? [])])];
