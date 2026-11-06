@@ -52,6 +52,7 @@ import { useTranslation } from "react-i18next";
 import { useLogout } from "../hooks/useAuth";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
 import { useAuthenticatedSession } from "../hooks/useAuthenticatedSession";
+import { useCurrentBranding } from "../hooks/useBranding";
 import { useChatUnreadLive } from "../hooks/useChat";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
 import { useLocalPref } from "../hooks/useLocalPref";
@@ -242,6 +243,7 @@ export function AuthenticatedLayout() {
 	const navigate = useNavigate();
 	const { t } = useTranslation("nav");
 	const { t: ts } = useTranslation("settings");
+	const { feedbackUrl } = useCurrentBranding();
 	const { data: user, isLoading, fetchStatus, hasToken, sessionLost } = useAuthenticatedSession();
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
@@ -547,7 +549,7 @@ export function AuthenticatedLayout() {
 								variant="subtle"
 								color="gray"
 								component="a"
-								href="https://github.com/NarraFork/NarraFork/issues"
+								href={feedbackUrl}
 								target="_blank"
 								rel="noopener noreferrer"
 							>

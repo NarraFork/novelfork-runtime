@@ -7,6 +7,7 @@ import type {
 } from "@shared/local-provider-import";
 import { type Ref, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import { api } from "../../lib/api";
 import type { AddProviderDraft } from "./provider-add-draft";
 import type { AddProviderType } from "./provider-presets";
@@ -57,6 +58,7 @@ export function LocalProviderImport({
 	headingRef?: Ref<HTMLHeadingElement>;
 }) {
 	const { t, i18n } = useTranslation("settings");
+	const brand = useBrandName();
 	const listFormat = new Intl.ListFormat(i18n.resolvedLanguage ?? i18n.language, {
 		type: "conjunction",
 	});
@@ -164,7 +166,7 @@ export function LocalProviderImport({
 				{t("localImport.title")}
 			</Title>
 			<Text size="sm" c="dimmed">
-				{t("localImport.description")}
+				{t("localImport.description", { brand })}
 			</Text>
 
 			{knowsSources && (

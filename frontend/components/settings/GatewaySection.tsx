@@ -22,6 +22,7 @@ import { IconDeviceFloppy, IconPlus, IconQrcode, IconTrash } from "@tabler/icons
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import { type GatewayPlatform, useGatewayCapability } from "../../hooks/usePlatform";
 import { miscApi } from "../../lib/api/misc";
 import type { ProxyOverride } from "../../lib/proxy";
@@ -127,6 +128,7 @@ function normalizeGatewayConfigUrls(config: GatewayConfig): GatewayConfig {
 
 export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProps) {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const {
 		persistentRuntimes,
 		supportedPlatforms,
@@ -285,7 +287,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 	return (
 		<Stack gap="md">
 			<Text size="sm" c="dimmed">
-				{t("gatewayDesc")}
+				{t("gatewayDesc", { brand })}
 			</Text>
 			{!persistentRuntimes && (
 				<Text size="xs" c="orange">

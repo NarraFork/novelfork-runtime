@@ -30,6 +30,7 @@ import { useConfirmDialog } from "../../components/common/confirm-dialog-context
 import { DevicePathRulesEditor } from "../../components/settings/DevicePathRulesEditor";
 import { ExecutorInstallModal } from "../../components/settings/ExecutorInstallModal";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useBrandName } from "../../hooks/useBranding";
 import { api } from "../../lib/api";
 import type {
 	CreateDeviceInput,
@@ -438,6 +439,7 @@ function CreateDeviceWizard({
 	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const [step, setStep] = useState(0);
 	const [name, setName] = useState("");
 	const [slug, setSlug] = useState("");
@@ -500,8 +502,8 @@ function CreateDeviceWizard({
 							<Select
 								label={t("deviceModeLabel")}
 								data={[
-									{ value: "reverse", label: t("deviceModeReverse") },
-									{ value: "direct", label: t("deviceModeDirect") },
+									{ value: "reverse", label: t("deviceModeReverse", { brand }) },
+									{ value: "direct", label: t("deviceModeDirect", { brand }) },
 								]}
 								value={mode}
 								onChange={(value) => setMode((value as "reverse" | "direct") ?? "reverse")}
@@ -509,8 +511,8 @@ function CreateDeviceWizard({
 							<Alert color="blue" variant="light">
 								<Text size="sm">
 									{mode === "reverse"
-										? t("deviceModeReverseDescription")
-										: t("deviceModeDirectDescription")}
+										? t("deviceModeReverseDescription", { brand })
+										: t("deviceModeDirectDescription", { brand })}
 								</Text>
 							</Alert>
 							{mode === "direct" ? (
@@ -643,6 +645,7 @@ function EditDeviceModal({
 	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const [name, setName] = useState("");
 	const [description, setDescription] = useState("");
 	const [mode, setMode] = useState<"reverse" | "direct">("reverse");
@@ -684,8 +687,8 @@ function EditDeviceModal({
 				<Select
 					label={t("deviceModeLabel")}
 					data={[
-						{ value: "reverse", label: t("deviceModeReverse") },
-						{ value: "direct", label: t("deviceModeDirect") },
+						{ value: "reverse", label: t("deviceModeReverse", { brand }) },
+						{ value: "direct", label: t("deviceModeDirect", { brand }) },
 					]}
 					value={mode}
 					onChange={(value) => setMode((value as "reverse" | "direct") ?? "reverse")}

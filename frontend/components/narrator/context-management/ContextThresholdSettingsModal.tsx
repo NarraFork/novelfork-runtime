@@ -2,6 +2,7 @@ import { Anchor, Box, Button, Group, Modal, NumberInput, Stack, Text } from "@ma
 import { IconExternalLink } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../../hooks/useBranding";
 import {
 	type ContextManagementDraft,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
@@ -31,6 +32,7 @@ export function ContextThresholdSettingsModal({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: ts } = useTranslation("settings");
+	const brand = useBrandName();
 	const [draft, setDraft] = useState<ContextManagementDraft>(current);
 
 	// Reseed the draft from the effective settings whenever the modal (re)opens,
@@ -49,7 +51,7 @@ export function ContextThresholdSettingsModal({
 		>
 			<Stack gap="md">
 				<Text size="sm" c="dimmed">
-					{t("contextThresholdSettingsIntro")}
+					{t("contextThresholdSettingsIntro", { brand })}
 				</Text>
 				<NumberInput
 					label={ts("autoCompactKeepPairs")}

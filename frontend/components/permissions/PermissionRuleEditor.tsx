@@ -16,6 +16,7 @@ import {
 import { IconPlus, IconTrash } from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import type { PathFlavor, RuleTargetSelector } from "../../lib/api/types";
 import {
 	devicePathFlavor,
@@ -63,12 +64,13 @@ function describeSelector(
 	selector: RuleTargetSelector,
 	devices: readonly PermissionTargetDevice[],
 	t: (key: string, options?: Record<string, unknown>) => string,
+	brand: string,
 ): string {
 	switch (selector.kind) {
 		case "all":
 			return t("permissionTargetSummaryAll");
 		case "host":
-			return t("permissionTargetSummaryHost");
+			return t("permissionTargetSummaryHost", { brand });
 		case "device":
 			return t("permissionTargetSummaryDevice", {
 				device:
@@ -103,6 +105,7 @@ function RuleRow({
 	onDelete: (index: number, value: PermissionRuleValue) => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const brand = useBrandName();
 	const [text, setText] = useState(rule.path ?? rule.pattern ?? "");
 	const [targetOpen, setTargetOpen] = useState(false);
 	const [denyPrompt, setDenyPrompt] = useState(rule.denyPrompt ?? "");
@@ -179,7 +182,7 @@ function RuleRow({
 				{/* The target is a summary line by default; most rules never change it. */}
 				<Group gap={6} wrap="nowrap" justify="space-between">
 					<Text size="xs" c="dimmed" truncate>
-						{describeSelector(rule.selector, devices, t)}
+						{describeSelector(rule.selector, devices, t, brand)}
 					</Text>
 					<Anchor
 						component="button"
@@ -298,6 +301,7 @@ export function PermissionRuleEditor({
 	onDelete: (index: number, value: PermissionRuleValue) => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const brand = useBrandName();
 	const directory = isDirectory(kind);
 	const [text, setText] = useState("");
 	// New rules target whatever the session currently runs on, so the common case
@@ -408,7 +412,7 @@ export function PermissionRuleEditor({
 					</Group>
 					<Group gap={6} wrap="nowrap" justify="space-between">
 						<Text size="xs" c="dimmed" truncate>
-							{describeSelector(selector, devices, t)}
+							{describeSelector(selector, devices, t, brand)}
 						</Text>
 						<Anchor
 							component="button"

@@ -19,6 +19,7 @@ import type { ExecutorInstallTarget } from "@shared/remote-executor";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import { api } from "../../lib/api";
 import type {
 	ExecutorTokenDelivery,
@@ -56,6 +57,7 @@ export function ExecutorInstallModal({
 	onClose: () => void;
 }) {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const deviceId = device?.id;
 	const [initializedDevice, setInitializedDevice] = useState<string | undefined>();
 	const [target, setTarget] = useState<ExecutorInstallTarget | null>(null);
@@ -333,7 +335,7 @@ export function ExecutorInstallModal({
 											)}
 								</Text>
 								<TextInput
-									label={t("executorInstallServerUrl")}
+									label={t("executorInstallServerUrl", { brand })}
 									value={serverBaseUrl}
 									onChange={(event) => {
 										setServerBaseUrl(event.currentTarget.value);
@@ -342,7 +344,7 @@ export function ExecutorInstallModal({
 								/>
 								{urlProblem === "loopback" && urlBlocked ? (
 									<Button onClick={() => setConfirmedLoopback(trimmedBaseUrl)}>
-										{t("executorInstallConfirmLocalHost")}
+										{t("executorInstallConfirmLocalHost", { brand })}
 									</Button>
 								) : null}
 							</Stack>
@@ -511,8 +513,8 @@ export function ExecutorInstallModal({
 								allowDeselect={false}
 							/>
 							<TextInput
-								label={t("executorInstallServerUrl")}
-								description={t("executorInstallServerUrlHelp")}
+								label={t("executorInstallServerUrl", { brand })}
+								description={t("executorInstallServerUrlHelp", { brand })}
 								placeholder="https://narrafork.example.com"
 								value={serverBaseUrl}
 								onChange={(event) => {
@@ -540,7 +542,7 @@ export function ExecutorInstallModal({
 							/>
 							{!canEnroll ? (
 								<Alert color="yellow" variant="light">
-									{t("executorInstallTokenDeliveryUnavailable")}
+									{t("executorInstallTokenDeliveryUnavailable", { brand })}
 								</Alert>
 							) : null}
 							<Alert color="blue" variant="light">

@@ -1,6 +1,7 @@
 import { Alert, Select, Stack, Text } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import type {
 	PathFlavor,
 	RuleTargetSelector as RuleTargetSelectorValue,
@@ -77,6 +78,7 @@ export function RuleTargetSelector({
 	disabled?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
+	const brand = useBrandName();
 	const selectedDevice = selectorDevice(value, devices);
 	const missingDevice = value.kind === "device" && !selectedDevice;
 	const deviceOptions = devices.map((device) => ({
@@ -85,7 +87,7 @@ export function RuleTargetSelector({
 	}));
 	const data = [
 		{ value: ALL_VALUE, label: t("permissionTargetAll") },
-		{ value: HOST_VALUE, label: t("permissionTargetHost") },
+		{ value: HOST_VALUE, label: t("permissionTargetHost", { brand }) },
 		...(showOauthGroups
 			? [
 					{ value: `${OAUTH_PREFIX}global`, label: t("permissionTargetOauthGlobal") },

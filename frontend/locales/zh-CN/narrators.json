@@ -129,7 +129,7 @@
 		"cwdLabel": "工作目录",
 		"cwdHint": "默认使用会话原来的目录。继续对话时工具会在这里运行。",
 		"modelLabel": "模型",
-		"modelHint": "在 NarraFork 中继续对话时使用。",
+		"modelHint": "在 {{brand}} 中继续对话时使用。",
 		"selectSession": "请先选择一个会话。",
 		"importAction": "导入",
 		"importFailed": "导入失败。",

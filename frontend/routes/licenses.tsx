@@ -32,6 +32,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { Fragment, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLicenses, useLicenseText } from "../hooks/use-licenses";
+import { useBrandName } from "../hooks/useBranding";
 import type { LicenseEntryKind, LicenseSummary } from "../lib/api";
 import { getToken } from "../lib/api";
 
@@ -61,6 +62,7 @@ function entryKey(dep: LicenseSummary): string {
 
 function LicensesPage() {
 	const { t } = useTranslation("common");
+	const brand = useBrandName();
 	const [search, setSearch] = useState("");
 	const backTo = getToken() ? "/" : "/login";
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
@@ -99,7 +101,7 @@ function LicensesPage() {
 					<Title order={2}>{t("licensesTitle")}</Title>
 				</Group>
 				<Text c="dimmed" mb="md">
-					{t("licensesDescription")}
+					{t("licensesDescription", { brand })}
 				</Text>
 
 				{errors.length > 0 && (
@@ -179,6 +181,7 @@ function LicenseGroup({
 	forceOpen: boolean;
 }) {
 	const { t } = useTranslation("common");
+	const brand = useBrandName();
 	// `bundled` and `runtime` start open because they are what a reader checking
 	// compliance came for; the 317 dev-only rows start collapsed.
 	const [open, setOpen] = useState(kind !== "development");
@@ -214,7 +217,7 @@ function LicenseGroup({
 				</Group>
 			</UnstyledButton>
 			<Text c="dimmed" size="xs" mb="xs">
-				{t(descriptionKey)}
+				{t(descriptionKey, { brand })}
 			</Text>
 			<Collapse expanded={isOpen}>
 				{isOpen && (
@@ -249,6 +252,7 @@ function DepName({ dep }: { dep: LicenseSummary }) {
 /** License badge, annotated when the identifier is a selected branch of a disjunction. */
 function LicenseBadge({ dep }: { dep: LicenseSummary }) {
 	const { t } = useTranslation("common");
+	const brand = useBrandName();
 	if (!dep.declaredLicense) {
 		return (
 			<Badge variant="light" size="sm">
@@ -260,7 +264,7 @@ function LicenseBadge({ dep }: { dep: LicenseSummary }) {
 		<Tooltip
 			multiline
 			w={280}
-			label={`${t("licensesSelectedFrom", { declared: dep.declaredLicense })}${
+			label={`${t("licensesSelectedFrom", { declared: dep.declaredLicense, brand })}${
 				dep.selectionReason ? ` — ${dep.selectionReason}` : ""
 			}`}
 		>

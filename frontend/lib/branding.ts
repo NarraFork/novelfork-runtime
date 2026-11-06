@@ -123,7 +123,10 @@ export function applyBranding(input: Partial<ResolvedBranding> | undefined): Res
 	// `getCurrentBranding` backs a `useSyncExternalStore` snapshot, so handing back
 	// a fresh-but-equal object would re-render every subscriber on each query settle
 	// and each StrictMode double-invoked effect.
-	const unchanged = current.name === branding.name && current.iconColor === branding.iconColor;
+	const unchanged =
+		current.name === branding.name &&
+		current.iconColor === branding.iconColor &&
+		current.feedbackUrl === branding.feedbackUrl;
 
 	// The DOM writes run regardless. They are not a consequence of the value
 	// *changing* but of this being the module that owns those attributes: the initial

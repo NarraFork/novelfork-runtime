@@ -9,9 +9,17 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { DEFAULT_BRAND_ICON_COLOR, DEFAULT_BRAND_NAME } from "@shared/branding";
+import {
+	DEFAULT_BRAND_FEEDBACK_URL,
+	DEFAULT_BRAND_ICON_COLOR,
+	DEFAULT_BRAND_NAME,
+} from "@shared/branding";
 import { Hono } from "hono";
 import { clearBrandIconCache } from "../../../server/lib/branding";
+import {
+	registerRuntimeProductIntegration,
+	resetRuntimeProductIntegrationForTests,
+} from "../../../server/lib/product-host";
 import { settings } from "../../../server/lib/settings";
 import brandingRoutes from "../../../server/routes/branding";
 
@@ -32,6 +40,7 @@ function setBranding(branding: { name?: string; iconColor?: string } | undefined
 
 afterEach(() => {
 	setBranding(undefined);
+	resetRuntimeProductIntegrationForTests();
 });
 
 describe("GET /api/branding", () => {
@@ -51,6 +60,7 @@ describe("GET /api/branding", () => {
 			name: DEFAULT_BRAND_NAME,
 			iconColor: DEFAULT_BRAND_ICON_COLOR,
 			customized: false,
+			feedbackUrl: DEFAULT_BRAND_FEEDBACK_URL,
 		});
 	});
 
@@ -61,15 +71,36 @@ describe("GET /api/branding", () => {
 			name: "Work Instance",
 			iconColor: "#e64980",
 			customized: true,
+			feedbackUrl: DEFAULT_BRAND_FEEDBACK_URL,
 		});
 	});
 
-	test("exposes only the three branding fields, whatever else settings hold", async () => {
+	test("takes the feedback URL from the product integration", async () => {
+		resetRuntimeProductIntegrationForTests();
+		registerRuntimeProductIntegration({
+			id: "test.product",
+			branding: () => ({ feedbackUrl: "https://example.com/feedback" }),
+		});
+		const body = (await (await app.request("/api/branding")).json()) as { feedbackUrl: string };
+		expect(body.feedbackUrl).toBe("https://example.com/feedback");
+	});
+
+	test("ignores a non-http(s) product feedback URL", async () => {
+		resetRuntimeProductIntegrationForTests();
+		registerRuntimeProductIntegration({
+			id: "test.product",
+			branding: () => ({ feedbackUrl: "javascript:alert(1)" }),
+		});
+		const body = (await (await app.request("/api/branding")).json()) as { feedbackUrl: string };
+		expect(body.feedbackUrl).toBe(DEFAULT_BRAND_FEEDBACK_URL);
+	});
+
+	test("exposes only the public branding fields, whatever else settings hold", async () => {
 		// The response is built field-by-field rather than spread, so this asserts the
 		// shape cannot grow by accident on an UNAUTHENTICATED endpoint.
 		setBranding({ name: "Home", iconColor: "#12b886" });
 		const body = (await (await app.request("/api/branding")).json()) as Record<string, unknown>;
-		expect(Object.keys(body).sort()).toEqual(["customized", "iconColor", "name"]);
+		expect(Object.keys(body).sort()).toEqual(["customized", "feedbackUrl", "iconColor", "name"]);
 	});
 
 	test("normalizes a stored short-form colour before returning it", async () => {

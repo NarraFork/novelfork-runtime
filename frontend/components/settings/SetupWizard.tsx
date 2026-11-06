@@ -384,7 +384,7 @@ function ProviderStep({
 				{t("wizardProviderDesc", { brand })}
 			</Text>
 			<Text size="sm" c="dimmed">
-				{t("wizardProviderImportHint")}
+				{t("wizardProviderImportHint", { brand })}
 			</Text>
 			<Group>
 				{providerCount > 0 ? (
@@ -583,7 +583,7 @@ function NetworkStep({
 			</Text>
 			<SegmentedControl fullWidth value={mode} onChange={handleChange} data={segmentData} />
 			<Text size="xs" c="dimmed">
-				{t(descKey)}
+				{t(descKey, { brand })}
 			</Text>
 			{mode === "lan" && firstLan && (
 				<Text size="xs" c="dimmed">

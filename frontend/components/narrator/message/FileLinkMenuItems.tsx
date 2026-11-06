@@ -21,6 +21,7 @@
  * action could reach it. The file panels gate their own download the same way.
  */
 
+import { useBrandName } from "@frontend/hooks/useBranding";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { ApiError, api } from "@frontend/lib/api";
 import {
@@ -51,6 +52,7 @@ export function FileLinkMenuItems({
 	onClose: () => void;
 }) {
 	const { t: tNarrator } = useTranslation("narrator");
+	const brand = useBrandName();
 	const { data: userPrefs } = useUserPreferences();
 
 	if (!target || target.deviceId !== "local") return null;
@@ -68,7 +70,7 @@ export function FileLinkMenuItems({
 				title: tNarrator("contextMenu_copyFileFailed"),
 				message:
 					error instanceof ApiError && error.status === 403
-						? tNarrator("contextMenu_copyFileRemote")
+						? tNarrator("contextMenu_copyFileRemote", { brand })
 						: error instanceof Error
 							? error.message
 							: String(error),

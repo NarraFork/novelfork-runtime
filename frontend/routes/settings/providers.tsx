@@ -69,6 +69,7 @@ import {
 	tokenDanceDraftSnapshot,
 } from "../../components/providers/tokendance-flow";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useBrandName } from "../../hooks/useBranding";
 import { modelCatalogKeys } from "../../hooks/useModelCatalog";
 import { useAllModels } from "../../hooks/useModels";
 import {
@@ -143,6 +144,7 @@ export function SettingsProvidersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
+	const brand = useBrandName();
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const settingsFeatureCapability = useSettingsFeatureCapability();
@@ -629,7 +631,7 @@ export function SettingsProvidersPage() {
 	const confirmSaveBeforeRefresh = useCallback(async () => {
 		const confirmed = await confirm({
 			title: t("saveBeforeRefreshTitle"),
-			message: t("saveBeforeRefreshMessage"),
+			message: t("saveBeforeRefreshMessage", { brand }),
 			confirmLabel: t("saveAndRefresh"),
 			cancelLabel: tc("cancel"),
 			confirmColor: "indigo",
@@ -641,7 +643,7 @@ export function SettingsProvidersPage() {
 		} catch {
 			return false;
 		}
-	}, [confirm, saveProvidersState, t, tc]);
+	}, [confirm, saveProvidersState, t, tc, brand]);
 
 	const saveBeforeNugAction = useCallback(async () => {
 		try {

@@ -23,6 +23,7 @@ import { resolveBranding } from "@shared/branding";
 import { Hono } from "hono";
 import { type BrandAssetName, getBrandIcons } from "../lib/branding";
 import { logger } from "../lib/logger";
+import { getRuntimeProductIntegration } from "../lib/product-host";
 import { settings } from "../lib/settings";
 
 const app = new Hono();
@@ -36,7 +37,12 @@ const ASSET_ROUTES: Array<{ path: string; asset: BrandAssetName }> = [
 ];
 
 app.get("/", (c) => {
-	const branding = resolveBranding(settings.branding);
+	// The feedback target belongs to the host product, not to instance settings, so
+	// it is merged in here rather than stored in `settings.branding`.
+	const branding = resolveBranding({
+		...settings.branding,
+		feedbackUrl: getRuntimeProductIntegration().branding?.()?.feedbackUrl,
+	});
 	// Built explicitly rather than spread: this response is unauthenticated, so the
 	// shape must not be able to grow by accident when `settings.branding` does.
 	return c.json(
@@ -44,6 +50,7 @@ app.get("/", (c) => {
 			name: branding.name,
 			iconColor: branding.iconColor,
 			customized: branding.customized,
+			feedbackUrl: branding.feedbackUrl,
 		},
 		200,
 		{ "Cache-Control": "no-cache" },

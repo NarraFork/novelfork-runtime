@@ -54,6 +54,7 @@ import {
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import {
 	useCodexManagerParityCapability,
 	useProviderRuntimeCapability,
@@ -407,6 +408,7 @@ export const CodexSection = React.memo(function CodexSection({
 	onTestModel,
 }: CodexSectionProps) {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const { data: codexSettingsData } = useQuery({
@@ -476,9 +478,9 @@ export const CodexSection = React.memo(function CodexSection({
 				network_error: "codexBrowserNetworkError",
 				token_exchange_failed: "codexBrowserTokenExchangeFailed",
 			};
-			return code && keys[code] ? t(keys[code]) : fallback;
+			return code && keys[code] ? t(keys[code], { brand }) : fallback;
 		},
-		[t],
+		[t, brand],
 	);
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
@@ -1491,6 +1493,7 @@ export const CodexSection = React.memo(function CodexSection({
 										<Text size="xs" c="dimmed">
 											{t("codexBrowserCallbackDesc", {
 												redirectUri: browserRedirectUri ?? "http://localhost:1455/auth/callback",
+												brand,
 											})}
 										</Text>
 										<Textarea

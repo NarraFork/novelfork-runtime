@@ -9,6 +9,7 @@ export type {
 	RuntimeLearningLocalizedText,
 	RuntimeLearningPresentation,
 	RuntimeProductAccessDeniedEvent,
+	RuntimeProductBranding,
 	RuntimeProductHostServices,
 	RuntimeProductIntegration,
 	RuntimeProductNarratorAdapter,

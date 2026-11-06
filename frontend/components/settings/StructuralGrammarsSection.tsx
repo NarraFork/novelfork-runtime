@@ -15,6 +15,7 @@ import { notifications } from "@mantine/notifications";
 import { IconAlertTriangle, IconDownload, IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import { api, type GrammarStatus } from "../../lib/api";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 
@@ -36,6 +37,7 @@ function formatBytes(bytes: number): string {
  */
 export function StructuralGrammarsSection() {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const confirm = useConfirmDialog();
 	const [grammars, setGrammars] = useState<GrammarStatus[] | null>(null);
 	const [excluded, setExcluded] = useState<Array<{ id: string; reason: string }>>([]);
@@ -193,7 +195,7 @@ export function StructuralGrammarsSection() {
 													</Table.Td>
 													<Table.Td>
 														{grammar.builtin ? (
-															<Tooltip label={t("grammarsBuiltinHint")}>
+															<Tooltip label={t("grammarsBuiltinHint", { brand })}>
 																<Badge color="blue" variant="light">
 																	{t("grammarsBuiltin")}
 																</Badge>

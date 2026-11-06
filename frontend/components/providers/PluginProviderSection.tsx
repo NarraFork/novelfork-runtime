@@ -32,6 +32,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import {
 	pluginKeys,
 	usePluginProviderConfig,
@@ -227,6 +228,7 @@ function PluginProviderAdvanced({
 }) {
 	const { t } = useTranslation("settings");
 	const { t: tp } = useTranslation("plugins");
+	const brand = useBrandName();
 	const queryClient = useQueryClient();
 	const configMutation = useUpdatePluginProviderConfig(pluginId);
 	const [proxySaving, setProxySaving] = useState(false);
@@ -314,7 +316,7 @@ function PluginProviderAdvanced({
 				{showConfigForm ? (
 					<>
 						<Text size="xs" c="dimmed">
-							{t("pluginProviderConnectionDesc")}
+							{t("pluginProviderConnectionDesc", { brand })}
 						</Text>
 						<PluginConfigForm
 							schema={filteredSchema}

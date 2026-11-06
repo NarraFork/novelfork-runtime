@@ -33,6 +33,7 @@ import {
 import { type UseMutationResult, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import type {
 	AutoContinuationMode,
 	DangerReflectionLevel,
@@ -170,6 +171,7 @@ function isRequestEvidenceAutoPin(value: string | null): value is RequestEvidenc
 export function AgentSection(props: AgentSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const brand = useBrandName();
 	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const platform = usePlatform();
 	const serverPathFlavor: PathFlavor = platform === "windows" ? "windows" : "posix";
@@ -316,7 +318,7 @@ export function AgentSection(props: AgentSectionProps) {
 				>
 					<Stack>
 						<Alert color="orange" icon={<IconAlertTriangle size={16} />} variant="light">
-							<Text size="sm">{t("requestEvidenceWarningBody")}</Text>
+							<Text size="sm">{t("requestEvidenceWarningBody", { brand })}</Text>
 						</Alert>
 						<Group justify="flex-end">
 							<Button variant="default" onClick={() => setDumpWarningOpen(false)}>

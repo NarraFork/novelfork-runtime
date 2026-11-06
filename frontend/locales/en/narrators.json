@@ -131,7 +131,7 @@
 		"cwdLabel": "Working directory",
 		"cwdHint": "Defaults to the session's own directory. Tools run here when you continue the conversation.",
 		"modelLabel": "Model",
-		"modelHint": "Used when you continue the conversation in NarraFork.",
+		"modelHint": "Used when you continue the conversation in {{brand}}.",
 		"selectSession": "Select a session first.",
 		"importAction": "Import",
 		"importFailed": "Import failed.",

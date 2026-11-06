@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { DEFAULT_BRAND_NAME } from "@shared/branding";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -1222,7 +1223,9 @@ describe("UpdateBadge first-check mirror dialog", () => {
 		await renderFailedChineseCheck();
 		expect(document.querySelector(".mantine-Badge-root")).toBeNull();
 		expect(document.body.textContent).toContain(commonZh.updateMirrorPromptTitle);
-		expect(document.body.textContent).toContain(commonZh.updateMirrorPromptDescription);
+		expect(document.body.textContent).toContain(
+			commonZh.updateMirrorPromptDescription.replace("{{brand}}", DEFAULT_BRAND_NAME),
+		);
 		expect(findButton(commonZh.updateMirrorSwitch)).toBeDefined();
 		await act(async () => findButton(commonZh.updateMirrorKeepGithub)?.click());
 		await settle();

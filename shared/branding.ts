@@ -34,12 +34,20 @@ export const DEFAULT_BRAND_ICON_COLOR = "#4c6ef5";
  */
 export const BRAND_NAME_MAX_LENGTH = 40;
 
+/**
+ * Where the header feedback button points when the host product supplies none.
+ * Kept at the upstream tracker so a standalone Runtime behaves exactly as before.
+ */
+export const DEFAULT_BRAND_FEEDBACK_URL = "https://github.com/NarraFork/NarraFork/issues";
+
 /** Strict form accepted by the settings write path: `#rgb` or `#rrggbb`. */
 export const BRAND_ICON_COLOR_PATTERN = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
 export interface BrandingInput {
 	name?: string;
 	iconColor?: string;
+	/** Feedback/issue page. Supplied by the host product, not by instance settings. */
+	feedbackUrl?: string;
 }
 
 export interface ResolvedBranding {
@@ -55,6 +63,11 @@ export interface ResolvedBranding {
 	 * the "powered by NovelFork" line under a renamed header.
 	 */
 	customized: boolean;
+	/**
+	 * Absolute http(s) URL behind the header feedback button. Not part of
+	 * `customized`: it changes no icon and no attribution line.
+	 */
+	feedbackUrl: string;
 }
 
 /**
@@ -96,6 +109,22 @@ export function normalizeBrandIconColor(raw: string | undefined | null): string 
 	return trimmed;
 }
 
+/**
+ * Normalize a feedback URL. Only absolute http(s) URLs pass, since the value ends
+ * up in an `href` and a `javascript:` URL there would run on click.
+ */
+export function normalizeBrandFeedbackUrl(raw: string | undefined | null): string {
+	if (typeof raw !== "string") return "";
+	const trimmed = raw.trim();
+	if (!trimmed) return "";
+	try {
+		const url = new URL(trimmed);
+		return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+	} catch {
+		return "";
+	}
+}
+
 /** Parse `#rgb`/`#rrggbb` into 8-bit RGB components, or null when unparseable. */
 export function parseHexColor(hex: string): [number, number, number] | null {
 	const normalized = normalizeBrandIconColor(hex);
@@ -111,10 +140,12 @@ export function parseHexColor(hex: string): [number, number, number] | null {
 export function resolveBranding(input: BrandingInput | undefined | null): ResolvedBranding {
 	const name = normalizeBrandName(input?.name) || DEFAULT_BRAND_NAME;
 	const iconColor = normalizeBrandIconColor(input?.iconColor) || DEFAULT_BRAND_ICON_COLOR;
+	const feedbackUrl = normalizeBrandFeedbackUrl(input?.feedbackUrl) || DEFAULT_BRAND_FEEDBACK_URL;
 	return {
 		name,
 		iconColor,
 		customized: name !== DEFAULT_BRAND_NAME || iconColor !== DEFAULT_BRAND_ICON_COLOR,
+		feedbackUrl,
 	};
 }
 

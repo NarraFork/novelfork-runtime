@@ -7,6 +7,7 @@ import {
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import {
 	pluginThemeKey,
@@ -134,6 +135,7 @@ export function AppearanceSection({
 	setLodAltGesture,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const [bottomSpacingResize, setBottomSpacingResize] = useLocalPref(
 		"narrafork_narrator_bottom_spacing_resize",
 	);
@@ -211,7 +213,7 @@ export function AppearanceSection({
 			/>
 			<Switch
 				label={t("wakeLock")}
-				description={t("wakeLockDesc")}
+				description={t("wakeLockDesc", { brand })}
 				checked={wakeLock}
 				onChange={(e) => setWakeLock(e.currentTarget.checked)}
 			/>
@@ -397,7 +399,7 @@ export function AppearanceSection({
 
 			<Switch
 				label={t("treatAsLocalAccess")}
-				description={t("treatAsLocalAccessDesc")}
+				description={t("treatAsLocalAccessDesc", { brand })}
 				checked={userPrefs?.treatAsLocalAccess ?? false}
 				disabled={updateUserPref.isPending}
 				onChange={(e) => updateUserPref.mutate({ treatAsLocalAccess: e.currentTarget.checked })}

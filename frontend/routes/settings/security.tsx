@@ -52,6 +52,7 @@ import {
 	useTotpSetup,
 	useUnlinkIdentity,
 } from "../../hooks/useAuth";
+import { useBrandName } from "../../hooks/useBranding";
 import { api } from "../../lib/api";
 import {
 	isPasskeySupported,
@@ -214,6 +215,7 @@ function TotpCard({ status, onEnroll }: { status?: MfaStatus; onEnroll: () => vo
 /** TOTP enrollment wizard: scan QR → verify code → save backup codes. */
 function EnrollModal({ status, onClose }: { status?: MfaStatus; onClose: () => void }) {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const setup = useTotpSetup();
 	const activate = useTotpActivate();
 	const setMfa = useSetMfaEnabled();
@@ -388,7 +390,7 @@ function EnrollModal({ status, onClose }: { status?: MfaStatus; onClose: () => v
 						<Button
 							variant="light"
 							leftSection={<IconDownload size={16} />}
-							onClick={() => downloadBackupCodes(backupCodes)}
+							onClick={() => downloadBackupCodes(backupCodes, brand)}
 						>
 							{t("backupCodesDownload")}
 						</Button>
@@ -486,8 +488,8 @@ function DisableButton() {
 	);
 }
 
-function downloadBackupCodes(codes: string[]) {
-	const blob = new Blob([`NarraFork backup codes\n\n${codes.join("\n")}\n`], {
+function downloadBackupCodes(codes: string[], brand: string) {
+	const blob = new Blob([`${brand} backup codes\n\n${codes.join("\n")}\n`], {
 		type: "text/plain",
 	});
 	const url = URL.createObjectURL(blob);
@@ -501,6 +503,7 @@ function downloadBackupCodes(codes: string[]) {
 /** SSO identity management: link new providers, list and unlink existing ones. */
 function IdentitiesSection() {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const confirm = useConfirmDialog();
 	const { data: providersData } = useSsoProviders();
 	const { data: identitiesData, isLoading } = useIdentities();
@@ -543,7 +546,7 @@ function IdentitiesSection() {
 				<Box style={{ flex: 1 }}>
 					<Text fw={600}>{t("ssoTitle")}</Text>
 					<Text size="sm" c="dimmed" mt={4} maw={520}>
-						{t("ssoDescription")}
+						{t("ssoDescription", { brand })}
 					</Text>
 
 					{isLoading ? (

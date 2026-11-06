@@ -3,6 +3,7 @@ import { IconPlayerPause } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
+import { useBrandName } from "../hooks/useBranding";
 import {
 	useSystemLifecycleStatus,
 	useSystemLifecycleSync,
@@ -16,6 +17,7 @@ import {
 /** Non-dismissible, global indication of the maintenance gate, not a narrator failure. */
 export function SystemMaintenanceBadge() {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const { data: user } = useCurrentUser();
 	const client = useQueryClient();
 	const isAdmin = user?.role === "admin";
@@ -83,11 +85,12 @@ export function SystemMaintenanceBadge() {
 								: prepared
 									? "systemMaintenancePausedDescription"
 									: "systemMaintenancePreparingDescription",
+							{ brand },
 						)}
 					</Text>
 					{status.shutdownRequested && !closing && (
 						<Text size="xs" c="dimmed">
-							{t("systemShutdownQueued")}
+							{t("systemShutdownQueued", { brand })}
 						</Text>
 					)}
 					{cancel.error && <Alert color="red">{cancel.error.message}</Alert>}

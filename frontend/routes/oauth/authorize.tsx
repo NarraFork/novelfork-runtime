@@ -25,6 +25,7 @@ import {
 import { createFileRoute, Navigate, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import { type ApiError, getToken } from "../../lib/api";
 import { request } from "../../lib/api/client";
 
@@ -136,6 +137,7 @@ function getScopeSections(info: ConsentInfo): {
 
 function OAuthAuthorizePage() {
 	const { t } = useTranslation("common");
+	const brand = useBrandName();
 	const navigate = useNavigate();
 	const search = Route.useSearch();
 	const hasToken = !!getToken();
@@ -308,10 +310,12 @@ function OAuthAuthorizePage() {
 									? t("oauthAuthorizeConsentNotRequired", {
 											app: info.client.name,
 											user: info.user.username,
+											brand,
 										})
 									: t("oauthAuthorizePrompt", {
 											app: info.client.name,
 											user: info.user.username,
+											brand,
 										})}
 							</Text>
 

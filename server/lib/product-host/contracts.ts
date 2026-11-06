@@ -253,6 +253,10 @@ export interface RuntimeProductHostServices {
 	): Promise<RuntimeProductTextGenerationResult>;
 }
 
+export interface RuntimeProductBranding {
+	readonly feedbackUrl?: string;
+}
+
 /**
  * Optional, host-owned product integration. A standalone NarraFork Runtime uses
  * the Null implementation; a product entrypoint must register its integration
@@ -268,6 +272,11 @@ export interface RuntimeProductIntegration {
 	learningContributions?(): readonly RuntimeLearningContribution[];
 	/** How built-in learning documents are presented (brand, hidden ids, overrides, category order). */
 	learningPresentation?(): RuntimeLearningPresentation;
+	/**
+	 * Product-owned branding defaults. Only `feedbackUrl` today: the header feedback
+	 * button target (absolute http(s); anything else falls back to the upstream tracker).
+	 */
+	branding?(): RuntimeProductBranding;
 	/** Built-in delegation templates (see `RuntimeProductSubagentTemplate`). */
 	subagentTemplates?(): readonly RuntimeProductSubagentTemplate[];
 	narrator?: RuntimeProductNarratorAdapter;

@@ -3,6 +3,7 @@ import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconFolderOpen, IconInfoCircle } from "@tabler/icons-react";
 import { lazy, Suspense, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../hooks/useBranding";
 import { api } from "../../lib/api";
 import type { PathFlavor, RuleTargetSelector } from "../../lib/api/types";
 import { Z } from "../../lib/z-index";
@@ -62,6 +63,7 @@ export function TargetPathInput({
 	error?: string;
 }) {
 	const { t } = useTranslation("narrator");
+	const brand = useBrandName();
 	const [opened, { open, close }] = useDisclosure(false);
 	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 	const hostTarget = selector.kind === "host";
@@ -79,7 +81,7 @@ export function TargetPathInput({
 			? t("permissionPathFlavorDevice", {
 					device: remoteDevice?.name ?? selector.deviceId,
 				})
-			: t("permissionPathFlavorHost");
+			: t("permissionPathFlavorHost", { brand });
 
 	const deviceQueryKey = useMemo(
 		() => ["permissionDeviceBrowse", narratorId ?? "admin", deviceId] as const,
@@ -94,7 +96,7 @@ export function TargetPathInput({
 	}, [narratorId, deviceId]);
 
 	const browseHint = hostTarget
-		? t("permissionHostBrowseHint")
+		? t("permissionHostBrowseHint", { brand })
 		: canBrowseDevice
 			? t("permissionDeviceBrowseHint")
 			: deviceId && !deviceOnline

@@ -38,3 +38,21 @@ export function useBranding(): ResolvedBranding {
 		resolveBranding(undefined),
 	);
 }
+
+/**
+ * Instance brand name for `{{brand}}` copy, read from the branding store only.
+ *
+ * Does not fetch: `App` mounts `useBranding()` once, which keeps the store current.
+ * Keeping this query-free lets leaf components (and their tests) use it without a
+ * QueryClient.
+ */
+export function useBrandName(): string {
+	return useCurrentBranding().name;
+}
+
+/** Full branding snapshot from the store, without fetching (see `useBrandName`). */
+export function useCurrentBranding(): ResolvedBranding {
+	return useSyncExternalStore(onBrandingChange, getCurrentBranding, () =>
+		resolveBranding(undefined),
+	);
+}

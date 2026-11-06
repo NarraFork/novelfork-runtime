@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
 	BRAND_NAME_MAX_LENGTH,
+	DEFAULT_BRAND_FEEDBACK_URL,
 	DEFAULT_BRAND_ICON_COLOR,
 	DEFAULT_BRAND_NAME,
+	normalizeBrandFeedbackUrl,
 	normalizeBrandIconColor,
 	normalizeBrandName,
 	parseHexColor,
@@ -75,6 +77,7 @@ describe("resolveBranding", () => {
 			name: DEFAULT_BRAND_NAME,
 			iconColor: DEFAULT_BRAND_ICON_COLOR,
 			customized: false,
+			feedbackUrl: DEFAULT_BRAND_FEEDBACK_URL,
 		});
 	});
 
@@ -98,6 +101,27 @@ describe("resolveBranding", () => {
 		const resolved = resolveBranding({ name: "   ", iconColor: "not-a-colour" });
 		expect(resolved.name).toBe(DEFAULT_BRAND_NAME);
 		expect(resolved.iconColor).toBe(DEFAULT_BRAND_ICON_COLOR);
+		expect(resolved.customized).toBe(false);
+	});
+});
+
+describe("normalizeBrandFeedbackUrl", () => {
+	test("keeps absolute http(s) URLs", () => {
+		expect(normalizeBrandFeedbackUrl(" https://example.com/issues ")).toBe(
+			"https://example.com/issues",
+		);
+		expect(normalizeBrandFeedbackUrl("http://intranet/feedback")).toBe("http://intranet/feedback");
+	});
+
+	test("rejects other schemes and junk, since the value lands in an href", () => {
+		for (const bad of ["javascript:alert(1)", "data:text/html,x", "/relative", "", undefined]) {
+			expect(normalizeBrandFeedbackUrl(bad)).toBe("");
+		}
+	});
+
+	test("a feedback URL does not mark branding customized", () => {
+		const resolved = resolveBranding({ feedbackUrl: "https://example.com/issues" });
+		expect(resolved.feedbackUrl).toBe("https://example.com/issues");
 		expect(resolved.customized).toBe(false);
 	});
 });

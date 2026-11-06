@@ -30,7 +30,12 @@ const catalogKeys = Object.keys(ERROR_CATALOG).sort();
  * comparison is on the NAME SET, not on the raw text.
  */
 function i18nextPlaceholders(template: string): string[] {
-	return [...template.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]).sort();
+	// `{{brand}}` is filled by the frontend's i18next defaults (instance brand name),
+	// never by the server, so it is not part of the catalog contract.
+	return [...template.matchAll(/\{\{(\w+)\}\}/g)]
+		.map((m) => m[1])
+		.filter((name) => name !== "brand")
+		.sort();
 }
 
 function catalogPlaceholders(template: string): string[] {

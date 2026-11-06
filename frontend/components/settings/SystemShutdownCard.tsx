@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useBrandName } from "../../hooks/useBranding";
 import { useSystemLifecycleStatus } from "../../hooks/useSystemLifecycleStatus";
 import { ApiError, api } from "../../lib/api";
 import {
@@ -21,6 +22,7 @@ export function SystemShutdownCard() {
 
 function AdminSystemShutdownCard() {
 	const { t } = useTranslation("settings");
+	const brand = useBrandName();
 	const confirm = useConfirmDialog();
 	const queryClient = useQueryClient();
 	const [confirming, setConfirming] = useState(false);
@@ -72,7 +74,7 @@ function AdminSystemShutdownCard() {
 		try {
 			const accepted = await confirm({
 				title: t("systemShutdownConfirmTitle"),
-				message: t("systemShutdownConfirmDescription"),
+				message: t("systemShutdownConfirmDescription", { brand }),
 				confirmLabel: t("systemShutdownAction"),
 				confirmColor: "red",
 			});
@@ -101,7 +103,7 @@ function AdminSystemShutdownCard() {
 				))}
 				{disconnected && (
 					<Alert color="yellow">
-						{t("systemShutdownDisconnected")}
+						{t("systemShutdownDisconnected", { brand })}
 						<Text size="xs">{statusQuery.error?.message}</Text>
 					</Alert>
 				)}
@@ -120,9 +122,9 @@ function AdminSystemShutdownCard() {
 					<Alert color="blue">{t("systemRecoveryPrepared")}</Alert>
 				)}
 				{status?.shutdownRequested && !shuttingDown && (
-					<Alert color="yellow">{t("systemShutdownQueued")}</Alert>
+					<Alert color="yellow">{t("systemShutdownQueued", { brand })}</Alert>
 				)}
-				{shuttingDown && <Alert color="yellow">{t("systemShutdownManualStart")}</Alert>}
+				{shuttingDown && <Alert color="yellow">{t("systemShutdownManualStart", { brand })}</Alert>}
 				<Group gap="xs">
 					<Button
 						size="xs"

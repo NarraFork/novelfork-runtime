@@ -6,6 +6,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
+import { useBrandName } from "../hooks/useBranding";
 import { useUpdateCheck } from "../hooks/useUpdateCheck";
 import { UPDATE_STATUS_QUERY_KEY, useUpdateScheduleStatus } from "../hooks/useUpdateSchedule";
 import { OFFICIAL_UPDATE_SERVER_URL, useUpdateSourcePrompt } from "../hooks/useUpdateSourcePrompt";
@@ -38,6 +39,7 @@ const UpdateModal = lazy(() =>
  */
 export function UpdateBadge() {
 	const { t, i18n } = useTranslation("common");
+	const brand = useBrandName();
 	const [opened, { open, close }] = useDisclosure(false);
 	const queryClient = useQueryClient();
 	const { data: user } = useCurrentUser();
@@ -105,7 +107,7 @@ export function UpdateBadge() {
 				centered
 			>
 				<Stack>
-					<Text size="sm">{t("updateMirrorPromptDescription")}</Text>
+					<Text size="sm">{t("updateMirrorPromptDescription", { brand })}</Text>
 					<Text size="xs" c="dimmed">
 						{OFFICIAL_UPDATE_SERVER_URL}
 					</Text>

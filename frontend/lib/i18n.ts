@@ -10,6 +10,7 @@ import i18n from "i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
 import { initReactI18next } from "react-i18next";
 import { stripBase } from "./base-path";
+import { getCurrentBranding, onBrandingChange } from "./branding";
 import { localeLoaders } from "./i18n-locale-loaders";
 
 export const supportedLanguages = SUPPORTED_LOCALES;
@@ -382,6 +383,24 @@ i18n.on("languageChanged", (lng) => {
 	setDocumentLanguage(lng);
 });
 
+/**
+ * Keep the `{{brand}}` default in step with the instance branding.
+ *
+ * Mutates the interpolation options object in place: i18next's interpolator reads
+ * `options.interpolation.defaultVariables` at interpolate time, so no re-init is needed.
+ * Returns the unsubscribe function (the app instance keeps it for its lifetime).
+ */
+export function installBrandDefaultVariable(instance: Pick<typeof i18n, "options">): () => void {
+	const interpolation = instance.options.interpolation;
+	if (!interpolation) return () => {};
+	interpolation.defaultVariables ??= {};
+	const defaults = interpolation.defaultVariables;
+	defaults.brand = getCurrentBranding().name;
+	return onBrandingChange((branding) => {
+		defaults.brand = branding.name;
+	});
+}
+
 export function initI18n(initialNamespaces: readonly Namespace[]): Promise<typeof i18n> {
 	const initialNs = uniqueNamespaces(initialNamespaces.length > 0 ? initialNamespaces : ["common"]);
 
@@ -402,6 +421,10 @@ export function initI18n(initialNamespaces: readonly Namespace[]): Promise<typeo
 			ns: initialNs,
 			interpolation: {
 				escapeValue: false,
+				// `{{brand}}` in copy renders the instance brand even where a caller does
+				// not pass it (error catalog, danger copy, plain modules). Callers that do
+				// pass `{ brand }` win, since defaults are spread underneath call options.
+				defaultVariables: { brand: getCurrentBranding().name },
 			},
 			detection: {
 				order: ["localStorage", "navigator"],
@@ -414,6 +437,7 @@ export function initI18n(initialNamespaces: readonly Namespace[]): Promise<typeo
 			},
 		})
 		.then(async () => {
+			installBrandDefaultVariable(i18n);
 			installLanguageResolutionCache();
 			await ensureI18nNamespaces(initialNs);
 			setDocumentLanguage(i18n.resolvedLanguage ?? i18n.language);

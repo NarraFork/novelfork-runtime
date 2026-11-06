@@ -29,6 +29,7 @@ import { IconFileUpload, IconFolder, IconRefresh } from "@tabler/icons-react";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBrandName } from "../../../hooks/useBranding";
 import { useAllModels } from "../../../hooks/useModels";
 import { api } from "../../../lib/api";
 import type {
@@ -215,6 +216,7 @@ function CandidateList({
 
 export function ImportSessionModal({ opened, onClose, onImported }: ImportSessionModalProps) {
 	const { t } = useTranslation("narrators");
+	const brand = useBrandName();
 	const { t: tc } = useTranslation("common");
 	const { t: te } = useTranslation("errors");
 	const qc = useQueryClient();
@@ -523,7 +525,7 @@ export function ImportSessionModal({ opened, onClose, onImported }: ImportSessio
 						/>
 						<Select
 							label={t("sessionInterchange.modelLabel")}
-							description={t("sessionInterchange.modelHint")}
+							description={t("sessionInterchange.modelHint", { brand })}
 							data={groupedModels}
 							searchable
 							limit={MODEL_SELECT_OPTION_LIMIT}
