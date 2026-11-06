@@ -32,6 +32,7 @@ import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useBranding } from "../hooks/useBranding";
 import { api, type LearningCategory, type LearningDocSummary } from "../lib/api";
 import { normalizeLanguage } from "../lib/i18n";
 
@@ -52,6 +53,7 @@ const LEARNING_QUERY_GC_TIME_MS = 60_000;
 
 function LearnPage() {
 	const { t, i18n } = useTranslation("learning");
+	const { name: brand } = useBranding();
 	const search = Route.useSearch();
 	const navigate = Route.useNavigate();
 	const lang = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language);
@@ -152,7 +154,7 @@ function LearnPage() {
 							{t("title")}
 						</Title>
 						<Text c="dimmed" mt="sm" size="lg" maw={680}>
-							{t("subtitle")}
+							{t("subtitle", { brand })}
 						</Text>
 					</Box>
 				</Group>

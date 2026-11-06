@@ -1,5 +1,6 @@
 import type {
 	RuntimeLearningContribution,
+	RuntimeLearningPresentation,
 } from "../../../shared/learning-contract";
 import type { Hono } from "hono";
 import type { ToolDefinition } from "../agent/types";
@@ -7,9 +8,12 @@ import type { ToolDefinition } from "../agent/types";
 export type {
 	RuntimeLearningActionContribution,
 	RuntimeLearningCategoryContribution,
+	RuntimeLearningCategoryOverride,
 	RuntimeLearningContribution,
 	RuntimeLearningDocumentContribution,
+	RuntimeLearningDocumentOverride,
 	RuntimeLearningLocalizedText,
+	RuntimeLearningPresentation,
 } from "../../../shared/learning-contract";
 
 export type RuntimeToolRisk = "read" | "draft-write" | "confirmed-write" | "destructive";
@@ -256,6 +260,8 @@ export interface RuntimeProductIntegration {
 	mountAuthenticatedRoutes?(app: Hono): void;
 	mountRuntimeBindingRoutes?(app: Hono): void;
 	learningContributions?(): readonly RuntimeLearningContribution[];
+	/** How built-in learning documents are presented (brand, hidden ids, overrides, category order). */
+	learningPresentation?(): RuntimeLearningPresentation;
 	/** Built-in delegation templates (see `RuntimeProductSubagentTemplate`). */
 	subagentTemplates?(): readonly RuntimeProductSubagentTemplate[];
 	narrator?: RuntimeProductNarratorAdapter;
@@ -269,7 +275,11 @@ export interface RuntimeProductIntegration {
 			fallbackCwd: string;
 		}>,
 	): string;
-	canAccessNarratorState?(input: Readonly<{ userId: string | undefined; narratorId: string }>): Promise<boolean>;
-	canAccessPermission?(input: Readonly<{ userId: string | undefined; requestId: string }>): Promise<boolean>;
+	canAccessNarratorState?(
+		input: Readonly<{ userId: string | undefined; narratorId: string }>,
+	): Promise<boolean>;
+	canAccessPermission?(
+		input: Readonly<{ userId: string | undefined; requestId: string }>,
+	): Promise<boolean>;
 	createNarratorAccessDeniedEvent?(narratorId?: string): RuntimeProductAccessDeniedEvent;
 }

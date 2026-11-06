@@ -1,6 +1,6 @@
 {
 	"title": "Learning Center",
-	"subtitle": "Documentation, workflows, and best practices for NarraFork's main features.",
+	"subtitle": "Documentation, workflows, and best practices for {{brand}}'s main features.",
 	"searchPlaceholder": "Search features, workflows, or best practices...",
 	"noResults": "No matching learning documents found.",
 	"selectDoc": "Select a learning document.",

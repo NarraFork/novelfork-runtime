@@ -9,6 +9,7 @@ import type {
 	RuntimeLearningCategoryContribution,
 	RuntimeLearningContribution,
 	RuntimeLearningDocumentContribution,
+	RuntimeLearningPresentation,
 } from "./learning-contract";
 
 export type LearningLocale = Locale;
@@ -1262,12 +1263,87 @@ function searchableText(doc: LearningDocInput, locale: LearningLocale): string {
 		.toLowerCase();
 }
 
-function contributedCategories(contributions: readonly RuntimeLearningContribution[]): readonly LearningCategoryInput[] {
-	const result: LearningCategoryInput[] = Object.entries(categories).map(([id, category]) => ({
-		id,
-		label: category,
-		description: category.description,
-	}));
+const BUILTIN_BRAND = /NarraFork/g;
+
+function rebrand(text: LocalizedText, brandName: string | undefined): LocalizedText {
+	if (!brandName) return text;
+	const result: Record<string, string> = {};
+	for (const [locale, value] of Object.entries(text)) {
+		if (typeof value === "string") result[locale] = value.replace(BUILTIN_BRAND, brandName);
+	}
+	return result as LocalizedText;
+}
+
+function rebrandDoc(doc: LearningDocSource, brandName: string | undefined): LearningDocSource {
+	if (!brandName) return doc;
+	const r = (text: LocalizedText) => rebrand(text, brandName);
+	return {
+		...doc,
+		title: r(doc.title),
+		summary: r(doc.summary),
+		sections: doc.sections.map((section) => ({ title: r(section.title), body: r(section.body) })),
+		workflow: doc.workflow.map(r),
+		bestPractices: doc.bestPractices.map(r),
+		pitfalls: doc.pitfalls.map(r),
+		agentHints: doc.agentHints.map(r),
+		actions: doc.actions.map((action) => ({
+			...action,
+			label: r(action.label),
+			description: r(action.description),
+		})),
+	};
+}
+
+/** Built-in documents as the product presents them (see RuntimeLearningPresentation). */
+function presentedBuiltinDocs(
+	presentation: RuntimeLearningPresentation | undefined,
+): readonly LearningDocInput[] {
+	if (!presentation) return docs;
+	const hidden = new Set(presentation.hiddenBuiltinDocIds ?? []);
+	return docs
+		.filter((doc) => !hidden.has(doc.id))
+		.map((doc) => {
+			const branded = rebrandDoc(doc, presentation.brandName);
+			const override = presentation.builtinDocOverrides?.[doc.id];
+			// Override fields are the contribution shape (readonly, fully localized), which
+			// localizeDoc/summarizeDoc read the same way as the built-in shape.
+			return override ? ({ ...branded, ...override } as LearningDocSource) : branded;
+		});
+}
+
+function presentedBuiltinCategories(
+	presentation: RuntimeLearningPresentation | undefined,
+): LearningCategoryInput[] {
+	return Object.entries(categories).map(([id, category]) => {
+		const override = presentation?.builtinCategoryOverrides?.[id];
+		return {
+			id,
+			label: override?.label ?? rebrand(category, presentation?.brandName),
+			description: override?.description ?? rebrand(category.description, presentation?.brandName),
+		};
+	});
+}
+
+/** Stable sort by `categoryOrder`; unlisted categories keep their relative order after the listed ones. */
+function orderByCategory<T>(
+	items: readonly T[],
+	categoryOf: (item: T) => string,
+	presentation: RuntimeLearningPresentation | undefined,
+): readonly T[] {
+	const order = presentation?.categoryOrder;
+	if (!order || order.length === 0) return items;
+	const rank = new Map(order.map((id, index) => [id, index]));
+	return items
+		.map((item, index) => ({ item, index, rank: rank.get(categoryOf(item)) ?? order.length }))
+		.sort((a, b) => a.rank - b.rank || a.index - b.index)
+		.map((entry) => entry.item);
+}
+
+function contributedCategories(
+	contributions: readonly RuntimeLearningContribution[],
+	presentation?: RuntimeLearningPresentation,
+): readonly LearningCategoryInput[] {
+	const result = presentedBuiltinCategories(presentation);
 	const seen = new Set(result.map((category) => category.id));
 	for (const contribution of contributions) {
 		for (const category of contribution.categories) {
@@ -1276,12 +1352,16 @@ function contributedCategories(contributions: readonly RuntimeLearningContributi
 			result.push(category);
 		}
 	}
-	return result;
+	return orderByCategory(result, (category) => category.id, presentation);
 }
 
-function contributedDocs(contributions: readonly RuntimeLearningContribution[]): readonly LearningDocInput[] {
-	const result: LearningDocInput[] = [...docs];
-	const seen = new Set(result.map((doc) => doc.id));
+function contributedDocs(
+	contributions: readonly RuntimeLearningContribution[],
+	presentation?: RuntimeLearningPresentation,
+): readonly LearningDocInput[] {
+	const result: LearningDocInput[] = [...presentedBuiltinDocs(presentation)];
+	// Hidden built-in ids stay reserved so a contribution cannot take one over by accident.
+	const seen = new Set([...docs.map((doc) => doc.id), ...result.map((doc) => doc.id)]);
 	for (const contribution of contributions) {
 		for (const doc of contribution.docs) {
 			if (seen.has(doc.id)) continue;
@@ -1289,15 +1369,16 @@ function contributedDocs(contributions: readonly RuntimeLearningContribution[]):
 			result.push(doc);
 		}
 	}
-	return result;
+	return orderByCategory(result, (doc) => doc.category, presentation);
 }
 
 export function getLearningCategories(
 	localeInput?: string | null,
 	contributions: readonly RuntimeLearningContribution[] = [],
+	presentation?: RuntimeLearningPresentation,
 ): LearningCategory[] {
 	const locale = normalizeLocale(localeInput);
-	return contributedCategories(contributions).map((category) => ({
+	return contributedCategories(contributions, presentation).map((category) => ({
 		id: category.id,
 		label: pick(category.label, locale),
 		description: pick(category.description, locale),
@@ -1307,26 +1388,29 @@ export function getLearningCategories(
 export function getLearningDocSummaries(
 	localeInput?: string | null,
 	contributions: readonly RuntimeLearningContribution[] = [],
+	presentation?: RuntimeLearningPresentation,
 ): LearningDocSummary[] {
 	const locale = normalizeLocale(localeInput);
-	return contributedDocs(contributions).map((doc) => summarizeDoc(doc, locale));
+	return contributedDocs(contributions, presentation).map((doc) => summarizeDoc(doc, locale));
 }
 
 export function getLearningDocs(
 	localeInput?: string | null,
 	contributions: readonly RuntimeLearningContribution[] = [],
+	presentation?: RuntimeLearningPresentation,
 ): LearningDoc[] {
 	const locale = normalizeLocale(localeInput);
-	return contributedDocs(contributions).map((doc) => localizeDoc(doc, locale));
+	return contributedDocs(contributions, presentation).map((doc) => localizeDoc(doc, locale));
 }
 
 export function getLearningDoc(
 	id: string,
 	localeInput?: string | null,
 	contributions: readonly RuntimeLearningContribution[] = [],
+	presentation?: RuntimeLearningPresentation,
 ): LearningDoc | undefined {
 	const locale = normalizeLocale(localeInput);
-	const doc = contributedDocs(contributions).find((item) => item.id === id);
+	const doc = contributedDocs(contributions, presentation).find((item) => item.id === id);
 	return doc ? localizeDoc(doc, locale) : undefined;
 }
 
@@ -1334,6 +1418,7 @@ export function searchLearningDocs(
 	query: string,
 	localeInput?: string | null,
 	contributions: readonly RuntimeLearningContribution[] = [],
+	presentation?: RuntimeLearningPresentation,
 ): LearningDocSummary[] {
 	const locale = normalizeLocale(localeInput);
 	const terms = query
@@ -1341,9 +1426,9 @@ export function searchLearningDocs(
 		.split(/\s+/)
 		.map((term) => term.trim())
 		.filter(Boolean);
-	if (terms.length === 0) return getLearningDocSummaries(locale, contributions);
+	if (terms.length === 0) return getLearningDocSummaries(locale, contributions, presentation);
 
-	return contributedDocs(contributions)
+	return contributedDocs(contributions, presentation)
 		.map((doc) => {
 			const text = searchableText(doc, locale);
 			const title = pick(doc.title, locale).toLowerCase();
@@ -1361,6 +1446,7 @@ export function searchLearningDocs(
 export function learningDocExists(
 	id: string,
 	contributions: readonly RuntimeLearningContribution[] = [],
+	presentation?: RuntimeLearningPresentation,
 ): boolean {
-	return contributedDocs(contributions).some((doc) => doc.id === id);
+	return contributedDocs(contributions, presentation).some((doc) => doc.id === id);
 }

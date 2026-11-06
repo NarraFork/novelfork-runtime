@@ -7,27 +7,45 @@ import {
 import { getRuntimeProductIntegration } from "@server/lib/product-host";
 import { Hono } from "hono";
 
-const productLearningContributions = getRuntimeProductIntegration().learningContributions?.() ?? [];
+const productIntegration = getRuntimeProductIntegration();
+const productLearningContributions = productIntegration.learningContributions?.() ?? [];
+const productLearningPresentation = productIntegration.learningPresentation?.();
 
 export const learningRoutes = new Hono();
 
 learningRoutes.get("/", (c) => {
 	const lang = c.req.query("lang");
 	return c.json({
-		categories: getLearningCategories(lang, productLearningContributions),
-		docs: getLearningDocSummaries(lang, productLearningContributions),
+		categories: getLearningCategories(
+			lang,
+			productLearningContributions,
+			productLearningPresentation,
+		),
+		docs: getLearningDocSummaries(lang, productLearningContributions, productLearningPresentation),
 	});
 });
 
 learningRoutes.get("/search", (c) => {
 	const lang = c.req.query("lang");
 	const query = c.req.query("q") ?? "";
-	return c.json({ results: searchLearningDocs(query, lang, productLearningContributions) });
+	return c.json({
+		results: searchLearningDocs(
+			query,
+			lang,
+			productLearningContributions,
+			productLearningPresentation,
+		),
+	});
 });
 
 learningRoutes.get("/:id", (c) => {
 	const lang = c.req.query("lang");
-	const doc = getLearningDoc(c.req.param("id"), lang, productLearningContributions);
+	const doc = getLearningDoc(
+		c.req.param("id"),
+		lang,
+		productLearningContributions,
+		productLearningPresentation,
+	);
 	if (!doc) return c.json({ error: "Learning document not found" }, 404);
 	return c.json(doc);
 });

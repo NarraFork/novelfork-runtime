@@ -1,3 +1,4 @@
+import { getRuntimeProductIntegration } from "@server/lib/product-host";
 import {
 	getLearningDoc,
 	getLearningDocSummaries,
@@ -11,6 +12,15 @@ import type { ToolDefinition, ToolResult } from "../types";
 function normalizeLang(lang: unknown, fallback: string): string {
 	if (typeof lang === "string" && lang.trim()) return lang;
 	return fallback;
+}
+
+/** Same content the /learn page shows: product contributions plus the product's presentation. */
+function productLearningInputs() {
+	const integration = getRuntimeProductIntegration();
+	return [
+		integration.learningContributions?.() ?? [],
+		integration.learningPresentation?.(),
+	] as const;
 }
 
 function isZh(lang: string): boolean {
@@ -87,7 +97,7 @@ function renderDoc(doc: LearningDoc, lang: string): string {
 export const learningGuideTool: ToolDefinition = {
 	name: "LearningGuide",
 	description:
-		"Look up NarraFork's built-in learning documentation. Use this when you need to understand NarraFork features, recommended workflows, best practices, or routes the user can jump to. The same knowledge base powers the /learn page.",
+		"Look up this app's built-in learning documentation. Use this when you need to understand its features, recommended workflows, best practices, or routes the user can jump to. The same knowledge base powers the /learn page.",
 	parameters: z.object({
 		mode: z
 			.enum(["list", "search", "get"])
@@ -100,10 +110,11 @@ export const learningGuideTool: ToolDefinition = {
 	async execute(args, ctx): Promise<ToolResult> {
 		const mode = typeof args.mode === "string" ? args.mode : "search";
 		const lang = normalizeLang(args.lang, ctx.locale);
+		const [contributions, presentation] = productLearningInputs();
 
 		if (mode === "list") {
 			return {
-				output: renderSummaryList(getLearningDocSummaries(lang), lang),
+				output: renderSummaryList(getLearningDocSummaries(lang, contributions, presentation), lang),
 				title: "Learning Guide: list",
 			};
 		}
@@ -117,7 +128,7 @@ export const learningGuideTool: ToolDefinition = {
 						: "Please provide the learning document id to read.",
 					isError: true,
 				};
-			const doc = getLearningDoc(id, lang);
+			const doc = getLearningDoc(id, lang, contributions, presentation);
 			if (!doc)
 				return {
 					output: isZh(lang) ? `未找到学习文档：${id}` : `Learning document not found: ${id}`,
@@ -129,12 +140,12 @@ export const learningGuideTool: ToolDefinition = {
 		const query = typeof args.query === "string" ? args.query : "";
 		if (!query.trim()) {
 			return {
-				output: renderSummaryList(getLearningDocSummaries(lang), lang),
+				output: renderSummaryList(getLearningDocSummaries(lang, contributions, presentation), lang),
 				title: "Learning Guide: search",
 			};
 		}
 		return {
-			output: renderSummaryList(searchLearningDocs(query, lang), lang),
+			output: renderSummaryList(searchLearningDocs(query, lang, contributions, presentation), lang),
 			title: `Learning Guide: ${query}`,
 		};
 	},
