@@ -1065,6 +1065,78 @@ describe("tracked-but-ignored files", () => {
  * 128, and the hot path swallows it into null — so the workspace silently and
  * permanently loses every boundary.
  */
+describe("snapshot scope after ignore rules change", () => {
+	/** Ensure the next capture sees a different .gitignore mtime. */
+	function writeLater(path: string, contents: string): void {
+		writeFileSync(path, contents);
+		const later = new Date(Date.now() + 5_000);
+		utimesSync(path, later, later);
+	}
+
+	test("a file captured before it was ignored leaves the snapshot once ignored", async () => {
+		const repo = await createRepo("nf-tree-newly-ignored-");
+		writeFileSync(join(repo, "chapter.md"), "正文\n");
+		writeFileSync(join(repo, "reference.txt"), "大参考文本\n");
+		const first = await worktreeTreeSnapshot.capture(repo);
+		expect(await treePaths(repo, first)).toContain("reference.txt");
+
+		writeLater(join(repo, ".gitignore"), "*.txt\n");
+		const second = await worktreeTreeSnapshot.capture(repo);
+		const paths = await treePaths(repo, second);
+		expect(paths).not.toContain("reference.txt");
+		expect(paths).toContain("chapter.md");
+		expect(await worktreeTreeSnapshot.diffPathStatuses(repo, first, second)).toEqual([
+			{ path: ".gitignore", kind: "added" },
+			{ path: "reference.txt", kind: "deleted" },
+		]);
+		// Stable afterwards: no repeated churn.
+		expect(await worktreeTreeSnapshot.capture(repo)).toBe(second);
+	});
+
+	test("an ignored file the real repository tracks stays in the snapshot", async () => {
+		const repo = await createRepo("nf-tree-newly-ignored-tracked-");
+		writeFileSync(join(repo, "notes.txt"), "tracked\n");
+		await safeSpawn({ cmd: ["git", "add", "-A"], cwd: repo, timeout: 15_000 });
+		await safeSpawn({ cmd: ["git", "commit", "-m", "seed"], cwd: repo, timeout: 15_000 });
+		await worktreeTreeSnapshot.capture(repo);
+
+		writeLater(join(repo, ".gitignore"), "*.txt\n");
+		const tree = await worktreeTreeSnapshot.capture(repo);
+		expect(await treePaths(repo, tree)).toContain("notes.txt");
+	});
+
+	test("workspace snapshot-exclude rules keep reference material out, chapters in", async () => {
+		const repo = await createRepo("nf-tree-workspace-exclude-");
+		mkdirSync(join(repo, "chapters"), { recursive: true });
+		mkdirSync(join(repo, "参考"), { recursive: true });
+		mkdirSync(join(repo, ".narrafork"), { recursive: true });
+		writeFileSync(join(repo, "chapters", "0001.md"), "第一章\n");
+		writeFileSync(join(repo, "参考", "原著.txt"), "很长的参考原文\n");
+		writeFileSync(join(repo, "big.txt"), "素材\n");
+		writeFileSync(join(repo, ".narrafork", "project.db"), "sqlite bytes");
+		const before = await worktreeTreeSnapshot.capture(repo);
+		expect(await treePaths(repo, before)).toContain("big.txt");
+		// The Runtime's own project database is never snapshot content.
+		expect(await treePaths(repo, before)).not.toContain(".narrafork/project.db");
+
+		writeLater(join(repo, ".narrafork", "snapshot-exclude"), "/参考/\n/*.txt\n");
+		const after = await worktreeTreeSnapshot.capture(repo);
+		const paths = await treePaths(repo, after);
+		expect(paths).toContain("chapters/0001.md");
+		expect(paths).not.toContain("big.txt");
+		expect(paths.some((path) => path.startsWith("参考/"))).toBe(false);
+		// The rules file itself is ordinary workspace content.
+		expect(paths).toContain(".narrafork/snapshot-exclude");
+
+		// A later chapter edit is still observed.
+		writeFileSync(join(repo, "chapters", "0001.md"), "第一章（改）\n");
+		const edited = await worktreeTreeSnapshot.capture(repo);
+		expect(await worktreeTreeSnapshot.diffPathStatuses(repo, after, edited)).toEqual([
+			{ path: "chapters/0001.md", kind: "updated" },
+		]);
+	});
+});
+
 describe("stale index.lock recovery", () => {
 	test("reclaims a lock left behind by a killed git process", async () => {
 		const repo = await createRepo("nf-tree-stale-lock-");

@@ -507,6 +507,32 @@ const globalIgnoreCache = new Map<string, { path: string | null; mtime: number }
 const trackedIgnoredCache = new Map<string, { indexKey: string; paths: string[] }>();
 
 /**
+ * Workspace-private snapshot exclude rules, relative to the worktree root.
+ *
+ * Lives under `.narrafork/` — the Runtime's own per-project directory, which is
+ * already kept out of the user's version control — so a product embedding the
+ * Runtime can keep bulky reference material (source novels, spreadsheets, export
+ * output) out of snapshots without editing the user's `.gitignore` or `.git/`.
+ * Same syntax as `info/exclude`, and the same precedence: a worktree `.gitignore`
+ * (including a `!negation`) still out-ranks it, and a file the real repository
+ * tracks is still force-added (see {@link trackedButIgnoredPaths}).
+ */
+export const SNAPSHOT_EXCLUDE_RELATIVE_PATH = ".narrafork/snapshot-exclude";
+
+function snapshotExcludePath(worktreePath: string): string {
+	return resolve(worktreePath, SNAPSHOT_EXCLUDE_RELATIVE_PATH);
+}
+
+/**
+ * Workspaces ({@link treeSnapshotKey}) whose shadow ignore rules were (re)written and
+ * whose shadow index has not yet been reconciled against them
+ * (see {@link evictNewlyIgnoredPaths}). Filled by
+ * {@link syncExcludes}, which runs on the first capture of every process and again
+ * whenever a mirrored ignore source changes.
+ */
+const pendingIgnoredEviction = new Set<string>();
+
+/**
  * Locate the repository-level `info/exclude` that applies to a worktree.
  *
  * A workspace is often a *linked* worktree, where `.git` is a file pointing at
@@ -591,6 +617,18 @@ async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
 		}
 	}
 
+	// Workspace-private snapshot rules (see SNAPSHOT_EXCLUDE_RELATIVE_PATH).
+	try {
+		const workspaceRules = snapshotExcludePath(worktreePath);
+		if (existsSync(workspaceRules)) parts.push(readFileSync(workspaceRules, "utf-8"));
+	} catch {
+		// Unreadable — the remaining sources still apply.
+	}
+
+	// The Runtime's own per-project SQLite database is a live binary that changes on
+	// every write; it is never workspace content, whatever the user's ignore files say.
+	parts.push("/.narrafork/project.db\n/.narrafork/project.db-wal\n/.narrafork/project.db-shm\n");
+
 	// Never snapshot the user's git metadata, and never snapshot the directory that
 	// holds nested linked worktrees.
 	//
@@ -615,6 +653,9 @@ async function syncExcludes(dir: string, worktreePath: string): Promise<void> {
 	parts.push(`/${WORKTREES_DIR_NAME}/\n`);
 	await Bun.write(resolve(infoDir, "exclude"), parts.join("\n"));
 	await writeShadowAttributes(dir);
+	// Keyed by workspace, not by `dir`: ensureShadowRepo hands this function the
+	// lifecycle-canonical shadow path, while the capture holds the raw one.
+	pendingIgnoredEviction.add(treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath));
 }
 
 /**
@@ -805,8 +846,15 @@ async function syncExcludesIfStale(dir: string, worktreePath: string): Promise<v
 		}
 	}
 
+	let workspaceRulesMtime = 0;
+	try {
+		workspaceRulesMtime = statSync(snapshotExcludePath(worktreePath)).mtimeMs;
+	} catch {
+		// Absent — contributes nothing, and its later appearance changes the key.
+	}
+
 	// Combine every mirrored source's mtime into a single cache key for the shadow dir
-	const combinedKey = `${localMtime}:${globalMtime}:${repoExcludeMtime}`;
+	const combinedKey = `${localMtime}:${globalMtime}:${repoExcludeMtime}:${workspaceRulesMtime}`;
 	if (excludeMtimes.get(dir) === combinedKey) return;
 	await syncExcludes(dir, worktreePath);
 	excludeMtimes.set(dir, combinedKey);
@@ -1257,11 +1305,102 @@ async function addAllUnlocked(
 				throw new TreeSnapshotError(`snapshot force-add coverage is incomplete: ${result.stderr}`);
 			}
 		}
-		return added;
 	} catch (error) {
 		trackedIgnoredCache.delete(dir);
 		throw error;
 	}
+
+	const evictionKey = treeSnapshotKey(LOCAL_DEVICE_ID, worktreePath);
+	if (pendingIgnoredEviction.has(evictionKey)) {
+		const evicted = await evictNewlyIgnoredPaths(dir, worktreePath, gitTimeoutMs, signal);
+		if (evicted.exitCode !== 0) return evicted;
+		pendingIgnoredEviction.delete(evictionKey);
+	}
+	return added;
+}
+
+/**
+ * Drop index entries that the current ignore rules exclude and the real repository
+ * does not track.
+ *
+ * `add -A` never removes a path that is already in the index just because an ignore
+ * rule now covers it — git's normal "ignore rules only apply to untracked files"
+ * behaviour. For a shadow index that is a leak: a workspace captured once *before* it
+ * had a `.gitignore` (or before a rule was added) keeps every bulky file of that first
+ * capture in every later snapshot, forever. Measured on a real novel workspace: an
+ * 18 MB reference text and a 71 MB SQLite database stayed in every snapshot after
+ * the user ignored them.
+ *
+ * Paths the real repository tracks are kept: those are exactly what
+ * {@link trackedButIgnoredPaths} force-adds, and dropping them would reopen the
+ * "a change to a tracked .env reads as nothing happened" bug.
+ *
+ * Runs once per rules change (and once per process), not per capture. The capture
+ * that runs it reports the evicted paths as deleted relative to its predecessor —
+ * once, and accurately: they left the snapshot scope.
+ */
+async function evictNewlyIgnoredPaths(
+	dir: string,
+	worktreePath: string,
+	gitTimeoutMs?: number,
+	signal?: AbortSignal,
+): Promise<GitResult> {
+	const listed = await runGitPaths(
+		["ls-files", "-i", "-c", "--exclude-standard", "-z"],
+		dir,
+		worktreePath,
+		{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
+	);
+	if (listed.exitCode !== 0) {
+		return {
+			stdout: "",
+			stderr: `snapshot ignored-path listing failed: ${listed.stderr}`,
+			exitCode: listed.exitCode,
+		};
+	}
+	if (listed.paths.length === 0) return { stdout: "", stderr: "", exitCode: 0 };
+
+	const realTracked = new Set<string>();
+	for (const batch of batchArgs(listed.paths.map((path) => `:(literal)${path}`))) {
+		const result = await safeSpawn({
+			cmd: ["git", "ls-files", "-c", "-z", "--", ...batch],
+			cwd: worktreePath,
+			timeout: gitTimeoutMs ?? GIT_TIMEOUT_MS,
+			maxOutputBytes: GIT_MAX_LISTING_BYTES,
+			env: { ...process.env, LC_ALL: "C" },
+			...(signal && { signal }),
+		});
+		if (result.exitCode === 128 && result.stderr.startsWith("fatal: not a git repository")) break;
+		if (result.exitCode !== 0 || result.stdoutTruncated || result.stderrTruncated) {
+			// Unknown real-repo coverage: keep everything rather than risk dropping a
+			// tracked file from the snapshot.
+			return {
+				stdout: "",
+				stderr: `snapshot real tracked listing failed: ${result.stderr}`,
+				exitCode: result.exitCode || 1,
+			};
+		}
+		for (const path of result.stdout.split("\0")) if (path) realTracked.add(path);
+	}
+
+	const evict = listed.paths.filter((path) => !realTracked.has(path));
+	for (const batch of batchArgs(evict.map((path) => `:(literal)${path}`))) {
+		const removed = await runGit(
+			["rm", "--cached", "-q", "--ignore-unmatch", "--", ...batch],
+			dir,
+			worktreePath,
+			gitTimeoutMs,
+			signal,
+		);
+		if (removed.exitCode !== 0) return removed;
+	}
+	if (evict.length > 0) {
+		logger.info("Dropped newly ignored paths from a workspace snapshot index", {
+			worktreePath,
+			count: evict.length,
+		});
+	}
+	return { stdout: "", stderr: "", exitCode: 0 };
 }
 
 /**
