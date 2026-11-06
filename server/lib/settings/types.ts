@@ -210,6 +210,14 @@ export interface AnthropicProviderConfig {
 	 * prompt caching on relays).
 	 */
 	nativeSearch?: boolean;
+	/**
+	 * Compatible mode only (officialApi=false): send explicit `cache_control`
+	 * breakpoints on the system prompt and the final message (two of the four
+	 * Anthropic allows). Off by default because some relays reject unknown block
+	 * fields; enable it for relays that forward to a real Claude backend, where
+	 * no breakpoint means no prompt cache at all. Official mode ignores it.
+	 */
+	promptCaching?: boolean;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
 	extraHeaders?: Record<string, string>;
 	/**

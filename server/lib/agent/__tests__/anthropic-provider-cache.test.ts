@@ -549,4 +549,22 @@ describe("AnthropicProvider final wire-body cache construction", () => {
 		expect(beta).not.toContain("mid-conversation-system-2026-04-07");
 		expect(beta).not.toContain("context-management-2025-06-27");
 	});
+
+	test("compatible mode with promptCaching marks the system prompt and the final message only", async () => {
+		installFetchCapture();
+		const provider = new AnthropicProvider(config(false, { promptCaching: true }));
+		const request = await sendAndCapture(provider, "compatible cached user tail");
+
+		const paths = collectCacheControlPaths(request.body);
+		expect(paths).toHaveLength(2);
+		expect(paths).toContain("$.system[0].cache_control");
+		const lastMessage = `$.messages[${messagesFrom(request.body).length - 1}]`;
+		expect(paths.some((path) => path.startsWith(lastMessage))).toBe(true);
+		expect(request.body.system).toEqual([
+			{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+		]);
+		// Still compatible mode: no Claude Code dialect, no tool breakpoints.
+		expect(JSON.stringify(request.body)).not.toContain("cch=");
+		expect(JSON.stringify(request.body.tools ?? [])).not.toContain("cache_control");
+	});
 });

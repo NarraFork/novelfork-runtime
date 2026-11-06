@@ -221,6 +221,7 @@ const anthropicProviderSchema = z.object({
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
 	nativeSearch: z.boolean().optional(),
+	promptCaching: z.boolean().optional(),
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,

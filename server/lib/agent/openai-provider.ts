@@ -137,6 +137,29 @@ export function applyOpenAIModelMetadata(
 	assertModelInputModalities(model, body, metadata);
 }
 
+/**
+ * Official OpenAI (api.openai.com) routes prompt-cache lookups by
+ * `prompt_cache_key`; without it, requests of one conversation can land on
+ * different cache shards. Codex already sends it (applyCodexStableRequestFields).
+ * Limited to the official host: compatible relays may reject unknown fields, and
+ * a model that still rejects it is remembered by the unsupported-parameter fallback.
+ */
+export function applyOfficialPromptCacheKey(
+	body: Record<string, unknown>,
+	baseUrl: string,
+	apiMode: OpenAIApiMode,
+	conversationId: string | undefined,
+): void {
+	if (apiMode === "codex" || !conversationId || body.prompt_cache_key !== undefined) return;
+	let host: string;
+	try {
+		host = new URL(baseUrl).hostname;
+	} catch {
+		return;
+	}
+	if (host === "api.openai.com") body.prompt_cache_key = conversationId;
+}
+
 /** Parsed stream events already carry disjoint counters; never subtract cache twice. */
 function parsedUsageToUsageData(
 	usage: NonNullable<ParsedStreamEvent["usage"]>,
@@ -1067,6 +1090,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 		}
 
+		applyOfficialPromptCacheKey(body, baseUrl, this.apiMode, params.conversationId);
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
 

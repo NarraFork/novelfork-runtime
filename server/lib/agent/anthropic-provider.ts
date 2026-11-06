@@ -1846,6 +1846,10 @@ export class AnthropicProvider implements ProviderAdapter {
 		// that the final set of messages is known.
 		const messages = ensureAlternating(draft);
 
+		// Compatible relays opted into prompt caching get two breakpoints: the
+		// system prompt and the final message (Anthropic allows four).
+		const compatibleCaching = !isOfficial && this.config.promptCaching === true;
+
 		// Build system blocks — official API uses the stable Claude Code 3-block
 		// prefix, while proxy mode uses only the NarraFork system prompt.
 		const systemBlocks: Array<Record<string, unknown>> = [];
@@ -1858,7 +1862,11 @@ export class AnthropicProvider implements ProviderAdapter {
 				systemBlocks.push({ type: "text", text: systemPrompt, ...CACHE_CONTROL });
 			}
 		} else if (systemPrompt) {
-			systemBlocks.push({ type: "text", text: systemPrompt });
+			systemBlocks.push(
+				compatibleCaching
+					? { type: "text", text: systemPrompt, ...CACHE_CONTROL }
+					: { type: "text", text: systemPrompt },
+			);
 		}
 
 		// Clone tool definitions so legacy cache markers can be removed without
@@ -1871,7 +1879,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// applyFinalCacheBreakpoint — trailing system and tool_result-only turns
 		// are marked too).
 		clearLegacyCacheMarkers(messages, cachedTools);
-		if (isOfficial) {
+		if (isOfficial || compatibleCaching) {
 			applyFinalCacheBreakpoint(messages);
 		}
 
