@@ -57,6 +57,12 @@ export interface RuntimeResolvedToolContribution {
 
 /** Minimal prompt extension shape consumed by the generic Runtime. */
 export interface RuntimeResolvedPromptExtension {
+	/**
+	 * Optional stable extension id. When present, the extension becomes its own named context
+	 * part (`product.<id>`), so a change to one volatile extension re-sends only that part.
+	 * Extensions without an id share the legacy `product` part.
+	 */
+	readonly id?: string;
 	readonly content: string;
 }
 

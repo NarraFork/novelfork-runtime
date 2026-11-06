@@ -1325,7 +1325,7 @@ export async function buildSystemPrompt(
 		devices: deviceContext?.devices,
 		defaultDeviceId: deviceContext?.defaultDeviceId,
 		runtimePromptExtensions:
-			runtimeContribution?.promptExtensions.map((extension) => extension.content) ?? [],
+			runtimeContribution?.promptExtensions.map(({ id, content }) => ({ id, content })) ?? [],
 		trustedResourcePromptRoot,
 		allowLocalExecution: deviceContext?.allowLocalExecution,
 		...context,

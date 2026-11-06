@@ -33,6 +33,31 @@ export function taskSectionFor(
 	return narratorType === "subagent" ? "none" : "outline";
 }
 
+/** A product prompt extension: a plain string, or content with an optional stable id. */
+export type RuntimePromptExtensionInput = string | { readonly id?: string; readonly content: string };
+
+/**
+ * Groups product prompt extensions into named context parts. Each id gets its own
+ * `product.<id>` part, so a volatile extension changing re-sends only itself; entries without
+ * an id share the legacy `product` part (so a host that sends no ids gets today's single part).
+ * Part order follows each key's first occurrence; repeated ids join in input order.
+ */
+export function groupRuntimePromptExtensions(
+	extensions: readonly RuntimePromptExtensionInput[],
+): PromptPart[] {
+	const groups = new Map<string, string[]>();
+	for (const extension of extensions) {
+		const content = (typeof extension === "string" ? extension : extension.content).trim();
+		if (!content) continue;
+		const id = typeof extension === "string" ? "" : (extension.id ?? "").trim();
+		const key = id ? `product.${id.replace(/[^A-Za-z0-9._-]/g, "-")}` : "product";
+		const group = groups.get(key);
+		if (group) group.push(content);
+		else groups.set(key, [content]);
+	}
+	return [...groups].map(([key, texts]) => ({ key, text: texts.join("\n\n") }));
+}
+
 export interface BuildPromptOptions {
 	/** Base system prompt (narrator's custom prompt or subagent type prompt) */
 	basePrompt: string | null;
@@ -70,8 +95,11 @@ export interface BuildPromptOptions {
 	}>;
 	/** Current session default device id (null/undefined → local server). */
 	defaultDeviceId?: string | null;
-	/** Trusted runtime contribution prompt extensions, ordered by the host integration. */
-	runtimePromptExtensions?: readonly string[];
+	/**
+	 * Trusted runtime contribution prompt extensions, ordered by the host integration. An entry
+	 * with an id becomes its own `product.<id>` part; plain strings share the `product` part.
+	 */
+	runtimePromptExtensions?: readonly RuntimePromptExtensionInput[];
 	/** Trusted product-owned root; never derived from model or browser input. */
 	trustedResourcePromptRoot?: string | null;
 	/** Whether the NarraFork server may be selected as an execution target. */
@@ -398,10 +426,8 @@ export async function buildEffectiveSystemPrompt(
 	// Runtime prompt extensions are ordered by the trusted host and kept outside
 	// the language/plan-mode blocks so they are added exactly once per assembly.
 	{
-		const extensions = (runtimePromptExtensions ?? [])
-			.map((extension) => extension.trim())
-			.filter(Boolean);
-		if (extensions.length > 0) appendPart("product", extensions.join("\n\n"));
+		for (const { key, text } of groupRuntimePromptExtensions(runtimePromptExtensions ?? []))
+			appendPart(key, text);
 	}
 
 	// 5. Inject plan mode system reminder and any other active mode constraints.

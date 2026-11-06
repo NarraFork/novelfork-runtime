@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { contextChanges } from "@shared/prefix-context";
 import { getDynamicSpecSystemReminder, getRunDeliveryHint } from "../../lib/prompt-i18n";
 import { MAX_PROJECT_INSTRUCTIONS_BYTES } from "../../lib/read-file-capped";
-import { buildEffectiveSystemPrompt } from "../narrator-prompt";
+import { buildEffectiveSystemPrompt, groupRuntimePromptExtensions } from "../narrator-prompt";
 
 describe("narrator prompt Dynamic Spec guidance", () => {
 	test("injects Dynamic Spec usage into the effective system prompt", async () => {
@@ -577,5 +577,58 @@ describe("narrator prompt shell tool naming", () => {
 		});
 
 		expect(prompt).toContain("File and command tools (Read, Write, Edit, Glob, Grep, Bash)");
+	});
+});
+
+describe("product prompt extension parts", () => {
+	const build = (runtimePromptExtensions: Parameters<typeof groupRuntimePromptExtensions>[0]) =>
+		buildEffectiveSystemPrompt({
+			basePrompt: "Base",
+			cwd: "/tmp/narrafork-product-parts",
+			locale: "en",
+			replyInUserLanguage: false,
+			runtimePromptExtensions,
+		});
+	const productParts = (parts: readonly { key: string; text: string }[]) =>
+		parts.filter((part) => part.key === "product" || part.key.startsWith("product."));
+
+	test("extensions without ids keep the legacy single product part", async () => {
+		const result = await build(["  core  ", "", { content: "brief" }]);
+		expect(productParts(result.parts)).toEqual([{ key: "product", text: "core\n\nbrief" }]);
+	});
+
+	test("extensions with ids become their own parts in host order", async () => {
+		const result = await build([
+			{ id: "novel.core", content: "core" },
+			{ id: "lore index", content: "cards" },
+			{ id: "workflow", content: "   " },
+			{ id: "novel.core", content: "core tail" },
+			"legacy",
+		]);
+		expect(productParts(result.parts)).toEqual([
+			{ key: "product.novel.core", text: "core\n\ncore tail" },
+			{ key: "product.lore-index", text: "cards" },
+			{ key: "product", text: "legacy" },
+		]);
+		for (const part of productParts(result.parts)) expect(result.prompt).toContain(part.text);
+	});
+
+	test("a volatile extension change only replaces its own part", async () => {
+		const first = await build([
+			{ id: "core", content: "stable core prompt" },
+			{ id: "workflow", content: "run revision 1" },
+		]);
+		const second = await build([
+			{ id: "core", content: "stable core prompt" },
+			{ id: "workflow", content: "run revision 2" },
+		]);
+		const baseline = new Map(first.parts.map((part) => [part.key, part.text]));
+		expect(contextChanges(baseline, second.parts)).toEqual([
+			{ key: "product.workflow", value: "run revision 2" },
+		]);
+		const removed = await build([{ id: "core", content: "stable core prompt" }]);
+		expect(contextChanges(baseline, removed.parts)).toEqual([
+			{ key: "product.workflow", value: null },
+		]);
 	});
 });
