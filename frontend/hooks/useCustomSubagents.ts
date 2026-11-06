@@ -10,6 +10,11 @@ export interface CustomSubagentDef {
 	customTools: string[];
 	defaultModel: string;
 	prompt: string;
+	/** "product" for read-only built-in templates contributed by the host product. */
+	source?: "user" | "product";
+	readOnly?: boolean;
+	nameZh?: string;
+	nameEn?: string;
 }
 
 export function useCustomSubagents() {

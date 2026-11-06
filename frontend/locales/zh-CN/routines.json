@@ -171,6 +171,7 @@
 	"tabCustomSubagents": "自定义子代理",
 	"customSubagentsDesc": "定义具有专用提示词和工具权限的自定义子代理类型。自定义类型可与内置类型（explore、plan、general）一起使用。",
 	"noCustomSubagents": "暂无自定义子代理。创建一个开始使用。",
+	"subagentProductBadge": "内置",
 	"createSubagent": "创建子代理",
 	"editSubagent": "编辑",
 	"deleteSubagent": "删除",

@@ -1,7 +1,11 @@
 import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import { requireAuth } from "../middleware/auth";
-import { customSubagentService, type ToolAccessMode } from "../services/custom-subagent-service";
+import {
+	type CustomSubagentDef,
+	customSubagentService,
+	type ToolAccessMode,
+} from "../services/custom-subagent-service";
 
 export const customSubagentRoutes = new Hono();
 
@@ -13,16 +17,7 @@ customSubagentRoutes.use("/*", requireAuth);
  */
 customSubagentRoutes.get("/", async (c) => {
 	const defs = await customSubagentService.loadAll();
-	return c.json(
-		defs.map((d) => ({
-			name: d.name,
-			description: d.description,
-			toolAccess: d.toolAccess,
-			customTools: d.customTools,
-			defaultModel: d.defaultModel,
-			prompt: d.prompt,
-		})),
-	);
+	return c.json(defs.map(toResponse));
 });
 
 /**
@@ -33,14 +28,7 @@ customSubagentRoutes.get("/:name", async (c) => {
 	const name = c.req.param("name");
 	const def = await customSubagentService.loadByName(name);
 	if (!def) return c.json({ error: "Not found" }, 404);
-	return c.json({
-		name: def.name,
-		description: def.description,
-		toolAccess: def.toolAccess,
-		customTools: def.customTools,
-		defaultModel: def.defaultModel,
-		prompt: def.prompt,
-	});
+	return c.json(toResponse(def));
 });
 
 /**
@@ -135,6 +123,25 @@ customSubagentRoutes.delete("/:name", async (c) => {
 	await customSubagentService.remove(name);
 	return c.json({ ok: true });
 });
+
+/**
+ * Wire shape of a definition. Product templates add `source: "product"`,
+ * `readOnly: true` and localized names; user definitions report `source: "user"`.
+ */
+function toResponse(def: CustomSubagentDef) {
+	return {
+		name: def.name,
+		description: def.description,
+		toolAccess: def.toolAccess,
+		customTools: def.customTools,
+		defaultModel: def.defaultModel,
+		prompt: def.prompt,
+		source: def.source ?? "user",
+		readOnly: def.readOnly === true,
+		...(def.nameZh ? { nameZh: def.nameZh } : {}),
+		...(def.nameEn ? { nameEn: def.nameEn } : {}),
+	};
+}
 
 function validateToolAccess(value: string | undefined): ToolAccessMode {
 	if (value === "general" || value === "custom") return value;

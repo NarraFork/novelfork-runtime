@@ -1646,8 +1646,13 @@ function CustomSubagentsTab() {
 						<div style={{ flex: 1, minWidth: 0 }}>
 							<Group gap="xs">
 								<Text size="sm" fw={600}>
-									{sa.name}
+									{sa.source === "product" ? (sa.nameZh ?? sa.name) : sa.name}
 								</Text>
+								{sa.source === "product" && (
+									<Badge size="xs" variant="light" color="gray">
+										{t("subagentProductBadge")}
+									</Badge>
+								)}
 								<Badge size="xs" variant="light" color="teal">
 									{toolAccessLabel(sa.toolAccess)}
 								</Badge>
@@ -1659,19 +1664,21 @@ function CustomSubagentsTab() {
 								)}
 							</Text>
 						</div>
-						<Group gap={4}>
-							<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(sa)}>
-								{t("editSubagent")}
-							</Button>
-							<ActionIcon
-								variant="subtle"
-								color="red"
-								size="sm"
-								onClick={() => handleDelete(sa.name)}
-							>
-								<IconTrash size={14} />
-							</ActionIcon>
-						</Group>
+						{!sa.readOnly && (
+							<Group gap={4}>
+								<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(sa)}>
+									{t("editSubagent")}
+								</Button>
+								<ActionIcon
+									variant="subtle"
+									color="red"
+									size="sm"
+									onClick={() => handleDelete(sa.name)}
+								>
+									<IconTrash size={14} />
+								</ActionIcon>
+							</Group>
+						)}
 					</Group>
 				</Paper>
 			))}

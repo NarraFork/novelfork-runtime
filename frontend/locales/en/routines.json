@@ -171,6 +171,7 @@
 	"tabCustomSubagents": "Custom Subagents",
 	"customSubagentsDesc": "Define custom subagent types with specialized prompts and tool permissions. Custom types can be used alongside built-in types (explore, plan, general).",
 	"noCustomSubagents": "No custom subagents defined. Create one to get started.",
+	"subagentProductBadge": "Built-in",
 	"createSubagent": "Create Subagent",
 	"editSubagent": "Edit",
 	"deleteSubagent": "Delete",

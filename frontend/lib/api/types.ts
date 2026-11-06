@@ -998,6 +998,10 @@ export interface CustomSubagentData {
 	customTools: string[];
 	defaultModel: string;
 	prompt: string;
+	source?: "user" | "product";
+	readOnly?: boolean;
+	nameZh?: string;
+	nameEn?: string;
 }
 
 export interface BufferCreator {

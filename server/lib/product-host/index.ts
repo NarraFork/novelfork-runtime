@@ -9,6 +9,7 @@ export type {
 	RuntimeProductHostServices,
 	RuntimeProductIntegration,
 	RuntimeProductNarratorAdapter,
+	RuntimeProductSubagentTemplate,
 	RuntimeProductTextGenerationOptions,
 	RuntimeProductTextGenerationRequest,
 	RuntimeProductTextGenerationResult,

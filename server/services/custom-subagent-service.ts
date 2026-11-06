@@ -1,9 +1,11 @@
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import matter from "gray-matter";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import type { RuntimePolicyTrait } from "../lib/runtime-policy-trait";
+import type { RuntimeProductSubagentTemplate } from "../lib/product-host/contracts";
+import { getProductSubagentTemplates } from "../lib/product-host/subagent-templates";
 import { narraforkDir } from "../lib/settings";
 import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
 
@@ -26,8 +28,15 @@ export interface CustomSubagentDef {
 	defaultModel: string;
 	/** System prompt (markdown body) */
 	prompt: string;
-	/** Absolute path to the SUBAGENT.md file */
+	/** Absolute path to the SUBAGENT.md file; `product:<productId>/<id>` for product templates */
 	location: string;
+	/** Where the definition comes from. Absent means a user SUBAGENT.md. */
+	source?: "user" | "product";
+	/** Product templates cannot be edited or deleted through this service. */
+	readOnly?: boolean;
+	/** Localized display names (product templates only). */
+	nameZh?: string;
+	nameEn?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -35,6 +44,11 @@ export interface CustomSubagentDef {
 // ---------------------------------------------------------------------------
 
 const BUILTIN_TYPES = new Set(["explore", "plan", "general", "review"]);
+/** Names product templates may never take: every built-in template and type. */
+const RESERVED_TEMPLATE_NAMES: ReadonlySet<string> = new Set([
+	...BUILTIN_TYPES,
+	...BUILTIN_DELEGATION_TEMPLATES,
+]);
 const SUBAGENTS_DIR = join(narraforkDir, "subagents");
 const SUBAGENT_FILE = "SUBAGENT.md";
 
@@ -123,8 +137,62 @@ async function loadCached(filePath: string, dirName: string): Promise<CustomSuba
 	return def;
 }
 
-/** Load all custom subagent definitions from ~/.narrafork/subagents/ */
+// ---------------------------------------------------------------------------
+// Product templates
+// ---------------------------------------------------------------------------
+
+function productTemplateDef(template: RuntimeProductSubagentTemplate): CustomSubagentDef {
+	return {
+		name: template.id,
+		description: template.description,
+		toolAccess: "custom",
+		customTools: [...template.tools],
+		defaultModel: template.defaultModel ?? "",
+		prompt: template.prompt,
+		location: `product:${template.id}`,
+		source: "product",
+		readOnly: true,
+		nameZh: template.nameZh,
+		nameEn: template.nameEn,
+	};
+}
+
+function productTemplates(): readonly RuntimeProductSubagentTemplate[] {
+	return getProductSubagentTemplates(RESERVED_TEMPLATE_NAMES);
+}
+
+function findProductTemplate(name: string): RuntimeProductSubagentTemplate | null {
+	const key = name.trim().toLowerCase();
+	if (!key) return null;
+	return productTemplates().find((template) => template.id === key) ?? null;
+}
+
+/** Whether a name (as typed, or as its directory form) belongs to a product template. */
+export function isProductTemplateName(name: string): boolean {
+	return findProductTemplate(name) !== null || findProductTemplate(sanitizeDirName(name)) !== null;
+}
+
+function assertNotProductTemplateName(name: string): void {
+	if (isProductTemplateName(name)) {
+		throw new ValidationError(`"${name}" is a built-in product subagent and cannot be used`);
+	}
+}
+
+/**
+ * Load all subagent definitions: product templates first, then the user's
+ * custom definitions from ~/.narrafork/subagents/ (a user file whose name a
+ * product template already takes is shadowed and not listed).
+ */
 export async function loadAll(): Promise<CustomSubagentDef[]> {
+	const products = productTemplates().map(productTemplateDef);
+	const userDefs = await loadAllUserDefs();
+	return [
+		...products,
+		...userDefs.filter((def) => !isProductTemplateName(def.name) && !isProductTemplateName(basename(dirname(def.location)))),
+	];
+}
+
+async function loadAllUserDefs(): Promise<CustomSubagentDef[]> {
 	const defs: CustomSubagentDef[] = [];
 	try {
 		const entries = await readdir(SUBAGENTS_DIR, { withFileTypes: true });
@@ -140,8 +208,14 @@ export async function loadAll(): Promise<CustomSubagentDef[]> {
 	return defs;
 }
 
-/** Load a single custom subagent by name. */
+/** Load a single subagent definition by name; product templates take precedence. */
 export async function loadByName(name: string): Promise<CustomSubagentDef | null> {
+	const product = findProductTemplate(name);
+	if (product) return productTemplateDef(product);
+	return loadUserDefByName(name);
+}
+
+async function loadUserDefByName(name: string): Promise<CustomSubagentDef | null> {
 	const dirName = sanitizeDirName(name);
 	if (!dirName) return null;
 	const filePath = join(SUBAGENTS_DIR, dirName, SUBAGENT_FILE);
@@ -187,6 +261,7 @@ export async function create(
 	if (isBuiltinType(input.name)) {
 		throw new ValidationError(`"${input.name}" is a built-in subagent type and cannot be used`);
 	}
+	assertNotProductTemplateName(input.name);
 	const dirName = sanitizeDirName(input.name);
 	if (!dirName) throw new ValidationError("Invalid subagent name");
 
@@ -212,11 +287,16 @@ export async function update(
 	currentName: string,
 	input: Omit<CustomSubagentDef, "location">,
 ): Promise<CustomSubagentDef> {
-	const existing = await loadByName(currentName);
+	if (isProductTemplateName(currentName)) {
+		throw new ValidationError(`"${currentName}" is a built-in product subagent and is read-only`);
+	}
+	assertNotProductTemplateName(input.name);
+	const existing = await loadUserDefByName(currentName);
 	if (!existing) throw new NotFoundError("Custom subagent", currentName);
 
 	const oldDir = dirname(existing.location);
-	const oldDirName = oldDir.split("/").pop() ?? "";
+	// basename, not split("/"): on Windows `join` yields backslashes.
+	const oldDirName = basename(oldDir);
 	const newDirName = sanitizeDirName(input.name);
 	if (!newDirName) throw new ValidationError("Invalid subagent name");
 
@@ -256,7 +336,10 @@ export async function update(
 }
 
 export async function remove(name: string): Promise<void> {
-	const existing = await loadByName(name);
+	if (isProductTemplateName(name)) {
+		throw new ValidationError(`"${name}" is a built-in product subagent and is read-only`);
+	}
+	const existing = await loadUserDefByName(name);
 	if (!existing) throw new NotFoundError("Custom subagent", name);
 
 	const dir = dirname(existing.location);
@@ -291,6 +374,7 @@ export const customSubagentService = {
 	loadAll,
 	loadByName,
 	isBuiltinType,
+	isProductTemplateName,
 	create,
 	update,
 	remove,

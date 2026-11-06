@@ -101,6 +101,36 @@ export interface RuntimeProductToolRoutineContribution {
 }
 
 /**
+ * A product-contributed delegation template (built-in subagent).
+ *
+ * It is resolved exactly like a user's custom subagent definition, with
+ * `toolAccess: "custom"`: the created narrator's capability ceiling is its
+ * `tools` list and nothing else. Product templates are read-only — users cannot
+ * create, edit or delete a definition with the same name — and they take
+ * precedence over any user SUBAGENT.md of the same name.
+ */
+export interface RuntimeProductSubagentTemplate {
+	/**
+	 * Stable, product-namespaced, lowercase id (`<product>-<role>`, e.g. `nf-writer`).
+	 * It is the `subagent_type` the model passes to the Agent tool, and is stored
+	 * on created narrators as their subagent type.
+	 */
+	readonly id: string;
+	readonly nameZh: string;
+	readonly nameEn: string;
+	readonly description: string;
+	/**
+	 * Registry names (as the model sees them, e.g. `chapter_read`) the delegated
+	 * narrator may use. This is the whole ceiling: names not listed are invisible.
+	 */
+	readonly tools: readonly string[];
+	/** Default model override for subagents created from this template. */
+	readonly defaultModel?: string;
+	/** Base system prompt of the created narrator. */
+	readonly prompt: string;
+}
+
+/**
  * Product-owned adapter for a narrator's trusted domain contributions. The
  * Runtime only consumes these generic operations; the product owns bindings,
  * tool implementations, prompts, and allowlist policy.
@@ -226,6 +256,8 @@ export interface RuntimeProductIntegration {
 	mountAuthenticatedRoutes?(app: Hono): void;
 	mountRuntimeBindingRoutes?(app: Hono): void;
 	learningContributions?(): readonly RuntimeLearningContribution[];
+	/** Built-in delegation templates (see `RuntimeProductSubagentTemplate`). */
+	subagentTemplates?(): readonly RuntimeProductSubagentTemplate[];
 	narrator?: RuntimeProductNarratorAdapter;
 	isProductNarrator?(traits: unknown): boolean;
 	resolveNarratorCwd?(
