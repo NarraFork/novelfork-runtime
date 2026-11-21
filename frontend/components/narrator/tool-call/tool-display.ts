@@ -852,9 +852,32 @@ export function getSummary(
 			if (!action) return label ? `Schedule: ${label}` : "Schedule";
 			return label ? short(`${action}: ${label}`, 60) : action;
 		}
+		case "generic":
+			return genericSummary(input);
 		default:
 			return toolName;
 	}
+}
+
+/**
+ * Product / MCP tools: the action plus one identifying field. Never the tool name —
+ * the header already prints it, so echoing it read as `style_manage style_manage`.
+ */
+function genericSummary(input: unknown): string {
+	const action = extractField(input, "action", "mode", "op");
+	const subject = extractField(
+		input,
+		"title",
+		"name",
+		"sourceName",
+		"file_path",
+		"filePath",
+		"path",
+		"query",
+		"jobId",
+	);
+	const label = /[\\/]/.test(subject) ? basename(subject.replace(/\\/g, "/")) : subject;
+	return short([action, label].filter(Boolean).join(" · "), 60);
 }
 
 /** Row titles are capped so one long summary cannot dominate a fold. */
