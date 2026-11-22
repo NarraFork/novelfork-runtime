@@ -13,6 +13,14 @@ function escapeHtml(text: string): string {
 	return text.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
 
+/** A JS string literal safe inside an inline `<script>` (no `</script>` or `<!--` breakout). */
+function scriptString(text: string): string {
+	return JSON.stringify(text).replace(
+		/[<>&\u2028\u2029]/g,
+		(char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`,
+	);
+}
+
 /**
  * The page, titled with the instance's display name: the Windows manager finds an open window by
  * that title, so a page titled "NarraFork" would get a second window opened next to it.
@@ -75,6 +83,8 @@ details { margin-top: 16px; }
 </main>
 <script>
 (() => {
+	// The instance display name (NovelFork fork layer) replaces the upstream product name below.
+	const brand = ${scriptString(brandName)};
 	const zh = /^zh/i.test(navigator.language || "");
 	document.documentElement.lang = zh ? "zh-CN" : "en";
 	const text = zh
@@ -82,19 +92,19 @@ details { margin-top: 16px; }
 			starting: "正在启动…",
 			database: "正在准备数据库…",
 			migrating: (c, t) => "正在升级数据库（" + c + "/" + t + "）…",
-			hint: "数据库较大时可能需要几分钟，请不要关闭 NarraFork。",
-			stopped: "NarraFork 已停止。处理完成后重新启动即可。",
-			gone: "NarraFork 没有响应。",
-			goneHint: "它可能已经退出。重新启动后，本页会自动进入 NarraFork。",
+			hint: "数据库较大时可能需要几分钟，请不要关闭 " + brand + "。",
+			stopped: brand + " 已停止。处理完成后重新启动即可。",
+			gone: brand + " 没有响应。",
+			goneHint: "它可能已经退出。重新启动后，本页会自动进入 " + brand + "。",
 			copy: "复制命令", copied: "已复制", details: "详细信息",
 		}
 		: {
 			starting: "Starting…",
 			database: "Preparing the database…",
 			migrating: (c, t) => "Upgrading the database (" + c + "/" + t + ")…",
-			hint: "A large database can take a few minutes. Please keep NarraFork running.",
-			stopped: "NarraFork has stopped. Start it again once this is resolved.",
-			gone: "NarraFork is not responding.",
+			hint: "A large database can take a few minutes. Please keep " + brand + " running.",
+			stopped: brand + " has stopped. Start it again once this is resolved.",
+			gone: brand + " is not responding.",
 			goneHint: "It may have exited. Once it is started again, this page opens it.",
 			copy: "Copy command", copied: "Copied", details: "Details",
 		};

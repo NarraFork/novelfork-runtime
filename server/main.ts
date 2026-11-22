@@ -64,6 +64,7 @@ import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, inlineScriptHashes, spaIndexHeaders } from "./lib/spa-base-href";
+import { getRuntimeStartupHooks, notifyStartupHook } from "./lib/startup-hooks";
 import { createStartupReadinessGate } from "./lib/startup-readiness";
 import { closeStartupStatus } from "./lib/startup-status";
 import { noPortAvailable, portUnavailable } from "./lib/startup-status/startup-problems";
@@ -956,6 +957,8 @@ const stopRemoteAccess = attachRemoteAccessRuntime({
 	console.log("");
 	// No-op when the startup page already opened it.
 	openFrontendOnce(url);
+	// An embedding host opens its own window (NovelFork fork layer, see lib/startup-hooks).
+	notifyStartupHook(getRuntimeStartupHooks().onServerListening, url);
 }
 
 // Verify database integrity in the background, now that the port is bound and requests are being

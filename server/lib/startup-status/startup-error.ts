@@ -32,3 +32,20 @@ export function formatStartupProblem(problem: StartupProblem): string {
 		.filter(Boolean)
 		.join("\n");
 }
+
+/**
+ * The problem worded with the instance's display name (NovelFork fork layer). Upstream messages
+ * name the product "NarraFork"; an embedding host or a renamed instance shows its own name. Only
+ * the message is rewritten: the command and the detail are for pasting and bug reports.
+ */
+export function brandStartupProblem(problem: StartupProblem, brandName: string): StartupProblem {
+	const brand = brandName.trim();
+	if (!brand || brand === "NarraFork") return problem;
+	return {
+		...problem,
+		message: {
+			en: problem.message.en.replaceAll("NarraFork", brand),
+			zh: problem.message.zh.replaceAll("NarraFork", brand),
+		},
+	};
+}
