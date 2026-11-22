@@ -51,7 +51,8 @@ import {
 	writePreferences,
 	writeServerAddress,
 } from "./manager-config";
-import { setLanguage, t } from "./manager-i18n";
+import { getManagerHost, managerIdentity } from "./manager-host";
+import { setLanguage, setProductName, t } from "./manager-i18n";
 import { resolveFrontendOpen } from "./open-frontend";
 import { ServiceHealthMonitor } from "./service-health-monitor";
 import { showSettingsDialog } from "./settings-window";
@@ -156,9 +157,12 @@ const WM_OPEN_FRONTEND = WM_APP + 6;
 const WM_MANAGER_HANDOVER = WM_APP + 7;
 /** 新面板等待旧面板释放单实例互斥体的上限。 */
 const MANAGER_HANDOVER_WAIT_MS = 20_000;
-/** 窗口标题：单实例聚焦时按它查找已有窗口，必须与创建时一致。 */
-const WINDOW_TITLE = "NarraFork Manager";
-const MANAGER_MUTEX_NAME = "Local\\NarraFork.Manager";
+/**
+ * 窗口标题：单实例聚焦时按它查找已有窗口，必须与创建时一致。嵌入宿主（NovelFork fork 层，
+ * manager-host.ts）按产品键另起一套，与同机的独立 NarraFork 互不干扰；runManager 开头确定。
+ */
+let WINDOW_TITLE = managerIdentity(undefined).windowTitle;
+let MANAGER_MUTEX_NAME = managerIdentity(undefined).mutexName;
 const TRAY_ID_OPEN = 9101;
 const TRAY_ID_EXIT = 9103;
 
@@ -182,10 +186,26 @@ async function loadBranding(): Promise<{ color: string; name: string }> {
 		const name =
 			typeof raw.branding?.name === "string" && raw.branding.name.trim()
 				? raw.branding.name.trim()
-				: DEFAULT_BRAND_NAME;
+				: defaultBrandName();
 		return { color: normalizeBrandColor(raw.branding?.iconColor), name };
 	} catch {
-		return { color: DEFAULT_BRAND_COLOR, name: DEFAULT_BRAND_NAME };
+		return { color: DEFAULT_BRAND_COLOR, name: defaultBrandName() };
+	}
+}
+
+/** 未配置实例名时前端页面标题用的名字：嵌入宿主的产品名，否则上游默认。 */
+function defaultBrandName(): string {
+	return getManagerHost()?.productName || DEFAULT_BRAND_NAME;
+}
+
+/** 嵌入宿主提供的产品图标（优先于按主题色重着色的 NarraFork 图标）。 */
+function hostWindowIcon(): Pointer | undefined {
+	try {
+		const pixels = getManagerHost()?.icon?.(WINDOW_ICON_SIZE);
+		if (!pixels || pixels.length !== WINDOW_ICON_SIZE * WINDOW_ICON_SIZE * 4) return undefined;
+		return createIconFromRgba(WINDOW_ICON_SIZE, pixels);
+	} catch {
+		return undefined;
 	}
 }
 
@@ -1091,7 +1111,26 @@ function restoreFromTray(hwnd: Pointer): void {
  * forceNewWindow 表示"用户明确要求打开"（托盘「打开新窗口」、Shift+点击）：此时即使设置是
  * "不打开"，也回落为浏览器网页 —— 否则那个菜单项会像坏掉一样毫无反应。
  */
-function openPanel(forceNewWindow = false, explicit = false): void {
+function openPanel(forceNewWindow = false, explicit = false, address?: string): void {
+	const host = getManagerHost();
+	if (host?.openFrontend) {
+		// 嵌入宿主自己开产品窗口（含聚焦已开窗口），不读 server.openBrowser。
+		const url = `${address ?? serviceOrigin()}/`;
+		const outcome = host.openFrontend({
+			url,
+			automatic: !explicit,
+			forceNewWindow,
+			windowTitle: settings.brandName,
+		});
+		if (outcome === "focused") appendLog("WEB", t("log.focusedPanel"));
+		else if (outcome === "opened") {
+			appendLog(
+				"WEB",
+				forceNewWindow ? t("log.openedPanelNew", { url }) : t("log.openedPanel", { url }),
+			);
+		}
+		return;
+	}
 	// 已有前端窗口（--app 窗口的标题就是实例显示名）时直接聚焦，不重复打开。
 	if (!forceNewWindow && focusWindowByTitle(settings.brandName)) {
 		appendLog("WEB", t("log.focusedPanel"));
@@ -1169,13 +1208,19 @@ function requestOpenFrontend(): void {
  * 与「打开 NarraFork」按钮走同一条路径：先聚焦已存在的窗口，没有才新建。
  * 启动时是否打开由 settings.json 的 openBrowser 决定；再次启动若带了明确要求，则仍会打开。
  */
-function openFrontendOnce(): void {
+function openFrontendOnce(address?: string): void {
 	if (frontendOpened && !openWhenReady) return;
 	const explicit = openWhenReady;
 	openWhenReady = false;
 	frontendOpened = true;
-	if (!explicit && readNarraForkSettings().openBrowser === "off") return;
-	openPanel(false, explicit);
+	if (
+		!explicit &&
+		!getManagerHost()?.openFrontend &&
+		readNarraForkSettings().openBrowser === "off"
+	) {
+		return;
+	}
+	openPanel(false, explicit, address);
 }
 
 /**
@@ -1203,10 +1248,12 @@ async function openSettings(): Promise<void> {
 	setLanguage(result.preferences.language);
 	if (result.narraforkChanged) {
 		settings.brandColor = result.narrafork.brandColor || DEFAULT_BRAND_COLOR;
-		settings.brandName = result.narrafork.brandName || DEFAULT_BRAND_NAME;
+		settings.brandName = result.narrafork.brandName || defaultBrandName();
 		brandColorRef = toColorRef(settings.brandColor);
 		const icon =
-			(await loadBrandedIcon(settings.brandColor)) ?? resolveWindowIcon(mainWindow.instance);
+			hostWindowIcon() ??
+			(await loadBrandedIcon(settings.brandColor)) ??
+			resolveWindowIcon(mainWindow.instance);
 		if (icon) {
 			windowIcon = icon;
 			setWindowIcon(mainWindow.hwnd, icon);
@@ -1223,6 +1270,9 @@ async function openSettings(): Promise<void> {
  * 运行面板。返回 `"serve"` 表示面板无法接手本次更新交接，调用方应改走服务模式自己完成交接。
  */
 export async function runManager(): Promise<"done" | "serve"> {
+	const host = getManagerHost();
+	({ windowTitle: WINDOW_TITLE, mutexName: MANAGER_MUTEX_NAME } = managerIdentity(host));
+	if (host) setProductName(host.productName);
 	if (!isNativeAvailable()) {
 		if (hasHandoffEnv()) return "serve";
 		console.error(t("error.nativeUnavailable"));
@@ -1268,7 +1318,8 @@ export async function runManager(): Promise<"done" | "serve"> {
 		managerToken,
 		onLine: (line) => appendLog(undefined, formatBackendLine(line)),
 		// 状态页已在服务地址上应答：现在打开，用户就能看到启动进度，而不是等迁移跑完。
-		onStartupPage: () => openFrontendOnce(),
+		// 用状态页自报的地址：此时还没有 `running on`，配置里的主机名可能连不上实际监听。
+		onStartupPage: (url) => openFrontendOnce(url),
 		onState: (state, detail) => {
 			// 让位中：旧服务按交接退出是预期结果，不当成崩溃，也不再弹出这个即将退出的窗口。
 			if (handingOver) return;
@@ -1362,7 +1413,7 @@ export async function runManager(): Promise<"done" | "serve"> {
 	// 横幅：WM_PAINT 画渐变底，两个白色静态文本叠在上面。
 	controls.bannerTitle = add(
 		"STATIC",
-		"NarraFork Manager",
+		WINDOW_TITLE,
 		SS_LEFT,
 		ID.bannerTitle,
 		22,
@@ -1574,8 +1625,9 @@ export async function runManager(): Promise<"done" | "serve"> {
 		font: monoFont,
 	});
 
-	// 图标：优先按主题色实时生成（品牌素材重着色），失败回退静态 ico / exe 内嵌资源。
-	windowIcon = (await loadBrandedIcon(settings.brandColor)) ?? resolveWindowIcon(instance);
+	// 图标：嵌入宿主的产品图标优先；否则按主题色实时生成（品牌素材重着色），失败回退静态 ico / exe 内嵌资源。
+	windowIcon =
+		hostWindowIcon() ?? (await loadBrandedIcon(settings.brandColor)) ?? resolveWindowIcon(instance);
 	taskbarCreatedMessage = registerWindowMessage("TaskbarCreated");
 	tray = new TrayLifecycle({
 		add: () => !!windowIcon && addTrayIcon(hwnd, windowIcon, WINDOW_TITLE, WM_TRAY),

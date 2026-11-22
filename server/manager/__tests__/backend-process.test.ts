@@ -281,7 +281,7 @@ describe("BackendProcess lifecycle ownership", () => {
 	});
 
 	test("the startup page is reported but neither counts as listening nor as running", async () => {
-		const startupPages: number[] = [];
+		const startupPages: string[] = [];
 		backend.dispose();
 		backend = new BackendProcess({
 			host: "127.0.0.1",
@@ -290,7 +290,7 @@ describe("BackendProcess lifecycle ownership", () => {
 			managerToken: "test-manager-token",
 			onLine: (line) => lines.push(line),
 			onState: (state, detail) => states.push({ state, detail }),
-			onStartupPage: () => startupPages.push(Date.now()),
+			onStartupPage: (url) => startupPages.push(url),
 		});
 		const child = fakeChild(101);
 		children.push(child);
@@ -298,7 +298,8 @@ describe("BackendProcess lifecycle ownership", () => {
 		const probe = spyOn(backend, "checkHealth").mockResolvedValue(true);
 		const started = backend.start();
 		await clock.advance(700);
-		expect(startupPages).toHaveLength(1);
+		// The page reports where it answers, so the manager can open it before `running on`.
+		expect(startupPages).toEqual(["http://127.0.0.1:7780"]);
 		// Still waiting for `running on`: the page's 503 health must not be probed as the service.
 		expect(probe).not.toHaveBeenCalled();
 		expect(backend.current).toBe("starting");

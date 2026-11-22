@@ -45,6 +45,17 @@ export function getRuntimeStartupHooks(): RuntimeStartupHooks {
 	return registry[HOOKS_KEY] ?? {};
 }
 
+/**
+ * Whether the host opens its own window. It is told where the app answers, so the Runtime's own
+ * browser auto-open (`server.openBrowser`) would only add a second window next to the host's.
+ * Read through the `globalThis` registry, so it holds even when the settings module that carries
+ * `server.openBrowser` was evaluated twice or reloaded from disk.
+ */
+export function hostOpensWindow(): boolean {
+	const hooks = getRuntimeStartupHooks();
+	return !!(hooks.onStartupPageListening || hooks.onServerListening);
+}
+
 /** Test-only reset. */
 export function resetRuntimeStartupHooksForTests(): void {
 	delete registry[HOOKS_KEY];

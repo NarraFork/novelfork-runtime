@@ -333,6 +333,12 @@ const MESSAGES: Record<string, Message> = {
 };
 
 let currentLang: ManagerLang = "zh-CN";
+/** 嵌入宿主的产品名（NovelFork fork 层，见 manager-host.ts）；文案里的 "NarraFork" 换成它。 */
+let productName = "NarraFork";
+
+export function setProductName(name: string): void {
+	productName = name.trim() || "NarraFork";
+}
 
 export function setLanguage(lang: ManagerLang): void {
 	currentLang = lang;
@@ -347,6 +353,7 @@ export function t(key: string, params?: Record<string, string | number>): string
 	const message = MESSAGES[key];
 	if (!message) return key;
 	let text = message[currentLang] ?? message["zh-CN"];
+	if (productName !== "NarraFork") text = text.replaceAll("NarraFork", productName);
 	if (params) {
 		for (const [name, value] of Object.entries(params)) {
 			text = text.replace(`{${name}}`, String(value));

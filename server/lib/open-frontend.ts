@@ -3,6 +3,7 @@ import { CHROMIUM_PATHS } from "../../shared/browser-paths";
 import { IS_MACOS, IS_WINDOWS } from "./platform";
 import { settings } from "./settings";
 import { shellExecute } from "./shell-exec";
+import { hostOpensWindow } from "./startup-hooks";
 
 const OPENED_URL = Symbol.for("narrafork.frontendOpenedUrl");
 const opened = globalThis as { [OPENED_URL]?: string };
@@ -18,12 +19,15 @@ const opened = globalThis as { [OPENED_URL]?: string };
  * never does.
  *
  * `explicit` is for a person asking to open it (starting the app again while it runs): "off" only
- * stops the automatic open at startup, the same rule the manager follows.
+ * stops the automatic open at startup, the same rule the manager follows. An embedding host that
+ * opens its own window (NovelFork fork layer, `startup-hooks`) owns the automatic open, whatever
+ * `server.openBrowser` says.
  *
  * Returns whether a browser is being opened.
  */
 export function openFrontendOnce(url: string, options: { explicit?: boolean } = {}): boolean {
 	if (process.env.NARRAFORK_MANAGER_MANAGED === "1") return false;
+	if (!options.explicit && hostOpensWindow()) return false;
 	const mode = settings.server.openBrowser;
 	if (mode === "off" && !options.explicit) return false;
 	if (opened[OPENED_URL] === url) return false;

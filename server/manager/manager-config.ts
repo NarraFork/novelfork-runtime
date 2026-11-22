@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSyn
 import { dirname, join } from "node:path";
 import { withSettingsFileLock } from "../lib/settings-file-lock";
 import { resolveNarraforkHome } from "./backend-process";
+import { getManagerHost } from "./manager-host";
 import { isManagerLang, type ManagerLang } from "./manager-i18n";
 
 export interface ServerAddress {
@@ -26,22 +27,46 @@ function settingsPath(): string {
 	return join(resolveNarraforkHome(), "settings.json");
 }
 
+/**
+ * 服务子进程继承面板的环境，`HOST` / `PORT` 在服务端优先于 settings（`server/serve.ts` 的
+ * listenTarget）。嵌入宿主（NovelFork fork 层）常用它们固定产品端口，面板必须探测同一个地址，
+ * 否则会把配置端口上的另一个程序（如独立 NarraFork）当成「外部启动」的服务。
+ */
+function withHostEnvOverrides(address: ServerAddress, hostConfigured: boolean): ServerAddress {
+	if (!getManagerHost()) return address;
+	// 没配主机时服务用 settings 默认的 localhost（server/lib/settings/defaults.ts），
+	// 不是面板历来的 127.0.0.1：Windows 上 localhost 常解析为 ::1，探 127.0.0.1 会落空。
+	const host = process.env.HOST?.trim() || (hostConfigured ? "" : "localhost");
+	const port = Number(process.env.PORT);
+	return {
+		...address,
+		...(host ? { host } : {}),
+		...(Number.isInteger(port) && port > 0 && port <= 65535 ? { port } : {}),
+	};
+}
+
 /** 读取监听地址；文件缺失或不可解析时回落到默认值。 */
 export function readServerAddress(): ServerAddress {
+	const { address, hostConfigured } = readSettingsAddress();
+	return withHostEnvOverrides(address, hostConfigured);
+}
+
+function readSettingsAddress(): { address: ServerAddress; hostConfigured: boolean } {
 	try {
 		const raw = Bun.JSONC.parse(readFileSync(settingsPath(), "utf8")) as {
 			server?: { host?: string; port?: number; tls?: { enabled?: boolean } };
 		};
+		const hostConfigured = typeof raw.server?.host === "string" && !!raw.server.host;
 		return {
-			host:
-				typeof raw.server?.host === "string" && raw.server.host
-					? raw.server.host
-					: DEFAULT_ADDRESS.host,
-			port: typeof raw.server?.port === "number" ? raw.server.port : DEFAULT_ADDRESS.port,
-			tls: raw.server?.tls?.enabled === true,
+			address: {
+				host: hostConfigured ? (raw.server?.host as string) : DEFAULT_ADDRESS.host,
+				port: typeof raw.server?.port === "number" ? raw.server.port : DEFAULT_ADDRESS.port,
+				tls: raw.server?.tls?.enabled === true,
+			},
+			hostConfigured,
 		};
 	} catch {
-		return { ...DEFAULT_ADDRESS };
+		return { address: { ...DEFAULT_ADDRESS }, hostConfigured: false };
 	}
 }
 
