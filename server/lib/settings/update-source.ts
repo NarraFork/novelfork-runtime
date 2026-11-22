@@ -1,5 +1,10 @@
 import { proxyOverrideSchema } from "@shared/proxy-settings";
 import { z } from "zod";
+import {
+	BUILD_UPDATE_PROFILE,
+	isOfficialGithubRepository,
+	type UpdateBuildProfile,
+} from "../../../shared/build-product";
 import { BUILD_GITHUB_REPOSITORY } from "../../../shared/build-repository";
 import { isValidGitHubRepository } from "../../../shared/github-repository";
 
@@ -14,43 +19,68 @@ export const DEFAULT_UPDATE_SETTINGS = {
 	source: "github",
 	githubRepository: DEFAULT_GITHUB_REPOSITORY,
 	serverUrl: LEGACY_UPDATE_SERVER_URL,
-	product: "narrafork",
+	product: BUILD_UPDATE_PROFILE.product ?? "narrafork",
 	channel: "stable",
 	checkIntervalMinutes: 60,
 	autoDownload: false,
 } satisfies NonNullable<NarraForkSettings["update"]>;
 
+type UpdateSourceProfile = Pick<UpdateBuildProfile, "repository" | "product">;
+
+/**
+ * Product builds update only from their own GitHub releases: the mirror source and the
+ * upstream NarraFork repository are rejected rather than silently ignored.
+ */
+export function createUpdateSourceSettingsSchema(
+	profile: UpdateSourceProfile = BUILD_UPDATE_PROFILE,
+) {
+	const product = profile.product !== null;
+	return z
+		.object({
+			proxy: proxyOverrideSchema,
+			source: z
+				.enum(["github", "update-server"])
+				.refine((source) => !product || source === "github", {
+					message: "This build only updates from its GitHub releases",
+				})
+				.optional(),
+			githubRepository: z
+				.string()
+				.max(140)
+				.refine(isValidGitHubRepository, {
+					message: "GitHub repository must be an owner/repo slug (owner <= 39, repo <= 100)",
+				})
+				.refine(
+					(repository) =>
+						!product ||
+						isOfficialGithubRepository(profile.repository) ||
+						!isOfficialGithubRepository(repository),
+					{ message: "This build does not update from the upstream NarraFork repository" },
+				)
+				.optional(),
+			// "" clears the override so the built-in default server is used again.
+			// Update payloads are trusted on TLS alone (the SHA-512 ships alongside
+			// the binary), so reject plaintext origins instead of silently disabling
+			// updates after saving an unsafe URL. Loopback is allowed for local testing.
+			serverUrl: z
+				.union([
+					z.string().url().refine(isTrustedUpdateServerUrl, {
+						message: "Update server must use https (plaintext http is only allowed for loopback)",
+					}),
+					z.literal(""),
+				])
+				.optional(),
+			product: z.string().min(1).optional(),
+			channel: z.enum(["stable", "beta"]).optional(),
+			checkIntervalMinutes: z.number().int().min(0).optional(),
+			autoDownload: z.boolean().optional(),
+		})
+		.partial()
+		.optional();
+}
+
 /** Shared by the settings PATCH route and isolated validation tests. */
-export const updateSourceSettingsSchema = z
-	.object({
-		proxy: proxyOverrideSchema,
-		source: z.enum(["github", "update-server"]).optional(),
-		githubRepository: z
-			.string()
-			.max(140)
-			.refine(isValidGitHubRepository, {
-				message: "GitHub repository must be an owner/repo slug (owner <= 39, repo <= 100)",
-			})
-			.optional(),
-		// "" clears the override so the built-in default server is used again.
-		// Update payloads are trusted on TLS alone (the SHA-512 ships alongside
-		// the binary), so reject plaintext origins instead of silently disabling
-		// updates after saving an unsafe URL. Loopback is allowed for local testing.
-		serverUrl: z
-			.union([
-				z.string().url().refine(isTrustedUpdateServerUrl, {
-					message: "Update server must use https (plaintext http is only allowed for loopback)",
-				}),
-				z.literal(""),
-			])
-			.optional(),
-		product: z.string().min(1).optional(),
-		channel: z.enum(["stable", "beta"]).optional(),
-		checkIntervalMinutes: z.number().int().min(0).optional(),
-		autoDownload: z.boolean().optional(),
-	})
-	.partial()
-	.optional();
+export const updateSourceSettingsSchema = createUpdateSourceSettingsSchema();
 
 function isLegacyUpdateServer(value: unknown): boolean {
 	if (value == null || value === "") return true;
@@ -81,23 +111,39 @@ function isLegacyUpdateServer(value: unknown): boolean {
 export function normalizeUpdateSourceSettings(
 	merged: Pick<NarraForkSettings, "update">,
 	raw: Record<string, unknown>,
+	profile: UpdateSourceProfile = BUILD_UPDATE_PROFILE,
 ): { update: NonNullable<NarraForkSettings["update"]>; needsSave: boolean } {
 	const rawUpdate =
 		raw.update && typeof raw.update === "object" && !Array.isArray(raw.update)
 			? (raw.update as Record<string, unknown>)
 			: {};
+	const productId = profile.product;
 	const source =
-		rawUpdate.source === "github" || rawUpdate.source === "update-server"
-			? rawUpdate.source
-			: isLegacyUpdateServer(rawUpdate.serverUrl) &&
-					(rawUpdate.product ?? "narrafork") === "narrafork"
-				? "github"
-				: "update-server";
-	const githubRepository = isValidGitHubRepository(merged.update?.githubRepository)
+		productId !== null
+			? "github"
+			: rawUpdate.source === "github" || rawUpdate.source === "update-server"
+				? rawUpdate.source
+				: isLegacyUpdateServer(rawUpdate.serverUrl) &&
+						(rawUpdate.product ?? "narrafork") === "narrafork"
+					? "github"
+					: "update-server";
+	let githubRepository = isValidGitHubRepository(merged.update?.githubRepository)
 		? merged.update.githubRepository
-		: DEFAULT_GITHUB_REPOSITORY;
+		: profile.repository;
+	// A product published from another repository never keeps checking the upstream releases;
+	// the stored official default predates that build identity, not an explicit choice.
+	if (
+		productId !== null &&
+		!isOfficialGithubRepository(profile.repository) &&
+		isOfficialGithubRepository(githubRepository)
+	)
+		githubRepository = profile.repository;
+	const product = productId ?? merged.update?.product ?? DEFAULT_UPDATE_SETTINGS.product;
 	return {
-		update: { ...DEFAULT_UPDATE_SETTINGS, ...merged.update, source, githubRepository },
-		needsSave: rawUpdate.source !== source || rawUpdate.githubRepository !== githubRepository,
+		update: { ...DEFAULT_UPDATE_SETTINGS, ...merged.update, source, githubRepository, product },
+		needsSave:
+			rawUpdate.source !== source ||
+			rawUpdate.githubRepository !== githubRepository ||
+			(productId !== null && rawUpdate.product !== product),
 	};
 }

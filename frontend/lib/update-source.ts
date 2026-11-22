@@ -1,3 +1,4 @@
+import { IS_PRODUCT_BUILD } from "@shared/build-product";
 import { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
 import {
 	parseUpdateSourceIdentity,
@@ -23,7 +24,8 @@ export function settingsSourceIdentity(
 	platform: string,
 ): UpdateSourceIdentity | null {
 	return parseUpdateSourceIdentity({
-		source: update?.source ?? "github",
+		// Mirrors the server: product builds capture only their GitHub source.
+		source: IS_PRODUCT_BUILD ? "github" : (update?.source ?? "github"),
 		repository: update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 		serverUrl: normalizeServerUrl(update?.serverUrl),
 		product: update?.product ?? "narrafork",

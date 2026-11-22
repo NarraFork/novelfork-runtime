@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import { open, unlink } from "node:fs/promises";
 import {
+	BUILD_UPDATE_PROFILE,
+	IS_PRODUCT_BUILD,
+	releaseBinaryName,
+} from "../../shared/build-product";
+import {
 	type GithubPatchStep,
 	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_LEGACY_BYTES,
@@ -303,7 +308,11 @@ function parseAsset(value: unknown, verifyDigest = false): Asset | null {
 	};
 }
 
-function selectCandidate(releases: unknown[], input: CheckInput): Candidate | undefined {
+function selectCandidate(
+	releases: unknown[],
+	input: CheckInput,
+	assetPrefix: string,
+): Candidate | undefined {
 	const suffix = PLATFORM_SUFFIXES[input.platform];
 	if (!suffix) throw new GithubUpdateError("PLATFORM_UNAVAILABLE", "Unsupported update platform");
 	let eligibleReleases = 0;
@@ -323,7 +332,7 @@ function selectCandidate(releases: unknown[], input: CheckInput): Candidate | un
 		if (!Array.isArray(release.assets) || release.assets.length > 200) {
 			throw new GithubUpdateError("INVALID_METADATA", "Invalid release assets");
 		}
-		const name = `narrafork-${version}-${suffix}`;
+		const name = releaseBinaryName(version, suffix, assetPrefix);
 		if (release.assets.some((asset) => isRecord(asset) && asset.name === name)) {
 			candidates.push({ version, release, name });
 		}
@@ -379,6 +388,7 @@ function discoverPatchAssets(
 	releases: unknown[],
 	input: CheckInput,
 	targetVersion: string,
+	assetPrefix: string,
 ): PatchCandidate[] {
 	const candidates: PatchCandidate[] = [];
 	let ignored = 0;
@@ -407,7 +417,11 @@ function discoverPatchAssets(
 			if (group) group.push(asset);
 			else byName.set(asset.name, [asset]);
 		}
-		const binaryName = `narrafork-${version}-${PLATFORM_SUFFIXES[input.platform]}`;
+		const binaryName = releaseBinaryName(
+			version,
+			PLATFORM_SUFFIXES[input.platform] ?? "",
+			assetPrefix,
+		);
 		const binaries = byName.get(binaryName) ?? [];
 		const binary = binaries.length === 1 ? parseAsset(binaries[0]) : null;
 		if (!binary || binary.size > MAX_BINARY_BYTES) continue;
@@ -510,6 +524,8 @@ export class GithubReleaseUpdater {
 	private readonly cooldowns = new Map<string, number>();
 	private generation = 0;
 	private readonly latestGenerations = new Map<string, number>();
+	private readonly assetPrefix: string;
+	private readonly updateIndex: boolean;
 
 	constructor(
 		private readonly fetcher: GithubFetch = updateFetch,
@@ -519,7 +535,12 @@ export class GithubReleaseUpdater {
 			checkTimeoutMs?: number;
 			patchTimeoutMs?: number;
 		} = {},
-	) {}
+		/** Defaults to the compiled build profile; product builds use the releases API only. */
+		release: { assetPrefix?: string; updateIndex?: boolean } = {},
+	) {
+		this.assetPrefix = release.assetPrefix ?? BUILD_UPDATE_PROFILE.assetPrefix;
+		this.updateIndex = release.updateIndex ?? !IS_PRODUCT_BUILD;
+	}
 
 	check(
 		input: CheckInput,
@@ -604,6 +625,8 @@ export class GithubReleaseUpdater {
 		fetcher: GithubFetch,
 		transportKey: string,
 	): Promise<{ index: UpdateIndexV1; bytes: number } | null> {
+		// Product builds publish no index branch; skip the raw request and use the releases API.
+		if (!this.updateIndex) return null;
 		const key = repository.toLowerCase();
 		const cached = this.indexCache.get(key);
 		const signal = AbortSignal.any([
@@ -764,7 +787,7 @@ export class GithubReleaseUpdater {
 		]);
 		const steps: GithubPatchStep[] = [];
 		try {
-			const candidates = discoverPatchAssets(releases, input, candidate.version);
+			const candidates = discoverPatchAssets(releases, input, candidate.version, this.assetPrefix);
 			let next = 0;
 			const consumeBytes = (bytes: number) => {
 				usedBytes += bytes;
@@ -941,6 +964,7 @@ export class GithubReleaseUpdater {
 						)
 					: releases,
 				input,
+				this.assetPrefix,
 			);
 			if (!candidate)
 				return {
@@ -1158,7 +1182,7 @@ function validatePatchDescriptor(step: GithubPatchStep): void {
 	const repository = `${parts[1]}/${parts[2]}`;
 	const filename = decodeURIComponent(parts[6] ?? "");
 	const binary = Object.values(PLATFORM_SUFFIXES)
-		.map((suffix) => `narrafork-${step.toVersion}-${suffix}`)
+		.map((suffix) => releaseBinaryName(step.toVersion, suffix))
 		.find((name) => parseReleasePatchName(name, filename));
 	if (!binary) throw new GithubUpdateError("INVALID_METADATA", "Invalid platform patch asset name");
 	const hint = parseReleasePatchName(binary, filename);

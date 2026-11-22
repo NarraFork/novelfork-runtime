@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { inArray } from "drizzle-orm";
+import { BUILD_UPDATE_PROFILE, IS_PRODUCT_BUILD } from "../../shared/build-product";
 import { type GithubPatchStep, MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import {
 	isLegacyMirrorSourceIdentity,
@@ -350,7 +351,7 @@ function sanitizeVersionFragment(version: string): string {
 
 function sanitizeUpdateFileName(filePath: string, version: string): string {
 	const fallbackExt = process.platform === "win32" ? ".exe" : "";
-	const fallback = `narrafork-${sanitizeVersionFragment(version)}${fallbackExt}`;
+	const fallback = `${BUILD_UPDATE_PROFILE.assetPrefix}${sanitizeVersionFragment(version)}${fallbackExt}`;
 	const baseName = basename(filePath).replace(/[<>:"/\\|?*]+/g, "-");
 	if (!baseName || baseName === "." || baseName === "..") return fallback;
 	return baseName;
@@ -560,8 +561,9 @@ export async function getUpdateNotes(request: UpdateNotesRequest, signal?: Abort
 
 export function getCurrentUpdateSourceIdentity(): UpdateSourceIdentity | null {
 	const common = { channel: settings.update?.channel ?? "stable", platform: getPlatform() };
+	// Product builds have no mirror source, even if a settings file was edited by hand.
 	return parseUpdateSourceIdentity(
-		(settings.update?.source ?? "github") === "github"
+		IS_PRODUCT_BUILD || (settings.update?.source ?? "github") === "github"
 			? {
 					...common,
 					source: "github",

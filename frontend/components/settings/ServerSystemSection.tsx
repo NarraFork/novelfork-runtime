@@ -16,11 +16,13 @@ import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react"
 import { Link } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { IS_PRODUCT_BUILD } from "../../../shared/build-product";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { api } from "../../lib/api";
 import {
+	DEFAULT_GITHUB_REPOSITORY,
 	type UpdateSource,
 	type UpdateSourceSettings,
 	updateCheckErrorKey,
@@ -309,27 +311,32 @@ export function ServerSystemSection({
 				{t("updateSource")}
 			</Text>
 			<Text size="xs" c="dimmed">
-				{t("updateSourceDesc")}
+				{t(IS_PRODUCT_BUILD ? "updateSourceDescProduct" : "updateSourceDesc")}
 			</Text>
 			<Button component={Link} to="/settings/proxy" variant="subtle" size="xs">
 				{t("updateProxySettingsLink")}
 			</Button>
-			<SegmentedControl
-				value={updateSource}
-				onChange={(v) => setUpdateSource(v as UpdateSource)}
-				data={[
-					{ label: t("updateSourceGithub"), value: "github" },
-					{ label: t("updateSourceServer"), value: "update-server" },
-				]}
-			/>
+			{/* Product builds update only from their own GitHub releases; no mirror choice. */}
+			{!IS_PRODUCT_BUILD && (
+				<SegmentedControl
+					value={updateSource}
+					onChange={(v) => setUpdateSource(v as UpdateSource)}
+					data={[
+						{ label: t("updateSourceGithub"), value: "github" },
+						{ label: t("updateSourceServer"), value: "update-server" },
+					]}
+				/>
+			)}
 			<TextInput
 				label={t("updateGithubRepository")}
-				description={t("updateGithubRepositoryDesc")}
-				placeholder="NarraFork/NarraFork"
+				description={t(
+					IS_PRODUCT_BUILD ? "updateGithubRepositoryDescProduct" : "updateGithubRepositoryDesc",
+				)}
+				placeholder={DEFAULT_GITHUB_REPOSITORY}
 				value={updateGithubRepository}
 				onChange={(e) => setUpdateGithubRepository(e.currentTarget.value)}
 			/>
-			{updateSource === "update-server" && (
+			{!IS_PRODUCT_BUILD && updateSource === "update-server" && (
 				<TextInput
 					label={t("updateServerUrl")}
 					description={t("updateServerUrlDesc")}
