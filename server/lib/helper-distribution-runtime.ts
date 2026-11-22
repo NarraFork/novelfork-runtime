@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, open, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { BUILD_UPDATE_PROFILE, IS_PRODUCT_BUILD } from "../../shared/build-product";
 import {
 	HELPER_BINARY_MAX_BYTES,
 	HELPER_MANIFEST_FILENAME,
@@ -28,6 +29,13 @@ export interface DistributionContext {
 	isTransportCurrent?(): boolean;
 }
 export function captureHelperSource(): HelperSource {
+	// Product builds pin helpers to the compiled helper repository: their own releases carry
+	// only the main program, and the mirror source is unavailable to them.
+	if (IS_PRODUCT_BUILD)
+		return normalizeHelperSource({
+			source: "github",
+			repository: BUILD_UPDATE_PROFILE.helperRepository,
+		});
 	return normalizeHelperSource({
 		source: settings.update?.source,
 		githubRepository: settings.update?.githubRepository,

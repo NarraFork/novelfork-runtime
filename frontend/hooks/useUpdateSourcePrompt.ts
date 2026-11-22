@@ -1,3 +1,4 @@
+import { IS_PRODUCT_BUILD } from "@shared/build-product";
 import { OFFICIAL_GITHUB_REPOSITORY } from "@shared/github-repository";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
@@ -19,7 +20,9 @@ const CONNECTION_ERRORS = new Set([
 ]);
 
 function isOfficialGithub(update?: UpdateSourceSettings): boolean {
+	// Product builds have no mirror source to offer; never prompt a switch to it.
 	return (
+		!IS_PRODUCT_BUILD &&
 		(update?.source ?? "github") === "github" &&
 		(update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY).trim().toLowerCase() ===
 			OFFICIAL_GITHUB_REPOSITORY.toLowerCase()
