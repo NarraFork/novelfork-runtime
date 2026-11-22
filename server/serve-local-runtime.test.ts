@@ -1,4 +1,6 @@
 import { afterAll, expect, mock, spyOn, test } from "bun:test";
+import { DEFAULT_BRAND_NAME } from "../shared/branding";
+import { brandStartupProblem } from "./lib/startup-status/startup-error";
 import { InstanceLockedError } from "./lib/startup-status/startup-problems";
 
 const conflict = new InstanceLockedError(12345, "isolated fixture: instance conflict");
@@ -51,7 +53,8 @@ test("a second local compiled launch reports the instance conflict instead of op
 	process.env.NARRAFORK_MANAGER_MANAGED = "0";
 	try {
 		await expect(serve()).rejects.toThrow("fixture-exit:1");
-		expect(shown).toEqual([conflict.problem]);
+		// NovelFork fork layer: problems are worded with the instance's brand.
+		expect(shown).toEqual([brandStartupProblem(conflict.problem, DEFAULT_BRAND_NAME)]);
 		expect(exit).toHaveBeenCalledWith(1);
 		expect(fetch).not.toHaveBeenCalled();
 		expect(opens).toBe(0);

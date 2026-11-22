@@ -16,6 +16,7 @@ import { resolveManagerListenHost } from "./lib/manager-control-server";
 import { readManagerToken } from "./lib/manager-token";
 import { resolveListenHost } from "./lib/net/listen-host";
 import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "./lib/runtime-target";
+import { getRuntimeStartupHooks, notifyStartupHook } from "./lib/startup-hooks";
 import {
 	closeStartupStatus,
 	expectStartupViewer,
@@ -23,12 +24,22 @@ import {
 	startStartupStatus,
 } from "./lib/startup-status";
 import type { StatusListenTarget } from "./lib/startup-status/protocol";
-import { formatStartupProblem, toStartupProblem } from "./lib/startup-status/startup-error";
+import {
+	brandStartupProblem,
+	formatStartupProblem,
+	toStartupProblem,
+} from "./lib/startup-status/startup-error";
 import { InstanceLockedError } from "./lib/startup-status/startup-problems";
 import { APP_VERSION } from "./lib/version";
 import { initWindowsChildJob } from "./lib/windows-child-job";
 
 type Settings = typeof import("./lib/settings").settings;
+
+/**
+ * Instance display name for the status page and startup problems (NovelFork fork layer). Set once
+ * settings load; before that, and when they cannot be read, the default brand.
+ */
+let startupBrandName: string | undefined;
 
 export async function serve(): Promise<void> {
 	// `bun --hot` re-runs this inside a process that already serves the port. There a failed
@@ -42,10 +53,17 @@ export async function serve(): Promise<void> {
 		// every child and grandchild born after this lands in the job (see windows-child-job).
 		initWindowsChildJob();
 		({ settings } = await import("./lib/settings"));
+		startupBrandName = resolveBranding(settings.branding).name;
 		if (firstStart) statusPageListening = await showStatusPage(settings);
+		// Host work that opens the database runs here, under the page and inside this boundary.
+		// Once per process: a hot re-evaluation finds the host's setup already done.
+		if (firstStart) await getRuntimeStartupHooks().beforeServerMain?.();
 		await import("./main");
 	} catch (error) {
 		if (!firstStart) throw error;
+		if (error instanceof InstanceLockedError && (await hostOpenedRunning(error))) {
+			process.exit(0);
+		}
 		if (
 			settings &&
 			error instanceof InstanceLockedError &&
@@ -54,6 +72,18 @@ export async function serve(): Promise<void> {
 			process.exit(0);
 		}
 		await exitWithStartupProblem(error);
+	}
+}
+
+/** An embedding host that knows how to bring its running instance forward does so first. */
+async function hostOpenedRunning(error: InstanceLockedError): Promise<boolean> {
+	const hook = getRuntimeStartupHooks().onInstanceLocked;
+	if (!hook) return false;
+	try {
+		return (await hook({ pid: error.pid })) === true;
+	} catch (hookError) {
+		logger.warn("Startup host could not open the running instance", { error: String(hookError) });
+		return false;
 	}
 }
 
@@ -108,7 +138,10 @@ export function isNarraForkHealth(body: unknown): boolean {
 
 /** Print why startup failed, let an open status page show it, and exit. */
 export async function exitWithStartupProblem(error: unknown): Promise<never> {
-	const problem = toStartupProblem(error);
+	const problem = brandStartupProblem(
+		toStartupProblem(error),
+		startupBrandName ?? resolveBranding(undefined).name,
+	);
 	logger.error("NarraFork could not start", { problem });
 	console.error(`\n${formatStartupProblem(problem)}\n`);
 	await showStartupProblem(problem);
@@ -127,7 +160,9 @@ async function showStatusPage(settings: Settings): Promise<boolean> {
 	// The Windows manager opens the browser itself when it reads this line.
 	logger.info(`${STARTUP_PAGE_LOG} ${url}`);
 	const { openFrontendOnce } = await import("./lib/open-frontend");
-	if (openFrontendOnce(url)) expectStartupViewer();
+	const hostOpened =
+		notifyStartupHook(getRuntimeStartupHooks().onStartupPageListening, url) === true;
+	if (openFrontendOnce(url) || hostOpened) expectStartupViewer();
 	return true;
 }
 

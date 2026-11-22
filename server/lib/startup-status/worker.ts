@@ -5,6 +5,7 @@
  */
 
 import { parentPort } from "node:worker_threads";
+import { DEFAULT_BRAND_NAME } from "../../../shared/branding";
 import { STARTUP_STATUS_HEADER } from "../../../shared/startup-status";
 import { injectSpaBaseHref } from "../spa-base-href";
 import { startupPageHtml } from "./page";
@@ -20,7 +21,8 @@ const port = parentPort;
 if (!port) throw new Error("startup status worker must run as a worker thread");
 
 let snapshot: StartupSnapshot | undefined;
-let pageHtml = startupPageHtml("NarraFork");
+let brandName = DEFAULT_BRAND_NAME;
+let pageHtml = startupPageHtml(brandName);
 let viewerExpected = false;
 let polled = false;
 /** A problem was posted and no page has read it yet. */
@@ -50,7 +52,7 @@ function respond(request: Request, server: Bun.Server<undefined>): Response {
 	const isPage =
 		request.method === "GET" && (request.headers.get("accept") ?? "").includes("text/html");
 	if (!isPage || pathname.startsWith("/api/") || pathname.startsWith("/ws/")) {
-		return new Response("NarraFork is starting", { status: 503, headers });
+		return new Response(`${brandName} is starting`, { status: 503, headers });
 	}
 	return new Response(injectSpaBaseHref(pageHtml, pathname), {
 		status: 503,
@@ -59,7 +61,8 @@ function respond(request: Request, server: Bun.Server<undefined>): Response {
 }
 
 function listen(message: Extract<ToStatusWorker, { type: "listen" }>): void {
-	pageHtml = startupPageHtml(message.brandName);
+	brandName = message.brandName;
+	pageHtml = startupPageHtml(brandName);
 	const { hostname, port: listenPort, tls } = message.target;
 	try {
 		Bun.serve({
