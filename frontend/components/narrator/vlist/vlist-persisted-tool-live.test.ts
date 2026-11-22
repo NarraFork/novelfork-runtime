@@ -6,10 +6,14 @@ import { getSummary } from "../tool-call/tool-display";
 import type { PersistedToolLiveUpdate } from "./useVListStreamingMessage";
 import { toolCompletedPatch } from "./vlist-live-events";
 import { patchToolLiveOutput } from "./vlist-live-patch";
-import { PersistedToolLiveCoalescer } from "./vlist-persisted-tool-live";
+import {
+	PersistedToolLiveCoalescer,
+	pruneRetainedLive,
+	retainedLivePatch,
+} from "./vlist-persisted-tool-live";
 
-function productToolDoc(status = "running"): TreeMessage[] {
-	const input = { action: "start", sourceName: "参考书.txt" };
+function runningToolDoc(status = "running"): TreeMessage[] {
+	const input = { command: "bun run build" };
 	return [
 		rowWithElements(
 			{
@@ -24,7 +28,7 @@ function productToolDoc(status = "running"): TreeMessage[] {
 						narratorId: "n1",
 						messageId: "m1",
 						toolUseId: "tu-1",
-						toolName: "style_manage",
+						toolName: "Bash",
 						inputJson: input,
 						status,
 						createdAt: "2026-01-01T00:00:00.000Z",
@@ -32,7 +36,7 @@ function productToolDoc(status = "running"): TreeMessage[] {
 				],
 				createdAt: "2026-01-01T00:00:00.000Z",
 			},
-			[{ type: "tool_use", id: "tu-1", name: "style_manage", input, inputJson: input, status }],
+			[{ type: "tool_use", id: "tu-1", name: "Bash", input, inputJson: input, status }],
 		) as unknown as TreeMessage,
 	];
 }
@@ -44,78 +48,108 @@ function liveFields(messages: readonly TreeMessage[]) {
 	return { tc, block };
 }
 
+describe("retained live bodies across a window replacement", () => {
+	const live = { output: "Waiting for build", progress: { completed: 1, total: 3 }, rowId: "tc-1" };
+
+	it("re-writes a dropped body, then is a no-op on the patched document", () => {
+		const retained = new Map([["tu-1", { ...live }]]);
+		const restored = retainedLivePatch(retained)(runningToolDoc());
+		expect(restored.changed).toBe(true);
+		expect(liveFields(restored.messages).block?._streamingOutput).toBe("Waiting for build");
+		const again = retainedLivePatch(retained)(restored.messages);
+		expect(again.changed).toBe(false);
+		expect(again.messages).toBe(restored.messages);
+	});
+
+	it("matches a WS-shaped card to its page-shaped replacement through the block's tcId", () => {
+		// Exact-history pages drop the toolCalls relation; enrichment copied its id onto
+		// the block as tcId.
+		const pageShaped = (tcId: string, executionAttempt?: number): TreeMessage[] => {
+			const doc = runningToolDoc();
+			const message = doc[0] as unknown as Record<string, unknown>;
+			message.toolCalls = [];
+			const block = (messageBody(doc[0] as never) as Record<string, unknown>[]).find(
+				(b) => b.type === "tool_use",
+			) as Record<string, unknown>;
+			block.tcId = tcId;
+			if (executionAttempt !== undefined) block.executionAttempt = executionAttempt;
+			return doc;
+		};
+		const same = new Map([["tu-1", { ...live, executionAttempt: 1 }]]);
+		pruneRetainedLive(pageShaped("tc-1", 1), same);
+		expect(same.size).toBe(1);
+		const restored = retainedLivePatch(same)(pageShaped("tc-1", 1));
+		expect(liveFields(restored.messages).block?._streamingOutput).toBe("Waiting for build");
+
+		const otherId = new Map([["tu-1", { ...live }]]);
+		pruneRetainedLive(pageShaped("tc-2"), otherId);
+		expect(otherId.size).toBe(0);
+		const otherAttempt = new Map([["tu-1", { ...live, executionAttempt: 1 }]]);
+		pruneRetainedLive(pageShaped("tc-1", 2), otherAttempt);
+		expect(otherAttempt.size).toBe(0);
+	});
+
+	it("prunes finished and re-attempted occurrences, keeps tools that are not loaded", () => {
+		const retained = new Map([
+			["tu-1", { ...live }],
+			["tu-unloaded", { output: "x" }],
+		]);
+		pruneRetainedLive(runningToolDoc("success"), retained);
+		expect([...retained.keys()]).toEqual(["tu-unloaded"]);
+
+		const reattempted = new Map([["tu-1", { ...live, executionAttempt: 1 }]]);
+		const doc = runningToolDoc();
+		(doc[0]?.toolCalls?.[0] as unknown as Record<string, unknown>).executionAttempt = 2;
+		pruneRetainedLive(doc, reattempted);
+		expect(reattempted.size).toBe(0);
+	});
+});
+
 describe("patchToolLiveOutput", () => {
 	it("writes the live body onto a running committed card (row + block)", () => {
-		const result = patchToolLiveOutput(productToolDoc(), "tu-1", {
-			output: "[1/3] 正在调用模型…",
+		const result = patchToolLiveOutput(runningToolDoc(), "tu-1", {
+			output: "[1/3] compiling…",
 			progress: { completed: 0, total: 3 },
 		});
 		expect(result.changed).toBe(true);
 		const { tc, block } = liveFields(result.messages);
-		expect(tc?._streamingOutput).toBe("[1/3] 正在调用模型…");
-		expect(block?._streamingOutput).toBe("[1/3] 正在调用模型…");
+		expect(tc?._streamingOutput).toBe("[1/3] compiling…");
+		expect(block?._streamingOutput).toBe("[1/3] compiling…");
 		expect(tc?._structuredProgress).toEqual({ completed: 0, total: 3 });
 	});
 
+	it("keeps messageVersion-relevant structure: same message count, same ids", () => {
+		const doc = runningToolDoc();
+		const result = patchToolLiveOutput(doc, "tu-1", { output: "x" });
+		expect(result.messages).toHaveLength(doc.length);
+		expect(result.messages[0]?.id).toBe(doc[0]?.id);
+	});
+
 	it("refuses a late frame once the card is terminal", () => {
-		const doc = productToolDoc("success");
+		const doc = runningToolDoc("success");
 		const result = patchToolLiveOutput(doc, "tu-1", { output: "late" });
 		expect(result.changed).toBe(false);
 		expect(result.messages).toBe(doc);
 	});
 
 	it("refuses an unknown tool and an empty update", () => {
-		const doc = productToolDoc();
+		const doc = runningToolDoc();
 		expect(patchToolLiveOutput(doc, "tu-x", { output: "x" }).changed).toBe(false);
 		expect(patchToolLiveOutput(doc, "tu-1", {}).changed).toBe(false);
 	});
 
 	it("completion clears the live body so the card matches a reload", () => {
-		const live = patchToolLiveOutput(productToolDoc(), "tu-1", {
+		const live = patchToolLiveOutput(runningToolDoc(), "tu-1", {
 			output: "running…",
 			progress: { completed: 1, total: 3 },
 		}).messages;
-		const done = toolCompletedPatch({ toolUseId: "tu-1", status: "success", output: "{}" })(live);
-		const { tc } = liveFields(done.messages);
+		const done = toolCompletedPatch({ toolUseId: "tu-1", status: "success", output: "ok" })(live);
+		const { tc, block } = liveFields(done.messages);
 		expect(tc?.status).toBe("success");
 		expect(tc?._streamingOutput).toBeUndefined();
 		expect(tc?._structuredProgress).toBeUndefined();
-	});
-});
-
-describe("generic tool detail while running", () => {
-	it("shows the live output and a count-based bar, and drops the bar when terminal", () => {
-		const metadata = {
-			_streamingOutput: "[2/3] 正在调用模型分析 batch-2…",
-			_structuredProgress: { completed: 1, total: 3, currentItem: "batch-2" },
-		};
-		const running = classifyToolDetail({
-			toolName: "style_manage",
-			category: "generic",
-			status: "running",
-			inputJson: { action: "start" },
-			outputJson: null,
-			metadata,
-		} as never);
-		const keys = running?.kind === "sections" ? running.sections.map((s) => s.key) : [];
-		expect(keys).toEqual(["meta.progress", "input.arguments", "output.main"]);
-		const done = classifyToolDetail({
-			toolName: "style_manage",
-			category: "generic",
-			status: "success",
-			inputJson: { action: "start" },
-			outputJson: "{}",
-			metadata,
-		} as never);
-		const doneKeys = done?.kind === "sections" ? done.sections.map((s) => s.key) : [];
-		expect(doneKeys).not.toContain("meta.progress");
-	});
-
-	it("the header summary never repeats the tool name", () => {
-		expect(getSummary("style_manage", { action: "start", sourceName: "参考书.txt" })).toBe(
-			"start · 参考书.txt",
-		);
-		expect(getSummary("book_overview", {})).toBe("");
+		expect(block?._streamingOutput).toBeUndefined();
+		expect(block?._structuredProgress).toBeUndefined();
 	});
 });
 
@@ -159,12 +193,30 @@ describe("PersistedToolLiveCoalescer", () => {
 		coalescer.push({ toolUseId: "t", progress: { completed: 1, total: 2 } });
 		coalescer.push({ toolUseId: "t", output: "a\nb\nc" });
 		expect(applied).toHaveLength(1);
-		advance(400);
+		advance(399);
+		expect(applied).toHaveLength(1);
+		advance(1);
 		expect(applied[1]).toEqual({
 			toolUseId: "t",
 			output: "a\nb\nc",
 			progress: { completed: 1, total: 2 },
 		});
+	});
+
+	it("rate-limits each tool independently", () => {
+		const { coalescer, applied } = harness();
+		coalescer.push({ toolUseId: "a", output: "1" });
+		coalescer.push({ toolUseId: "b", output: "1" });
+		expect(applied.map((u) => u.toolUseId)).toEqual(["a", "b"]);
+	});
+
+	it("a tool whose window elapsed is forgotten and applies at once again", () => {
+		const { coalescer, applied, advance } = harness();
+		coalescer.push({ toolUseId: "a", output: "1" });
+		advance(400);
+		coalescer.push({ toolUseId: "b", output: "1" });
+		coalescer.push({ toolUseId: "a", output: "2" });
+		expect(applied.map((u) => `${u.toolUseId}:${u.output}`)).toEqual(["a:1", "b:1", "a:2"]);
 	});
 
 	it("dispose drops pending frames", () => {
@@ -174,5 +226,41 @@ describe("PersistedToolLiveCoalescer", () => {
 		coalescer.dispose();
 		advance(1000);
 		expect(applied).toHaveLength(1);
+	});
+});
+
+describe("generic tool detail while running", () => {
+	it("shows the live output and a count-based bar, and drops the bar when terminal", () => {
+		const metadata = {
+			_streamingOutput: "[2/3] 正在调用模型分析 batch-2…",
+			_structuredProgress: { completed: 1, total: 3, currentItem: "batch-2" },
+		};
+		const running = classifyToolDetail({
+			toolName: "style_manage",
+			category: "generic",
+			status: "running",
+			inputJson: { action: "start" },
+			outputJson: null,
+			metadata,
+		} as never);
+		const keys = running?.kind === "sections" ? running.sections.map((s) => s.key) : [];
+		expect(keys).toEqual(["meta.progress", "input.arguments", "output.main"]);
+		const done = classifyToolDetail({
+			toolName: "style_manage",
+			category: "generic",
+			status: "success",
+			inputJson: { action: "start" },
+			outputJson: "{}",
+			metadata,
+		} as never);
+		const doneKeys = done?.kind === "sections" ? done.sections.map((s) => s.key) : [];
+		expect(doneKeys).not.toContain("meta.progress");
+	});
+
+	it("the header summary never repeats the tool name", () => {
+		expect(getSummary("style_manage", { action: "start", sourceName: "参考书.txt" })).toBe(
+			"start · 参考书.txt",
+		);
+		expect(getSummary("book_overview", {})).toBe("");
 	});
 });
