@@ -17,6 +17,7 @@ import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { type NarratorWSCallbacks, useNarratorWS } from "@frontend/hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "@frontend/hooks/usePlatform";
+import { useNarratorCurrentTask } from "@frontend/hooks/useTaskBoard";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { TreeMessage } from "@frontend/lib/api/types";
@@ -219,6 +220,7 @@ import type { InjectionNavigation } from "./vlist-injection-header";
 import { createVListInteractionAdmission } from "./vlist-interaction-admission";
 import { VListInteractionAdmissionContext } from "./vlist-interaction-admission-context";
 import {
+	applyVListPlanTreeAction,
 	createVListInteractionState,
 	isFileChangesOpenRow,
 	isFullPayloadRequestedRow,
@@ -227,6 +229,7 @@ import {
 	isVListTextExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
+	resolvePlanTreeViewRow,
 	setVListExpanded,
 	setVListTextExpanded,
 	toggleVListFileChangesOpen,
@@ -277,6 +280,7 @@ import {
 	prefersReducedMotion,
 	rowScope,
 } from "./vlist-motion-scheduler";
+import { useOutlineAskSlots } from "./vlist-outline-ask-bridge";
 import {
 	toolUseIdFromSpecKey,
 	usePermissionSlots,
@@ -413,6 +417,8 @@ type PretextExactMessageListProps = {
 	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
+	/** Private narrator surfaces only: mount the current Outline Ask answer form. */
+	enableOutlineAsk?: boolean;
 	/**
 	 * Deep-link / search target: jump to this message once and flash it.
 	 *
@@ -534,6 +540,7 @@ export const PretextExactMessageList = memo(
 				onSelectionResolverChange,
 				rowHandlers,
 				permCb,
+				enableOutlineAsk = false,
 				highlightMessageId,
 				highlightRequestId,
 				highlightNeedle,
@@ -988,6 +995,11 @@ export const PretextExactMessageList = memo(
 				(key: string) => isFileChangesOpenRow(activeInteraction, key),
 				[activeInteraction],
 			);
+			// An outline plan card's tree as the reader opened it (the overview when untouched).
+			const resolvePlanTreeView = useCallback(
+				(key: string) => resolvePlanTreeViewRow(activeInteraction, key),
+				[activeInteraction],
+			);
 			const resolveExactToolColor = useCallback(
 				(toolName: string, input?: unknown) => getCategoryColor(getCategory(toolName, input)),
 				[],
@@ -1058,7 +1070,11 @@ export const PretextExactMessageList = memo(
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: summaryInputMetadata;
+							: getCategory(call.toolName) === "outline"
+								? // An outline call says a change happened only once it did (still running,
+									// failed: `outlineToolSummary` words it so).
+									{ ...summaryInputMetadata, _toolStatus: call.status }
+								: summaryInputMetadata;
 					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
 				[vlistLabels],
@@ -1070,10 +1086,6 @@ export const PretextExactMessageList = memo(
 			const resolveExactSubagentRecentSummary = useCallback(
 				(toolName: string, inputSummary: unknown) =>
 					subagentRecentCallSummary(toolName, normalizeSubagentToolInputSummary(inputSummary)),
-				[],
-			);
-			const resolveRecentMessageIds = useCallback(
-				(messages: readonly NarratorMsg[]) => recentRunSegmentMessageIds([...messages], 2),
 				[],
 			);
 			const readCurrentView = useCallback(() => {
@@ -1557,6 +1569,11 @@ export const PretextExactMessageList = memo(
 							captureFoldBefore(key);
 							setInteraction((prev) => toggleVListFileChangesOpen(prev, key));
 						},
+						// A node, a text or the whole tree of an outline plan card: the card resizes.
+						onPlanTree: (action) => {
+							captureFoldBefore(key);
+							setInteraction((prev) => applyVListPlanTreeAction(prev, key, action));
+						},
 					};
 					togglesCacheRef.current.set(key, toggles);
 					return toggles;
@@ -1617,7 +1634,11 @@ export const PretextExactMessageList = memo(
 			const openSpecTasks = useCallback(() => {
 				viewportRef.current?.dispatchEvent(new CustomEvent("spec-open-tasks", { bubbles: true }));
 			}, []);
-			const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
+			// The session's task backend, read from the cache the panel fills (no request of its own):
+			// an outline session's old spec cards are read-only and its old tasks.json call is not
+			// pinned (outline P2 PR 12a).
+			const taskBackend = useNarratorCurrentTask(narratorId, false).data?.backend;
+			const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks, taskBackend);
 
 			// Error notice cards: "mark as retryable" opens the shared rule dialog, the
 			// close button deletes the notice. The dialog is one shell-level instance
@@ -1685,6 +1706,11 @@ export const PretextExactMessageList = memo(
 					toolUseId ? pendingPermissionToolUseIds.has(toolUseId) : false,
 				[pendingPermissionToolUseIds],
 			);
+			const resolveQuestionStatus = useCallback(
+				(toolUseId: string | undefined) =>
+					toolUseId ? permCb?.asyncQuestions?.get(toolUseId)?.question?.status : undefined,
+				[permCb?.asyncQuestions],
+			);
 			// ⚠️ The pinned latest-tasks card is NOT resolved here.
 			//
 			// The shell tracks its own `latestSpecTasksToolUseId` (the `LatestTodosToolUseIdCtx`
@@ -1738,6 +1764,22 @@ export const PretextExactMessageList = memo(
 			const permissionCapability = useNarratorPermissionsCapability();
 			const canDecidePermissions =
 				permissionCapability.supported && permissionCapability.approveDeny;
+			// The outline plan's decision labels, in the reader's language: they decide where the
+			// card's button bar wraps (outline P2 PR 8, review round 1 U1).
+			const planButtonLabels = useMemo(
+				() => [t("outlinePlan.draft"), t("outlinePlan.lock"), t("outlinePlan.return")],
+				[t],
+			);
+			const planButtonLabelsRef = useRef(planButtonLabels);
+			planButtonLabelsRef.current = planButtonLabels;
+			// Its empty feedback box is as tall as its placeholder (outline P2 PR 8b review round 1),
+			// and so is every other card's (D49 review round 1 S1).
+			const planFeedbackPlaceholder = t("outlinePlan.feedbackPlaceholder");
+			const planFeedbackPlaceholderRef = useRef(planFeedbackPlaceholder);
+			planFeedbackPlaceholderRef.current = planFeedbackPlaceholder;
+			const feedbackPlaceholder = t("feedbackPlaceholder");
+			const feedbackPlaceholderRef = useRef(feedbackPlaceholder);
+			feedbackPlaceholderRef.current = feedbackPlaceholder;
 			const permissionPredictionsByToolUseId = useMemo(() => {
 				const map = new Map<string, InlinePermissionData>();
 				const innerWidth = toolCardInnerWidth(contentWidth, false);
@@ -1746,11 +1788,21 @@ export const PretextExactMessageList = memo(
 					const prediction = predictInlinePermission(perm, {
 						innerWidth,
 						canDecide: canDecidePermissions,
+						planButtonLabels,
+						planFeedbackPlaceholder,
+						feedbackPlaceholder,
 					});
 					if (prediction) map.set(perm.toolUseId, prediction);
 				}
 				return map;
-			}, [permCb?.pendingPermissions, contentWidth, canDecidePermissions]);
+			}, [
+				permCb?.pendingPermissions,
+				contentWidth,
+				canDecidePermissions,
+				planButtonLabels,
+				planFeedbackPlaceholder,
+				feedbackPlaceholder,
+			]);
 			const resolvePermissionFormPrediction = useCallback(
 				(toolUseId: string | undefined) =>
 					toolUseId ? permissionPredictionsByToolUseId.get(toolUseId) : undefined,
@@ -1784,6 +1836,9 @@ export const PretextExactMessageList = memo(
 						const prediction = predictInlinePermission(perm, {
 							innerWidth: toolCardInnerWidth(width, false),
 							canDecide: canDecidePermissionsRef.current,
+							planButtonLabels: planButtonLabelsRef.current,
+							planFeedbackPlaceholder: planFeedbackPlaceholderRef.current,
+							feedbackPlaceholder: feedbackPlaceholderRef.current,
 						});
 						if (!prediction) return undefined;
 						const painted = resizeFormHeightsRef.current.get(toolUseId);
@@ -2063,6 +2118,12 @@ export const PretextExactMessageList = memo(
 				isFetched: userPrefsFetched,
 			} = useUserPreferences();
 			const showTokenUsage = userPrefs?.showTokenUsage ?? false;
+			const compactAuxiliaryContent = userPrefs?.compactAuxiliaryContent ?? true;
+			const resolveRecentMessageIds = useCallback(
+				(messages: readonly NarratorMsg[]) =>
+					recentRunSegmentMessageIds([...messages], 2, { compactAuxiliaryContent }),
+				[compactAuxiliaryContent],
+			);
 			// During a resize, the live breakpoint selects visible usage specs locally.
 			// Only the settled breakpoint reaches the full document build below.
 			// Height as the LAYOUT sees it (see the buildOptions comment below). Derived here
@@ -2089,9 +2150,11 @@ export const PretextExactMessageList = memo(
 				[dataSource?.fetchPage, dataSource?.locateMessage],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				compactAuxiliaryContent,
 				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
 				keepEmptyReasoningLive: isActive,
+				pinLatestSpecTasks: taskBackend !== "outline",
 				labels: vlistLabels,
 				labelsRevision,
 				widthBucket: String(Math.round(contentWidth)),
@@ -2123,6 +2186,7 @@ export const PretextExactMessageList = memo(
 				showOriginal: resolveShowOriginal,
 				isPromptOpen: resolvePromptOpen,
 				isFileChangesOpen: resolveFileChangesOpen,
+				planTreeView: resolvePlanTreeView,
 				resolveToolCategory: getCategory,
 				resolveToolColor: resolveExactToolColor,
 				resolveToolSummary: resolveExactToolSummary,
@@ -2133,6 +2197,7 @@ export const PretextExactMessageList = memo(
 				canOfferModelTest: errorNotice.canOfferModelTest,
 				resolveSubagentRecentSummary: resolveExactSubagentRecentSummary,
 				resolveRecentMessageIds,
+				resolveQuestionStatus,
 				resolveHasPendingPermission,
 				resolvePermissionFormPrediction,
 				resolvePermissionFormHeight,
@@ -2842,6 +2907,11 @@ export const PretextExactMessageList = memo(
 				() => buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]),
 				[pretextDocument.messages],
 			);
+			const outlineAskSlotByKey = useOutlineAskSlots({
+				renderItems: semanticItems,
+				tools: rowToolMetaIndex,
+				enabled: enableOutlineAsk && !dataSource,
+			});
 			const permissionSlotByKey = usePermissionSlots({
 				renderItems: semanticItems,
 				tools: rowToolMetaIndex,
@@ -2930,6 +3000,9 @@ export const PretextExactMessageList = memo(
 				const keys = new Set<string>();
 				for (const item of semanticItems) {
 					if (!item) continue;
+					// Outline forms are only present while expanded. Removing the slot also
+					// prunes its height override in the same render as the fold.
+					if (outlineAskSlotByKey.has(item.spec.key)) keys.add(item.spec.key);
 					// A card that RESERVED its form arithmetically stays a fixed, clipped row: the
 					// form reports its own height through `permissionFormHeight`. Only a form the
 					// card could not reserve (AskUserQuestion's banner, a subagent card's) keeps
@@ -2953,7 +3026,7 @@ export const PretextExactMessageList = memo(
 				}
 				if (editingRow) keys.add(editingRow.key);
 				return keys;
-			}, [semanticItems, permissionSlotByKey, editingRow]);
+			}, [semanticItems, permissionSlotByKey, outlineAskSlotByKey, editingRow]);
 			dynamicRowKeysRef.current = dynamicRowKeys;
 
 			// Drop overrides that must no longer apply. The decisive case is a RESOLVED
@@ -5036,14 +5109,23 @@ export const PretextExactMessageList = memo(
 					// An injection bubble speaks FOR somebody; its spec carries the verbatim
 					// model-facing copy (`modelFacing`) plus the speaker/source label, which the
 					// inspector shows so the reader can audit what the agent actually received.
+					// A task notice (a system card) carries the same copy: its rows are the reader's
+					// projection, the model got the text.
+					const taskNotice =
+						item.spec.kind === "system-text" &&
+						(item.spec.data as { kind?: unknown } | null)?.kind === "tasks_notice"
+							? (item.spec.data as { modelFacing?: unknown; title?: unknown })
+							: null;
 					const injectionData =
-						item.spec.kind === "injection-bubble"
+						item.spec.kind === "injection-bubble" || item.spec.kind === "auxiliary-content"
 							? (item.spec.data as {
 									modelFacing?: unknown;
 									speaker?: unknown;
 									source?: unknown;
 								} | null)
-							: null;
+							: taskNotice
+								? { modelFacing: taskNotice.modelFacing, speaker: taskNotice.title }
+								: null;
 					const modelFacing =
 						typeof injectionData?.modelFacing === "string" ? injectionData.modelFacing : "";
 					const inspectContent =
@@ -5311,6 +5393,7 @@ export const PretextExactMessageList = memo(
 						injectionNavigation,
 						currentUserId,
 						permissionSlot,
+						outlineAskSlot: outlineAskSlotByKey.get(item.spec.key),
 						traceRowPermissionSlots: tracePermissionSlotsByKey.get(item.spec.key),
 						onPermissionFormHeight: getPermissionHeightReporter(
 							item.spec.key,

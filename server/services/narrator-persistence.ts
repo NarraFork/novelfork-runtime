@@ -10,11 +10,13 @@ import {
 	truncateCompactError,
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
+import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
-import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
+import { and, desc, eq, getTableColumns, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	fileChangeExecutionSegments,
+	narratorBlocks,
 	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
@@ -62,6 +64,7 @@ import { getExecutionOwner, preserveHeldSubstatus } from "./agent-runtime/owners
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import {
+	CLEARED_TOOL_OUTPUT_SQL,
 	contentByAttempt,
 	flushQueuedSince,
 	newEnvelopeColumns,
@@ -70,7 +73,7 @@ import {
 	syncEnvelopeNow,
 	syncQueueMark,
 } from "./narrator-block-sync";
-import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
+import { bodyColumns, envelopeStoredBytesSql, fillBodies, fillBody } from "./narrator-body-reads";
 import {
 	insertEnvelope,
 	readEnvelope,
@@ -524,6 +527,26 @@ export function cowEnvelopeTx(
 	},
 ): string {
 	const { original, ref } = input;
+	if (
+		isHistoryProtectedContent(original.contentJson) &&
+		input.changes?.editedAt &&
+		Array.isArray(input.changes.contentJson) &&
+		input.changes.contentJson[0]
+	) {
+		const {
+			historyClearVersion: _version,
+			historyClearedAt: _at,
+			...first
+		} = input.changes.contentJson[0];
+		input.changes = {
+			...input.changes,
+			originalContentJson: null,
+			contentJson: [
+				{ historyToolsSuppressed: true, ...first },
+				...input.changes.contentJson.slice(1),
+			],
+		};
+	}
 	const id = generateId();
 	const now = new Date().toISOString();
 	const copy = {
@@ -563,6 +586,393 @@ export function cowEnvelopeTx(
 		.where(and(eq(narrators.id, ref.narratorId), eq(narrators.forkMessageId, original.id)))
 		.run();
 	return id;
+}
+
+/** Main-thread fork work is bounded before reading any body or ledger JSON. */
+const FORK_SNAPSHOT_MAX_MESSAGES = 128;
+const FORK_SNAPSHOT_MAX_ROWS = 2048;
+const FORK_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024;
+const FORK_PRODUCER_METADATA_MAX_REFS = 4096;
+const FORK_PRODUCER_METADATA_SLOW_MS = 50;
+
+export type ForkRefRow = Pick<
+	typeof narratorMessageRefs.$inferSelect,
+	"messageId" | "seq" | "isCompact" | "segmentCompactId"
+>;
+
+/**
+ * A lazy fork must hold every still-mutable old message NOW, not when a later UI
+ * backfill happens. Locate producers through metadata indexes (never old bodies),
+ * then read only the bounded, continuous interval that must precede the model tail.
+ * Ancestor intervals are disjoint; copying them directly into the new child does
+ * not materialize or mutate any existing lazy parent.
+ */
+export function extendMutableForkPrefixTx(
+	tx: DbTx,
+	parentNarratorId: string,
+	rows: ForkRefRow[],
+	upperSeq: number | undefined,
+	partialMessageIds: readonly string[],
+	pendingCompactIds: readonly string[],
+	maxRefs: number,
+): ForkRefRow[] {
+	const fail = () => {
+		throw new ValidationError(
+			"Live fork snapshot exceeds its safe copy budget; retry after the active work settles",
+		);
+	};
+	const firstSeq = rows[0]?.seq;
+	const layers: { narratorId: string; lower: number; upper: number | undefined }[] = [];
+	const producerParents = new Map<string, (string | null)[]>();
+	let needsActualOwners = false;
+	const noteDetached = (state: { inheritMode: string; parentNarratorId: string | null }) => {
+		if (state.inheritMode !== "fresh" && state.parentNarratorId === null) needsActualOwners = true;
+	};
+	const seen = new Set<string>();
+	let narratorId = parentNarratorId;
+	let upper: number | undefined;
+	for (;;) {
+		if (seen.has(narratorId))
+			throw new ValidationError("Inherited history contains a lineage cycle");
+		if (seen.size >= 32) fail();
+		seen.add(narratorId);
+		const state = tx.query.narrators
+			.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: {
+					refsInheritedFrom: true,
+					refsBackfillCursor: true,
+					parentNarratorId: true,
+					inheritMode: true,
+				},
+			})
+			.sync();
+		if (!state) throw new ValidationError("Inherited narrator no longer exists");
+		producerParents.set(narratorId, [state.parentNarratorId, state.refsInheritedFrom]);
+		noteDetached(state);
+		const cursor = state.refsBackfillCursor;
+		if (
+			(state.refsInheritedFrom === null) !== (cursor === null) ||
+			(cursor !== null && (!Number.isSafeInteger(cursor) || cursor < 0))
+		) {
+			throw new ValidationError("Inherited history cursor is invalid");
+		}
+		layers.push({ narratorId, lower: cursor ?? 0, upper });
+		if (!state.refsInheritedFrom || cursor === null) break;
+		upper = Math.min(upper ?? Number.POSITIVE_INFINITY, cursor);
+		narratorId = state.refsInheritedFrom;
+	}
+	// Do not traverse provenance at all when no earlier inherited interval exists.
+	// These are indexed LIMIT 1 probes, including hidden refs rather than scanning
+	// through arbitrarily many hidden rows while searching for a visible one.
+	const earlierLayers = layers.filter((layer) => {
+		if (
+			layer.lower >=
+				Math.min(layer.upper ?? Number.POSITIVE_INFINITY, firstSeq ?? Number.POSITIVE_INFINITY) ||
+			(upperSeq !== undefined && layer.lower > upperSeq)
+		)
+			return false;
+		return Boolean(
+			tx
+				.select({ id: narratorMessageRefs.id })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, layer.narratorId),
+						sql`${narratorMessageRefs.seq} >= ${layer.lower}`,
+						layer.upper === undefined
+							? undefined
+							: sql`${narratorMessageRefs.seq} < ${layer.upper}`,
+						firstSeq === undefined ? undefined : sql`${narratorMessageRefs.seq} < ${firstSeq}`,
+						upperSeq === undefined ? undefined : sql`${narratorMessageRefs.seq} <= ${upperSeq}`,
+					),
+				)
+				.limit(1)
+				.get(),
+		);
+	});
+	if (!earlierLayers.length) return rows;
+	// A non-lazy fork can still share its ancestor's live initiating call. Walk
+	// both lineage edges, not just the lazy backfill chain, before ledger seeks.
+	const producerIds = new Set<string>();
+	const producerQueue = layers.map((layer) => layer.narratorId);
+	const addProducer = (id: string) => {
+		producerIds.add(id);
+		if (producerIds.size > FORK_SNAPSHOT_MAX_MESSAGES) fail();
+	};
+	while (producerQueue.length && producerIds.size < FORK_SNAPSHOT_MAX_MESSAGES) {
+		const producerId = producerQueue.pop();
+		if (producerId === undefined) break;
+		if (producerIds.has(producerId)) continue;
+		addProducer(producerId);
+		let parents = producerParents.get(producerId);
+		if (!parents) {
+			const state = tx.query.narrators
+				.findFirst({
+					where: eq(narrators.id, producerId),
+					columns: { parentNarratorId: true, refsInheritedFrom: true, inheritMode: true },
+				})
+				.sync();
+			if (state) noteDetached(state);
+			else needsActualOwners = true;
+			parents = state ? [state.parentNarratorId, state.refsInheritedFrom] : [];
+		}
+		for (const parent of parents)
+			if (parent && !producerIds.has(parent)) producerQueue.push(parent);
+	}
+	if (producerQueue.length) {
+		// Provenance depth is not missing content. Stop this auxiliary walk and
+		// prove actual owners from bounded ref metadata instead of rejecting a deep,
+		// fully materialized fork or spending its identity budget on mere ancestors.
+		needsActualOwners = true;
+		producerIds.clear();
+		for (const layer of layers) addProducer(layer.narratorId);
+	}
+	// Probe only the already bounded inherited tail. An owner outside the known
+	// ancestry is another signal of legacy sharing with an incomplete lineage.
+	if (rows.length) {
+		const tailOwners = tx
+			.select({ narratorId: narratorMessages.narratorId })
+			.from(narratorMessages)
+			.where(
+				inArray(
+					narratorMessages.id,
+					rows.slice(0, maxRefs).map((ref) => ref.messageId),
+				),
+			)
+			.limit(maxRefs)
+			.all();
+		for (const owner of tailOwners) {
+			if (!producerIds.has(owner.narratorId)) needsActualOwners = true;
+			addProducer(owner.narratorId);
+		}
+	}
+	let ownerScanRows = 0;
+	let ownerScanDurationMs = 0;
+	let ownerScanLogged = false;
+	const checkOwnerScan = () => {
+		const durationMs = ownerScanDurationMs;
+		if (!ownerScanLogged && durationMs >= FORK_PRODUCER_METADATA_SLOW_MS) {
+			ownerScanLogged = true;
+			logger.warn("Slow detached fork producer metadata scan", {
+				parentNarratorId,
+				durationMs,
+				rows: ownerScanRows,
+			});
+		}
+		if (ownerScanRows > FORK_PRODUCER_METADATA_MAX_REFS) {
+			throw new ValidationError("Detached fork producer metadata exceeds its safe scan budget");
+		}
+	};
+	let earliest: number | undefined;
+	const pending = new Set(pendingCompactIds);
+	for (const layer of earlierLayers) {
+		const metadataRange = sql`refs.narrator_id = ${layer.narratorId}
+			AND refs.seq >= ${layer.lower}
+			${layer.upper === undefined ? sql`` : sql`AND refs.seq < ${layer.upper}`}
+			${firstSeq === undefined ? sql`` : sql`AND refs.seq < ${firstSeq}`}
+			${upperSeq === undefined ? sql`` : sql`AND refs.seq <= ${upperSeq}`}`;
+		const range = sql`${metadataRange} AND refs.segment_compact_id IS NULL`;
+		// Only detached/incomplete legacy ancestry needs an old-owner scan. Bound
+		// actual rows (including hidden refs), not DISTINCT owners: a single owner
+		// must not cause an unbounded scan over tens of thousands of stable refs.
+		if (needsActualOwners) {
+			checkOwnerScan();
+			const started = performance.now();
+			const owners = tx.all<{ narratorId: string | null }>(sql`
+				SELECT m.narrator_id AS narratorId
+				FROM narrator_message_refs refs INDEXED BY idx_narrator_refs_seq
+				LEFT JOIN narrator_messages m ON m.id = refs.message_id
+				WHERE ${metadataRange}
+				LIMIT ${FORK_PRODUCER_METADATA_MAX_REFS - ownerScanRows + 1}`);
+			ownerScanRows += owners.length;
+			ownerScanDurationMs += performance.now() - started;
+			checkOwnerScan();
+			for (const owner of owners) {
+				if (owner.narratorId === null)
+					throw new ValidationError("Inherited message no longer exists");
+				addProducer(owner.narratorId);
+			}
+		}
+		const producerScope = sql.join(
+			[...producerIds].map((id) => sql`${id}`),
+			sql`, `,
+		);
+		// CROSS JOIN keeps (producer, status) seeks ahead of the refs lookup. Both
+		// leading index columns are constrained, even for a legacy task binding.
+		const producers = [
+			sql`SELECT refs.message_id AS messageId, refs.seq AS seq
+				FROM narrator_blocks b INDEXED BY idx_blocks_open
+				CROSS JOIN narrator_message_refs refs INDEXED BY idx_narrator_refs_unique
+				WHERE b.phase = 'open' AND b.kind <> 'tool'
+					AND refs.message_id = b.message_id AND ${range}`,
+			sql`SELECT refs.message_id AS messageId, refs.seq AS seq
+				FROM narrator_tool_calls c INDEXED BY idx_toolcalls_status
+				CROSS JOIN narrator_message_refs refs INDEXED BY idx_narrator_refs_unique
+				WHERE c.narrator_id IN (${producerScope}) AND c.status IN ('initializing', 'pending', 'running')
+					AND c.execution_origin_tool_call_id IS NULL
+					AND refs.message_id = c.message_id AND ${range}`,
+			sql`SELECT refs.message_id AS messageId, refs.seq AS seq
+				FROM background_tasks task INDEXED BY idx_bg_tasks_parent
+				CROSS JOIN narrator_tool_calls c
+				CROSS JOIN narrator_message_refs refs INDEXED BY idx_narrator_refs_unique
+				WHERE task.parent_narrator_id IN (${producerScope})
+					AND task.status IN ('running', 'paused') AND c.id = task.tool_call_id
+					AND c.narrator_id = task.parent_narrator_id
+					AND c.execution_origin_tool_call_id IS NULL
+					AND refs.message_id = c.message_id AND ${range}`,
+			sql`SELECT refs.message_id AS messageId, refs.seq AS seq
+				FROM background_tasks task INDEXED BY idx_bg_tasks_parent
+				CROSS JOIN narrator_tool_calls c INDEXED BY idx_toolcalls_attempt
+				CROSS JOIN narrator_message_refs refs INDEXED BY idx_narrator_refs_unique
+				WHERE task.parent_narrator_id IN (${producerScope})
+					AND task.status IN ('running', 'paused') AND task.tool_call_id IS NULL
+					AND c.tool_use_id = task.tool_use_id AND c.narrator_id = task.parent_narrator_id
+					AND c.execution_origin_tool_call_id IS NULL
+					AND refs.message_id = c.message_id AND ${range}`,
+		];
+		if (partialMessageIds.length)
+			producers.push(sql`
+			SELECT refs.message_id AS messageId, refs.seq AS seq FROM narrator_message_refs refs
+			WHERE refs.message_id IN (${sql.join(
+				partialMessageIds.map((id) => sql`${id}`),
+				sql`, `,
+			)})
+				AND ${range}`);
+		const mutable = tx.all<{ messageId: string; seq: number }>(sql`
+			SELECT DISTINCT messageId, seq FROM (${sql.join(producers, sql` UNION ALL `)})
+			LIMIT ${FORK_SNAPSHOT_MAX_MESSAGES + 1}`);
+		if (mutable.length > FORK_SNAPSHOT_MAX_MESSAGES) fail();
+		for (const ref of mutable) {
+			if (!pending.has(ref.messageId)) earliest = Math.min(earliest ?? ref.seq, ref.seq);
+		}
+	}
+	if (earliest === undefined) return rows;
+	const expanded: ForkRefRow[] = [];
+	let actualRows = 0;
+	for (const layer of layers) {
+		const page = tx
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+				isCompact: narratorMessageRefs.isCompact,
+				segmentCompactId: narratorMessageRefs.segmentCompactId,
+			})
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, layer.narratorId),
+					sql`${narratorMessageRefs.seq} >= ${Math.max(earliest, layer.lower)}`,
+					layer.upper === undefined ? undefined : sql`${narratorMessageRefs.seq} < ${layer.upper}`,
+					upperSeq === undefined ? undefined : sql`${narratorMessageRefs.seq} <= ${upperSeq}`,
+				),
+			)
+			.limit(maxRefs - actualRows + 1)
+			.all();
+		actualRows += page.length;
+		// Count hidden refs too, and reject instead of cutting a same-seq group.
+		if (actualRows > maxRefs) fail();
+		expanded.push(
+			...page.filter((ref) => ref.segmentCompactId === null && !pending.has(ref.messageId)),
+		);
+	}
+	return expanded.sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * Freeze only the child's inherited messages that a producer may still write. The
+ * source ref, execution rows, approvals and live partial id are never moved. Called
+ * after refs and the fork boundary are inserted, under the fork transaction's write
+ * lock, so metadata preflight and the actual COW observe the same committed state.
+ */
+export function snapshotMutableForkMessagesTx(
+	tx: DbTx,
+	narratorId: string,
+	partialMessageIds: readonly string[] = [],
+): void {
+	const partialCondition = partialMessageIds.length
+		? inArray(narratorMessageRefs.messageId, [...new Set(partialMessageIds)])
+		: sql`0`;
+	// A historical tool block can remain open while its ledger is non-executable
+	// (COW or retained self-origin). Only canonical live ledgers/background tasks
+	// make tool cards mutable; the open-block branch is for streamed body output.
+	const mutableRefs = tx
+		.select({ id: narratorMessageRefs.id, messageId: narratorMessageRefs.messageId })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				sql`(
+					${partialCondition}
+					OR EXISTS (SELECT 1 FROM narrator_blocks b
+						WHERE b.message_id = ${narratorMessageRefs.messageId}
+							AND b.phase = 'open' AND b.kind <> 'tool')
+					OR EXISTS (SELECT 1 FROM narrator_tool_calls c
+						WHERE c.message_id = ${narratorMessageRefs.messageId}
+							AND c.execution_origin_tool_call_id IS NULL
+							AND (c.status IN ('initializing', 'pending', 'running')
+								OR EXISTS (SELECT 1 FROM background_tasks task
+									WHERE task.parent_narrator_id = c.narrator_id
+										AND task.status IN ('running', 'paused')
+										AND (task.tool_call_id = c.id OR
+											(task.tool_call_id IS NULL AND task.tool_use_id = c.tool_use_id)))))
+				)`,
+			),
+		)
+		.limit(FORK_SNAPSHOT_MAX_MESSAGES + 1)
+		.all();
+	if (!mutableRefs.length) return;
+	const overBudget = () => {
+		throw new ValidationError(
+			"Live fork snapshot exceeds its safe copy budget; retry after the active work settles",
+		);
+	};
+	if (mutableRefs.length > FORK_SNAPSHOT_MAX_MESSAGES) overBudget();
+	const messageIds = mutableRefs.map((ref) => ref.messageId);
+	// octet_length reads SQLite's stored length without decoding payloads. Include
+	// originalPayload and every ledger column: bodyBytes alone omits both of them.
+	const storedBytes = (table: typeof narratorBlocks | typeof narratorToolCalls) =>
+		sql<number>`${sql.join(
+			Object.values(getTableColumns(table))
+				.filter((column) => !column.generated)
+				.map((column) => sql`coalesce(octet_length(${column}), 0)`),
+			sql` + `,
+		)}`;
+	const envelopes = tx
+		.select({ bytes: envelopeStoredBytesSql() })
+		.from(narratorMessages)
+		.where(inArray(narratorMessages.id, messageIds))
+		.all();
+	const blocks = tx
+		.select({ bytes: storedBytes(narratorBlocks) })
+		.from(narratorBlocks)
+		.where(inArray(narratorBlocks.messageId, messageIds))
+		.limit(FORK_SNAPSHOT_MAX_ROWS + 1)
+		.all();
+	const calls = tx
+		.select({ bytes: storedBytes(narratorToolCalls) })
+		.from(narratorToolCalls)
+		.where(inArray(narratorToolCalls.messageId, messageIds))
+		.limit(FORK_SNAPSHOT_MAX_ROWS + 1)
+		.all();
+	if (blocks.length > FORK_SNAPSHOT_MAX_ROWS || calls.length > FORK_SNAPSHOT_MAX_ROWS) overBudget();
+	let bytes = 0;
+	for (const row of [...envelopes, ...blocks, ...calls]) {
+		if (!Number.isSafeInteger(row.bytes) || row.bytes < 0) overBudget();
+		bytes += row.bytes;
+		if (bytes > FORK_SNAPSHOT_MAX_BYTES) overBudget();
+	}
+	for (const ref of mutableRefs) {
+		const original = readEnvelope(tx, ref.messageId);
+		if (!original) throw new NotFoundError("Message", ref.messageId);
+		cowEnvelopeTx(tx, {
+			original,
+			ref: { id: ref.id, narratorId },
+			toolCalls: tx.query.narratorToolCalls
+				.findMany({ where: eq(narratorToolCalls.messageId, ref.messageId) })
+				.sync(),
+		});
+	}
 }
 
 /**
@@ -894,6 +1304,12 @@ function overwriteToolInputTx(
 	toolUseId: string,
 	input: Record<string, unknown>,
 ): Record<string, unknown> {
+	if (
+		sqlite
+			.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
+			.get(toolCallId)
+	)
+		return {};
 	const existing = tx
 		.select({
 			messageId: narratorToolCalls.messageId,
@@ -1751,6 +2167,8 @@ const sqliteNarratorPersistence = {
 			text: string;
 			definitionSnapshots?: import("../lib/agent/tool-loading").ToolDefinitionSnapshot[];
 			definitionSnapshotRef?: string;
+			/** The epoch's strategy could not append this load; the next request rebaselines. */
+			rebaseline?: true;
 		},
 		/** `system` for a change the runtime reconciled rather than a `/load` someone typed. */
 		origin?: "system",
@@ -1906,6 +2324,69 @@ const sqliteNarratorPersistence = {
 				}),
 			{ label: "persistCompactingMessage", maxRetries: 5 },
 		);
+	},
+
+	/**
+	 * Record the context-window occupancy a compact marker actually changed.
+	 *
+	 * `before` is the narrator's own history footprint when the compact started and
+	 * `after` the footprint once the summary was committed. Both are display metadata
+	 * only — they never feed the agent loop — so a declined write costs a label, not a
+	 * compact. The summary model's own request occupancy is a different number (a
+	 * different model's window) and must never be stored here.
+	 */
+	async setCompactContextPercent(
+		narratorId: string,
+		messageId: string,
+		patch: { before?: number | null; after?: number | null },
+	) {
+		const before =
+			typeof patch.before === "number" && Number.isFinite(patch.before) ? patch.before : undefined;
+		const after =
+			typeof patch.after === "number" && Number.isFinite(patch.after) ? patch.after : undefined;
+		if (before == null && after == null) return null;
+		return db.transaction((tx) => {
+			const msg = fillBody(
+				tx.query.narratorMessages
+					.findFirst({
+						...bodyColumns({ id: true, contentJson: true }),
+						where: and(
+							eq(narratorMessages.id, messageId),
+							eq(narratorMessages.narratorId, narratorId),
+							eq(narratorMessages.role, "system"),
+						),
+					})
+					.sync(),
+			);
+			if (!msg) return null;
+			const ref = tx.query.narratorMessageRefs
+				.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true },
+				})
+				.sync();
+			if (!ref) return null;
+
+			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+			const index = blocks.findIndex((block) => parseCompactMessageBlock(block) != null);
+			if (index < 0) return null;
+			const nextBlocks = [...blocks];
+			nextBlocks[index] = {
+				...(blocks[index] as Record<string, unknown>),
+				...(before != null ? { contextPercentBefore: before } : {}),
+				...(after != null ? { contextPercentAfter: after } : {}),
+			};
+			const written = writeEnvelopeBody(tx, messageId, nextBlocks, {
+				set: { contextCharsJson: measureMessageCharacters("system", nextBlocks) },
+				where: eq(narratorMessages.narratorId, narratorId),
+			});
+			if (!written) return null;
+			const updated = readEnvelope(tx, messageId);
+			return updated ? { ...updated, seq: ref.seq } : null;
+		});
 	},
 
 	async prepareFailedCompactRetry(narratorId: string, messageId: string, model?: string) {
@@ -2230,7 +2711,12 @@ const sqliteNarratorPersistence = {
 			);
 			const compactBlock = {
 				...finished,
-				...(status === "compacted" ? { summary, contextPercentAfter: contextPercent } : {}),
+				// `contextPercent` is what the summary model's own request occupied on ITS
+				// window — not what this compact left in the narrator's. The real `after` is
+				// estimated from the rebuilt history once the summary is committed and is
+				// written back through `setCompactContextPercent`; storing the summary model's
+				// number here would publish a percentage of the wrong window.
+				...(status === "compacted" ? { summary } : {}),
 				...(status === "compacted" && options?.epoch ? { epoch: options.epoch } : {}),
 			};
 			const failureText = truncateCompactError(options?.error ?? "Compact failed");
@@ -2520,10 +3006,16 @@ const sqliteNarratorPersistence = {
 			| {
 					type: "image_generation";
 					id: string;
+					status?: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					outputIndex?: number;
 					savedPath?: string;
 					result?: string;
+					partialSavedPath?: string;
+					partialImageIndex?: number;
+					partialImageB64?: string;
 					width?: number;
 					height?: number;
 			  },
@@ -2543,152 +3035,174 @@ const sqliteNarratorPersistence = {
 		let toolCallId: string | undefined;
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
-		const persisted = db.transaction(
-			(tx) => {
-				const queueMark = syncQueueMark();
-				const existing = fillBody(
-					tx.query.narratorMessages
-						.findFirst({
-							where: eq(narratorMessages.id, messageId),
-							...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
-						})
-						.sync(),
-				);
-				if (!existing) throw new NotFoundError("Assistant message", messageId);
-
-				type StoredAssistantBlock =
-					| {
-							type: "text";
-							text: string;
-							outputIndex?: number;
-							citations?: import("@shared/citations").TextCitation[];
-							fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
-							id?: string;
-							revision?: number;
-							rawTextLength?: number;
-							completed?: boolean;
-					  }
-					| {
-							type: "reasoning";
-							text: string;
-							id?: string;
-							revision?: number;
-							rawTextLength?: number;
-							completed?: boolean;
-							providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
-							outputIndex?: number;
-					  }
-					| {
-							type: "redacted_thinking";
-							data: string;
-							outputIndex?: number;
-							signatureSource?: string;
-					  }
-					| {
-							type: "tool_use";
-							id: string;
-							name: string;
-							input: Record<string, unknown>;
-							streamStartedAt?: number;
-							streamCompletedAt?: number;
-							outputIndex?: number;
-							thoughtSignature?: string;
-							thoughtSignatureSource?: string;
-					  }
-					| {
-							type: "web_search";
-							id: string;
-							query?: string;
-							queries?: string[];
-							outputIndex?: number;
-					  }
-					| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
-				const current = (
-					Array.isArray(existing.contentJson) ? existing.contentJson : []
-				) as StoredAssistantBlock[];
-				let content: StoredAssistantBlock[];
-				const matchingIndex =
-					(block.type === "text" || block.type === "reasoning") && block.id
-						? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
-						: -1;
-				if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
-					const previous = current[matchingIndex] as Record<string, unknown>;
-					const stale =
-						typeof previous.revision === "number" &&
-						(block.revision == null || block.revision < previous.revision);
-					const next: Record<string, unknown> = {
-						...previous,
-						...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
-					};
-					if (block.type === "reasoning" && block.providerMetadata) {
-						next.providerMetadata = mergeReasoningMetadata(
-							previous.providerMetadata as ReasoningProviderMetadata | undefined,
-							block.providerMetadata,
+		// A transient BUSY here aborts the whole assistant-content checkpoint, and the
+		// loop treats that as a critical persistence failure. Other writers in this file
+		// already retry the same way; this path must not be the one that gives up first.
+		const persisted = await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						const existing = fillBody(
+							tx.query.narratorMessages
+								.findFirst({
+									where: eq(narratorMessages.id, messageId),
+									...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
+								})
+								.sync(),
 						);
-					}
-					if (previous.text !== block.text) delete next.translatedText;
-					if (stale || isDeepStrictEqual(previous, next)) {
-						content = current;
-					} else {
-						// A checkpoint updates the original chronological slot, even when its
-						// metadata arrives after a tool has already been committed.
-						content = [...current];
-						content[matchingIndex] = next as StoredAssistantBlock;
-					}
-				} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
-					const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
-						const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
-						return typeof outputIndex === "number" ? outputIndex : undefined;
-					};
-					// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
-					// avoid the former wrapper object + two extra arrays for every checkpoint.
-					content = [...current, block as StoredAssistantBlock];
-					content.sort((a, b) => {
-						const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
-						const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
-						return aOrder === bOrder ? 0 : aOrder - bOrder;
-					});
-				} else {
-					// Unindexed providers/checkpoints already arrive in occurrence order. Do not
-					// pull later reasoning in front of text/tools that were actually seen first.
-					content = [...current, block];
-				}
-				if (content === current && !options?.republishUnchanged) return undefined;
-				const writeLedgerRow = () => {
-					if (block.type === "tool_use")
-						toolCallId = insertToolCallRowTx(tx, {
-							narratorId,
-							messageId,
-							parentSegmentId: toolParentSegmentId,
-							block,
-							createdAt: toolCreatedAt,
-						});
-				};
-				// One item changed: its block row (and the tool's ledger binding) follows.
-				const stamp = { attemptId: options?.attemptId };
-				if (content !== current) {
-					const textParts: string[] = [];
-					for (const entry of content)
-						if (entry.type === "text" && typeof entry.text === "string") textParts.push(entry.text);
-					const contentText = textParts.join("\n");
-					writeEnvelopeBody(tx, messageId, content, {
-						set: {
-							contextCharsJson: measureMessageCharacters("assistant", content),
-							contentText: contentText || null,
-						},
-						mode: "streaming",
-						stamp,
-						rows: writeLedgerRow,
-					});
-					queueContextCharacterRefresh(narratorId, messageId);
-				} else {
-					writeLedgerRow();
-					syncEnvelopeNow(messageId, "streaming", stamp);
-				}
-				flushQueuedSince(queueMark);
-				return existing;
-			},
-			{ behavior: "immediate" },
+						if (!existing) throw new NotFoundError("Assistant message", messageId);
+						if (isHistoryProtectedContent(existing.contentJson)) return undefined;
+						if (block.type === "tool_use") {
+							const adopted = sqlite
+								.query<
+									{ cleared: number },
+									[string, string]
+								>(`SELECT (${CLEARED_TOOL_OUTPUT_SQL}) AS cleared
+								FROM narrator_tool_calls WHERE message_id = ? AND tool_use_id = ?
+								ORDER BY execution_attempt DESC, created_at DESC, id DESC LIMIT 1`)
+								.get(messageId, block.id);
+							if (adopted?.cleared) return undefined;
+						}
+
+						type StoredAssistantBlock =
+							| {
+									type: "text";
+									text: string;
+									outputIndex?: number;
+									citations?: import("@shared/citations").TextCitation[];
+									fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
+									id?: string;
+									revision?: number;
+									rawTextLength?: number;
+									completed?: boolean;
+							  }
+							| {
+									type: "reasoning";
+									text: string;
+									id?: string;
+									revision?: number;
+									rawTextLength?: number;
+									completed?: boolean;
+									providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+									outputIndex?: number;
+							  }
+							| {
+									type: "redacted_thinking";
+									data: string;
+									outputIndex?: number;
+									signatureSource?: string;
+							  }
+							| {
+									type: "tool_use";
+									id: string;
+									name: string;
+									input: Record<string, unknown>;
+									streamStartedAt?: number;
+									streamCompletedAt?: number;
+									outputIndex?: number;
+									thoughtSignature?: string;
+									thoughtSignatureSource?: string;
+							  }
+							| {
+									type: "web_search";
+									id: string;
+									query?: string;
+									queries?: string[];
+									outputIndex?: number;
+							  }
+							| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
+						const current = (
+							Array.isArray(existing.contentJson) ? existing.contentJson : []
+						) as StoredAssistantBlock[];
+						let content: StoredAssistantBlock[];
+						const matchingIndex =
+							(block.type === "text" || block.type === "reasoning") && block.id
+								? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
+								: -1;
+						if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
+							const previous = current[matchingIndex] as Record<string, unknown>;
+							const stale =
+								typeof previous.revision === "number" &&
+								(block.revision == null || block.revision < previous.revision);
+							const next: Record<string, unknown> = {
+								...previous,
+								...Object.fromEntries(
+									Object.entries(block).filter(([, value]) => value !== undefined),
+								),
+							};
+							if (block.type === "reasoning" && block.providerMetadata) {
+								next.providerMetadata = mergeReasoningMetadata(
+									previous.providerMetadata as ReasoningProviderMetadata | undefined,
+									block.providerMetadata,
+								);
+							}
+							if (previous.text !== block.text) delete next.translatedText;
+							if (stale || isDeepStrictEqual(previous, next)) {
+								content = current;
+							} else {
+								// A checkpoint updates the original chronological slot, even when its
+								// metadata arrives after a tool has already been committed.
+								content = [...current];
+								content[matchingIndex] = next as StoredAssistantBlock;
+							}
+						} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+							const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
+								const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
+								return typeof outputIndex === "number" ? outputIndex : undefined;
+							};
+							// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
+							// avoid the former wrapper object + two extra arrays for every checkpoint.
+							content = [...current, block as StoredAssistantBlock];
+							content.sort((a, b) => {
+								const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
+								const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
+								return aOrder === bOrder ? 0 : aOrder - bOrder;
+							});
+						} else {
+							// Unindexed providers/checkpoints already arrive in occurrence order. Do not
+							// pull later reasoning in front of text/tools that were actually seen first.
+							content = [...current, block];
+						}
+						if (content === current && !options?.republishUnchanged) return undefined;
+						const writeLedgerRow = () => {
+							if (block.type === "tool_use")
+								toolCallId = insertToolCallRowTx(tx, {
+									narratorId,
+									messageId,
+									parentSegmentId: toolParentSegmentId,
+									block,
+									createdAt: toolCreatedAt,
+								});
+						};
+						// One item changed: its block row (and the tool's ledger binding) follows.
+						const stamp = { attemptId: options?.attemptId };
+						if (content !== current) {
+							const textParts: string[] = [];
+							for (const entry of content)
+								if (entry.type === "text" && typeof entry.text === "string")
+									textParts.push(entry.text);
+							const contentText = textParts.join("\n");
+							writeEnvelopeBody(tx, messageId, content, {
+								set: {
+									contextCharsJson: measureMessageCharacters("assistant", content),
+									contentText: contentText || null,
+								},
+								mode: "streaming",
+								stamp,
+								rows: writeLedgerRow,
+							});
+							queueContextCharacterRefresh(narratorId, messageId);
+						} else {
+							writeLedgerRow();
+							syncEnvelopeNow(messageId, "streaming", stamp);
+						}
+						flushQueuedSince(queueMark);
+						return existing;
+					},
+					{ behavior: "immediate" },
+				),
+			{ label: "appendBlockToMessage", maxRetries: 5 },
 		);
 		if (!persisted) return undefined;
 		const existing = persisted;
@@ -2957,6 +3471,7 @@ const sqliteNarratorPersistence = {
 		updates: {
 			planReflectionAutoApproveOverride?: BooleanOverride;
 			dangerReflectionOverride?: DangerReflectionOverride;
+			questionReflectionOverride?: BooleanOverride;
 			autoContinuationOverride?: AutoContinuationOverride;
 			tasksReminderIntervalOverride?: number | null;
 		},
@@ -3009,7 +3524,14 @@ const sqliteNarratorPersistence = {
 		const requestedSubstatus =
 			options?.substatus ?? (status === "working" || status === "waiting" ? [] : undefined);
 		const isError = requestedSubstatus?.includes("error");
-		const keepsErrorMessage = isError || requestedSubstatus?.includes("payment_required");
+		// Timed-wait details share this existing column with errors. They must survive
+		// reloads while parked, but disappear on recovery/interruption like other waits.
+		const keepsWaitMessage =
+			status === "waiting" &&
+			(requestedSubstatus?.includes("quota_exhausted") ||
+				requestedSubstatus?.includes("model_unavailable"));
+		const keepsErrorMessage =
+			isError || requestedSubstatus?.includes("payment_required") || keepsWaitMessage;
 		const now = new Date().toISOString();
 		const nowMs = new Date(now).getTime();
 		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
@@ -4020,6 +4542,8 @@ const sqliteNarratorPersistence = {
 			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
 			onPersist?: (tx: DbTx) => void;
+			/** Recovery explanations may update only an active row, never a terminal result. */
+			onlyIfActive?: boolean;
 		},
 		messageId?: string,
 		toolCallId?: string,
@@ -4051,9 +4575,20 @@ const sqliteNarratorPersistence = {
 			);
 			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		}
+		if (result.onlyIfActive)
+			conditions.push(
+				ne(narratorToolCalls.status, "success"),
+				ne(narratorToolCalls.status, "fail"),
+			);
 		const affectedToolCalls = db.transaction(
 			(tx) => {
 				const queueMark = syncQueueMark();
+				if (
+					sqlite
+						.query(`SELECT 1 FROM narrator_tool_calls WHERE id = ? AND ${CLEARED_TOOL_OUTPUT_SQL}`)
+						.get(exactId)
+				)
+					return [];
 				const updated = tx
 					.update(narratorToolCalls)
 					.set({
@@ -4090,6 +4625,9 @@ const sqliteNarratorPersistence = {
 						executionDeviceId: narratorToolCalls.executionDeviceId,
 					})
 					.all();
+				// Another writer already settled or retired this receipt. A recovery
+				// explanation must not replace it or trigger another publication commit.
+				if (result.onlyIfActive && updated.length === 0) return [];
 				if (expected && updated.length !== 1) {
 					throw new ValidationError(
 						"Tool execution binding is stale or belongs to another narrator",
@@ -4320,7 +4858,7 @@ const sqliteNarratorPersistence = {
 			};
 			const updateOriginal = () => {
 				if (overrides && Object.keys(overrides).length > 0) {
-					updateEnvelope(tx, messageId, overrides);
+					updateEnvelope(tx, messageId, overrides, { allowHistoryRewrite: !!overrides.editedAt });
 					if (semanticEdit)
 						updateRecipientMessageRef(tx, narratorId, currentRef.id, {
 							kind: "semantic_edit",
@@ -4516,13 +5054,19 @@ const sqliteNarratorPersistence = {
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
 		// The step is complete: items it left incomplete are interrupted, not streaming.
-		db.transaction(
-			(tx) => {
-				const queueMark = syncQueueMark();
-				updateEnvelope(tx, messageId, updates, { mode: "sealed" });
-				flushQueuedSince(queueMark);
-			},
-			{ behavior: "immediate" },
+		// 这一步是 assistant_message 的封口写：一次 BUSY 会把整个 loop 判死，
+		// 与其它写路径一样交给带退避的 withDbRetry。
+		await withDbRetry(
+			async () =>
+				db.transaction(
+					(tx) => {
+						const queueMark = syncQueueMark();
+						updateEnvelope(tx, messageId, updates, { mode: "sealed" });
+						flushQueuedSince(queueMark);
+					},
+					{ behavior: "immediate" },
+				),
+			{ label: "patchStepMeta", maxRetries: 5 },
 		);
 	},
 
@@ -4934,6 +5478,7 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 		db.transaction((tx) => {
 			writeEnvelopeBody(tx, messageId, [newBlock], {
+				allowHistoryRewrite: true,
 				set: {
 					contextCharsJson: measureMessageCharacters("user", [newBlock]),
 					contentText: `[Segment Compact]\n${summary}`,

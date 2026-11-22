@@ -15,6 +15,8 @@ import {
 	serializeDiagnostics,
 	startApiRequest,
 } from "../api-request-tracker";
+import { resolveCredentialDisplayName } from "../credential-display-name";
+import { settings } from "../settings";
 
 afterEach(() => {
 	cleanDb(sqlite);
@@ -97,6 +99,30 @@ describe("request evidence linkage on the inserted row", () => {
 		const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
 		expect(row?.recordingRequestId).toBeNull();
 		expect(row?.diagnosticsJson).toBeNull();
+	});
+
+	test("cache_usage_reported mirrors the adapter's flag and stays null when unknown", async () => {
+		const cases = [
+			{
+				usage: buildUsageDataFromSnapshot({ inputTokens: 5, cacheReported: true }),
+				expected: true,
+			},
+			{
+				usage: buildUsageDataFromSnapshot({ inputTokens: 5, cacheReported: false }),
+				expected: false,
+			},
+			{
+				usage: buildUsageDataFromSnapshot({ inputTokens: 5, cachedInputTokens: 2 }),
+				expected: null,
+			},
+			{ usage: null, expected: null },
+		];
+		for (const { usage, expected } of cases) {
+			const handle = startApiRequest({ provider: "openai", model: "gpt-5" });
+			await finishApiRequest(handle, { usage });
+			const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
+			expect(row?.cacheUsageReported).toBe(expected);
+		}
 	});
 });
 
@@ -270,6 +296,43 @@ describe("request user attribution", () => {
 			cacheCreationTokens: 50,
 		});
 	});
+	test("an API connection without a reported credential is attributed to the connection", async () => {
+		const saved = settings.anthropicProviders;
+		settings.anthropicProviders = [
+			{
+				id: "conn1234",
+				name: "Team relay",
+				prefix: "relay",
+				apiKey: "k",
+				baseUrl: "",
+				defaultModel: "",
+			},
+		];
+		try {
+			const handle = startApiRequest({ provider: "relay", model: "claude-x", userId: "u" });
+			await finishApiRequest(handle, { usage: { inputTokens: 10, outputTokens: 5 } });
+			expect(
+				db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get(),
+			).toMatchObject({ credentialId: "conn1234" });
+			expect(
+				db
+					.select()
+					.from(credentialUsageTotals)
+					.where(eq(credentialUsageTotals.credentialId, "conn1234"))
+					.get(),
+			).toMatchObject({ provider: "relay", requestCount: 1 });
+			expect(resolveCredentialDisplayName("relay", "conn1234")).toBe("Team relay");
+			// Unknown prefixes stay unattributed instead of being guessed.
+			const unknown = startApiRequest({ provider: "nowhere", model: "m", userId: "u" });
+			await finishApiRequest(unknown, { usage: { inputTokens: 1, outputTokens: 1 } });
+			expect(
+				db.select().from(apiRequests).where(eq(apiRequests.id, unknown.id)).get()?.credentialId,
+			).toBeNull();
+		} finally {
+			settings.anthropicProviders = saved;
+		}
+	});
+
 	test("completion persists frozen user and rolls up once, including unknown-cost failures", async () => {
 		const userId = "tracker-user-rollup-test";
 		const handle = startApiRequest({ provider: "test", model: "unknown", userId });

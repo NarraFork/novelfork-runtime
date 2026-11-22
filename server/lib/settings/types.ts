@@ -7,6 +7,7 @@ import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SpeechSettings } from "@shared/speech";
+import type { StorageRetentionSettings } from "@shared/storage-retention";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
@@ -89,6 +90,21 @@ export interface CustomApiProviderConfig {
 	customUserAgent?: string;
 	/** Additional request headers injected on outbound requests. */
 	extraHeaders?: Record<string, string>;
+	/**
+	 * Interface root used only by the site-account credit query (`/api/user/self`).
+	 *
+	 * Separate from `baseUrl` on purpose: several presets keep `/v1` in the inference base URL,
+	 * and `{baseUrl}/api/user/self` would resolve to `/v1/api/user/self` and 404. Empty means
+	 * "derive it from `baseUrl`", with `/v1` and trailing slashes stripped.
+	 */
+	quotaSiteUrl?: string;
+	/**
+	 * Site system access token (the one issued by the site console), not the inference
+	 * `sk-` key: `sk-` keys are rejected by `/api/user/self` with 401.
+	 */
+	quotaAccessToken?: string;
+	/** Site user id, sent as the `New-Api-User` header. */
+	quotaUserId?: string;
 }
 
 /**
@@ -140,6 +156,11 @@ export interface OpenAIProviderConfig {
 	apiMode?: "responses" | "completions" | "codex";
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header (for org subscriptions). */
 	codexAccountId?: string;
+	/**
+	 * Internal: the installation id a Codex-mode request sends in `client_metadata`, set per
+	 * credential by the Codex provider. Absent = this instance's id. Not persisted.
+	 */
+	codexInstallationId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP (experimental; falls back to HTTP when unavailable). */
 	codexWebSocket?: boolean;
 	/** Codex: allow the native web_search tool to be sent to the model. */
@@ -514,12 +535,64 @@ export interface OidcProviderConfig {
 	enabled?: boolean;
 }
 
+/**
+ * A single LDAP / Active Directory directory used as a *credential provider* for the
+ * ordinary login form — not as another sign-in button.
+ *
+ * The local account stays the authorization record (role, sessions, MFA); the directory
+ * only decides whether the submitted password is correct. So a login is: local bcrypt
+ * first, and only when that fails, the directory. One directory per instance.
+ */
+export interface LdapSettings {
+	/** Master switch. `enabled && url` is what actually turns directory logins on. */
+	enabled: boolean;
+	/** `ldap://host:port` or `ldaps://host:port`. Never carries credentials or a base DN. */
+	url: string;
+	/** Upgrade a plaintext `ldap://` connection with StartTLS before binding. */
+	startTls?: boolean;
+	/** Verify the server certificate. Defaults to true; only disable for a self-signed CA. */
+	tlsRejectUnauthorized?: boolean;
+	/** TCP/TLS connect timeout in ms (1000..30000, default 5000). */
+	connectTimeoutMs?: number;
+	/** Per-operation timeout in ms (1000..30000, default 5000). */
+	timeoutMs?: number;
+	/**
+	 * `search` (default): bind a service account, find the user's DN, bind as them.
+	 * `direct`: build the DN (or UPN) from `bindDnTemplate` and bind as them directly.
+	 */
+	mode?: "search" | "direct";
+	/** Service-account DN for `search` mode. Empty/omitted = anonymous search. */
+	bindDn?: string;
+	/** Service-account password. Masked on read; empty/masked on write keeps the stored value. */
+	bindPassword?: string;
+	/** Search root, e.g. `dc=example,dc=com`. Required in `search` mode. */
+	searchBase?: string;
+	/** Search scope. Defaults to `sub`. */
+	searchScope?: "sub" | "one" | "base";
+	/** RFC 4515 filter containing `{username}`. Defaults to `(uid={username})`. */
+	searchFilter?: string;
+	/** `direct` mode template containing `{username}`, e.g. `{username}@corp.example.com`. */
+	bindDnTemplate?: string;
+	/** Attribute holding the login name. Defaults to `uid`; Active Directory uses `sAMAccountName`. */
+	usernameAttribute?: string;
+	/** Attribute holding the email address. Defaults to `mail`. */
+	emailAttribute?: string;
+	/** Attribute holding the display name. Defaults to `cn`. */
+	displayNameAttribute?: string;
+}
+
 /** 逐模型可选的协议；`agent.modelProtocols` 与 `agent.modelProtocolOverrides` 的值域。 */
-export type ModelProtocol =
-	| "anthropic-messages"
-	| "openai-responses"
-	| "completions-compatible"
-	| "gemini-compatible";
+export const MODEL_PROTOCOLS = [
+	"anthropic-messages",
+	"openai-responses",
+	"completions-compatible",
+	"gemini-compatible",
+] as const;
+export type ModelProtocol = (typeof MODEL_PROTOCOLS)[number];
+
+export function isModelProtocol(value: unknown): value is ModelProtocol {
+	return typeof value === "string" && (MODEL_PROTOCOLS as readonly string[]).includes(value);
+}
 
 export interface TokenDanceSettings {
 	apiKey: string;
@@ -591,6 +664,11 @@ export interface NarraForkSettings {
 		installationId?: string;
 		claudeDeviceId?: string;
 	};
+	/** How credential files (e.g. codex-credentials.json) are stored. See lib/secret-store.ts. */
+	secrets?: {
+		/** Encrypt credential files with the instance key in secret.key. Default true. */
+		encrypt?: boolean;
+	};
 	/**
 	 * Unified outbound proxy policy applied to every outbound network channel.
 	 * Defaults to "system" (follow the OS/env proxy). Replaces the previous
@@ -652,10 +730,29 @@ export interface NarraForkSettings {
 		 * Master switch, off by default while the feature is built: when off the outline agent
 		 * tools are not offered, its routes answer 404 and navigation hides it. When on, root
 		 * sessions created from then on keep their tasks in the outline (`narrators.task_backend`
-		 * `outline`); existing sessions keep Dynamic Spec. Turned off again, every session reads
-		 * as a spec session until it is back on (`services/task-source`).
+		 * `outline`); existing sessions keep Dynamic Spec until they are imported into the outline
+		 * (`specImport`), which moves them to it and leaves their Dynamic Spec rows in place.
+		 * Turned off again, every session reads as a spec session until it is back on
+		 * (`services/task-source`).
 		 */
 		enabled: boolean;
+		/**
+		 * How sessions that still keep their tasks in Dynamic Spec are imported into the outline
+		 * (outline P2 PR 12b), while `enabled` is on: their current spec files, tasks and behavior
+		 * fence are written into the session space, checked one by one, and the session is moved
+		 * to the outline (its Dynamic Spec rows stay). `auto` (the default, outline P2 PR 12b2):
+		 * before a small session's next run, by a background job while sessions are idle, and from
+		 * the Spec panel's button. `manual`: only from the button (and an administrator's
+		 * re-import). `off`: not at all.
+		 */
+		specImport?: "auto" | "manual" | "off";
+		/**
+		 * When the swallowed-content scan (outline P2 PR 12c) first ran on this instance (ISO time;
+		 * written by the scan, not meant to be edited). The scan ships after the Spec panel's editor
+		 * was fixed, so a person's save made after this moment was made with the fixed editor: what
+		 * it removed was removed on purpose, and the scan does not look at it.
+		 */
+		specLossCutoff?: string;
 	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */
@@ -859,6 +956,11 @@ export interface NarraForkSettings {
 		 * Multi-instance providers use their own `disabled` field instead.
 		 */
 		disabledProviders?: string[];
+		/**
+		 * Provider prefixes left out of `auto:<model>` routing. They still serve values that
+		 * name them (`<prefix>:<model>`); use it for relays whose same-named models may differ.
+		 */
+		autoExcludedProviders?: string[];
 		/** Browser proxy override for new sessions. Absent/"default" = global policy. */
 		browserProxy?: ProxyOverride;
 		/** Explicit pre-approval for Notification.send; never overrides read-only mode. */
@@ -910,7 +1012,9 @@ export interface NarraForkSettings {
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
-	/** Block storage rollout switches (docs/BLOCK_STORAGE-DESIGN.md §10.6). */
+	/** Independent retention policies. A null horizon never expires historical content. */
+	storageRetention: StorageRetentionSettings;
+	/** Stable block storage; switches remain available for deliberate rollback. */
 	narratorBlocks: {
 		/**
 		 * Whether new envelopes are stored as blocks (`body_format = 2`), with the
@@ -932,6 +1036,10 @@ export interface NarraForkSettings {
 		 * restore job writes their projection back.
 		 */
 		compactJson: boolean;
+		/** Internal one-time migration; subsequent explicit rollback switches are preserved. */
+		singleCopyDefaultsVersion?: number;
+		/** Backend startup resumed pre-upgrade paused jobs; later explicit pauses stay effective. */
+		singleCopyBackfillResumeVersion?: number;
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";
@@ -966,6 +1074,11 @@ export interface NarraForkSettings {
 		 * enables a "Sign in with …" option. Empty/omitted = SSO disabled.
 		 */
 		oidcProviders?: OidcProviderConfig[];
+		/**
+		 * Optional LDAP / Active Directory directory that accepts the ordinary login
+		 * form's password. Omitted or `enabled: false` = directory logins off.
+		 */
+		ldap?: LdapSettings;
 	};
 	/** OAuth provider runtime configuration. */
 	oauth?: {
@@ -1063,6 +1176,8 @@ export interface NarraForkSettings {
 		/** Automatically download updates when available. */
 		autoDownload: boolean;
 	};
+	/** Optional RTC access; secrets and state paths are never settings. */
+	remoteAccess?: import("../../../shared/remote-access/management").RemoteAccessSettings;
 	/** Application-level virtual network relay for Bun-to-Bun communication. */
 	vnet?: {
 		enabled: boolean;

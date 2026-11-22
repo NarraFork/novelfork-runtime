@@ -25,7 +25,12 @@ import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import { assertRuntimeCanAwaitAgent } from "./subagent-communication-policy";
-import { agentLabelFromNarrator, resolveAgentLabel, shortAgentId } from "./subagent-label";
+import {
+	agentLabelFromNarrator,
+	agentMarkdownReference,
+	resolveAgentLabel,
+	shortAgentId,
+} from "./subagent-label";
 import {
 	applySubagentModelSwitch,
 	planSubagentModelSwitch,
@@ -55,6 +60,8 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	onDeliveryResolved?: (target: SendDeliveryTarget & { deliveryMessageId: string }) => void;
 	onTargetsResolved?: (count: number) => void;
 	message: string;
+	/** Display intent only; false messages remain readable by the user. Defaults to false for Send. */
+	showToUser?: boolean;
 	doInterrupt?: boolean;
 	/**
 	 * Explicitly restart a direct child whose last turn ended with an error. Agent
@@ -431,7 +438,9 @@ async function buildAwaitAgentResult(
 		...(knownTitle ? { title: knownTitle } : {}),
 		status,
 		output: output ?? "(no output)",
-		formatted: formatAgentAwaitResult(label, status, output ?? null, recentActivity),
+		formatted:
+			formatAgentAwaitResult(label, status, output ?? null, recentActivity) +
+			`\n\n${agentMarkdownReference(id, knownTitle || label)}`,
 		...(receipt
 			? {
 					terminalResultReceived: receipt.terminalResultReceived,
@@ -902,6 +911,7 @@ async function deliverSubagentMessageToParent(
 		input.toolUseId,
 		input.message,
 		input.toolCallBinding,
+		input.showToUser ?? false,
 	);
 	const accepted = await enqueueInboxAgent(delivery, input.message, {
 		channel: "parent",
@@ -1086,6 +1096,7 @@ export async function sendSubagentMessageDetailed(
 				input.toolUseId,
 				input.message,
 				input.toolCallBinding,
+				input.showToUser ?? false,
 			);
 			let deliveryMessageId = delivery.recipientMessageId;
 

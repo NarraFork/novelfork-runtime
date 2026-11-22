@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { inArray } from "drizzle-orm";
-import type { GithubPatchStep } from "../../shared/release-patch";
+import { type GithubPatchStep, MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import {
 	isLegacyMirrorSourceIdentity,
 	type PreparedUpdateIdentity,
@@ -43,7 +43,8 @@ import { managerChildTokenEnv } from "../lib/manager-token";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
-import { replacementLaunchArgs } from "../lib/replacement-launch";
+import { replacementLaunchArgs, spawnReplacementProcess } from "../lib/replacement-launch";
+import { IS_LOCAL_RUNTIME, isCompiledRuntime } from "../lib/runtime-target";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -91,7 +92,14 @@ import {
 	writePlannedUpdateRecoverySnapshot,
 	writePreparedUpdateRecoverySnapshot,
 } from "./update-coordinator";
-import { checkMirrorUpdate, downloadMirrorPatch, getMirrorNotes } from "./update-mirror-client";
+import {
+	checkMirrorUpdate,
+	downloadMirrorBinary,
+	downloadMirrorPatch,
+	getMirrorNotes,
+	type MirrorBinaryDescriptor,
+	type MirrorPatchStep,
+} from "./update-mirror-client";
 import {
 	CHECKPOINT_ACTIVE_TOOL_LIMIT,
 	checkpointPlannedUpdateContinuations,
@@ -156,7 +164,8 @@ export interface ReleaseInfo {
 	_github?: { repository: string; downloadUrl: string; patchChain?: GithubPatchStep[] };
 	_mirror?: {
 		serverUrl: string;
-		patch?: { name: string; size: number; sha256: string; url: string };
+		full: MirrorBinaryDescriptor;
+		patchChain?: MirrorPatchStep[];
 	};
 	version: string;
 	releaseDate: string;
@@ -237,7 +246,7 @@ const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
 /** Recovery manifest name, owned by update-coordinator; cleanup must never delete it. */
 const RECOVERY_SNAPSHOT_FILE_NAME = "planned-update-recovery.json";
 const PLACED_UPDATE_INFO_FILE_NAME = "placed-update.json";
-const MAX_BINARY_BYTES = 1024 * 1024 * 1024;
+const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
 const REPLACEMENT_HANDOFF_WATCHDOG_MS = 75_000;
 const CHECKPOINT_MAX_ROUNDS = 8;
 const CHECKPOINT_REQUIRED_STABLE_PASSES = 2;
@@ -303,12 +312,11 @@ function getPlatform(): string {
 /**
  * Get the current executable path.
  * For compiled binaries, this is the running executable.
- * For dev mode, returns null.
+ * For source development and local launch artifacts, returns null.
  */
 function getCurrentExecutablePath(): string | null {
-	// Check if running as compiled binary
-	// Linux/macOS: $bunfs, Windows: ~BUN/%7EBUN
-	if (import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/")) {
+	// Local launch artifacts are frozen source builds, not release installations.
+	if (!IS_LOCAL_RUNTIME && isCompiledRuntime()) {
 		return process.execPath;
 	}
 	return null;
@@ -649,6 +657,12 @@ export async function downloadUpdate(
 	placed?: boolean;
 	preparedIdentity?: PreparedUpdateIdentity;
 }> {
+	if (IS_LOCAL_RUNTIME) {
+		return {
+			success: false,
+			error: "Local runtime builds must be rebuilt from source, not self-updated",
+		};
+	}
 	const forceDownload = options.forceDownload ?? false;
 	const sourceIdentity = parseUpdateSourceIdentity(releaseInfo.sourceIdentity);
 	let recoveryManifestVersions: number[];
@@ -665,8 +679,9 @@ export async function downloadUpdate(
 		sourceIdentity: sourceIdentity ?? undefined,
 		recoveryManifestVersions,
 	};
-	const isGithub =
-		!!releaseInfo._github && (releaseInfo.source === "github" || !!releaseInfo._mirror);
+	const hasCanonicalTransport =
+		(releaseInfo.source === "github" && !!releaseInfo._github) ||
+		(releaseInfo.source === "update-server" && !!releaseInfo._mirror);
 	if (!sourceIdentity || !isUpdateSourceCurrent(releaseInfo)) {
 		return { success: false, error: "Update source changed; check for updates again" };
 	}
@@ -677,7 +692,7 @@ export async function downloadUpdate(
 				"A restart is already scheduled; keep its prepared update until it finishes or is cancelled",
 		};
 	}
-	if (!isGithub && !getServerBaseUrl()) {
+	if (!hasCanonicalTransport && !getServerBaseUrl()) {
 		return { success: false, error: "Update server not configured" };
 	}
 
@@ -689,7 +704,7 @@ export async function downloadUpdate(
 	const releaseFileName = sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version);
 	const updatePath = join(UPDATE_DIR, releaseFileName);
 	const tempPath = `${updatePath}.${process.pid}.${randomUUID()}.tmp`;
-	let ownsGithubTemp = false;
+	let ownsDownloadTemp = false;
 
 	logger.info("Starting update download", {
 		version: releaseInfo.version,
@@ -699,20 +714,26 @@ export async function downloadUpdate(
 		hasMirror: !!releaseInfo._mirror,
 	});
 
-	const githubDeadline = isGithub ? createGithubUpdateDeadline(options.signal) : undefined;
-	const signal = githubDeadline?.signal ?? options.signal;
-	let githubStrategy: "full" | "zstd" = releaseInfo._github?.patchChain?.length ? "zstd" : "full";
-	let githubFallback = false;
-	let githubDownloadedBytes = 0;
-	let githubDownloadTotal = releaseInfo.files[0]?.size ?? 0;
+	const updateDeadline = hasCanonicalTransport
+		? createGithubUpdateDeadline(options.signal)
+		: undefined;
+	const signal = updateDeadline?.signal ?? options.signal;
+	let downloadStrategy: "full" | "zstd" = (
+		releaseInfo._mirror?.patchChain ?? releaseInfo._github?.patchChain
+	)?.length
+		? "zstd"
+		: "full";
+	let downloadFallback = false;
+	let downloadedBytes = 0;
+	let downloadTotal = releaseInfo.files[0]?.size ?? 0;
 	const emitProgress = (progress: UpdateProgress) => {
-		if (!isGithub) {
+		if (!hasCanonicalTransport) {
 			onProgress?.(progress);
 			return;
 		}
-		githubStrategy = progress.strategy ?? githubStrategy;
-		githubFallback = progress.fallback ?? githubFallback;
-		onProgress?.({ ...progress, strategy: githubStrategy, fallback: githubFallback });
+		downloadStrategy = progress.strategy ?? downloadStrategy;
+		downloadFallback = progress.fallback ?? downloadFallback;
+		onProgress?.({ ...progress, strategy: downloadStrategy, fallback: downloadFallback });
 	};
 	try {
 		signal?.throwIfAborted();
@@ -727,42 +748,47 @@ export async function downloadUpdate(
 
 		let applied = false;
 
-		if (isGithub && githubDeadline) {
+		if (hasCanonicalTransport && updateDeadline) {
 			const startedAt = Date.now();
 			const strategy = await downloadGithubUpdateToFile(
 				{
-					release: { ...releaseInfo, source: "github" },
+					release: releaseInfo,
 					currentVersion: APP_VERSION,
 					basePath: execPath,
 					outputPath: tempPath,
-					signal: githubDeadline.signal,
+					signal: updateDeadline.signal,
 					onProgress: (progress) => {
-						githubDownloadedBytes = progress.bytesDownloaded;
-						githubDownloadTotal = progress.totalBytes;
+						downloadedBytes = progress.bytesDownloaded;
+						downloadTotal = progress.totalBytes;
 						emitProgress(progress);
 					},
 				},
 				{
-					downloadPatch: (step, path, downloadOptions) =>
-						releaseInfo._mirror
-							? downloadMirrorPatch(releaseInfo, path, downloadOptions, transport)
+					downloadPatch: (step, path, downloadOptions) => {
+						if (!isUpdateSourceCurrent(releaseInfo))
+							throw new Error("Update source changed; check again");
+						return releaseInfo.source === "update-server"
+							? downloadMirrorPatch(releaseInfo, path, downloadOptions, transport, step)
 							: downloadGithubPatchToFile(step, path, {
 									...downloadOptions,
 									fetcher: transport.fetch,
-								}),
+								});
+					},
 					downloadFull: (release, path, downloadOptions) => {
 						if (!isUpdateSourceCurrent(releaseInfo))
 							throw new Error("Update source changed; check again");
-						return downloadGithubBinaryToFile(release, path, {
-							...downloadOptions,
-							fetcher: transport.fetch,
-						});
+						return releaseInfo.source === "update-server"
+							? downloadMirrorBinary(release, path, downloadOptions, transport)
+							: downloadGithubBinaryToFile(release, path, {
+									...downloadOptions,
+									fetcher: transport.fetch,
+								});
 					},
 					resolveZstd: (patchSignal) =>
 						getZstdCliPath(forceDownload, true, patchSignal, helperContext),
 					onFallback: (error) =>
 						logger.warn(
-							"Incremental update unavailable; downloading canonical GitHub full binary",
+							"Incremental update unavailable; downloading full binary from the selected source",
 							{
 								source: releaseInfo.source,
 								error: String(error),
@@ -770,7 +796,7 @@ export async function downloadUpdate(
 						),
 				},
 			);
-			ownsGithubTemp = true;
+			ownsDownloadTemp = true;
 			applied = true;
 			logger.info("Canonical update downloaded", {
 				source: releaseInfo.source,
@@ -781,13 +807,13 @@ export async function downloadUpdate(
 			});
 		}
 
-		if (!applied) throw new Error("Canonical GitHub descriptor required; check again");
+		if (!applied) throw new Error("Canonical update descriptor required; check again");
 
 		// Verify SHA512
 		emitProgress({
 			phase: "applying",
-			bytesDownloaded: isGithub ? githubDownloadedBytes : (releaseInfo.files[0]?.size ?? 0),
-			totalBytes: isGithub ? githubDownloadTotal : (releaseInfo.files[0]?.size ?? 0),
+			bytesDownloaded: hasCanonicalTransport ? downloadedBytes : (releaseInfo.files[0]?.size ?? 0),
+			totalBytes: hasCanonicalTransport ? downloadTotal : (releaseInfo.files[0]?.size ?? 0),
 			percent: 100,
 		});
 
@@ -861,8 +887,8 @@ export async function downloadUpdate(
 
 		emitProgress({
 			phase: "complete",
-			bytesDownloaded: isGithub ? githubDownloadedBytes : (releaseInfo.files[0]?.size ?? 0),
-			totalBytes: isGithub ? githubDownloadTotal : (releaseInfo.files[0]?.size ?? 0),
+			bytesDownloaded: hasCanonicalTransport ? downloadedBytes : (releaseInfo.files[0]?.size ?? 0),
+			totalBytes: hasCanonicalTransport ? downloadTotal : (releaseInfo.files[0]?.size ?? 0),
 			percent: 100,
 		});
 
@@ -876,7 +902,7 @@ export async function downloadUpdate(
 		};
 	} catch (err) {
 		// The full-download helper owns cleanup on failure, including exclusive-create conflicts.
-		if ((!isGithub || ownsGithubTemp) && existsSync(tempPath)) {
+		if ((!hasCanonicalTransport || ownsDownloadTemp) && existsSync(tempPath)) {
 			try {
 				unlinkSync(tempPath);
 			} catch {}
@@ -893,7 +919,7 @@ export async function downloadUpdate(
 
 		return { success: false, error };
 	} finally {
-		githubDeadline?.dispose();
+		updateDeadline?.dispose();
 	}
 }
 
@@ -1141,7 +1167,9 @@ export function getUpdateInstructions(
 	if (!execPath) {
 		return {
 			manual: true,
-			message: "Running in development mode. Update rebuilt and saved to the update cache.",
+			message: IS_LOCAL_RUNTIME
+				? "Local runtime builds must be rebuilt from source, not self-updated"
+				: "Running in development mode. Update rebuilt and saved to the update cache.",
 		};
 	}
 
@@ -1276,6 +1304,13 @@ export async function applyUpdate(
 	replacementPid?: number;
 	drainStartedAt?: string;
 }> {
+	if (IS_LOCAL_RUNTIME) {
+		return {
+			success: false,
+			error: "Local runtime builds must be rebuilt from source, not self-updated",
+			code: "NOT_COMPILED_BINARY",
+		};
+	}
 	if (!options.preparedId || !/^[a-f0-9]{64}$/.test(options.preparedId)) {
 		return {
 			success: false,
@@ -1872,46 +1907,23 @@ async function drainAndSpawnPreparedUpdate(options: {
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
-		const isWindows = process.platform === "win32";
 		const launchArgs = replacementLaunchArgs(process.argv.slice(2), {
 			platform: process.platform,
 			managerManaged: process.env.NARRAFORK_MANAGER_MANAGED === "1",
 		});
-		const proc = isWindows
-			? Bun.spawn(
-					[
-						process.env.ComSpec || "cmd.exe",
-						"/d",
-						"/c",
-						"start",
-						"",
-						"/D",
-						process.cwd(),
-						options.newExecPath,
-						...launchArgs,
-					],
-					{
-						cwd: process.cwd(),
-						env,
-						stdio: ["ignore", "ignore", "ignore"],
-						windowsHide: true,
-					},
-				)
-			: Bun.spawn([options.newExecPath, ...launchArgs], {
-					cwd: process.cwd(),
-					env,
-					detached: true,
-					stdio: ["ignore", "ignore", "ignore"],
-				});
-		(proc as { unref?: () => void }).unref?.();
+		const replacementPid = spawnReplacementProcess({
+			execPath: options.newExecPath,
+			args: launchArgs,
+			cwd: process.cwd(),
+			env,
+		});
 
 		logger.info("Update replacement server spawned after scheduled drain", {
 			oldExecPath: options.execPath,
 			newExecPath: options.newExecPath,
 			targetVersion: options.targetVersion,
-			replacementPid: isWindows ? undefined : proc.pid,
-			launcherPid: isWindows ? proc.pid : undefined,
-			launchMode: isWindows ? "cmd-start" : "detached",
+			replacementPid,
+			launchMode: process.platform === "win32" ? "windows-breakaway" : "detached",
 			handoffUrl: session.url,
 			markerPath: session.markerPath,
 		});

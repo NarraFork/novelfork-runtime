@@ -222,7 +222,7 @@ export function ImportSessionModal({ opened, onClose, onImported }: ImportSessio
 	const qc = useQueryClient();
 	const targets = useSessionTargets(opened);
 	const fileResetRef = useRef<() => void>(null);
-	const { groupedModels } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels();
 
 	const [requestedTab, setTab] = useState<SourceTab>("upload");
 	const [format, setFormat] = useState<SessionFormat>("claude-code");
@@ -528,6 +528,7 @@ export function ImportSessionModal({ opened, onClose, onImported }: ImportSessio
 							description={t("sessionInterchange.modelHint", { brand })}
 							data={groupedModels}
 							searchable
+							filter={modelOptionsFilter}
 							limit={MODEL_SELECT_OPTION_LIMIT}
 							value={model || FOLLOW_DEFAULT_MODEL}
 							onChange={(value) => setModel(value ?? "")}

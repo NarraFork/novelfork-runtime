@@ -22,6 +22,32 @@ import { redactHeaders, redactPostData, redactUrl } from "./redaction";
 import { serializeBrowserValue } from "./serialization";
 import { closeTab, isSharedContext, targetIdOf } from "./tab-scope";
 
+function safeLog(
+	level: "info" | "warn" | "debug",
+	message: string,
+	fields: Record<
+		string,
+		| number
+		| boolean
+		| "console-serialization"
+		| "initial-navigation-close"
+		| "closed"
+		| "capture-stopped"
+		| "handoff-target"
+		| "restore-viewport"
+		| "restored"
+	>,
+) {
+	try {
+		const scalars = Object.fromEntries(
+			Object.entries(fields).filter(
+				([, value]) => typeof value !== "number" || Number.isFinite(value),
+			),
+		);
+		logger[level](message, scalars);
+	} catch {}
+}
+
 /** Default session TTL: 10 minutes of inactivity. */
 export const DEFAULT_SESSION_TTL_MS = 10 * 60 * 1000;
 /** Minimum configurable session TTL: 1 second. */
@@ -88,6 +114,8 @@ export interface BrowserSession {
 	inUserBrowser: boolean;
 	/** Whether network request capture is currently enabled for this session. */
 	networkCaptureEnabled: boolean;
+	/** Viewport currently emulated on the session page. */
+	viewport: BrowserViewport;
 	/** Recent console output and page errors captured from the page. */
 	consoleMessages: BrowserConsoleMessage[];
 	/** Monotonic counter for console messages, independent of the capped buffer size. */
@@ -129,6 +157,67 @@ export interface BrowserSessionHandoff {
 	headless: boolean;
 	ttlMs: number;
 	networkCaptureEnabled: boolean;
+	/** Emulated viewport; absent in handoff files written before viewport support. */
+	viewport?: BrowserViewport;
+}
+
+/** Viewport emulated on a session page (CSS pixels). */
+export interface BrowserViewport {
+	width: number;
+	height: number;
+	deviceScaleFactor?: number;
+	isMobile?: boolean;
+}
+
+export const MIN_VIEWPORT_SIZE = 100;
+export const MAX_VIEWPORT_SIZE = 4096;
+export const MIN_DEVICE_SCALE_FACTOR = 0.5;
+export const MAX_DEVICE_SCALE_FACTOR = 4;
+
+/** Validate a viewport, throwing a readable error for out-of-range values. */
+export function normalizeViewport(viewport: BrowserViewport): BrowserViewport {
+	const dimension = (name: string, value: number) => {
+		if (!Number.isFinite(value) || value < MIN_VIEWPORT_SIZE || value > MAX_VIEWPORT_SIZE) {
+			throw new Error(
+				`Viewport ${name} must be between ${MIN_VIEWPORT_SIZE} and ${MAX_VIEWPORT_SIZE} pixels`,
+			);
+		}
+		return Math.round(value);
+	};
+	const result: BrowserViewport = {
+		width: dimension("width", viewport.width),
+		height: dimension("height", viewport.height),
+	};
+	if (viewport.deviceScaleFactor !== undefined) {
+		const dsf = viewport.deviceScaleFactor;
+		if (!Number.isFinite(dsf) || dsf < MIN_DEVICE_SCALE_FACTOR || dsf > MAX_DEVICE_SCALE_FACTOR) {
+			throw new Error(
+				`Device scale factor must be between ${MIN_DEVICE_SCALE_FACTOR} and ${MAX_DEVICE_SCALE_FACTOR}`,
+			);
+		}
+		result.deviceScaleFactor = dsf;
+	}
+	if (viewport.isMobile !== undefined) result.isMobile = viewport.isMobile;
+	return result;
+}
+
+/** Drop undefined fields so a partial viewport spread does not erase existing values. */
+function definedOnly(viewport: Partial<BrowserViewport> | undefined): Partial<BrowserViewport> {
+	if (!viewport) return {};
+	return Object.fromEntries(
+		Object.entries(viewport).filter(([, value]) => value !== undefined),
+	) as Partial<BrowserViewport>;
+}
+
+/** Puppeteer viewport including the touch flag that matches mobile emulation. */
+function toPuppeteerViewport(viewport: BrowserViewport) {
+	return {
+		width: viewport.width,
+		height: viewport.height,
+		deviceScaleFactor: viewport.deviceScaleFactor ?? 1,
+		isMobile: viewport.isMobile ?? false,
+		hasTouch: viewport.isMobile ?? false,
+	};
 }
 
 export function normalizeSessionTtlMs(ttlMs: number | undefined): number {
@@ -147,10 +236,23 @@ export function normalizeSessionTtlMs(ttlMs: number | undefined): number {
 /**
  * narratorId → Map<sessionId, BrowserSession>
  */
-const sessions = new Map<string, Map<string, BrowserSession>>();
-
-/** Start periodic cleanup of expired sessions. */
-let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+interface SessionOwner {
+	version: 1;
+	sessions: Map<string, Map<string, BrowserSession>>;
+	cleanupTimer: ReturnType<typeof setInterval> | null;
+}
+const SESSION_OWNER = Symbol.for("narrafork.browser.sessions");
+const sessionGlobals = globalThis as typeof globalThis & { [SESSION_OWNER]?: SessionOwner };
+const oldOwner = sessionGlobals[SESSION_OWNER];
+if (oldOwner && (oldOwner.version !== 1 || !(oldOwner.sessions instanceof Map)))
+	throw new Error("Browser session ownership cannot be recovered");
+const sessionOwner: SessionOwner = oldOwner ?? {
+	version: 1,
+	sessions: new Map(),
+	cleanupTimer: null,
+};
+sessionGlobals[SESSION_OWNER] = sessionOwner;
+const sessions = sessionOwner.sessions;
 
 function isSessionExpired(session: BrowserSession, now = Date.now()): boolean {
 	return now - session.lastActivity > session.ttlMs;
@@ -166,7 +268,7 @@ function expireSession(
 	sessionId: string,
 	session: BrowserSession,
 ): void {
-	logger.info("Browser session expired", { narratorId, sessionId, ttlMs: session.ttlMs });
+	safeLog("info", "Browser session expired", { ttlMs: session.ttlMs });
 	if (session.tracing?.active) void finishPerformanceTrace(session).catch(() => {});
 	void cancelMemoryJob(session)
 		.then(() => closeSessionTab(session))
@@ -177,8 +279,8 @@ function expireSession(
 }
 
 function ensureCleanupTimer(): void {
-	if (cleanupTimer) return;
-	cleanupTimer = setInterval(() => {
+	if (sessionOwner.cleanupTimer) return;
+	sessionOwner.cleanupTimer = setInterval(() => {
 		const now = Date.now();
 		for (const [narratorId, map] of sessions) {
 			for (const [sessionId, session] of map) {
@@ -188,14 +290,18 @@ function ensureCleanupTimer(): void {
 			}
 			if (map.size === 0) sessions.delete(narratorId);
 		}
-		if (sessions.size === 0 && cleanupTimer) {
-			clearInterval(cleanupTimer);
-			cleanupTimer = null;
+		if (sessions.size === 0 && sessionOwner.cleanupTimer) {
+			clearInterval(sessionOwner.cleanupTimer);
+			sessionOwner.cleanupTimer = null;
 		}
 	}, CLEANUP_INTERVAL_MS);
 	// Don't keep the process alive just for cleanup
-	if (cleanupTimer && typeof cleanupTimer === "object" && "unref" in cleanupTimer) {
-		cleanupTimer.unref();
+	if (
+		sessionOwner.cleanupTimer &&
+		typeof sessionOwner.cleanupTimer === "object" &&
+		"unref" in sessionOwner.cleanupTimer
+	) {
+		sessionOwner.cleanupTimer.unref();
 	}
 }
 
@@ -352,9 +458,9 @@ function attachConsoleListeners(page: Page, session: BrowserSession): void {
 		});
 		trackConsoleCapture(
 			session,
-			populateConsoleMessageArgs(entry, msg).catch((err) => {
-				logger.debug("Failed to serialize browser console arguments", {
-					error: err instanceof Error ? err.message : String(err),
+			populateConsoleMessageArgs(entry, msg).catch(() => {
+				safeLog("debug", "Failed to serialize browser console arguments", {
+					stage: "console-serialization",
 				});
 			}),
 		);
@@ -425,8 +531,10 @@ export async function createSession(
 	headless = true,
 	ttlMs?: number,
 	captureNetwork = false,
+	viewport?: Partial<BrowserViewport>,
 ): Promise<BrowserSession> {
 	const normalizedTtlMs = normalizeSessionTtlMs(ttlMs);
+	const normalizedViewport = normalizeViewport({ ...DEFAULT_VIEWPORT, ...definedOnly(viewport) });
 	const { context, page, inUserBrowser } = await openTab(headless);
 	const sessionId = generateShortId();
 	const session: BrowserSession = {
@@ -440,6 +548,7 @@ export async function createSession(
 		headless,
 		inUserBrowser,
 		networkCaptureEnabled: captureNetwork,
+		viewport: normalizedViewport,
 		consoleMessages: [],
 		consoleMessageSeq: 0,
 		pendingConsoleCaptures: new Set(),
@@ -452,7 +561,7 @@ export async function createSession(
 	try {
 		// Puppeteer doesn't support viewport/userAgent at context level (unlike Playwright),
 		// so we set them per-page to match fetchPage() defaults.
-		await page.setViewport(DEFAULT_VIEWPORT);
+		await page.setViewport(toPuppeteerViewport(normalizedViewport));
 		// 用户的浏览器带着真实登录态，伪造的 UA 容易触发站点的异常登录风控
 		if (!inUserBrowser) await page.setUserAgent(USER_AGENT);
 		await installDialogProtection(
@@ -462,11 +571,9 @@ export async function createSession(
 		);
 		await page.goto(url, { waitUntil: "domcontentloaded" });
 	} catch (err) {
-		await closeSessionTab(session).catch((closeErr) => {
-			logger.warn("Failed to close browser tab after initial navigation failure", {
-				narratorId,
-				sessionId,
-				error: String(closeErr),
+		await closeSessionTab(session).catch(() => {
+			safeLog("warn", "Failed to close browser tab after initial navigation failure", {
+				stage: "initial-navigation-close",
 			});
 		});
 		throw err;
@@ -480,16 +587,39 @@ export async function createSession(
 	map.set(sessionId, session);
 
 	ensureCleanupTimer();
-	logger.info("Browser session created", {
-		narratorId,
-		sessionId,
-		url,
+	safeLog("info", "Browser session created", {
 		headless,
 		inUserBrowser,
 		ttlMs: normalizedTtlMs,
 		networkCaptureEnabled: captureNetwork,
+		viewportWidth: normalizedViewport.width,
+		viewportHeight: normalizedViewport.height,
 	});
 	eventBus.emit({ type: "browser:session_created", sessionId, narratorId, url });
+	return session;
+}
+
+/**
+ * Change the emulated viewport of a live session. Omitted fields keep their current value.
+ * Mobile emulation changes require a reload for the page to pick up the new UA metrics,
+ * which Puppeteer performs automatically.
+ */
+export async function setSessionViewport(
+	narratorId: string,
+	sessionId: string,
+	viewport: Partial<BrowserViewport>,
+): Promise<BrowserSession | undefined> {
+	const session = getSession(narratorId, sessionId);
+	if (!session) return undefined;
+	const next = normalizeViewport({ ...session.viewport, ...definedOnly(viewport) });
+	await session.page.setViewport(toPuppeteerViewport(next));
+	session.viewport = next;
+	touchSession(session);
+	safeLog("info", "Browser session viewport updated", {
+		viewportWidth: next.width,
+		viewportHeight: next.height,
+	});
+	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
 
@@ -530,7 +660,7 @@ export async function closeSession(narratorId: string, sessionId: string): Promi
 	map.delete(sessionId);
 	if (map.size === 0) sessions.delete(narratorId);
 
-	logger.info("Browser session closed", { narratorId, sessionId });
+	safeLog("info", "Browser session closed", { stage: "closed" });
 	eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 	return true;
 }
@@ -548,7 +678,7 @@ export function setSessionTtl(
 	// Treat a manual/agent TTL update as activity, so the new countdown starts now.
 	touchSession(session);
 	ensureCleanupTimer();
-	logger.info("Browser session TTL updated", { narratorId, sessionId, ttlMs: normalizedTtlMs });
+	safeLog("info", "Browser session TTL updated", { ttlMs: normalizedTtlMs });
 	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
@@ -567,7 +697,7 @@ export function startNetworkCapture(
 	}
 	session.networkCaptureEnabled = true;
 	touchSession(session);
-	logger.info("Browser network capture started", { narratorId, sessionId, clear: opts?.clear });
+	safeLog("info", "Browser network capture started", { clear: opts?.clear ?? false });
 	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
@@ -581,7 +711,7 @@ export function stopNetworkCapture(
 	if (!session) return undefined;
 	session.networkCaptureEnabled = false;
 	touchSession(session);
-	logger.info("Browser network capture stopped", { narratorId, sessionId });
+	safeLog("info", "Browser network capture stopped", { stage: "capture-stopped" });
 	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
 	return session;
 }
@@ -613,10 +743,7 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 	for (const sessionId of sessionIds) {
 		eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 	}
-	logger.info("All browser sessions cleaned up", {
-		narratorId,
-		count: promises.length,
-	});
+	safeLog("info", "All browser sessions cleaned up", { count: promises.length });
 }
 
 /** List active sessions for a narrator. */
@@ -627,6 +754,7 @@ export function listSessions(narratorId: string): Array<{
 	ttlMs: number;
 	expiresAt: number;
 	headless: boolean;
+	viewport: BrowserViewport;
 	tracing: { active: boolean; startedAt: number } | null;
 	memoryProfile: {
 		profileId?: string;
@@ -653,6 +781,7 @@ export function listSessions(narratorId: string): Array<{
 		ttlMs: s.ttlMs,
 		expiresAt: s.lastActivity + s.ttlMs,
 		headless: s.headless,
+		viewport: s.viewport,
 		tracing: s.tracing ? { active: s.tracing.active, startedAt: s.tracing.startedAt } : null,
 		memoryProfile: s.memoryProfile
 			? {
@@ -712,7 +841,7 @@ export async function closeAllSessions(options: { preserve?: boolean } = {}): Pr
 				);
 			}
 			promises.push(
-				cancelMemoryJob(session)
+				cancelMemoryJob(session, { waitForCleanup: true })
 					.then(() => (preserve ? undefined : closeSessionTab(session)))
 					.catch(() => {}),
 			);
@@ -721,11 +850,11 @@ export async function closeAllSessions(options: { preserve?: boolean } = {}): Pr
 	}
 	await Promise.all(promises);
 	sessions.clear();
-	if (cleanupTimer) {
-		clearInterval(cleanupTimer);
-		cleanupTimer = null;
+	if (sessionOwner.cleanupTimer) {
+		clearInterval(sessionOwner.cleanupTimer);
+		sessionOwner.cleanupTimer = null;
 	}
-	logger.info("All browser sessions closed", { count: closed, preserve });
+	safeLog("info", "All browser sessions closed", { count: closed, preserve });
 	return closed;
 }
 
@@ -741,9 +870,8 @@ export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
 			const contextId = shared ? undefined : session.context.id;
 			const targetId = shared ? targetIdOf(session.page.target()) : undefined;
 			if (!contextId && !targetId) {
-				logger.warn("Skipping browser session that cannot be located after handoff", {
-					narratorId,
-					sessionId: session.id,
+				safeLog("warn", "Skipping browser session that cannot be located after handoff", {
+					stage: "handoff-target",
 				});
 				continue;
 			}
@@ -768,6 +896,7 @@ export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
 				headless: session.headless,
 				ttlMs: session.ttlMs,
 				networkCaptureEnabled: session.networkCaptureEnabled,
+				viewport: session.viewport,
 			});
 		}
 	}
@@ -821,6 +950,7 @@ export async function restoreSessionFromHandoff(
 		// 交接只保留我们启动的浏览器
 		inUserBrowser: false,
 		networkCaptureEnabled: handoff.networkCaptureEnabled,
+		viewport: restoredViewport(handoff.viewport),
 		consoleMessages: [],
 		consoleMessageSeq: 0,
 		pendingConsoleCaptures: new Set(),
@@ -848,6 +978,17 @@ export async function restoreSessionFromHandoff(
 	);
 	attachConsoleListeners(page, session);
 	attachNetworkListeners(page, session);
+	// Reconnecting re-applies connect()'s defaultViewport, so restore a customized size.
+	// Skip the CDP round-trip for default sessions to keep restore unchanged for them.
+	if (!isDefaultViewport(session.viewport)) {
+		try {
+			await page.setViewport(toPuppeteerViewport(session.viewport));
+		} catch {
+			safeLog("warn", "Failed to restore browser session viewport after update", {
+				stage: "restore-viewport",
+			});
+		}
+	}
 
 	let map = sessions.get(handoff.narratorId);
 	if (!map) {
@@ -857,11 +998,7 @@ export async function restoreSessionFromHandoff(
 	map.set(handoff.sessionId, session);
 	ensureCleanupTimer();
 
-	logger.info("Browser session restored after update", {
-		narratorId: handoff.narratorId,
-		sessionId: handoff.sessionId,
-		url: page.url(),
-	});
+	safeLog("info", "Browser session restored after update", { stage: "restored" });
 	eventBus.emit({
 		type: "browser:session_created",
 		sessionId: handoff.sessionId,
@@ -869,6 +1006,25 @@ export async function restoreSessionFromHandoff(
 		url: page.url(),
 	});
 	return { ok: true };
+}
+
+function isDefaultViewport(viewport: BrowserViewport): boolean {
+	return (
+		viewport.width === DEFAULT_VIEWPORT.width &&
+		viewport.height === DEFAULT_VIEWPORT.height &&
+		(viewport.deviceScaleFactor ?? 1) === 1 &&
+		!viewport.isMobile
+	);
+}
+
+/** Viewport recorded in a handoff; invalid or missing (older handoff files) → default. */
+function restoredViewport(viewport: BrowserViewport | undefined): BrowserViewport {
+	if (!viewport) return { ...DEFAULT_VIEWPORT };
+	try {
+		return normalizeViewport(viewport);
+	} catch {
+		return { ...DEFAULT_VIEWPORT };
+	}
 }
 
 /** Prefer a page matching the captured URL; otherwise take the first available page. */

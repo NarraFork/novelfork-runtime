@@ -59,6 +59,7 @@ import {
 	KNOWLEDGE_MERGE_ACTION_SET,
 } from "../lib/agent/tools/knowledge-actions";
 import {
+	OUTLINE_ASK_TOOL,
 	OUTLINE_EDIT_TOOL,
 	OUTLINE_READ_TOOL,
 	OUTLINE_SEARCH_TOOL,
@@ -79,6 +80,7 @@ import type {
 import {
 	type DangerReflectionLevel,
 	normalizeDangerReflectionLevel,
+	resolveBooleanOverride,
 	resolveDangerReflectionLevel,
 } from "../lib/boolean-override";
 import {
@@ -804,6 +806,7 @@ export function resolvePermissionDecision(
 		planFilePath: designatedPlanFilePath,
 		relaxedPlan = false,
 		planMode = false,
+		outlinePlan = false,
 		meta,
 		projectGitPath,
 		executionBackend,
@@ -876,8 +879,22 @@ export function resolvePermissionDecision(
 	// person's write permission, and in read-only and strict plan mode only the session's own
 	// space. Under bypassPermissions the danger classification below still applies.
 	if (toolName === OUTLINE_EDIT_TOOL) return "allow";
+	// A question put to a person writes one block under the task (outline P2 PR 7).
+	if (toolName === OUTLINE_ASK_TOOL) return "allow";
 
-	const planFileCandidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
+	const planFileCandidates = outlinePlan
+		? []
+		: planFileWriteCandidates(planFileId, designatedPlanFilePath);
+	if (planMode && outlinePlan && !relaxedPlan && (toolName === "Write" || toolName === "Edit")) {
+		if (meta) {
+			meta.blacklistReason =
+				"Plan mode: this session's plan is a task tree in the outline, not a file. " +
+				"Write it under the plan root with OutlineEdit, then call ExitPlanMode. " +
+				"Only after the user approves your plan can you implement changes.";
+			meta.planModeSoftDeny = true;
+		}
+		return "deny";
+	}
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileCandidates.length > 0) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
@@ -1492,6 +1509,11 @@ export interface PermissionDecisionOpts {
 	 */
 	planFilePath?: string;
 	planMode?: boolean;
+	/**
+	 * The session plans in the outline (outline P2 PR 8): plan mode has no plan file, so strict
+	 * planning allows no file write at all.
+	 */
+	outlinePlan?: boolean;
 	/** Hard Bash policy for review follow-up subagents. */
 	reviewReadOnlyBash?: boolean;
 	whitelistDirs?: WhitelistDir[];
@@ -2178,16 +2200,25 @@ function getQuestionReflectionTimeoutMs(): number {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(10_000, value) : 300_000;
 }
 
-function shouldScheduleQuestionReflection(effectiveMode: string): boolean {
-	return effectiveMode === "bypassPermissions" && settings.agent.questionReflectionEnabled === true;
+/**
+ * Whether automatic AskUserQuestion reflection may run: it needs 全部允许 mode AND
+ * the per-session override resolved against the instance default
+ * (`agent.questionReflectionEnabled`).
+ */
+function shouldScheduleQuestionReflection(effectiveMode: string, override: unknown): boolean {
+	return (
+		effectiveMode === "bypassPermissions" &&
+		resolveBooleanOverride(override, settings.agent.questionReflectionEnabled === true)
+	);
 }
 
 function scheduleQuestionReflection(
 	requestId: string,
 	effectiveMode: string,
 	deadline: number,
+	override: unknown,
 ): ReturnType<typeof setTimeout> | undefined {
-	if (!shouldScheduleQuestionReflection(effectiveMode)) return undefined;
+	if (!shouldScheduleQuestionReflection(effectiveMode, override)) return undefined;
 	const delay = Math.max(0, deadline - Date.now());
 	return setTimeout(() => {
 		void reflectPendingAskUserQuestion(requestId, { automatic: true }).catch((err) => {
@@ -2209,6 +2240,7 @@ async function currentPermissionModeAllowsAutomaticQuestionReflection(
 			relaxedPlan: true,
 			previousPermissionMode: true,
 			traits: true,
+			questionReflectionOverride: true,
 		},
 	});
 	if (!narrator) return false;
@@ -2218,7 +2250,7 @@ async function currentPermissionModeAllowsAutomaticQuestionReflection(
 		resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
 		narrator.previousPermissionMode,
 	);
-	return shouldScheduleQuestionReflection(effectiveMode);
+	return shouldScheduleQuestionReflection(effectiveMode, narrator.questionReflectionOverride);
 }
 
 export async function reflectPendingAskUserQuestion(
@@ -2979,6 +3011,30 @@ function classifyToolDanger(
 		);
 	}
 
+	// Folding the switch into creation must not lose the workspace-change review that
+	// a separate SwitchWorkingDirectory call would have triggered.
+	if (
+		(toolName === "CreateWorktree" || toolName === "AttachWorktree") &&
+		input.switchToWorktree === true
+	) {
+		return danger(
+			"Creating a worktree also switches the narrator's execution workspace.",
+			[
+				"Subsequent tools use the new worktree as working directory, with its own skills and permission context.",
+				"Existing background tools, subagents and terminals keep their original targets after the switch.",
+			],
+			[
+				"Verify the destination worktree matches the user's requested workspace.",
+				"Omit switchToWorktree to create the worktree without changing the working directory.",
+			],
+			[
+				`Current working directory: ${cwd}`,
+				`Requested working directory: ${String(input.destinationPath ?? "unknown")}`,
+			],
+			"high",
+		);
+	}
+
 	if (toolName === "Agent") {
 		if (input.subagent_type === "explore" || input.subagent_type === "plan") return null;
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";
@@ -3595,14 +3651,44 @@ function isPlanFileReadAuthorized(
 export async function resolveExitPlanModeInputWithBackend(
 	narratorId: string,
 	cwd: string,
-	input: Record<string, unknown>,
+	rawInput: Record<string, unknown>,
 	locale: Locale = "en",
 	isRelaxedPlan = false,
 	backend: ExecutionBackend = localBackend,
 	executionTarget?: ToolExecutionTarget,
 	designatedPlanPath?: string,
 	planReadPolicy?: PlanFileReadPolicy,
+	/** The call was persisted before (restored after a restart; outline P2 PR 8 review N3). */
+	recovered = false,
+	/**
+	 * The call itself (outline P2 PR 8b): an outline plan's review is the one handed on for this
+	 * tool use, and counts only as written for this tool call.
+	 */
+	call: { toolUseId?: string | null; toolCallId?: string | null } = {},
 ): Promise<ExitPlanModeInputResolution> {
+	// An outline session plans in the outline (outline P2 PR 8): the plan is its task tree, read
+	// as of now. A plan-file cycle begun before that keeps this flow (null).
+	const { resolveOutlineExitPlanInput, withoutOutlinePlanKeys } = await import(
+		"./outline-plan-mode"
+	);
+	const outline = await resolveOutlineExitPlanInput(narratorId, rawInput, locale, {
+		recovered,
+		toolUseId: call.toolUseId ?? null,
+		toolCallId: call.toolCallId ?? null,
+	});
+	if (outline) {
+		return outline.ok
+			? {
+					ok: true,
+					input: outline.input,
+					resolvedFromFile: false,
+					planSource: { kind: "inline" },
+				}
+			: { ok: false, message: outline.message, input: outline.input, resolvedFromFile: false };
+	}
+	// The keys of an outline submission are the server's own: on any other path they are dropped,
+	// so a model cannot make a spec plan read as an outline one (review round 1 S6).
+	const input = withoutOutlinePlanKeys(rawInput);
 	const active = activeNarrators.get(narratorId);
 	const planFileId = active?._planFileId;
 	const allowInlinePlan = settings.agent.planModeAllowInlinePlan;
@@ -5218,6 +5304,7 @@ export async function handlePermission(
 			previousPermissionMode: true,
 			planFileId: true,
 			dangerReflectionOverride: true,
+			questionReflectionOverride: true,
 			variant: true,
 			type: true,
 			parentNarratorId: true,
@@ -5525,11 +5612,17 @@ export async function handlePermission(
 			executionContext.target as ToolExecutionTarget,
 			activeNarrators.get(narratorId)?._planFilePath,
 			{ narratorId, compiledPolicy },
+			isRecoveredHumanPermission(getPermissionRecovery(options)),
+			{ toolUseId, toolCallId: permissionToolCallId || null },
 		);
+		// An outline plan is the outline itself (outline P2 PR 8b, review round 1): one that changed
+		// while it waited is put to the person again as it is now (they see the changes, and the
+		// agent is told of them), never sent back to the agent. A plan file stays refused.
 		if (
 			isRecoveredHumanPermission(getPermissionRecovery(options)) &&
 			typeof input.plan === "string" &&
-			input.plan !== resolved.input.plan
+			input.plan !== resolved.input.plan &&
+			!(resolved.ok && resolved.input._planRoot)
 		) {
 			return { behavior: "deny", message: "Plan changed while its approval was awaiting a user" };
 		}
@@ -5558,6 +5651,12 @@ export async function handlePermission(
 			: runtimeConstraint && oauthKnowledgeCapability === "write"
 				? "bypassPermissions"
 				: permMode;
+	// An outline session plans in the outline, without a plan file (outline P2 PR 8).
+	// A plan-file cycle begun before PR 8 keeps writing its file (review round 1 S7).
+	const outlinePlanSession =
+		isPlanMode &&
+		(toolName === "Write" || toolName === "Edit") &&
+		(await (await import("./outline-plan-mode")).outlinePlanCycle(narratorId))?.kind === "outline";
 	let decision =
 		toolName === "Send" &&
 		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))
@@ -5571,6 +5670,7 @@ export async function handlePermission(
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
+					outlinePlan: outlinePlanSession,
 					reviewReadOnlyBash,
 					compiledPolicy,
 					executionContext,
@@ -6099,7 +6199,7 @@ export async function handlePermission(
 	const questionReflectionDeadline =
 		toolName === "AskUserQuestion" &&
 		!isRecoveredHumanPermission(restoredGate) &&
-		shouldScheduleQuestionReflection(effectiveMode)
+		shouldScheduleQuestionReflection(effectiveMode, narrator?.questionReflectionOverride)
 			? Date.now() + getQuestionReflectionTimeoutMs()
 			: undefined;
 
@@ -6225,6 +6325,7 @@ export async function handlePermission(
 				toolCallId,
 				effectiveMode,
 				questionReflectionDeadline,
+				narrator?.questionReflectionOverride,
 			);
 		}
 		pendingPermissionContexts.set(pendingEntry, { options, runtimeConstraint, reviewReadOnlyBash });
@@ -6524,6 +6625,11 @@ export interface ResolvePermissionOpts {
 	 */
 	decidedBy?: "user" | "auto" | "reflection" | `narrator:${string}`;
 	exitPlanCancelled?: boolean;
+	/**
+	 * ExitPlanMode of an outline session returned on the card (`outline-plan-mode.ts`): the tool
+	 * result the agent gets, as is.
+	 */
+	outlinePlanMessage?: string;
 }
 
 type DangerReflectionDecidedBy = "reflection" | "user" | "auto" | `narrator:${string}`;
@@ -6581,6 +6687,7 @@ export async function resolvePermission(
 		userId,
 		decidedBy = "user",
 		exitPlanCancelled,
+		outlinePlanMessage,
 	} = opts;
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -6591,6 +6698,13 @@ export async function resolvePermission(
 		});
 		return false;
 	}
+	// A person decides inside the run: it counts as a person's run (outline P2 PR 10c-2), for the
+	// session asking and for the one its request shows on (a subagent's parent).
+	if (decidedBy === "user")
+		for (const id of new Set([pending.narratorId, pending.broadcastTargetId])) {
+			const asking = activeNarrators.get(id);
+			if (asking) asking._runPersonActed = true;
+		}
 
 	if (pending.toolName === "RequestPermissionRule") {
 		const state = permissionRuleRequestPauses.get(requestId);
@@ -6802,7 +6916,9 @@ export async function resolvePermission(
 			// `activeNarrators` instead resolved to undefined for every subagent and
 			// silently degraded this message to English for Chinese users.
 			const locale = pending.locale ?? "en";
-			if (exitPlanCancelled && userFeedback) {
+			if (outlinePlanMessage) {
+				pending.resolve({ behavior: "deny", message: outlinePlanMessage, rawMessage: true });
+			} else if (exitPlanCancelled && userFeedback) {
 				pending.resolve({ behavior: "deny", message: userFeedback, rawMessage: true });
 			} else {
 				const denyKey = pending.planSubmittedFromFile

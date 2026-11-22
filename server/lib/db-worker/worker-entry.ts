@@ -16,6 +16,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { parentPort } from "node:worker_threads";
 import {
 	collectSessionAggregateStats,
 	loadScanContext,
@@ -25,6 +26,8 @@ import {
 	scanDatabaseObjectStorage,
 	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
+import { RUNTIME_BUILD_ID } from "../runtime-target";
+import { instrumentSqliteConnection, runInSqlTraceSpan, startSqlTraceSpan } from "../sql-trace";
 import {
 	runBlockBackfillSlice,
 	runBlockIndexQueueSlice,
@@ -34,6 +37,7 @@ import {
 } from "./block-backfill-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
+import { workerFailureDetails } from "./failure";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
@@ -48,8 +52,10 @@ import type {
 } from "./protocol";
 import { assertSessionPreviewBudget } from "./protocol";
 import { runSelectRows } from "./select-rows";
+import { runStorageHistoryBody, runStorageHistoryRead } from "./storage-history-query";
 
-declare const self: Worker;
+if (!parentPort) throw new Error("Database reader requires a worker thread");
+const port = parentPort;
 
 /** Cached read-only connections, keyed by path. A worker usually only ever sees one path. */
 const connections = new Map<string, Database>();
@@ -57,7 +63,7 @@ const connections = new Map<string, Database>();
 function getConnection(dbPath: string): Database {
 	const existing = connections.get(dbPath);
 	if (existing) return existing;
-	const db = new Database(dbPath, { readonly: true });
+	const db = instrumentSqliteConnection(new Database(dbPath, { readonly: true }));
 	// Match the main connection's read tuning. No write pragmas: this handle is read-only.
 	try {
 		db.run("PRAGMA cache_size = -16000");
@@ -73,7 +79,7 @@ function getConnection(dbPath: string): Database {
 }
 
 function post(message: DbWorkerOutbound): void {
-	postMessage(message);
+	port.postMessage(message);
 }
 
 function runStorageScanContext(dbPath: string): StorageScanContextResult {
@@ -175,8 +181,7 @@ function runStorageScanSessionPreview(
 }
 
 const activeTasks = new Map<string, AbortController>();
-self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
-	const message = event.data;
+port.on("message", async (message: DbWorkerInbound) => {
 	if (!message || typeof message !== "object") return;
 
 	if (message.type === "cancel") {
@@ -200,52 +205,63 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	const startedAt = Date.now();
 	const controller = new AbortController();
 	activeTasks.set(message.requestId, controller);
+	const sqlSpan = startSqlTraceSpan(
+		"worker",
+		`db-worker ${message.params.kind}`,
+		undefined,
+		message.traceParent,
+	);
 	try {
 		const params = message.params;
-		const result =
-			params.kind === "displayPageMessagesPostgres"
-				? await runPostgresDisplayPageQuery(
-						message.dbPath,
-						{ ...params, kind: "displayPageMessages" },
-						controller.signal,
-					)
-				: params.kind === "blockBackfillSlice"
-					? runBlockBackfillSlice(getConnection(message.dbPath), params)
-					: params.kind === "blockVerifySlice"
-						? runBlockVerifySlice(getConnection(message.dbPath), params)
-						: params.kind === "blockReindexSlice"
-							? runBlockReindexSlice(getConnection(message.dbPath), params)
-							: params.kind === "blockIndexQueueSlice"
-								? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
-								: params.kind === "blockProjectionSlice"
-									? runBlockProjectionSlice(getConnection(message.dbPath), params)
-									: params.kind === "displayPageMessages"
-										? runDisplayPageQuery(getConnection(message.dbPath), params)
-										: params.kind === "selectRows"
-											? runSelectRows(getConnection(message.dbPath), params)
-											: params.kind === "storageScanContext"
-												? runStorageScanContext(message.dbPath)
-												: params.kind === "storageScanSerial"
-													? runStorageScanSerial(
-															message.dbPath,
-															message.requestId,
-															params.mainBytes,
-															controller.signal,
-														)
-													: params.kind === "storageScanCleanupSummaries"
-														? runStorageScanCleanupSummaries(message.dbPath, params)
-														: params.kind === "storageScanSessionPreview"
-															? runStorageScanSessionPreview(
-																	message.dbPath,
-																	params,
-																	controller.signal,
-																)
-															: runStorageScanTables(
+		const result = await runInSqlTraceSpan(sqlSpan, async () =>
+			params.kind === "storageHistoryRead"
+				? runStorageHistoryRead(getConnection(message.dbPath), params)
+				: params.kind === "storageHistoryBody"
+					? runStorageHistoryBody(getConnection(message.dbPath), params)
+					: params.kind === "displayPageMessagesPostgres"
+						? await runPostgresDisplayPageQuery(
+								message.dbPath,
+								{ ...params, kind: "displayPageMessages" },
+								controller.signal,
+							)
+						: params.kind === "blockBackfillSlice"
+							? runBlockBackfillSlice(getConnection(message.dbPath), params)
+							: params.kind === "blockVerifySlice"
+								? runBlockVerifySlice(getConnection(message.dbPath), params)
+								: params.kind === "blockReindexSlice"
+									? runBlockReindexSlice(getConnection(message.dbPath), params)
+									: params.kind === "blockIndexQueueSlice"
+										? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
+										: params.kind === "blockProjectionSlice"
+											? runBlockProjectionSlice(getConnection(message.dbPath), params)
+											: params.kind === "displayPageMessages"
+												? runDisplayPageQuery(getConnection(message.dbPath), params)
+												: params.kind === "selectRows"
+													? runSelectRows(getConnection(message.dbPath), params)
+													: params.kind === "storageScanContext"
+														? runStorageScanContext(message.dbPath)
+														: params.kind === "storageScanSerial"
+															? runStorageScanSerial(
 																	message.dbPath,
 																	message.requestId,
-																	params,
+																	params.mainBytes,
 																	controller.signal,
-																);
+																)
+															: params.kind === "storageScanCleanupSummaries"
+																? runStorageScanCleanupSummaries(message.dbPath, params)
+																: params.kind === "storageScanSessionPreview"
+																	? runStorageScanSessionPreview(
+																			message.dbPath,
+																			params,
+																			controller.signal,
+																		)
+																	: runStorageScanTables(
+																			message.dbPath,
+																			message.requestId,
+																			params,
+																			controller.signal,
+																		),
+		);
 		post({
 			type: "result",
 			requestId: message.requestId,
@@ -259,6 +275,7 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 		post({
 			type: "error",
 			requestId: message.requestId,
+			diagnostic: workerFailureDetails(err, false),
 			message: unknownPgError
 				? "PostgreSQL read-only display worker failed"
 				: err instanceof Error
@@ -271,10 +288,11 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 					: {}),
 		});
 	} finally {
+		sqlSpan?.end();
 		activeTasks.delete(message.requestId);
 	}
-};
+});
 
 // Aggregation deliberately stays on the main thread (see pool.ts): merging there, after every
 // shard has returned, is what makes the result independent of shard completion order.
-post({ type: "ready" });
+post({ type: "ready", buildId: RUNTIME_BUILD_ID });

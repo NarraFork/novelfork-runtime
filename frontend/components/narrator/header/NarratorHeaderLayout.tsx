@@ -51,6 +51,7 @@ export function NarratorHeaderLayout({
 	titleFullWidth,
 	surfacedToolCount,
 	showBack = false,
+	showMenu = false,
 	showTitleActions = false,
 	showClose = false,
 	onHeaderPointerDown,
@@ -69,6 +70,7 @@ export function NarratorHeaderLayout({
 			titleFullWidth,
 			surfacedToolCount,
 			showBack,
+			showMenu,
 			showTitleActions,
 			showClose,
 			showPin,
@@ -76,7 +78,17 @@ export function NarratorHeaderLayout({
 	);
 	const published = useRef(layout);
 	const measure = useCallback(() => {
-		const width = rowRef.current?.getBoundingClientRect().width ?? 0;
+		const row = rowRef.current;
+		let width = row?.getBoundingClientRect().width ?? 0;
+		if (width > 0 && row?.hasAttribute("data-nf-titlebar-row")) {
+			// WCO adds native-button padding without changing the border-box width.
+			// The layout arithmetic already reserves the normal row padding.
+			const style = window.getComputedStyle(row);
+			const padding = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+			if (Number.isFinite(padding)) {
+				width = Math.max(1, width - Math.max(0, padding - HEADER_ROW_PADDING_PX));
+			}
+		}
 		// A hidden row must not discard its last usable width. On first mount 0
 		// retains the original optimistic/unmeasured layout, not a false shortfall.
 		if (width > 0) lastWidth.current = width;
@@ -85,6 +97,7 @@ export function NarratorHeaderLayout({
 			titleFullWidth,
 			surfacedToolCount,
 			showBack,
+			showMenu,
 			showTitleActions,
 			showClose,
 			showPin,
@@ -92,7 +105,7 @@ export function NarratorHeaderLayout({
 		if (sameLayout(published.current, next)) return;
 		published.current = next;
 		setLayout(next);
-	}, [titleFullWidth, surfacedToolCount, showBack, showTitleActions, showClose, showPin]);
+	}, [titleFullWidth, surfacedToolCount, showBack, showMenu, showTitleActions, showClose, showPin]);
 
 	useLayoutEffect(() => {
 		const row = rowRef.current;

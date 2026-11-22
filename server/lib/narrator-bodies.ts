@@ -20,10 +20,42 @@
 
 import type { Database } from "bun:sqlite";
 import { parseStored } from "@shared/narrator-blocks/plan";
+import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { assembleContent } from "@shared/narrator-blocks/storage";
 import { assembledBodyLengthSql } from "./narrator-body-length";
 
 const blockStorage = new WeakMap<Database, boolean>();
+const bodyRevisionColumns = new WeakMap<Database, boolean>();
+
+/** Whether this connection's envelope schema can fence native body/state revisions. */
+export function hasBodyRevisions(db: Database): boolean {
+	let supported = bodyRevisionColumns.get(db);
+	if (supported === undefined) {
+		supported =
+			db
+				.query<{ supported: number }, []>(
+					"SELECT EXISTS(SELECT 1 FROM pragma_table_info('narrator_messages') WHERE name='body_revision' LIMIT 1) AND EXISTS(SELECT 1 FROM pragma_table_info('narrator_messages') WHERE name='state_revision' LIMIT 1) AS supported LIMIT 1",
+				)
+				.get()?.supported === 1;
+		bodyRevisionColumns.set(db, supported);
+	}
+	return supported;
+}
+
+/**
+ * Final synchronous fence for a legacy envelope without body revisions. `expected`
+ * must be the already-budgeted text read through this body layer. Only the equality
+ * verdict crosses the SQLite boundary; no body is fetched, parsed or hashed here.
+ */
+export function legacyBodyTextMatches(db: Database, messageId: string, expected: string): boolean {
+	return (
+		db
+			.query<{ unchanged: number }, [string, string]>(
+				"SELECT 1 AS unchanged FROM narrator_messages WHERE id = ? AND content_json IS ? LIMIT 1",
+			)
+			.get(messageId, expected)?.unchanged === 1
+	);
+}
 
 /**
  * Whether the database has block storage at all; a connection to a schema predating it
@@ -45,11 +77,12 @@ export function hasBlockStorage(db: Database): boolean {
 /**
  * Whether a block-format body keeps its `content_json` projection with rows-only writes on:
  * a compact marker (compact, plan, clear, segment compact), whose lifecycle is read from
- * the column (the `compact_pending` column behind startup recovery and fork exclusion).
+ * the column (the `compact_pending` column behind startup recovery and fork exclusion),
+ * or a retention fence, which late/checkpoint writers must check without reading a large body.
  */
 export function keepsProjection(content: unknown[]): boolean {
 	const type = (content[0] as { type?: unknown } | undefined)?.type;
-	return type === "compact" || type === "segment_compact";
+	return type === "compact" || type === "segment_compact" || isHistoryProtectedContent(content);
 }
 
 /**

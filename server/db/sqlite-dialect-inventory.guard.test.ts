@@ -408,6 +408,7 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	],
 	["server/lib/db-resilience.ts", "WAL recovery and `sqlite3 .recover` CLI fallback"],
 	["server/lib/db-worker/worker-entry.ts", "read-only SQLite worker connection"],
+	["server/lib/sql-trace.ts", "opt-in per-statement timing of `bun:sqlite` connections"],
 	["server/lib/db-worker/select-rows.ts", "bounded read-only SQLite SELECT worker execution"],
 	["server/db/worker-read.ts", "routes Drizzle SQLite selects to the read-only worker"],
 	["server/lib/db-worker/storage-scan-runner.ts", "SQLite storage scan budgets"],
@@ -462,7 +463,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// `getDbPath` (the PG branch acquires the same instance lock at the same path — the lock
 	// guards local resources, not the database file). Neither opens a SQLite connection.
 	"server/db/index.ts": ["drizzleDialect", "driver", "connectionModule"],
-	"server/db/resource-protection-index.ts": ["driver"],
+	"server/db/resource-protection-index.ts": ["driver", "sqliteCatalog"],
 	"server/services/resource-protection-index.ts": ["driver", "handle"],
 	"server/db/integrity-check.ts": ["connectionModule", "sqliteCli"],
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
@@ -488,8 +489,11 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// the raw-handle access path for its non-search reads.
 	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
+	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
+	"server/lib/db-worker/failure.ts": ["errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
+	"server/lib/sql-trace.ts": ["driver"],
 	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
@@ -507,6 +511,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"rowid",
 		"insertOr",
 		"errorCode",
+		// Session model remap filters the imported ids with json_each over a JSON parameter.
+		"json1",
 	],
 	"server/routes/user-preferences.ts": ["handle"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
@@ -585,6 +591,15 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"rowid",
 	],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
+	// The startup migrations run on both backends: SQLite column types and the synchronous
+	// Drizzle handle are used only in the SQLite branch; PostgreSQL goes through BunSQLDatabase.
+	"server/services/migration-db.ts": ["drizzleDialect"],
+	// Same two-backend shape as migration-db.ts: dialect-bound column types in the plan phase.
+	"server/services/aggregation-migration-service.ts": ["drizzleDialect"],
+	"server/services/provider-prefix-migration-service.ts": ["drizzleDialect"],
+	// The usage ledger is fed from the api_requests rowid cursor after an import; the SQLite
+	// driver type is the function's parameter type.
+	"server/services/usage-daily.ts": ["driver", "rowid", "blobFn"],
 	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
 	"server/services/narrator-block-backfill.ts": [
 		"handle",
@@ -604,15 +619,18 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
 	// Main-thread Drizzle readers' bodies from block rows (SQLite-only, like block storage).
 	"server/services/narrator-body-reads.ts": ["handle", "json1"],
+	// Retention fences consult the SQLite body projection before accepting late writes.
+	"server/services/narrator-body-writes.ts": ["handle"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
-	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
+	"server/lib/narrator-bodies.ts": ["driver", "pragmaFn", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
 	// storage): exports, the session interchange, and the body length they measure in SQL.
 	"server/lib/narrator-body-length.ts": ["json1"],
 	"server/services/narrator-export.ts": ["handle"],
 	"server/services/session-interchange/export.ts": ["handle"],
 	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
-	"server/services/narrator-refs-backfill.ts": ["blobFn"],
+	// Lazy refs must reject an ambient native transaction before any async page preparation.
+	"server/services/narrator-refs-backfill.ts": ["nativeClient", "blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
 	"server/services/narrator-subagent-recovery.ts": ["handle"],
@@ -627,6 +645,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
 	"server/services/outline/store/sqlite-store.ts": ["json1"],
 	"server/services/parent-injection-queue.ts": ["json1"],
+	// SQLite-gated project indexing uses connection change counters only to invalidate
+	// per-pass caches; a PostgreSQL implementation must provide its own revision signal.
+	"server/services/project-index.ts": ["handle", "sessionFn"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",
@@ -691,8 +712,25 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
+	"server/services/tool-input-stream-source.ts": ["handle"],
+	// The trusted read-only eval program now belongs to the worker adapter, not the source owner.
+	"server/services/tool-input-stream-source-worker.ts": ["driver", "pragma"],
+	// 用量分桶：SQLite 用 strftime + 按 DST 分段应用的偏移，PostgreSQL 用 date_trunc/AT TIME ZONE。
+	// 两个分支都在 usage-bucket-sql.ts 里，PG 分支有真实库测试。
+	"server/services/usage-bucket-sql.ts": ["timeFn"],
 	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
+	// History retention has an explicit SQLite capability boundary; a PG implementation
+	// needs its own async candidate/read/write adapter, rather than opening a second DB.
+	"server/lib/db-worker/storage-history-query.ts": ["driver", "rowid", "json1", "timeFn"],
+	"server/services/storage-history-runtime.ts": ["connectionModule"],
+	"server/services/storage-history-mutations.ts": [
+		"handle",
+		"connectionModule",
+		"pragma",
+		"sessionFn",
+	],
+	"server/services/storage-history-service.ts": ["rowid"],
+	"shared/storage-retention.ts": ["rowid"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
 

@@ -1,5 +1,6 @@
-import { parseCompactMessageBlock } from "@shared/compact-message";
+import { normalizeCompactAttempts, parseCompactMessageBlock } from "@shared/compact-message";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
+import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
@@ -13,6 +14,7 @@ import {
 	isDanglingReasoningOnlyAssistantMessage,
 	isMetadataOnlyEmptyReasoningAssistantMessage,
 } from "@shared/reasoning-content";
+import { isClearedToolOutput } from "@shared/storage-retention";
 import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
@@ -74,6 +76,7 @@ import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings"
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { MAX_BATCH_DELETE_BLOCKS } from "../lib/validators/narrators";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import type { ModelSourceRow } from "./agent-runtime/model-history-query";
 import {
 	type LoadModelHistoryOptions,
 	loadModelHistorySource,
@@ -88,7 +91,11 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
-import { newEnvelopeColumns, withRetiredBlocks } from "./narrator-block-sync";
+import {
+	CLEARED_TOOL_OUTPUT_SQL,
+	newEnvelopeColumns,
+	withRetiredBlocks,
+} from "./narrator-block-sync";
 import {
 	MAX_BLOCK_DELETE_ELEMENTS,
 	materializeTargets,
@@ -118,9 +125,11 @@ import {
 import { attachPrefixHistorySource } from "./narrator-prefix-state";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
+	assertNoLazyChildrenForHistoryRewriteTx,
 	ensureRefsCoverMessage,
 	ensureRefsCoverSeq,
 	hasUnmaterializedRefsBelow,
+	prepareLazyChildrenForHistoryRewrite,
 } from "./narrator-refs-backfill";
 import {
 	authorizeRevertHistory,
@@ -224,6 +233,65 @@ async function revertForDeletedBlocks(
 }
 
 type MessageTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+function minimumHistorySeqTx(
+	tx: Pick<MessageTx, "select">,
+	narratorId: string,
+	messageIds: string[],
+): number | null {
+	return (
+		tx
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessageRefs.messageId, messageIds),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq)
+			.limit(1)
+			.get()?.seq ?? null
+	);
+}
+
+/** Shared admissions are not mutexes: a fork can appear during any preparation yield. */
+async function withPreparedLazyHistoryRewrite<T>(
+	narratorId: string,
+	minimum: (tx: Pick<MessageTx, "select">) => number | null,
+	mutate: (tx: MessageTx) => T,
+	signal?: AbortSignal,
+): Promise<T> {
+	const deadlineAt = Date.now() + 10_000;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		signal?.throwIfAborted();
+		try {
+			const minSeq = minimum(db);
+			if (minSeq !== null)
+				await prepareLazyChildrenForHistoryRewrite(narratorId, minSeq, { signal, deadlineAt });
+			return db.transaction((tx) => {
+				signal?.throwIfAborted();
+				const currentMin = minimum(tx);
+				if (currentMin !== null)
+					assertNoLazyChildrenForHistoryRewriteTx(tx, narratorId, currentMin);
+				return mutate(tx);
+			});
+		} catch (error) {
+			if (
+				!(error instanceof AppError) ||
+				error.code !== "HISTORY_LAZY_DEPENDENCY_CHANGED" ||
+				attempt === 2
+			)
+				throw error;
+		}
+	}
+	throw new AppError(
+		"Derived history readers keep changing; retry the selection",
+		409,
+		"HISTORY_DELETE_STALE",
+	);
+}
+
 type DeletableBlock = { type: string; id?: string; text?: string };
 type BlockSelection = { messageId: string; blockIndex: number };
 type BlockDeleteOptions = ScopedRevertOptions & {
@@ -626,6 +694,8 @@ function planBlockDeletions(
 			);
 		}
 	};
+	const minSeq = minimumHistorySeqTx(tx, narratorId, [...grouped.keys()]);
+	if (minSeq !== null) assertNoLazyChildrenForHistoryRewriteTx(tx, narratorId, minSeq);
 	const plans: BlockDeletionPlan[] = [];
 	for (const [messageId, indices] of grouped) {
 		const ref = tx.query.narratorMessageRefs
@@ -932,8 +1002,23 @@ async function deleteBlockSelection(
 	}
 	for (const indices of grouped.values()) indices.sort((a, b) => b - a);
 	if (grouped.size === 0) return { deleted: 0, failed: 0, results: [] };
-	const planned = db.transaction((tx) => planBlockDeletions(tx, narratorId, grouped, opts));
-	const version = JSON.stringify(planned);
+	for (const id of grouped.keys())
+		await ensureRefsCoverMessage(narratorId, id, { signal: opts?.signal });
+	const minimum = (tx: Pick<MessageTx, "select">) =>
+		minimumHistorySeqTx(tx, narratorId, [...grouped.keys()]);
+	let planned = await withPreparedLazyHistoryRewrite(
+		narratorId,
+		minimum,
+		(tx) => planBlockDeletions(tx, narratorId, grouped, opts),
+		opts?.signal,
+	);
+	let version = JSON.stringify(planned);
+	const selectionIdentity = (plan: typeof planned) =>
+		JSON.stringify({
+			messageVersion: plan.messageVersion,
+			plans: plan.plans.map(({ isShared: _shared, ...selected }) => selected),
+		});
+	const originalSelection = selectionIdentity(planned);
 	const toolUses = planned.plans.flatMap(({ message, removed }) =>
 		removed
 			.filter((block) => block.type === "tool_use")
@@ -963,56 +1048,79 @@ async function deleteBlockSelection(
 		}
 	}
 	const updatedMessageIds: Array<{ id: string; oldId?: string; seq: number }> = [];
-	const removedRefMessageIds = planned.plans
+	let removedRefMessageIds = planned.plans
 		.filter((plan) => plan.remaining.length === 0)
 		.map((plan) => plan.message.id);
 	let affectedQuestionIds: string[] = [];
-	const mutate = () =>
-		db.transaction((tx) => {
-			// Recheck refs, content, tool evidence and narrator version after async rollback.
-			// A drift rejects the whole transaction rather than following a moved index.
-			if (JSON.stringify(planBlockDeletions(tx, narratorId, grouped, opts)) !== version) {
-				throw new AppError(
-					"Message history changed during block deletion; retry the selection.",
-					409,
-					"HISTORY_DELETE_STALE",
-				);
-			}
-			affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
-				deletedMessageIds: [...removedRefMessageIds, ...planned.derived.messageIds],
-				deletedToolBlocks: toolUses.filter(
-					(block): block is { messageId: string; toolUseId: string } =>
-						typeof block.toolUseId === "string",
-				),
-			}).affectedQuestionIds;
-			insertFileHistoryCheckpoints(tx, narratorId, planned.derived.checkpoints);
-			deleteOrphanedMessages(tx, planned.derived.messageIds);
-			for (const plan of planned.plans) {
-				const updatedId = applyBlockDeletionTx(tx, narratorId, plan, opts);
-				if (updatedId)
-					updatedMessageIds.push({
-						id: updatedId,
-						...(updatedId !== plan.message.id ? { oldId: plan.message.id } : {}),
-						seq: plan.ref.seq,
-					});
-			}
-			if (!opts?.skipNarratorUpdate) {
-				tx.update(narrators)
-					.set({
-						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
-						messageVersion: sql`${narrators.messageVersion} + 1`,
-						contextUsageSnapshotJson: null,
-						updatedAt: new Date().toISOString(),
-					})
-					.where(eq(narrators.id, narratorId))
-					.run();
-			}
-		});
+	const mutate = (tx: MessageTx) => {
+		// Recheck refs, content, tool evidence and narrator version after async rollback.
+		// A drift rejects the whole transaction rather than following a moved index.
+		if (JSON.stringify(planBlockDeletions(tx, narratorId, grouped, opts)) !== version) {
+			throw new AppError(
+				"Message history changed during block deletion; retry the selection.",
+				409,
+				"HISTORY_DELETE_STALE",
+			);
+		}
+		affectedQuestionIds = reconcileQuestionHistoryInTransaction(tx, narratorId, {
+			deletedMessageIds: [...removedRefMessageIds, ...planned.derived.messageIds],
+			deletedToolBlocks: toolUses.filter(
+				(block): block is { messageId: string; toolUseId: string } =>
+					typeof block.toolUseId === "string",
+			),
+		}).affectedQuestionIds;
+		insertFileHistoryCheckpoints(tx, narratorId, planned.derived.checkpoints);
+		deleteOrphanedMessages(tx, planned.derived.messageIds);
+		for (const plan of planned.plans) {
+			const updatedId = applyBlockDeletionTx(tx, narratorId, plan, opts);
+			if (updatedId)
+				updatedMessageIds.push({
+					id: updatedId,
+					...(updatedId !== plan.message.id ? { oldId: plan.message.id } : {}),
+					seq: plan.ref.seq,
+				});
+		}
+		if (!opts?.skipNarratorUpdate) {
+			tx.update(narrators)
+				.set({
+					...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					contextUsageSnapshotJson: null,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		}
+	};
 	if (snapshotRevert) assertSnapshotRevertComplete(snapshotRevert);
 	try {
 		if (snapshotRevert && opts?.principal) await authorizeRevertHistory(narratorId, opts);
 		opts?.signal?.throwIfAborted();
-		withRetiredBlocks(byBlock?.retiredRows ?? [], mutate);
+		if (snapshotRevert) {
+			// A fixed file result cannot be silently paired with a newly prepared history plan.
+			withRetiredBlocks(byBlock?.retiredRows ?? [], () => db.transaction(mutate));
+		} else {
+			await withPreparedLazyHistoryRewrite(
+				narratorId,
+				minimum,
+				(tx) => {
+					const current = planBlockDeletions(tx, narratorId, grouped, opts);
+					if (selectionIdentity(current) !== originalSelection)
+						throw new AppError(
+							"Selected blocks changed during history preparation",
+							409,
+							"HISTORY_DELETE_STALE",
+						);
+					planned = current;
+					version = JSON.stringify(planned);
+					removedRefMessageIds = planned.plans
+						.filter((plan) => plan.remaining.length === 0)
+						.map((plan) => plan.message.id);
+					withRetiredBlocks(byBlock?.retiredRows ?? [], () => mutate(tx));
+				},
+				opts?.signal,
+			);
+		}
 	} catch (error) {
 		if (snapshotRevert) throw snapshotHistoryFailure(snapshotRevert, error);
 		throw error;
@@ -1438,6 +1546,7 @@ function planMessageRangeDeletion(
 		throw new AppError("Selected history contains a missing message", 409, "HISTORY_DELETE_STALE");
 	const toolBlocks = assertNoRunningCompactMessagesTx(tx, messageIds);
 	reserve(toolBlocks.length);
+	if (refs.length) assertNoLazyChildrenForHistoryRewriteTx(tx, narratorId, refs[0].seq);
 	const allRefs =
 		messageIds.length > 0
 			? tx
@@ -1571,16 +1680,42 @@ async function deleteMessageRange(
 					.run(),
 			);
 		};
-		const planned = measureSync("transaction", () =>
-			db.transaction((tx) => {
-				const plan = measureSync("plan", () =>
-					planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
-				);
-				// History-only deletion needs no async gap: plan and mutation share this tx.
-				// A range with no file history needs no restore, so it commits the same way.
-				if (opts?.skipRevert || !ownsFileHistory(plan)) apply(tx, plan);
-				return plan;
-			}),
+		await ensureRefsCoverMessage(narratorId, messageId, { signal: opts?.signal });
+		const minimum = (tx: Pick<MessageTx, "select">) => {
+			const boundary = minimumHistorySeqTx(tx, narratorId, [messageId]);
+			if (boundary === null) return null;
+			return (
+				tx
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							inclusive
+								? gte(narratorMessageRefs.seq, boundary)
+								: gt(narratorMessageRefs.seq, boundary),
+						),
+					)
+					.orderBy(narratorMessageRefs.seq)
+					.limit(1)
+					.get()?.seq ?? null
+			);
+		};
+		const planned = await measureAsync("transaction", () =>
+			withPreparedLazyHistoryRewrite(
+				narratorId,
+				minimum,
+				(tx) => {
+					const plan = measureSync("plan", () =>
+						planMessageRangeDeletion(tx, narratorId, messageId, inclusive, opts),
+					);
+					// History-only deletion needs no async gap: plan and mutation share this tx.
+					// A range with no file history needs no restore, so it commits the same way.
+					if (opts?.skipRevert || !ownsFileHistory(plan)) apply(tx, plan);
+					return plan;
+				},
+				opts?.signal,
+			),
 		);
 		selectedMessageCount = planned.refs.length;
 		const messageIds = planned.refs.map((ref) => ref.messageId);
@@ -1991,8 +2126,16 @@ const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 /**
  * Tool names whose inputJson should not be truncated. OutlineEdit's input is the markdown it
  * writes, bounded by the tool (200 edits, 256 KiB of text), and its card renders it whole.
+ * GenUI `render` carries the UI itself in `source` (schema-capped at 12K chars): a truncated
+ * leaf is not markup, so the finished card would drop the UI and show the model-facing output.
  */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set([
+	"Agent",
+	"Task",
+	"Send",
+	OUTLINE_EDIT_TOOL,
+	GEN_UI_TOOL_NAME,
+]);
 
 const SPEC_TASKS_URI = "spec://tasks.json";
 
@@ -2063,6 +2206,8 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 				: {}),
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			toolCalls: toolCalls?.map((tc: any) => {
+				if (isClearedToolOutput(tc.outputJson))
+					return toolCallWithExecutionTargets({ ...tc, inputJson: null });
 				const withExecutionTargets = toolCallWithExecutionTargets(tc);
 				if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return withExecutionTargets;
 				const skipInput =
@@ -2080,7 +2225,17 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function enrichToolUseBlocks(tree: any[]): any[] {
-	return tree.map((msg) => {
+	return tree.map((original) => {
+		const msg = original.toolCalls?.some((tc: { outputJson?: unknown }) =>
+			isClearedToolOutput(tc.outputJson),
+		)
+			? {
+					...original,
+					toolCalls: original.toolCalls.map((tc: { inputJson?: unknown; outputJson?: unknown }) =>
+						isClearedToolOutput(tc.outputJson) ? { ...tc, inputJson: null } : tc,
+					),
+				}
+			: original;
 		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) {
 			return msg.children?.length ? { ...msg, children: enrichToolUseBlocks(msg.children) } : msg;
 		}
@@ -2100,7 +2255,8 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 					: undefined;
 			return {
 				...block,
-				inputJson: tc.inputJson ?? block.input,
+				input: isClearedToolOutput(tc.outputJson) ? {} : block.input,
+				inputJson: isClearedToolOutput(tc.outputJson) ? null : (tc.inputJson ?? block.input),
 				outputJson: tc.outputJson,
 				status: tc.status,
 				executionAttempt: tc.executionAttempt,
@@ -2373,7 +2529,7 @@ function subagentSummarySql(): SQL<string | null> {
 		pairs.push(sql`${key}, ${paths[index]}`);
 	});
 	return sql<string | null>`CASE
-		WHEN ${narratorToolCalls.inputJson} IS NOT NULL
+		WHEN NOT (${sql.raw(CLEARED_TOOL_OUTPUT_SQL)}) AND ${narratorToolCalls.inputJson} IS NOT NULL
 			AND octet_length(${narratorToolCalls.inputJson}) <= ${MAX_SUBAGENT_SUMMARY_INPUT_BYTES}
 			AND json_valid(${narratorToolCalls.inputJson})
 		THEN json_object(${sql.join(pairs, sql`, `)})
@@ -3321,8 +3477,15 @@ function getToolCallDetailTx(
 	const selected = selectVisibleToolCallTx(tx, narratorId, toolUseId, reference);
 	// Even a unique authorized row has a response budget. Never truncate it and
 	// claim it is complete, or parse a large payload just to discover its length.
+	const columns = getTableColumns(narratorToolCalls);
+	const allBytes = storedRowBytes(Object.values(columns));
+	const visibleBytes = storedRowBytes(
+		Object.values(columns).filter((column) => column !== narratorToolCalls.inputJson),
+	);
 	const size = tx
-		.select({ bytes: storedRowBytes(Object.values(getTableColumns(narratorToolCalls))) })
+		.select({
+			bytes: sql<number>`CASE WHEN ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN ${visibleBytes} ELSE ${allBytes} END`,
+		})
 		.from(narratorToolCalls)
 		.where(eq(narratorToolCalls.id, selected.id))
 		.get();
@@ -3335,7 +3498,13 @@ function getToolCallDetailTx(
 		);
 	}
 	const detail = tx
-		.select()
+		.select({
+			...columns,
+			inputJson:
+				sql<unknown>`CASE WHEN ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN NULL ELSE ${narratorToolCalls.inputJson} END`.mapWith(
+					narratorToolCalls.inputJson,
+				),
+		})
 		.from(narratorToolCalls)
 		.where(eq(narratorToolCalls.id, selected.id))
 		.get();
@@ -3525,7 +3694,7 @@ const narratorMessageQueriesUnlocked = {
 				toolName: narratorToolCalls.toolName,
 				status: narratorToolCalls.status,
 				inputText: sql<string | null>`CASE
-					WHEN ${narratorToolCalls.inputJson} IS NULL THEN NULL
+					WHEN ${narratorToolCalls.inputJson} IS NULL OR ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN NULL
 					ELSE substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_INPUT_LIMIT})
 				END`,
 				outputText: sql<string | null>`CASE
@@ -3533,6 +3702,7 @@ const narratorMessageQueriesUnlocked = {
 					ELSE substr(CAST(${narratorToolCalls.outputJson} AS TEXT), 1, ${CONTEXT_ASK_TOOL_OUTPUT_LIMIT})
 				END`,
 				inputTruncated: sql<number>`CASE
+					WHEN ${sql.raw(CLEARED_TOOL_OUTPUT_SQL)} THEN 0
 					WHEN ${narratorToolCalls.inputJson} IS NOT NULL
 						AND length(CAST(${narratorToolCalls.inputJson} AS TEXT)) > ${CONTEXT_ASK_TOOL_INPUT_LIMIT}
 					THEN 1 ELSE 0
@@ -3635,7 +3805,7 @@ const narratorMessageQueriesUnlocked = {
 		narratorId: string,
 		limit?: number,
 		options: Omit<LoadModelHistoryOptions, "limit"> = {},
-	) {
+	): Promise<readonly ModelSourceRow[]> {
 		const postgres = modelHistoryDatabase.postgresRuntime;
 		if (
 			modelHistoryDatabase.activeDatabaseBackend === "postgres" &&
@@ -4624,7 +4794,10 @@ const narratorMessageQueriesUnlocked = {
 		return db.transaction((tx) => {
 			const selected = selectVisibleToolCallTx(tx, narratorId, toolUseId, reference);
 			const row = tx
-				.select(toolEditPreviewColumns)
+				.select({
+					...toolEditPreviewColumns,
+					payloadCleared: sql<boolean>`(${sql.raw(CLEARED_TOOL_OUTPUT_SQL)})`,
+				})
 				.from(narratorToolCalls)
 				.where(eq(narratorToolCalls.id, selected.id))
 				.get();
@@ -4638,7 +4811,12 @@ const narratorMessageQueriesUnlocked = {
 			const msg = fillBody(
 				tx.query.narratorMessages
 					.findFirst({
-						...bodyColumns(),
+						...bodyColumns({
+							id: true,
+							contentJson: true,
+							tokensIn: true,
+							contextPercent: true,
+						}),
 						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
 					})
 					.sync(),
@@ -4674,6 +4852,59 @@ const narratorMessageQueriesUnlocked = {
 			const latestAttempt = compactBlock.attempts?.at(-1);
 			const live =
 				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
+
+			// Display fallbacks for markers written before both ends of the occupancy pair
+			// were recorded. A marker without `before` inherits the last real occupancy its
+			// history carried; a marker without `after` inherits its own row only when that
+			// row came from the post-compact estimate — the summary model's own request
+			// occupancy also lands in this column, and that is a percentage of a different
+			// window, so it must not be shown as the narrator's occupancy.
+			// The search stops at the previous compact boundary: anything older belongs to a
+			// different context, and compact markers themselves (system rows) may carry the
+			// summary model's own occupancy. Bounding it also keeps this read small.
+			const previousCompactSeq = (() => {
+				if (compactBlock.contextPercentBefore != null) return null;
+				return (
+					tx
+						.select({ seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.isCompact, 1),
+								lt(narratorMessageRefs.seq, ref.seq),
+							),
+						)
+						.orderBy(desc(narratorMessageRefs.seq))
+						.limit(1)
+						.get()?.seq ?? null
+				);
+			})();
+			const contextPercentBefore =
+				compactBlock.contextPercentBefore ??
+				tx
+					.select({ contextPercent: narratorMessages.contextPercent })
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							lt(narratorMessageRefs.seq, ref.seq),
+							...(previousCompactSeq != null
+								? [gt(narratorMessageRefs.seq, previousCompactSeq)]
+								: []),
+							ne(narratorMessages.role, "system"),
+							isNotNull(narratorMessages.contextPercent),
+						),
+					)
+					.orderBy(desc(narratorMessageRefs.seq))
+					.limit(1)
+					.get()?.contextPercent ??
+				undefined;
+			const contextPercentAfter =
+				compactBlock.contextPercentAfter ??
+				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
+
 			return {
 				status: compactBlock.status,
 				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
@@ -4702,8 +4933,8 @@ const narratorMessageQueriesUnlocked = {
 							: undefined,
 				mode: compactBlock.mode,
 				trigger: compactBlock.trigger,
-				contextPercentBefore: compactBlock.contextPercentBefore,
-				contextPercentAfter: compactBlock.contextPercentAfter,
+				contextPercentBefore,
+				contextPercentAfter,
 				attempts: compactBlock.attempts ?? [],
 				canRetry,
 			};
@@ -4711,84 +4942,89 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async deleteCompactMessage(narratorId: string, messageId: string) {
-		const result = db.transaction((tx) => {
-			// Resolve the message through the caller-owned ref. The message owner is
-			// intentionally ignored because forked narrators share immutable history.
-			const currentRef = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				})
-				.sync();
-			const msg = fillBody(
-				tx.query.narratorMessages
+		await ensureRefsCoverMessage(narratorId, messageId);
+		const result = await withPreparedLazyHistoryRewrite(
+			narratorId,
+			(tx) => minimumHistorySeqTx(tx, narratorId, [messageId]),
+			(tx) => {
+				// Resolve the message through the caller-owned ref. The message owner is
+				// intentionally ignored because forked narrators share immutable history.
+				const currentRef = tx.query.narratorMessageRefs
 					.findFirst({
-						...bodyColumns(),
-						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
 					})
-					.sync(),
-			);
-			if (!msg || !currentRef) throw new NotFoundError("Message", messageId);
-
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
-			if (!compactBlock) throw new ValidationError("Message is not a compact message");
-			if (compactBlock.status === "compacting") {
-				throw new AppError(
-					"A running compact must be cancelled before its marker can be deleted",
-					409,
-					"COMPACT_IN_PROGRESS",
+					.sync();
+				const msg = fillBody(
+					tx.query.narratorMessages
+						.findFirst({
+							...bodyColumns(),
+							where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						})
+						.sync(),
 				);
-			}
+				if (!msg || !currentRef) throw new NotFoundError("Message", messageId);
 
-			const previousCompact = tx
-				.select({ seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.isCompact, 1),
-						lt(narratorMessageRefs.seq, currentRef.seq),
-					),
-				)
-				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-				.limit(1)
-				.all();
+				const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+				const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+				if (!compactBlock) throw new ValidationError("Message is not a compact message");
+				if (compactBlock.status === "compacting") {
+					throw new AppError(
+						"A running compact must be cancelled before its marker can be deleted",
+						409,
+						"COMPACT_IN_PROGRESS",
+					);
+				}
 
-			// Delete only this narrator's ref. A sibling fork keeps its own view of
-			// the shared marker and its message row remains alive while referenced.
-			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, currentRef.id)).run();
-			const remainingRef = tx.query.narratorMessageRefs
-				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
-				.sync();
-			if (!remainingRef) {
-				tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
-				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
-			}
+				const previousCompact = tx
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.isCompact, 1),
+							lt(narratorMessageRefs.seq, currentRef.seq),
+						),
+					)
+					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+					.limit(1)
+					.all();
 
-			const now = new Date().toISOString();
-			tx.update(narrators)
-				.set({
-					...(compactBlock.status === "compacted"
-						? {
-								contextSummary: null,
-								contextSummaryChars: 0,
-								apiConversationId: null,
-							}
-						: {}),
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
+				// Delete only this narrator's ref. A sibling fork keeps its own view of
+				// the shared marker and its message row remains alive while referenced.
+				deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.id, currentRef.id)).run();
+				const remainingRef = tx.query.narratorMessageRefs
+					.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+					.sync();
+				if (!remainingRef) {
+					tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
+					tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+				}
 
-			return {
-				previousCompactExists: compactBlock.status === "compacted" && previousCompact.length > 0,
-			};
-		});
+				const now = new Date().toISOString();
+				tx.update(narrators)
+					.set({
+						...(compactBlock.status === "compacted"
+							? {
+									contextSummary: null,
+									contextSummaryChars: 0,
+									apiConversationId: null,
+								}
+							: {}),
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+
+				return {
+					previousCompactExists: compactBlock.status === "compacted" && previousCompact.length > 0,
+				};
+			},
+		);
 		queueContextCharacterRefresh(narratorId);
 		return result;
 	},
@@ -5198,58 +5434,129 @@ const narratorMessageQueriesUnlocked = {
 		};
 	},
 
-	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const result = db.transaction((tx) => {
+	/**
+	 * Whether a committed compact's `after` occupancy can still be re-measured from the
+	 * narrator's current history: only while it is the latest compact boundary and nothing
+	 * has been added after it since it finished. Otherwise the current estimate would
+	 * measure later turns (or a different compact) and no longer describe this one.
+	 */
+	async isCompactAfterRemeasurable(narratorId: string, messageId: string): Promise<boolean> {
+		return db.transaction((tx) => {
 			const ref = tx.query.narratorMessageRefs
 				.findFirst({
 					where: and(
 						eq(narratorMessageRefs.narratorId, narratorId),
 						eq(narratorMessageRefs.messageId, messageId),
+						eq(narratorMessageRefs.isCompact, 1),
 					),
+					columns: { seq: true },
 				})
 				.sync();
+			if (!ref) return false;
+			const newerCompact = tx
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.isCompact, 1),
+						gt(narratorMessageRefs.seq, ref.seq),
+					),
+				)
+				.limit(1)
+				.get();
+			if (newerCompact) return false;
 			const msg = fillBody(
 				tx.query.narratorMessages
 					.findFirst({
-						...bodyColumns(),
-						where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						...bodyColumns({ id: true, contentJson: true, createdAt: true }),
+						where: eq(narratorMessages.id, messageId),
 					})
 					.sync(),
 			);
-			if (!msg || !ref) throw new NotFoundError("Message", messageId);
-
+			if (!msg) return false;
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const compactBlock = blocks
-				.map(parseCompactMessageBlock)
-				.find((block) => block?.status === "compacted");
-			if (!compactBlock) throw new ValidationError("Message is not a compacted message");
-
-			const isPlan = compactBlock.subtype === "plan";
-			const newBlock = { ...compactBlock, summary };
-			const prefix = isPlan ? "[Plan]" : "[Compact]";
-			const now = new Date().toISOString();
-			const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
-
-			writeEnvelopeBody(tx, copied.messageId, [newBlock], {
-				set: {
-					contextCharsJson: { segments: [] },
-					contentText: `${prefix} ${summary.slice(0, 200)}...`,
-				},
-			});
-
-			tx.update(narrators)
-				.set({
-					contextSummary: summary,
-					contextSummaryChars: measureSummaryCharacters(summary),
-					apiConversationId: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-			return copied.messageId;
+			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);
+			if (compactBlock?.status !== "compacted") return false;
+			// Messages kept after the boundary predate the compact; anything created after it
+			// finished is new history the original estimate never saw.
+			const finishedAt =
+				normalizeCompactAttempts(compactBlock.attempts).at(-1)?.finishedAt ?? msg.createdAt;
+			const newer = tx
+				.select({ id: narratorMessages.id })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						gt(narratorMessageRefs.seq, ref.seq),
+						gt(narratorMessages.createdAt, finishedAt),
+					),
+				)
+				.limit(1)
+				.get();
+			return !newer;
 		});
+	},
+
+	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
+		await ensureRefsCoverMessage(narratorId, messageId);
+		const result = await withPreparedLazyHistoryRewrite(
+			narratorId,
+			(tx) => minimumHistorySeqTx(tx, narratorId, [messageId]),
+			(tx) => {
+				const ref = tx.query.narratorMessageRefs
+					.findFirst({
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
+					})
+					.sync();
+				const msg = fillBody(
+					tx.query.narratorMessages
+						.findFirst({
+							...bodyColumns(),
+							where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.role, "system")),
+						})
+						.sync(),
+				);
+				if (!msg || !ref) throw new NotFoundError("Message", messageId);
+
+				const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+				const compactBlock = blocks
+					.map(parseCompactMessageBlock)
+					.find((block) => block?.status === "compacted");
+				if (!compactBlock) throw new ValidationError("Message is not a compacted message");
+
+				const isPlan = compactBlock.subtype === "plan";
+				const newBlock = { ...compactBlock, summary };
+				const prefix = isPlan ? "[Plan]" : "[Compact]";
+				const now = new Date().toISOString();
+				const copied = copySharedCompactMessageTx(tx, narratorId, msg, ref);
+
+				writeEnvelopeBody(tx, copied.messageId, [newBlock], {
+					allowHistoryRewrite: true,
+					set: {
+						contextCharsJson: { segments: [] },
+						contentText: `${prefix} ${summary.slice(0, 200)}...`,
+					},
+				});
+
+				tx.update(narrators)
+					.set({
+						contextSummary: summary,
+						contextSummaryChars: measureSummaryCharacters(summary),
+						apiConversationId: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+				return copied.messageId;
+			},
+		);
 		queueContextCharacterRefresh(narratorId, result);
 		return result;
 	},

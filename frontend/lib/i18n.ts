@@ -37,6 +37,7 @@ export const namespaces = [
 	"plugins",
 	"chat",
 	"publicShare",
+	"remote",
 ] as const;
 export type Namespace = (typeof namespaces)[number];
 

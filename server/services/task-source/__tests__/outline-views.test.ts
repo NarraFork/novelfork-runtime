@@ -48,6 +48,7 @@ import {
 	resetOutlineBehaviorImport,
 } from "../outline-behavior";
 import { OUTLINE_VIEW_LIMITS, resetOutlineViewCache } from "../outline-views";
+import { seedLegacyPluginSop } from "./legacy-plugin-sop";
 import { seedBehaviorPage, seedOutlineTasks, taskState } from "./outline-task-source-scenarios";
 
 const NOW = "2026-11-02T00:00:00.000Z";
@@ -211,7 +212,7 @@ describe("the behavior view", () => {
 		const root = await session();
 		const pageId = await seedBehaviorPage(root, "Never force-push the main branch.");
 		const address = await addressOf(pageId);
-		await setSpecBehaviorFenceForPlugin(root, "Report to the session lead.", "upsert");
+		await seedLegacyPluginSop(root, "Report to the session lead.");
 		const sub = await subagent(root);
 		await setSpecBehaviorFenceForPlugin(sub, "Report to the worker lead.", "upsert");
 
@@ -335,7 +336,7 @@ describe("the view cache", () => {
 		expect(await parts(id)).toEqual(first);
 		expect(total(counts)).toBeGreaterThan(0);
 
-		await setSpecBehaviorFenceForPlugin(id, "Report back.", "upsert");
+		await seedLegacyPluginSop(id, "Report back.");
 		expect(part(await parts(id), "outline.behavior")).toContain("Plugin SOP:\nReport back.");
 	});
 
@@ -489,7 +490,7 @@ describe("importing an old fence", () => {
 		const owner = await user();
 		const id = await session({ owner });
 		await oldFence(id, "- Never force-push.\n- Ask before deleting files.");
-		await setSpecBehaviorFenceForPlugin(id, "Report to the lead.", "upsert");
+		await seedLegacyPluginSop(id, "Report to the lead.");
 		expect(await importOutlineBehaviorFence(id, "zh-CN")).toBe("imported");
 
 		const space = await ensureSessionSpace(id);
@@ -804,6 +805,16 @@ describe("the turn-end note", () => {
 			`System note: \`${address}\` Write the parser is still in progress; when it is done, tick it [x] with OutlineEdit.`,
 		);
 		expect(rows[0]?.contentText?.includes("\n")).toBe(false);
+		// Beside the unchanged model text, the reader's copy: the task as data (address, title,
+		// status), so the transcript shows a titled link and a status chip, not the text's markdown.
+		const block = (rows[0]?.contentJson as Array<Record<string, unknown>>).find(
+			(entry) => entry.source === "outline_task_turn_end",
+		);
+		expect(block?.body).toEqual({
+			kind: "outlineTasks",
+			variant: "turnEnd",
+			items: [{ address, title: "Write the parser", status: "doing" }],
+		});
 		// Once per run.
 		expect(await maybeDeliverOutlineTurnEndNote(active)).toBe(false);
 		expect(await notes(id)).toHaveLength(1);
@@ -844,6 +855,13 @@ describe("the turn-end note", () => {
 	});
 
 	test("spec sessions and subagents never get one", async () => {
+		// A spec session stays one at a run's start only while imports are not automatic (outline
+		// P2 PR 12b): with `auto` its run would import it first.
+		const specImport = settings.outline.specImport;
+		settings.outline.specImport = "manual";
+		restores.push(() => {
+			settings.outline.specImport = specImport;
+		});
 		const spec = await session({ backend: "spec" });
 		const specRun = await run(spec);
 		expect(specRun._outlineTurnStart).toBeUndefined();
@@ -958,18 +976,34 @@ describe("spec sessions are unchanged", () => {
 		}
 	});
 
-	// The whole spec prompt for a fixed input, as PR 3 (`924aebac`) built it: computed there and
-	// pinned here, so any byte of it changing fails.
-	test("the full spec prompt is byte for byte what PR 3 built", async () => {
+	// Keep PR 3's legacy task-source baseline pinned. Agent References is an intentional
+	// global contract addition: account for only that section, not unrelated prompt drift.
+	test("the spec prompt retains the PR 3 baseline apart from agent-reference guidance", async () => {
 		const out: Record<string, string> = {};
 		for (const locale of ["en", "zh-CN"] as const) {
 			const built = await buildEffectiveSystemPrompt({ ...options, locale });
-			out[locale] = digest({ prompt: built.prompt, contract: built.contract, parts: built.parts });
+			const sections = built.contract.match(/\n\n## Agent References\n\n[^\n]+/g) ?? [];
+			expect(sections).toHaveLength(1);
+			const referenceSection = sections[0];
+			if (!referenceSection) throw new Error("Missing agent reference contract");
+			if (built.prompt === null) throw new Error("Missing effective spec prompt");
+			expect(referenceSection).toContain("[task name](nf-agent://open?id=NARRATOR_ID)");
+			out[locale] = digest({
+				prompt: built.prompt.replace(referenceSection, ""),
+				contract: built.contract.replace(referenceSection, ""),
+				parts: built.parts,
+			});
 		}
 		expect(out).toEqual(SPEC_PROMPT_DIGESTS);
 	});
 
 	test("a spec session's digest, fence and drain are read as before; its run prepares nothing", async () => {
+		// While imports are not automatic (outline P2 PR 12b: with `auto` the run imports it first).
+		const specImport = settings.outline.specImport;
+		settings.outline.specImport = "manual";
+		restores.push(() => {
+			settings.outline.specImport = specImport;
+		});
 		const id = await session({ backend: "spec" });
 		await writeSpecFile(id, "spec://behavior_fence", "Never force-push.", { actor: "user" });
 		const source = await taskSourceForNarrator(id);
@@ -993,7 +1027,7 @@ describe("spec sessions are unchanged", () => {
 	});
 });
 
-/** See "the full spec prompt is byte for byte what PR 3 built". */
+/** Historical PR 3 baseline; later global contracts must be accounted for explicitly. */
 const SPEC_PROMPT_DIGESTS: Record<string, string> = {
 	en: "85bd631b5545aa90",
 	"zh-CN": "3f9b5c535127b3cb",

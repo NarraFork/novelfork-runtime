@@ -17,11 +17,36 @@ export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
 export type {
+	OutlinePlanPromptReview,
+	OutlinePlanPromptRoot,
+	OutlinePlanStructureProblem,
+	OutlinePlanSubmitProblem,
+} from "./prompts/outline-plan";
+export {
+	getOutlinePlanApprovedPrompt,
+	getOutlinePlanEnterOutput,
+	getOutlinePlanModeSystemReminder,
+	getOutlinePlanRelaxedReminder,
+	getOutlinePlanReturnedMessage,
+	getOutlinePlanReturnedNote,
+	getOutlinePlanReviewPrompt,
+	getOutlinePlanReviewTitle,
+	getOutlinePlanSubmitProblem,
+} from "./prompts/outline-plan";
+export type {
 	OutlineCompactNote,
+	OutlineTaskEdit,
+	OutlineTaskEditChange,
+	OutlineTaskEditGroup,
+	OutlineTaskFinishedEntry,
 	OutlineTaskPromptTask,
 	OutlineTasksViewSection,
 	OutlineTaskWaitText,
+	OutlineTeamAssignedEntry,
+	OutlineTeamUnblockedEntry,
+	OutlineViewAgent,
 	OutlineViewTask,
+	SpecImportNoticePage,
 } from "./prompts/outline-tasks";
 export {
 	getOutlineBehaviorFenceTruncated,
@@ -38,13 +63,19 @@ export {
 	getOutlineCompactTaskLine,
 	getOutlineContinuationPrompt,
 	getOutlineInterruptNote,
+	getOutlineSpecMovedHint,
 	getOutlineSpecUnavailableHint,
+	getOutlineTaskEditNote,
+	getOutlineTaskFinishedNote,
 	getOutlineTaskSystemReminder,
 	getOutlineTasksViewHeading,
 	getOutlineTasksViewMore,
 	getOutlineTasksViewSection,
+	getOutlineTeamEventsNote,
 	getOutlineTurnEndNote,
+	getOutlineViewDelegatedLine,
 	getOutlineViewTaskLine,
+	getSpecImportNotice,
 } from "./prompts/outline-tasks";
 export type {
 	SetupAuthorization,

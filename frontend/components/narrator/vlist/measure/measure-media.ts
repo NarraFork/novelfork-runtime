@@ -273,7 +273,7 @@ export const IMGGEN_GROUP_GAP = 6;
 /** Group mb="xs" between header and the reserved image area. */
 export const IMGGEN_IMAGE_GAP = SPACING.xs; // 10
 /** Header text (xs) line box height. */
-export const IMGGEN_HEADER_LINE_HEIGHT = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
+export const IMGGEN_HEADER_LINE_HEIGHT_BASELINE = lineBoxHeight(FONT_SIZE.xs, LINE_HEIGHT.xs); // 17
 /** GENERATED_IMAGE_MAX_DISPLAY_WIDTH from the original component. */
 export const IMGGEN_MAX_DISPLAY_WIDTH = 512;
 /** Conservative fallback image area height when intrinsic size is unknown. */
@@ -309,6 +309,8 @@ export interface MeasureMediaOpts {
 export interface MeasuredImageGeneration extends MeasuredElement {
 	inRun: boolean;
 	isLast: boolean;
+	/** Exactly the same activity predicate drives reserved and painted loader space. */
+	generating: boolean;
 }
 
 interface ImageMetrics {
@@ -332,7 +334,7 @@ function getImageMetrics(data: MeasureImageGenerationInput): ImageMetrics | null
 }
 
 function isGeneratingStatus(status: string | undefined): boolean {
-	return !!status && status !== "completed";
+	return status === "in_progress" || status === "generating";
 }
 
 /** Build the header rich-inline flow (status text + optional revisedPrompt). */
@@ -503,6 +505,7 @@ export function measureImageGeneration(
 	return {
 		inRun,
 		isLast,
+		generating,
 		height,
 		blocks,
 		frame,
@@ -588,7 +591,7 @@ export const MEASURE_MEDIA_CONSTANTS = {
 	IMGGEN_LOADER_SIZE,
 	IMGGEN_GROUP_GAP,
 	IMGGEN_IMAGE_GAP,
-	IMGGEN_HEADER_LINE_HEIGHT,
+	IMGGEN_HEADER_LINE_HEIGHT_BASELINE,
 	IMGGEN_MAX_DISPLAY_WIDTH,
 	IMGGEN_UNKNOWN_IMAGE_HEIGHT,
 } as const;

@@ -1,6 +1,13 @@
 import { basename, isAbsolute, normalize, parse } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import { hotSafe } from "../lib/hot-safe";
+import { isCompiledRuntime } from "../lib/runtime-target";
+import { WorkerHandle } from "../lib/worker-runtime/lifecycle";
+import { TaskQueue, TaskQueueError } from "../lib/worker-runtime/queue";
+
+/** Private subprocess entry; index.ts dispatches before importing the application. */
+export const FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG = "--file-change-physical-audit-worker";
 
 export const FILE_CHANGE_PHYSICAL_AUDIT_LIMITS = Object.freeze({
 	blobBytes: FILE_CHANGE_LIMITS.blobBytes,
@@ -150,14 +157,28 @@ interface Job {
 	request: FileChangePhysicalAuditRequest;
 	signal?: AbortSignal;
 	onProgress?: FileChangePhysicalAuditOptions["onProgress"];
-	scope: string;
-	resolve: (summary: FileChangePhysicalAuditSummary) => void;
-	timer?: ReturnType<typeof setTimeout>;
-	abort?: () => void;
 }
-const activeScopes = new Set<string>();
-const queue: Job[] = [];
-let active = 0;
+const owner = hotSafe("narrafork.physicalAudit.owner", () => ({
+	queue: new TaskQueue({
+		concurrency: LIMITS.concurrency,
+		maxQueued: LIMITS.queueItems,
+		maxQueuedBytes: LIMITS.queueItems * LIMITS.requestBytes,
+		maxActivePerKey: 1,
+	}),
+	handles: new Set<WorkerHandle<Bun.Subprocess<"ignore", "ignore", "ignore">>>(),
+	closing: undefined as Promise<void> | undefined,
+}));
+
+/** Permanent production close. Admission closes before cooperative cancel, and exit owns release. */
+export function closeFileChangePhysicalAudits(): Promise<void> {
+	if (owner.closing) return owner.closing;
+	const drained = owner.queue.close();
+	owner.closing = (async () => {
+		await Promise.all([...owner.handles].map((handle) => handle.close()));
+		await drained;
+	})();
+	return owner.closing;
+}
 
 /** Explicit, internal, finite read-only maintenance work. Never automatically called
  * by startup, retention, a scheduler or HTTP. The private root is an OS trust boundary,
@@ -172,59 +193,55 @@ export function auditFileChangePhysical(
 	const request = validateRequest(options);
 	if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) invalid();
 	if (options.onProgress !== undefined && typeof options.onProgress !== "function") invalid();
-	if (options.signal?.aborted) return Promise.resolve(stopped("cancelled"));
-	if (queue.length >= LIMITS.queueItems) return Promise.resolve(stopped("queue_limit"));
-	return new Promise((resolve) => {
-		const job: Job = {
-			request,
-			signal: options.signal,
-			onProgress: options.onProgress,
-			scope: JSON.stringify([request.description.databasePath, request.description.namespaceKey]),
-			resolve,
-		};
-		const remove = (code: string) => {
-			const index = queue.indexOf(job);
-			if (index < 0) return;
-			queue.splice(index, 1);
-			clearWaiting(job);
-			resolve(stopped(code));
-		};
-		job.abort = () => remove("cancelled");
-		job.signal?.addEventListener("abort", job.abort, { once: true });
-		job.timer = setTimeout(() => remove("queue_deadline"), request.budget.durationMs);
-		queue.push(job);
-		drain();
-	});
+	return admitAudit(request, options);
 }
 
-function drain(): void {
-	while (active < LIMITS.concurrency) {
-		const index = queue.findIndex((job) => !activeScopes.has(job.scope));
-		if (index < 0) return;
-		const job = queue.splice(index, 1)[0];
-		clearWaiting(job);
-		active++;
-		activeScopes.add(job.scope);
-		void runWorker(job).then((summary) => {
-			active--;
-			activeScopes.delete(job.scope);
-			job.resolve(summary);
-			drain();
+async function admitAudit(
+	request: FileChangePhysicalAuditRequest,
+	options: FileChangePhysicalAuditOptions,
+): Promise<FileChangePhysicalAuditSummary> {
+	let permit: Awaited<ReturnType<TaskQueue["acquire"]>>;
+	try {
+		permit = await owner.queue.acquire({
+			signal: options.signal,
+			deadlineAt: Infinity,
+			waitTimeoutMs: request.budget.durationMs,
+			bytes: Buffer.byteLength(JSON.stringify(request)),
+			key: JSON.stringify([request.description.databasePath, request.description.namespaceKey]),
 		});
+	} catch (error) {
+		if (options.signal?.aborted) return stopped("cancelled");
+		return stopped(
+			error instanceof TaskQueueError
+				? error.code === "TASK_QUEUE_FULL"
+					? "queue_limit"
+					: error.code === "TASK_QUEUE_TIMEOUT"
+						? "queue_deadline"
+						: "closed"
+				: "worker_start_failed",
+		);
+	}
+	try {
+		if (owner.closing) return stopped("closed");
+		// Preserve separate waiting and execution budgets, not a new combined total deadline.
+		return await runWorker({ request, signal: options.signal, onProgress: options.onProgress });
+	} finally {
+		permit.release();
 	}
 }
-function clearWaiting(job: Job): void {
-	clearTimeout(job.timer);
-	if (job.abort) job.signal?.removeEventListener("abort", job.abort);
-}
 async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
-	// Source-only internal maintenance step. Never accidentally launch a compiled
-	// NarraFork application binary as a child server. Bundled worker packaging is not wired.
-	if (
-		!/^bun(?:-debug)?(?:\.exe)?$/.test(basename(process.execPath)) ||
-		import.meta.url.includes("$bunfs")
-	)
+	const compiled = isCompiledRuntime();
+	if (!compiled && !/^bun(?:-debug)?(?:\.exe)?$/.test(basename(process.execPath)))
 		return stopped("unsupported_runtime");
+	// The compiled app dispatches this private flag before importing main/DB/HTTP.
+	// Keep a separate OS process: closing SQLite FDs or forced cancellation must
+	// never affect the server's locks and connections.
+	const command = compiled
+		? [process.execPath, FILE_CHANGE_PHYSICAL_AUDIT_WORKER_FLAG]
+		: [
+				process.execPath,
+				fileURLToPath(new URL("./file-change-physical-audit-worker.ts", import.meta.url)),
+			];
 	return new Promise((resolve) => {
 		let result: FileChangePhysicalAuditSummary | undefined;
 		let reason: string | undefined;
@@ -232,6 +249,7 @@ async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
 		let progress: FileChangePhysicalAuditProgress | undefined;
 		let termination: ReturnType<typeof setTimeout> | undefined;
 		let worker: Bun.Subprocess<"ignore", "ignore", "ignore">;
+		let handle: WorkerHandle<typeof worker>;
 		const stop = (code: string) => {
 			if (reason) return;
 			reason = code;
@@ -251,11 +269,8 @@ async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
 			}, 50);
 		};
 		try {
-			worker = Bun.spawn(
-				[
-					process.execPath,
-					fileURLToPath(new URL("./file-change-physical-audit-worker.ts", import.meta.url)),
-				],
+			handle = WorkerHandle.subprocess(
+				command,
 				{
 					stdin: "ignore",
 					stdout: "ignore",
@@ -292,7 +307,10 @@ async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
 						}
 					},
 				},
+				() => stop("closed"),
 			);
+			worker = handle.resource;
+			owner.handles.add(handle);
 		} catch {
 			resolve(stopped("worker_start_failed"));
 			return;
@@ -300,7 +318,8 @@ async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
 		const abort = () => stop("cancelled");
 		job.signal?.addEventListener("abort", abort, { once: true });
 		const timer = setTimeout(() => stop("deadline"), job.request.budget.durationMs);
-		void worker.exited.then((code) => {
+		void handle.exited.then((code) => {
+			owner.handles.delete(handle);
 			clearTimeout(timer);
 			clearTimeout(termination);
 			job.signal?.removeEventListener("abort", abort);

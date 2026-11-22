@@ -12,6 +12,7 @@
  */
 import type {
 	OutlineActorKind,
+	OutlineAskJson,
 	OutlineLinkKind,
 	OutlineLinkTargetKind,
 	OutlineTaskJson,
@@ -26,6 +27,8 @@ export interface OutlineStructureRow {
 	orderKey: string;
 	alias: string | null;
 	taskJson: OutlineTaskJson | null;
+	/** A question put to a person; process like a task (design §2.1). Absent: none. */
+	askJson?: OutlineAskJson | null;
 	/** `from_seq` of the version this row comes from (the block's `version_seq` when current). */
 	versionSeq: number;
 }
@@ -213,6 +216,11 @@ export interface OutlineReadPort {
 	): Promise<string[]>;
 	/** Blocks by id, live or deleted, in any space. */
 	getBlocks(ids: readonly string[]): Promise<OutlineBlockRow[]>;
+	/**
+	 * The first {@link OUTLINE_PAGE_HEAD_CHARS} characters of the content of blocks, by id, in any
+	 * space: enough for their titles (a task list shows many, and a whole body is up to 16 KiB).
+	 */
+	getBlockHeads(ids: readonly string[]): Promise<Array<{ id: string; contentHead: string }>>;
 	/** Live blocks of the given spaces with a sid or an alias, at most `limit`. */
 	findLiveBlocks(
 		spaceIds: readonly string[],
@@ -231,11 +239,16 @@ export interface OutlineReadPort {
 	): Promise<string[]>;
 	/** Live blocks matching a full-text query, best first, at most `query.limit`. */
 	searchBlocks(query: OutlineSearchQuery): Promise<OutlineSearchRow[]>;
-	/** Open links to any of the targets, written in one of `spaceIds`, at most `limit`. */
+	/**
+	 * Open links to any of the targets, written in one of `spaceIds` (null: in any space, for a
+	 * system read that tells nobody what it found), only of `kinds` when given, at most `limit`.
+	 * By the target index (`idx_outline_links_target`).
+	 */
 	listLinksTo(
 		targets: readonly OutlineLinkTargetRef[],
-		spaceIds: readonly string[],
+		spaceIds: readonly string[] | null,
 		limit: number,
+		options?: { kinds?: readonly OutlineLinkKind[] },
 	): Promise<OutlineLinkRow[]>;
 	/**
 	 * Live pages of a space in sibling order (order key, then id, bytewise), after the page

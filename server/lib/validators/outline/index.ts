@@ -1,10 +1,16 @@
 import {
 	OUTLINE_BLOCK_ID_RE,
 	OUTLINE_PENDING_API_LIMITS,
+	OUTLINE_REPORT_AUTHORS_API_LIMITS,
 	OUTLINE_RESOLVE_REQUEST_LIMITS,
 	OUTLINE_VIEW_LIMITS,
 	OUTLINE_VIEW_STATE_LIMITS,
 } from "@shared/outline-api";
+import {
+	OUTLINE_SPEC_IMPORT_ADMIN_STATES,
+	OUTLINE_SPEC_LOSS_STATUSES,
+} from "@shared/outline-spec-import";
+import { OUTLINE_TASK_BOARD_LIMITS } from "@shared/outline-task-board";
 import { z } from "zod";
 
 /**
@@ -45,6 +51,8 @@ export const outlineBlockViewQuerySchema = z
 		view: z.enum(["facts", "all"]).optional(),
 		blocks: limitSchema(OUTLINE_VIEW_LIMITS.maxBlocks).optional(),
 		bytes: limitSchema(OUTLINE_VIEW_LIMITS.maxBytes).optional(),
+		/** Leave out what is behind rows closed by default and by the reader (the tree's pages). */
+		fold: z.literal("default").optional(),
 	})
 	.refine((query) => query.asOf === undefined || query.at === undefined, {
 		message: "asOf and at are exclusive",
@@ -63,6 +71,7 @@ export const outlineSearchQuerySchema = z.object({
 	q: z.string().trim().min(1).max(500),
 	spaceId: outlineIdSchema.optional(),
 	limit: limitSchema(OUTLINE_VIEW_LIMITS.maxSearch).optional(),
+	cursor: cursorSchema.optional(),
 });
 
 /**
@@ -82,14 +91,41 @@ export const outlineResolveQuerySchema = z
 		message: "commit needs space",
 	});
 
-/** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
-export const outlineViewStatePutSchema = z.object({
-	// Block ids only: not free text (a reader may write this for every page they can read).
-	collapsed: z
-		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
-		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
-	layout: z.enum(["right", "down"]),
+/** The report containers to name the subagents of (`GET /spaces/:spaceId/report-authors`). */
+export const outlineReportAuthorsQuerySchema = z.object({
+	ids: z
+		.string()
+		.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds * (OUTLINE_VIEW_STATE_LIMITS.maxIdChars + 1))
+		.transform((value) => value.split(",").filter(Boolean))
+		.pipe(
+			z
+				.array(z.string().regex(OUTLINE_BLOCK_ID_RE))
+				.min(1)
+				.max(OUTLINE_REPORT_AUTHORS_API_LIMITS.maxIds),
+		),
 });
+
+/** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
+export const outlineViewStatePutSchema = z
+	.object({
+		// Block ids only: not free text (a reader may write this for every page they can read).
+		collapsed: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
+		// What the reader opened that is folded by default; absent from an older client.
+		expanded: z
+			.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+			.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed)
+			.optional(),
+		layout: z.enum(["right", "down"]),
+	})
+	// The two sets share one budget (what is stored is bounded the same way).
+	.refine(
+		(body) =>
+			body.collapsed.length + (body.expanded?.length ?? 0) <=
+			OUTLINE_VIEW_STATE_LIMITS.maxCollapsed,
+		{ message: "collapsed and expanded together exceed the limit" },
+	);
 
 /** Locking a task tree: the session that may confirm step changes on the locker's behalf. */
 export const outlineLockBodySchema = z.object({
@@ -99,4 +135,143 @@ export const outlineLockBodySchema = z.object({
 /** Rejecting a pending change: why, for its proposer. */
 export const outlinePendingRejectBodySchema = z.object({
 	reason: z.string().trim().max(OUTLINE_PENDING_API_LIMITS.maxReasonChars).nullable().optional(),
+});
+
+/** Answering questions put to the person (`POST /questions/answer`, outline P2 PR 7). */
+export const outlineAnswerBodySchema = z.object({
+	answers: z
+		.array(
+			z
+				.object({
+					blockId: outlineIdSchema,
+					option: z.number().int().min(1).max(100).optional(),
+					text: z.string().max(16_384).optional(),
+					adopt: z.boolean().optional(),
+					// The version the person read: required, so every caller gets the stale check (S3).
+					versionSeq: z.number().int().min(1),
+				})
+				.strict(),
+		)
+		.min(1)
+		.max(50),
+});
+
+/** Acknowledging confirmations agents made on the person's behalf (`POST /digest/seen`). */
+export const outlineDigestSeenBodySchema = z.object({
+	pendingIds: z.array(outlineIdSchema).min(1).max(50),
+});
+
+// ── Task board (outline P2 PR 5) ──────────────────────────────────────────────
+
+/** A project board's next page of spaces. */
+export const outlineTaskBoardQuerySchema = z.object({
+	cursor: cursorSchema.optional(),
+});
+
+/** A page of a listing of the connected outline (`/outline/tree…`). */
+export const outlineTreeQuerySchema = z.object({
+	cursor: cursorSchema.optional(),
+});
+
+/** A space's next finished tasks. */
+export const outlineFinishedTasksQuerySchema = z.object({
+	cursor: cursorSchema.optional(),
+	limit: limitSchema(OUTLINE_TASK_BOARD_LIMITS.maxFinishedPage).optional(),
+});
+
+/** A person adds a task to a session (the board's form). */
+export const outlineBoardAddBodySchema = z.object({
+	text: z.string().trim().min(1).max(OUTLINE_TASK_BOARD_LIMITS.maxTaskChars),
+	lock: z.boolean().optional(),
+	start: z.boolean().optional(),
+});
+
+/** A person changes one task on the board: its checkbox, or whom it is handed to. */
+export const outlineBoardTaskUpdateBodySchema = z
+	.object({
+		baseVersionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		status: z.enum(["todo", "done", "cancelled"]).optional(),
+		assign: z
+			.discriminatedUnion("kind", [
+				z.object({ kind: z.literal("me") }),
+				z.object({
+					kind: z.literal("user"),
+					username: z.string().trim().min(1).max(OUTLINE_TASK_BOARD_LIMITS.maxUsernameChars),
+				}),
+				z.object({ kind: z.literal("session") }),
+				z.object({ kind: z.literal("narrator"), narratorId: outlineIdSchema }),
+				z.object({ kind: z.literal("team") }),
+			])
+			.optional(),
+		start: z.boolean().optional(),
+	})
+	.refine((body) => body.status !== undefined || body.assign !== undefined, {
+		message: "nothing to change",
+	});
+
+/** Open a new session for a project task (outline P2 PR 10c-1). */
+export const outlineBoardOpenSessionBodySchema = z.object({
+	baseVersionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+	model: z.string().trim().min(1).max(256).optional(),
+	cwd: z.string().trim().min(1).max(4096).optional(),
+	previousDirectory: z.boolean().optional(),
+	note: z.string().max(OUTLINE_TASK_BOARD_LIMITS.maxOpenNoteChars).optional(),
+});
+
+/** The reader saw these tasks marked 「新完成」 on a board (outline P2 PR 9b). */
+export const outlineBoardSeenBodySchema = z.object({
+	tasks: z
+		.array(
+			z.object({
+				id: outlineIdSchema,
+				versionSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+			}),
+		)
+		.min(1)
+		.max(OUTLINE_TASK_BOARD_LIMITS.seenPerRequest),
+});
+
+/** A plan's diff (outline P2 PR 8): compared from `from` (a seq; 0 is nothing) to now. */
+export const outlinePlanDiffQuerySchema = z.object({
+	from: seqSchema,
+});
+
+/** A person's decision on a submitted plan (`POST /narrators/permissions/:id/plan`). */
+export const outlinePlanDecisionSchema = z
+	.object({
+		action: z.enum(["return", "draft", "lock"]),
+		feedback: z.string().max(4000).optional(),
+		delegate: outlineIdSchema.nullable().optional(),
+		seenSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+		compactAfter: z.boolean().optional(),
+	})
+	.strict();
+
+/**
+ * The admin page of the Dynamic Spec import (outline P2 PR 12b2,
+ * `GET /api/admin/outline/spec-import`): one state's sessions, a page at a time.
+ */
+export const outlineSpecImportAdminQuerySchema = z.object({
+	state: z.enum(OUTLINE_SPEC_IMPORT_ADMIN_STATES).default("attention"),
+	cursor: cursorSchema.optional(),
+	limit: limitSchema(50).default(20),
+});
+
+/**
+ * Content the old Spec panel may have swallowed (outline P2 PR 12c): one status's findings, a
+ * page at a time (a session's, or the admin page's), and a person's decision about one.
+ */
+export const outlineSpecLossQuerySchema = z.object({
+	status: z.enum(OUTLINE_SPEC_LOSS_STATUSES).default("open"),
+	cursor: cursorSchema.optional(),
+	limit: limitSchema(50).default(20),
+});
+
+export const outlineSpecLossActionSchema = z.object({
+	action: z.enum(["attach", "dismiss", "reopen"]),
+	/**
+	 * With `attach` of a finding of the behavior fence: the person confirmed that the agent will
+	 * read the content as a rule. Refused without it.
+	 */
+	confirmRule: z.boolean().optional(),
 });

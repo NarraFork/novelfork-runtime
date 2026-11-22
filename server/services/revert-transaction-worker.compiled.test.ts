@@ -4,6 +4,8 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { parse } from "@babel/parser";
+import { compiledBuildArguments } from "../../scripts/lib/compiled-build";
 import { compiledWorkerBuildEntrypoints } from "../lib/compiled-worker";
 
 const execFileAsync = promisify(execFile);
@@ -12,32 +14,55 @@ const manifestEntry = "./server/services/revert-transaction-manifest-worker.ts";
 const mainEntry = "./server/index.ts";
 const maxBuffer = 1024 * 1024;
 
-/** The production compile command spreads the shared worker registry, not a local path list. */
+/** Read the real compile call structurally: nested arrays must not truncate its argument list. */
 async function productionCompileArguments(): Promise<string[]> {
 	const source = await readFile(join(root, "scripts/build-cross-platform.ts"), "utf8");
-	const command = source.match(/const compile = await runBuildStep\(\s*\[([\s\S]*?)\]\s*,?\s*\)/);
-	if (!command) throw new Error("Production Bun compile argument array was not found");
-	const withoutComments = command[1].replace(/\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g, "");
-	expect(withoutComments).toMatch(/^\s*process\.execPath\s*,/);
-	expect(withoutComments).toContain('"./server/index.ts"');
-	expect(withoutComments).toContain("...compiledWorkerBuildEntrypoints()");
+	const ast = parse(source, { sourceType: "module", plugins: ["typescript"] });
+	const declaration = ast.program.body
+		.flatMap((node) =>
+			node.type === "ForOfStatement" && node.body.type === "BlockStatement" ? node.body.body : [],
+		)
+		.flatMap((node) => (node.type === "VariableDeclaration" ? node.declarations : []))
+		.find((node) => node.id.type === "Identifier" && node.id.name === "compile");
+	const call =
+		declaration?.init?.type === "AwaitExpression" ? declaration.init.argument : undefined;
+	if (
+		call?.type !== "CallExpression" ||
+		call.callee.type !== "Identifier" ||
+		call.callee.name !== "runBuildStep"
+	)
+		throw new Error("Production Bun compile call was not found");
+	const command = call.arguments[0];
+	if (command?.type !== "ArrayExpression")
+		throw new Error("Production compile arguments must be an array");
+	expect(command.elements[0]).toMatchObject({
+		type: "MemberExpression",
+		object: { name: "process" },
+		property: { name: "execPath" },
+	});
+	expect(command.elements[1]).toMatchObject({ type: "StringLiteral", value: "build" });
+	expect(command.elements[2]).toMatchObject({ type: "StringLiteral", value: mainEntry });
+	const spreadCalls = command.elements.flatMap((node) =>
+		node?.type === "SpreadElement" &&
+		node.argument.type === "CallExpression" &&
+		node.argument.callee.type === "Identifier"
+			? [node.argument.callee.name]
+			: [],
+	);
+	expect(spreadCalls).toContain("compiledWorkerBuildEntrypoints");
+	expect(spreadCalls).toContain("compiledBuildArguments");
 	const { stdout } = await execFileAsync(
 		process.execPath,
 		["--eval", "process.stdout.write(Bun.version)"],
-		{
-			timeout: 10_000,
-			maxBuffer: 1024,
-		},
+		{ timeout: 10_000, maxBuffer: 1024 },
 	);
 	expect(stdout).toBe(Bun.version);
-	const literals = [...withoutComments.matchAll(/"([^"\r\n]+)"/g)].map((match) => match[1]);
-	const index = literals.indexOf("./server/index.ts");
-	const compileFlag = literals.indexOf("--compile");
 	return [
 		process.execPath,
-		...literals.slice(0, index + 1),
+		"build",
+		mainEntry,
 		...compiledWorkerBuildEntrypoints(),
-		...literals.slice(compileFlag),
+		...compiledBuildArguments(),
 	];
 }
 
@@ -47,6 +72,7 @@ const probeSource = `
 import {
 	RevertTransactionError,
 	runRevertManifestWorker,
+	closeRevertManifestWorkers,
 	revertManifestWorkerSpecifiers,
 } from "../services/revert-transaction-worker";
 import { isCompiledRuntime } from "../lib/runtime-target";
@@ -83,6 +109,7 @@ console.log(JSON.stringify({
 	equal: await compare({ selection: ["fixed"] }),
 	stale: await compare({ selection: ["/private/selection-canary"] }),
 }));
+await closeRevertManifestWorkers();
 `;
 
 interface ProbeResult {
@@ -124,7 +151,10 @@ describe("revert manifest worker in a real compiled executable", () => {
 		expect(args.slice(2, args.indexOf("--compile"))).toContain(manifestEntry);
 	});
 
-	test("minified binaries compare outside the source cwd and fail safely if the worker is omitted", async () => {
+	test.each([
+		"production",
+		"manifest-only",
+	] as const)("%s minified binaries compare outside the source cwd and fail safely if the worker is omitted", async (scope) => {
 		// tests/preload.ts owns this isolation; all children inherit it unchanged.
 		expect(process.env.NARRAFORK_TEST).toBe("1");
 		const isolatedHome = process.env.NARRAFORK_HOME;
@@ -146,42 +176,66 @@ describe("revert manifest worker in a real compiled executable", () => {
 			const suffix = process.platform === "win32" ? ".exe" : "";
 			const complete = join(artifacts, `with-worker${suffix}`);
 			const missing = join(artifacts, `without-worker${suffix}`);
+			const buildFailures: Error[] = [];
 			for (const [binary, includeManifest] of [
 				[complete, true],
 				[missing, false],
 			] as const) {
-				await execFileAsync(
-					process.execPath,
-					[
-						"build",
-						probe,
-						...entries.filter(
-							(entry) => entry !== mainEntry && (includeManifest || entry !== manifestEntry),
+				try {
+					await execFileAsync(
+						process.execPath,
+						[
+							"build",
+							probe,
+							...(scope === "production"
+								? entries.filter(
+										(entry) => entry !== mainEntry && (includeManifest || entry !== manifestEntry),
+									)
+								: includeManifest
+									? [manifestEntry]
+									: []),
+							"--root",
+							join(root, "server"),
+							...compiledBuildArguments(),
+							"--outfile",
+							binary,
+						],
+						{ cwd: root, env: { ...process.env }, timeout: 60_000, maxBuffer },
+					);
+				} catch (cause) {
+					// Always compile the omitted-entry control too: an unrelated entry may fail both.
+					const detail = (cause as { stderr?: string }).stderr ?? String(cause);
+					buildFailures.push(
+						new Error(
+							`${scope}/${includeManifest ? "with-manifest" : "without-manifest"} compile failed: ${detail.slice(0, 4096)}`,
+							{ cause },
 						),
-						"--root",
-						join(root, "server"),
-						"--compile",
-						"--minify",
-						"--asset-naming=[dir]/[name].[ext]",
-						"--external=electron",
-						"--outfile",
-						binary,
-					],
-					{ cwd: root, env: { ...process.env }, timeout: 60_000, maxBuffer },
-				);
+					);
+				}
 			}
+			if (buildFailures.length)
+				throw new AggregateError(buildFailures, `${scope} probe compilation failed`);
 			// Neither executable can load the original probe; cwd has no source or node_modules.
 			await rm(sourceDir, { recursive: true, force: true });
 			expect(await readdir(cwd)).toEqual([]);
 			const results: ProbeResult[] = [];
 			for (const binary of [complete, missing]) {
-				const { stdout } = await execFileAsync(binary, [], {
+				const { stdout, stderr } = await execFileAsync(binary, [], {
 					cwd,
-					env: { ...process.env },
+					// Keep stdout machine-readable; worker startup warnings still reach stderr.
+					env: { ...process.env, NARRAFORK_LOG_LEVEL: "warn" },
 					timeout: 20_000,
 					maxBuffer,
 				});
-				const result = JSON.parse(stdout.trim()) as ProbeResult;
+				let result: ProbeResult;
+				try {
+					result = JSON.parse(stdout.trim()) as ProbeResult;
+				} catch (cause) {
+					throw new Error(
+						`Invalid ${binary === complete ? "with-worker" : "without-worker"} probe output: stdout(${Buffer.byteLength(stdout)} bytes)=${JSON.stringify(stdout.slice(0, 4096))}; stderr(${Buffer.byteLength(stderr)} bytes)=${JSON.stringify(stderr.slice(0, 4096))}`,
+						{ cause },
+					);
+				}
 				expect(result.compiled).toBe(true);
 				expect(result.moduleUrl).toMatch(/\$bunfs\/|%7EBUN\/|~BUN\//i);
 				expect(

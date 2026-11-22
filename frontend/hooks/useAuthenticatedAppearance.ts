@@ -1,15 +1,47 @@
-import { useComputedColorScheme } from "@mantine/core";
+import {
+	type MantineColorScheme,
+	useComputedColorScheme,
+	useMantineColorScheme,
+} from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { setTypography } from "@shared/pretext-layout/typography";
-import { useEffect } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	appearanceStore,
+	subscribeAppearancePreferences,
+} from "../lib/appearance-preference-store";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
+import { ensureTypographyCssVars } from "../lib/typography-css-vars";
+import { typographyFromPreferences } from "../lib/typography-preferences";
 import { useLocalNumberPref, useLocalPref } from "./useLocalPref";
 import type { useUserPreferences } from "./useUserPreferences";
+import { useUserPreferencesChangeSync } from "./useUserPreferencesChangeSync";
 
-/** Shared preferences only: no navigation, badges, workspace or realtime subscriptions. */
+/** Presentation and account-preference invalidation shared by app and standalone windows. */
 export function useAuthenticatedAppearance(prefs: ReturnType<typeof useUserPreferences>["data"]) {
 	const { i18n } = useTranslation("common");
+	const { t: settingsText } = useTranslation("settings");
+	useUserPreferencesChangeSync();
+	const theme = useSyncExternalStore(
+		subscribeAppearancePreferences,
+		() => appearanceStore.get("colorScheme"),
+		() => "auto",
+	) as MantineColorScheme;
+	const syncError = useSyncExternalStore(
+		subscribeAppearancePreferences,
+		() => appearanceStore.error,
+		() => null,
+	);
+	const { setColorScheme } = useMantineColorScheme();
+	useEffect(() => {
+		setColorScheme(theme);
+	}, [theme, setColorScheme]);
+	useEffect(() => {
+		if (syncError)
+			notifications.show({ color: "red", message: settingsText("appearanceSyncFailed") });
+	}, [syncError, settingsText]);
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [blurInMs] = useLocalNumberPref("narrafork_blur_in_ms");
@@ -38,19 +70,22 @@ export function useAuthenticatedAppearance(prefs: ReturnType<typeof useUserPrefe
 	// layout with an anchor) — so nothing else is needed here. Values are only applied
 	// once prefs have loaded; `undefined` would clamp to the defaults and cause a
 	// visible reflow on every page load for anyone who changed a setting.
+	//
+	// The same values are published as `--nf-type-*` CSS variables on <html> (the outline
+	// editor, tree, mind map and task board paint with them), kept current by a typography
+	// subscription so a slider drag previews there too. Installed once; idempotent.
+	//
+	// Line height is read from `narratorLineHeightV2Percent`, the current scale (100 = the old
+	// 120%); the server derives it from the old-scale column for rows saved before the rescale.
 	useEffect(() => {
+		ensureTypographyCssVars();
 		if (!prefs) return;
-		setTypography({
-			fontScalePercent: prefs.narratorFontScalePercent,
-			letterSpacingPercent: prefs.narratorLetterSpacingPercent,
-			lineHeightScalePercent: prefs.narratorLineHeightScalePercent,
-			paragraphScalePercent: prefs.narratorParagraphScalePercent,
-		});
+		setTypography(typographyFromPreferences(prefs));
 	}, [
 		prefs,
 		prefs?.narratorFontScalePercent,
 		prefs?.narratorLetterSpacingPercent,
-		prefs?.narratorLineHeightScalePercent,
+		prefs?.narratorLineHeightV2Percent,
 		prefs?.narratorParagraphScalePercent,
 	]);
 

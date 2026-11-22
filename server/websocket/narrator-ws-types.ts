@@ -89,6 +89,8 @@ export type NarratorServerMessage =
 	| import("@shared/outline-page-events").OutlinePageServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
+	/** Delivered only to this account's sockets; clients refetch authorized preferences. */
+	| { type: "user_preferences_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
 	| {
 			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
@@ -327,6 +329,8 @@ export type NarratorServerMessage =
 			balance?: number;
 			required?: number;
 			resumeAction: "retry" | "continue";
+			/** Parent copy of a subagent's frame: the parent must not react to it. */
+			isSubagent?: boolean;
 	  }
 	| {
 			/**
@@ -341,7 +345,7 @@ export type NarratorServerMessage =
 			providerPrefix?: string;
 			nugModelId?: string;
 			/** `credentials` when omitted. `quota` waits carry `resumeAt`. */
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 			quotaProvider?: "kimi" | "opencode";
 			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
@@ -360,7 +364,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			model: string;
 			nugModelId?: string;
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 			quotaProvider?: "kimi" | "opencode";
 	  }
@@ -539,6 +543,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 	  }
 	| {
 			type: "behavior_fence_settings_changed";
@@ -683,7 +688,9 @@ export type NarratorServerMessage =
 			type: "image_generation";
 			narratorId: string;
 			id: string;
-			status: "in_progress" | "generating" | "completed";
+			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			partialImageIndex?: number;
 			partialSavedPath?: string;
@@ -954,6 +961,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
+			/** Parent copy of a subagent's frame: its balance is not the parent's. */
+			isSubagent?: boolean;
 	  }
 	| {
 			type: "queue_status";
@@ -988,6 +997,8 @@ export type NarratorServerMessage =
 						type: "image_generation";
 						id: string;
 						status: string;
+						error?: string;
+						errorCode?: string;
 						revisedPrompt?: string;
 						result?: string;
 						partialImageIndex?: number;
@@ -1112,7 +1123,7 @@ export type NarratorServerMessage =
 			message: string;
 			model: string;
 			nugModelId?: string;
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			quotaProvider?: "kimi" | "opencode";
 			quotaBucket?: string;
 			resumeAt?: number;
@@ -1125,7 +1136,7 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			model: string;
 			nugModelId?: string;
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			quotaProvider?: "kimi" | "opencode";
 	  }
 	| {
@@ -1246,13 +1257,21 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 	  }
 	| {
+			/**
+			 * The tasks a session's task board shows changed (outline P2 PR 5): ids only, merged
+			 * within 250 ms; the board and the status bar read again over HTTP.
+			 */
+			type: "outline_tasks_changed";
+			narratorId: string;
+	  }
+	| {
 			type: "spec_changed";
 			narratorId: string;
 			uri: string;
 			path: string;
 			revisionId: string | null;
 			updatedBy: "user" | "assistant" | "system";
-			source: "ui" | "tool" | "task_create" | "reset";
+			source: "ui" | "tool" | "task_create" | "reset" | "import" | "revert";
 	  }
 	| {
 			/**

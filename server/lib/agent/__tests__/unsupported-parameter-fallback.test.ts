@@ -4,6 +4,7 @@
  * strip-and-retry the whole turn dies even though the model is fine.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { replaceModelOverridesForTests } from "../../model-catalog";
 import { settings } from "../../settings";
 import { ProviderInvalidStateError } from "../error-handling";
 import { OpenAIProvider } from "../openai-provider";
@@ -157,33 +158,17 @@ describe("OpenAI request paths", () => {
 	const originalFetch = globalThis.fetch;
 	let requests: Array<Record<string, unknown>> = [];
 	let savedOpenAI: typeof settings.openaiProviders;
-	let savedCatalog: typeof settings.agent.modelCatalog;
+	let restoreOverrides: () => void = () => {};
 
 	beforeEach(() => {
 		resetUnsupportedParameterMemory();
 		requests = [];
 		savedOpenAI = settings.openaiProviders;
-		savedCatalog = settings.agent.modelCatalog;
 		settings.openaiProviders = [...(savedOpenAI ?? []), { ...config }];
-		settings.agent.modelCatalog = {
-			schemaVersion: 2,
-			migrationVersion: 2,
-			autoApply: false,
-			pinnedVersion: null,
-			local: {
-				revision: 1,
-				models: [{ id: "card", metadata: {} }],
-				bindings: [
-					{
-						id: "b",
-						providerId: config.id,
-						upstreamModelId: "gpt-6-astra",
-						modelId: "card",
-						overrides: { max_output_tokens: 2300 },
-					},
-				],
-			},
-		};
+		// The entry's own override declares an output ceiling.
+		restoreOverrides = replaceModelOverridesForTests({
+			connections: { [model]: { maxOutputTokens: 2300 } },
+		});
 
 		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
 			const raw = init?.body;
@@ -202,7 +187,7 @@ describe("OpenAI request paths", () => {
 	afterEach(() => {
 		globalThis.fetch = originalFetch;
 		settings.openaiProviders = savedOpenAI;
-		settings.agent.modelCatalog = savedCatalog;
+		restoreOverrides();
 	});
 
 	test("codex chat omits max_output_tokens even when metadata declares a ceiling", async () => {
@@ -236,5 +221,66 @@ describe("OpenAI request paths", () => {
 		expect(result.text).toBe("hi");
 		expect(requests).toHaveLength(1);
 		expect(requests[0]).not.toHaveProperty("max_output_tokens");
+	});
+});
+
+describe("Completions prompt cache key fallback", () => {
+	const completionsConfig = { ...config, apiMode: "completions" as const };
+	const completionsModel = `${completionsConfig.prefix}:gpt-6-astra`;
+	const originalFetch = globalThis.fetch;
+	let requests: Array<Record<string, unknown>> = [];
+	let savedOpenAI: typeof settings.openaiProviders;
+
+	beforeEach(() => {
+		resetUnsupportedParameterMemory();
+		requests = [];
+		savedOpenAI = settings.openaiProviders;
+		settings.openaiProviders = [...(savedOpenAI ?? []), { ...completionsConfig }];
+		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requests.push(body);
+			if ("prompt_cache_key" in body)
+				return new Response('{"detail":"Unsupported parameter: prompt_cache_key"}', {
+					status: 400,
+				});
+			return new Response(
+				'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+		settings.openaiProviders = savedOpenAI;
+	});
+
+	const send = async (provider: OpenAIProvider) => {
+		for await (const _event of provider.chat({
+			conversationId: "unsupported-cache-key",
+			content: "hello",
+			model: completionsModel,
+			cwd: process.cwd(),
+			history: [],
+			tools: [],
+			toolResults: [],
+			signal: new AbortController().signal,
+		})) {
+			/* drain */
+		}
+	};
+
+	test("chat strips the rejected key, retries, and skips it afterwards", async () => {
+		const provider = new OpenAIProvider({ ...completionsConfig });
+		await send(provider);
+		expect(requests).toHaveLength(2);
+		expect(requests[0].prompt_cache_key).toBe("unsupported-cache-key");
+		expect(requests[1]).not.toHaveProperty("prompt_cache_key");
+		expect(modelRejectsParameter(completionsModel, "prompt_cache_key")).toBe(true);
+
+		requests = [];
+		await send(provider);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).not.toHaveProperty("prompt_cache_key");
 	});
 });

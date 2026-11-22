@@ -2,6 +2,7 @@ import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";
 import { api } from "../lib/api";
+import { modelCatalogApi } from "../lib/api/model-catalog";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
@@ -12,6 +13,7 @@ import {
 	mergeModels,
 	modelValue,
 } from "../lib/constants";
+import { createModelOptionsFilter } from "../lib/model-search";
 import type { ProviderCapabilityKey } from "./usePlatform";
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
@@ -242,6 +244,30 @@ export function useAllModels() {
 			);
 		};
 	}, [qc]);
+
+	// auto:<model> rows and their sources. Keyed under ["settings"] so every settings
+	// invalidation refreshes them. Settings pages that write the cache with setQueryData do
+	// not invalidate, so the fields that decide auto candidates are part of the key too.
+	const autoInputs = settingsData
+		? JSON.stringify([
+				settingsData.agent?.hiddenModels,
+				settingsData.agent?.disabledProviders,
+				settingsData.agent?.autoExcludedProviders,
+				settingsData.agent?.customModels?.length,
+				...[settingsData.customApiProviders, settingsData.nugProviders].map(
+					(list?: Array<{ prefix?: string; disabled?: boolean }>) =>
+						list?.map((p) => [p.prefix, p.disabled]),
+				),
+			])
+		: "";
+	const { data: autoModelsData } = useQuery({
+		queryKey: ["settings", "auto-models", autoInputs],
+		queryFn: modelCatalogApi.autoModels,
+		enabled: !!settingsData,
+		staleTime: MODELS_SETTINGS_QUERY_STALE_TIME_MS,
+		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
+		placeholderData: (previous) => previous,
+	});
 
 	return useMemo(() => {
 		const hidden = new Set<string>(settingsData?.agent?.hiddenModels ?? []);
@@ -759,10 +785,29 @@ export function useAllModels() {
 			summaryModelValue,
 		);
 
-		// Prepend follow-default, follow-summary and aggregations to visible models for grouped select
+		// --- auto:<model> (docs/PROVIDER-SOURCING-DESIGN.md §4.1, §10.2) ---
+		// A source the picker hides (disabled provider) is dropped; a model left with none is too.
+		const autoOptions: ModelOption[] = (autoModelsData?.models ?? []).flatMap((model) => {
+			const sources = model.sources.filter((source) =>
+				isSelectableProviderPrefix(source.provider, disabledProviders),
+			);
+			if (sources.length === 0) return [];
+			return [
+				{
+					value: model.value,
+					label: model.name,
+					provider: "__auto__",
+					autoSources: sources,
+					...(model.family ? { family: model.family } : {}),
+				},
+			];
+		});
+
+		// Prepend follow-default, follow-summary, auto and aggregations to visible models
 		const visibleWithDefault = [
 			followDefaultOption,
 			followSummaryOption,
+			...autoOptions,
 			...aggModels,
 			...visibleModels,
 		];
@@ -770,6 +815,7 @@ export function useAllModels() {
 			...providerLabels,
 			__default__: "Default",
 			__summary__: "Summary",
+			__auto__: "Auto",
 			__agg__: "Aggregations",
 		});
 
@@ -781,6 +827,14 @@ export function useAllModels() {
 			if (group.nugProviderId) nugProviderIdByPrefix[group.prefix] = group.nugProviderId;
 		}
 
+		// The full metadata snapshot survives the grouped value/label projection.
+		// Hidden models enrich already-stored pool references without becoming options.
+		// Its identity changes only with the settings/auto-model snapshots.
+		const modelOptionsFilter = createModelOptionsFilter(
+			{ providerLabels, defaultModelValue, summaryModelValue },
+			[...allModels, followDefaultOption, followSummaryOption, ...autoOptions, ...aggModels],
+		);
+
 		return {
 			/** All models (including hidden) — disabled providers filtered out. */
 			allModels,
@@ -790,6 +844,11 @@ export function useAllModels() {
 			visibleWithDefault,
 			/** Grouped for Mantine Select (includes "follow default" and aggregations). */
 			groupedModels,
+			/**
+			 * `filter` for model Select / MultiSelect: matches provider display name,
+			 * prefix and model id, and resolves Default/Summary rows to their target.
+			 */
+			modelOptionsFilter,
 			/** The "follow default" ModelOption. */
 			followDefaultOption,
 			/** The "follow summary" ModelOption. */
@@ -839,6 +898,8 @@ export function useAllModels() {
 			agentModeUnsupportedProviders,
 			/** Set of disabled provider prefixes (for overview). */
 			disabledProviders,
+			/** `auto:<model>` rows, each with its sources in routing order. */
+			autoModels: autoOptions,
 		};
-	}, [settingsData]);
+	}, [settingsData, autoModelsData]);
 }

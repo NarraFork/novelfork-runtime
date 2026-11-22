@@ -45,6 +45,8 @@ let revisionCounter = 0;
 let outlineBehavior: SpecOutlineBehavior | undefined;
 /** Set for an outline session while the outline is switched off (it runs on Dynamic Spec). */
 let outlineSwitchedOff = false;
+/** The session's task backend, as the status bar's route reports it. */
+let backend: "spec" | "outline" = "spec";
 const writes: { uri: string; content: string; baseRevisionId?: string | null }[] = [];
 /** Every source editor render: the document it shows and the text it was opened on. */
 const sourceRenders: { documentKey: string; initialValue: string }[] = [];
@@ -155,6 +157,7 @@ beforeEach(async () => {
 	revisionCounter = 0;
 	outlineBehavior = undefined;
 	outlineSwitchedOff = false;
+	backend = "spec";
 	writes.length = 0;
 	sourceRenders.length = 0;
 
@@ -184,6 +187,20 @@ beforeEach(async () => {
 				interjected: false,
 			} as SpecWriteResult;
 		}),
+		spyOn(api, "getNarratorCurrentTask").mockImplementation(async () => ({
+			backend,
+			current: null,
+			awaitingConfirmation: 0,
+			awaitingYourConfirmation: 0,
+			awaitingFrom: [],
+		})),
+		spyOn(api, "getSessionTaskBoard").mockImplementation(async () => ({
+			scope: { kind: "session", narratorId: NARRATOR },
+			sections: [],
+			canAdd: false,
+			nextCursor: null,
+			me: { userId: "u1", name: "u1" },
+		})),
 		spyOn(api, "getUserPreferences").mockResolvedValue({} as never),
 		spyOn(api, "getSettings").mockResolvedValue({ agent: {} } as never),
 		spyOn(api, "getNarrator").mockResolvedValue({ id: NARRATOR } as never),
@@ -343,4 +360,81 @@ test("with the outline switched off, an outline session's fence tab is editable 
 	// Only on the fence tab.
 	await open("design.md");
 	expect(notice()).toBeNull();
+});
+
+test("an outline session's old Spec files are read only: previews, no task editor, nothing saved", async () => {
+	backend = "outline";
+	server.set("tasks.json", {
+		content: '{"tasks":[{"text":"Old spec task","status":"todo"}]}\n',
+		revisionId: "t2",
+	});
+	spyOn(api, "readSpecTasks").mockImplementation(async () => ({
+		content: server.get("tasks.json")?.content ?? "",
+		revisionId: "t2",
+		document: { tasks: [{ text: "Old spec task", status: "todo" }] },
+		compiled: null as never,
+	}));
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	const legacy = () => host.querySelector('[data-testid="outline-tasks-legacy"]');
+	await waitFor(() => !!legacy());
+	await act(async () => (legacy() as unknown as { click: () => void }).click());
+	const tasks = () => host.querySelector('[data-testid="spec-tasks-readonly"]');
+	await waitFor(() => !!tasks() && !!tasks()?.textContent?.includes("Old spec task"));
+	expect(host.querySelector('[data-testid="outline-tasks-back"]')).not.toBeNull();
+	// No task editor (its empty state, its add and save controls).
+	expect(host.textContent).not.toContain(en.spec.noTasks);
+	await act(async () => {
+		revealSpecFile(NARRATOR, "spec://design.md");
+	});
+	await waitFor(() => !!host.textContent?.includes("snake_case"));
+	expect(host.querySelector("[data-monaco-test-editor]")).toBeNull();
+	expect(writes).toEqual([]);
+});
+
+test("the old Spec files of a session the import moved say so and link to its task page (12b2)", async () => {
+	backend = "outline";
+	let switchedAt: string | null = "2026-11-12T00:00:00.000Z";
+	const status = spyOn(api, "getSpecImportStatus").mockImplementation(async () => ({
+		mode: "auto",
+		importable: false,
+		canImport: false,
+		state: "imported",
+		error: null,
+		reason: null,
+		at: switchedAt,
+		attempts: 0,
+		switchedAt,
+		spaceId: switchedAt ? "space-1" : null,
+		taskPageId: switchedAt ? "page-1" : null,
+		revertedAt: null,
+	}));
+	restores.push(() => status.mockRestore());
+	const settingsSpy = spyOn(api, "getSettings").mockResolvedValue({
+		agent: {},
+		outline: { enabled: true },
+	} as never);
+	restores.push(() => settingsSpy.mockRestore());
+	queryClient.setQueryData(["settings"], { agent: {}, outline: { enabled: true } });
+	await act(async () => {
+		await queryClient.invalidateQueries();
+	});
+	const legacy = () => host.querySelector('[data-testid="outline-tasks-legacy"]');
+	await waitFor(() => !!legacy());
+	await act(async () => (legacy() as unknown as { click: () => void }).click());
+	const notice = () => host.querySelector('[data-testid="spec-moved-notice"]');
+	await waitFor(() => !!notice());
+	expect(notice()?.textContent).toContain(en.spec.specImportMovedTitle);
+	expect(notice()?.textContent).toContain(en.spec.specImportMovedBody);
+	const link = host.querySelector('[data-testid="spec-moved-open"]');
+	expect(link?.textContent).toBe(en.spec.specImportMovedOpen);
+	expect(link?.getAttribute("href")).toEndWith("/outline/space-1/page-1");
+	// A session created in the outline was never moved: no such line.
+	switchedAt = null;
+	await act(async () => {
+		await queryClient.invalidateQueries({ queryKey: ["spec-import", NARRATOR] });
+	});
+	await waitFor(() => !notice());
+	expect(host.querySelector('[data-testid="outline-tasks-back"]')).not.toBeNull();
 });

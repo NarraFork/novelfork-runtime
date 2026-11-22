@@ -28,6 +28,7 @@ const {
 	cancelCompact,
 	createCompactProgressReporter,
 	isCompactInProgress,
+	refreshCompactContextPercentAfter,
 	retryFailedCompact,
 	runCustomCompact,
 	runSegmentCompact,
@@ -35,6 +36,8 @@ const {
 const { narratorService } = await import("../narrator-service");
 const { narratorContext } = await import("../narrator-context");
 const { settings, getSummaryModelContextWindowDetail } = await import("../../lib/settings");
+const catalog = await import("../../lib/model-catalog");
+const historyTokens = await import("../narrator-history-token-estimate");
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -177,7 +180,6 @@ describe("compact metadata lookup failure cleanup", () => {
 	const narratorId = "n-metadata";
 	const validModel = "anthropic:claude-haiku-4-5";
 	const originalSummaryModel = settings.agent.summaryModel;
-	const originalCatalog = settings.agent.modelCatalog;
 
 	beforeEach(() => {
 		cleanDb(sqlite);
@@ -205,21 +207,18 @@ describe("compact metadata lookup failure cleanup", () => {
 			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('r-metadata', ?, 'm-metadata', 0)",
 			[narratorId],
 		);
-		// Exercise the real catalog query's empty upstream ID validation, not a
-		// fake provider failure or a replacement metadata resolver.
-		settings.agent.modelCatalog = {
-			schemaVersion: 2,
-			migrationVersion: 2,
-			local: { revision: 1, models: [] },
-			autoApply: false,
-			pinnedVersion: null,
-		};
+		// The catalog accepts any model value, so a lookup failure is injected at the
+		// catalog boundary for this one value; the settings and compact paths stay real.
+		const realProfile = catalog.getEffectiveModelProfile;
+		spyOn(catalog, "getEffectiveModelProfile").mockImplementation((model, options) => {
+			if (model === "anthropic:") throw new Error("catalog lookup failed: upstreamModelId");
+			return realProfile(model, options);
+		});
 		settings.agent.summaryModel = "anthropic:";
 	});
 
 	afterEach(() => {
 		settings.agent.summaryModel = originalSummaryModel;
-		settings.agent.modelCatalog = originalCatalog;
 		mock.restore();
 	});
 
@@ -247,7 +246,7 @@ describe("compact metadata lookup failure cleanup", () => {
 		return marker?.id ?? "";
 	}
 
-	test("history and failed-marker retry both settle a genuine catalog lookup throw", async () => {
+	test("history and failed-marker retry both settle a catalog lookup throw", async () => {
 		expect(() => getSummaryModelContextWindowDetail("anthropic:")).toThrow("upstreamModelId");
 		const generate = spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
 			summary: "Retained history summary",
@@ -291,5 +290,213 @@ describe("compact metadata lookup failure cleanup", () => {
 		expect(generate.mock.calls[0]?.[9]).toBe("compact-user");
 		expect(broadcasts.some((event) => event.type === "compact_done")).toBe(true);
 		expect(isCompactInProgress(narratorId)).toBe(false);
+	});
+});
+
+describe("compact context occupancy bookkeeping", () => {
+	const narratorId = "n-occupancy";
+	const model = "anthropic:claude-haiku-4-5";
+	const originalSummaryModel = settings.agent.summaryModel;
+
+	beforeEach(() => {
+		cleanDb(sqlite);
+		const now = new Date().toISOString();
+		db.insert(narrators)
+			.values({
+				id: narratorId,
+				type: "primary",
+				inheritMode: "fresh",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		db.insert(narratorMessages)
+			.values({
+				id: "m-occupancy",
+				narratorId,
+				role: "user",
+				contentText: "Keep this history",
+				contentJson: [{ type: "text", text: "Keep this history" }],
+				createdAt: now,
+			})
+			.run();
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('r-occupancy', ?, 'm-occupancy', 0)",
+			[narratorId],
+		);
+		settings.agent.summaryModel = model;
+		broadcasts = [];
+	});
+
+	afterEach(() => {
+		settings.agent.summaryModel = originalSummaryModel;
+		mock.restore();
+	});
+
+	test("records the narrator's own occupancy on both ends of a manual compact", async () => {
+		// The regression this covers: `before` was never recorded for a manual compact, and
+		// `after` was the summary model's own request occupancy (a percentage of a different
+		// window, and usually absent entirely).
+		const percents = [91.5, 2.4];
+		const estimate = spyOn(historyTokens, "estimateNarratorBuildHistoryTokens").mockImplementation(
+			async () => ({
+				promptTokens: 9_150,
+				contextWindow: 10_000,
+				contextPercent: percents.shift(),
+				turnUsage: { prompt_tokens: 9_150, input_tokens: 9_150, is_estimated: true },
+			}),
+		);
+		spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
+			summary: "Retained history summary",
+			// Measured against the summary model's window: never the marker's occupancy.
+			contextPercent: 77,
+		});
+
+		await runCustomCompact(narratorId, "en");
+
+		const markers = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const marker = markers.find((message) => message.id !== "m-occupancy");
+		expect(marker).toBeDefined();
+		const detail = await narratorService.getCompactSummary(narratorId, marker?.id ?? "");
+		expect(detail.status).toBe("compacted");
+		expect(detail.contextPercentBefore).toBe(91.5);
+		expect(detail.contextPercentAfter).toBe(2.4);
+		expect(estimate).toHaveBeenCalledTimes(2);
+	});
+
+	test("editing the summary re-measures the compact's after occupancy", async () => {
+		// A shorter or longer summary moves how much history the next request carries, so the
+		// percentage the detail panel shows has to move with the edit.
+		let percent = 5;
+		spyOn(historyTokens, "estimateNarratorBuildHistoryTokens").mockImplementation(async () => ({
+			promptTokens: 500,
+			contextWindow: 10_000,
+			contextPercent: percent,
+			turnUsage: { prompt_tokens: 500, input_tokens: 500, is_estimated: true },
+		}));
+		spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
+			summary: "Retained history summary",
+			contextPercent: 77,
+		});
+		await runCustomCompact(narratorId, "en");
+
+		const markers = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const marker = markers.find((message) => message.id !== "m-occupancy");
+		expect(marker).toBeDefined();
+		const messageId = marker?.id ?? "";
+		expect(
+			(await narratorService.getCompactSummary(narratorId, messageId)).contextPercentAfter,
+		).toBe(5);
+
+		percent = 1.1;
+		await narratorService.updateCompactSummary(narratorId, messageId, "A much shorter summary");
+		await expect(refreshCompactContextPercentAfter(narratorId, messageId, "en")).resolves.toBe(1.1);
+
+		expect(
+			(await narratorService.getCompactSummary(narratorId, messageId)).contextPercentAfter,
+		).toBe(1.1);
+		const row = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+		});
+		expect(row?.contextPercent).toBe(1.1);
+	});
+
+	async function compactWithEstimates(percent: () => number) {
+		spyOn(historyTokens, "estimateNarratorBuildHistoryTokens").mockImplementation(async () => ({
+			promptTokens: 500,
+			contextWindow: 10_000,
+			contextPercent: percent(),
+			turnUsage: { prompt_tokens: 500, input_tokens: 500, is_estimated: true },
+		}));
+		spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
+			summary: "Retained history summary",
+			contextPercent: 77,
+		});
+		await runCustomCompact(narratorId, "en");
+		const markers = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const marker = markers.find((message) => message.id !== "m-occupancy");
+		expect(marker).toBeDefined();
+		return marker?.id ?? "";
+	}
+
+	test("an edit after later turns keeps the recorded after instead of measuring them", async () => {
+		// Once the narrator has moved on, its current history no longer describes this
+		// compact: re-measuring would publish an `after` that includes the later turns.
+		let percent = 5;
+		const messageId = await compactWithEstimates(() => percent);
+		const later = new Date(Date.now() + 60_000).toISOString();
+		db.insert(narratorMessages)
+			.values({
+				id: "m-later",
+				narratorId,
+				role: "user",
+				contentText: "A later turn",
+				contentJson: [{ type: "text", text: "A later turn" }],
+				createdAt: later,
+			})
+			.run();
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('r-later', ?, 'm-later', 100)",
+			[narratorId],
+		);
+
+		percent = 60;
+		await narratorService.updateCompactSummary(narratorId, messageId, "Edited summary");
+		await expect(refreshCompactContextPercentAfter(narratorId, messageId, "en")).resolves.toBe(
+			undefined,
+		);
+		expect(
+			(await narratorService.getCompactSummary(narratorId, messageId)).contextPercentAfter,
+		).toBe(5);
+	});
+
+	test("an edit copied on write re-measures the copy, never the row a fork still owns", async () => {
+		let percent = 5;
+		const messageId = await compactWithEstimates(() => percent);
+		const now = new Date().toISOString();
+		db.insert(narrators)
+			.values({
+				id: "n-fork",
+				type: "primary",
+				inheritMode: "full",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES ('r-fork', 'n-fork', ?, 1, 1)",
+			[messageId],
+		);
+
+		percent = 1.1;
+		const editedId = await narratorService.updateCompactSummary(
+			narratorId,
+			messageId,
+			"A much shorter summary",
+		);
+		expect(editedId).not.toBe(messageId);
+		broadcasts = [];
+		await expect(refreshCompactContextPercentAfter(narratorId, editedId, "en")).resolves.toBe(1.1);
+
+		expect(
+			(await narratorService.getCompactSummary(narratorId, editedId)).contextPercentAfter,
+		).toBe(1.1);
+		// The fork's row keeps the occupancy measured when the compact ran.
+		expect((await narratorService.getCompactSummary("n-fork", messageId)).contextPercentAfter).toBe(
+			5,
+		);
+		const original = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+		});
+		expect(original?.contextPercent).toBe(5);
+		expect(
+			broadcasts.every((event) => (event.message as { id?: string } | undefined)?.id !== messageId),
+		).toBe(true);
 	});
 });

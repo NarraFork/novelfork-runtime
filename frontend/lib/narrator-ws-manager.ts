@@ -10,6 +10,7 @@
  * dedicated connection via `useTerminalWS`.
  */
 
+import { businessTransport } from "@frontend/lib/business-transport";
 import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
@@ -17,11 +18,12 @@ import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
+import type { BusinessSocket } from "@shared/remote-access/business-transport";
 import { getToken } from "./api";
 import { decodeBlockFrame } from "./block-protocol";
 import { observePageLifecycle } from "./page-lifecycle";
 import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
-import { buildWsUrl, safeCloseWs } from "./ws";
+import { safeCloseWs } from "./ws";
 import { removeWSStatus, setWSStatus } from "./ws-status";
 
 // ---------------------------------------------------------------------------
@@ -383,7 +385,7 @@ export function setNarratorWSShareAuth(auth: { shareId: string; token: string } 
 }
 
 export class NarratorWSManager {
-	private ws: WebSocket | null = null;
+	private ws: BusinessSocket | null = null;
 	private _connected = false;
 	private _disconnected = false;
 	private hasConnectedOnce = false;
@@ -628,7 +630,7 @@ export class NarratorWSManager {
 				removedIds.push(nId);
 			}
 		}
-		if (removedIds.length && this.ws?.readyState === WebSocket.OPEN) {
+		if (removedIds.length && this.ws?.readyState === 1) {
 			for (const narratorIds of chunkNarratorIds(removedIds)) {
 				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds }));
 			}
@@ -721,7 +723,7 @@ export class NarratorWSManager {
 		const record = this.subscriptions.get(handle._id);
 		if (record) record.narratorIds = acceptedNarratorIds;
 
-		if (this.ws?.readyState === WebSocket.OPEN) {
+		if (this.ws?.readyState === 1) {
 			for (const narratorIds of chunkNarratorIds(actuallyRemoved)) {
 				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds }));
 			}
@@ -740,7 +742,7 @@ export class NarratorWSManager {
 			refs = new Set();
 			this.presenceRefCounts.set(narratorId, refs);
 			// First joiner — send to server
-			if (this.ws?.readyState === WebSocket.OPEN) {
+			if (this.ws?.readyState === 1) {
 				this.ws.send(JSON.stringify({ type: "presence_join", narratorId }));
 			}
 		}
@@ -753,7 +755,7 @@ export class NarratorWSManager {
 		refs.delete(handleId);
 		if (refs.size === 0) {
 			this.presenceRefCounts.delete(narratorId);
-			if (this.ws?.readyState === WebSocket.OPEN) {
+			if (this.ws?.readyState === 1) {
 				this.ws.send(JSON.stringify({ type: "presence_leave", narratorId }));
 			}
 		}
@@ -775,7 +777,7 @@ export class NarratorWSManager {
 		if (!refs) {
 			refs = new Set();
 			this.chatRoomRefCounts.set(roomId, refs);
-			if (this.ws?.readyState === WebSocket.OPEN) {
+			if (this.ws?.readyState === 1) {
 				this.ws.send(JSON.stringify({ type: "chat_subscribe", roomIds: [roomId] }));
 			}
 		}
@@ -788,7 +790,7 @@ export class NarratorWSManager {
 		refs.delete(handleId);
 		if (refs.size === 0) {
 			this.chatRoomRefCounts.delete(roomId);
-			if (this.ws?.readyState === WebSocket.OPEN) {
+			if (this.ws?.readyState === 1) {
 				this.ws.send(JSON.stringify({ type: "chat_unsubscribe", roomIds: [roomId] }));
 			}
 		}
@@ -800,14 +802,14 @@ export class NarratorWSManager {
 
 	subscribeStats(): void {
 		this.statsRefCount++;
-		if (this.statsRefCount === 1 && this.ws?.readyState === WebSocket.OPEN) {
+		if (this.statsRefCount === 1 && this.ws?.readyState === 1) {
 			this.ws.send(JSON.stringify({ type: "subscribe_stats" }));
 		}
 	}
 
 	unsubscribeStats(): void {
 		this.statsRefCount = Math.max(0, this.statsRefCount - 1);
-		if (this.statsRefCount === 0 && this.ws?.readyState === WebSocket.OPEN) {
+		if (this.statsRefCount === 0 && this.ws?.readyState === 1) {
 			this.ws.send(JSON.stringify({ type: "unsubscribe_stats" }));
 		}
 	}
@@ -831,14 +833,14 @@ export class NarratorWSManager {
 	// -----------------------------------------------------------------------
 
 	send(message: Record<string, unknown>): boolean {
-		if (this.ws?.readyState !== WebSocket.OPEN) return false;
+		if (this.ws?.readyState !== 1) return false;
 		this.ws.send(JSON.stringify(message));
 		return true;
 	}
 
 	/** Send a binary frame (outline live sessions). False when the socket is not open. */
 	sendBinary(bytes: Uint8Array): boolean {
-		if (this.ws?.readyState !== WebSocket.OPEN) return false;
+		if (this.ws?.readyState !== 1) return false;
 		this.ws.send(bytes as Uint8Array<ArrayBuffer>);
 		return true;
 	}
@@ -1346,7 +1348,7 @@ export class NarratorWSManager {
 	 */
 	checkSync(narratorId: string): boolean {
 		if (this.pendingMessageReconciles.has(narratorId)) return false;
-		if (this.ws?.readyState !== WebSocket.OPEN) return false;
+		if (this.ws?.readyState !== 1) return false;
 		const handle = [...this.subscriptions.values()].find(
 			(record) => record.kind === "messages" && record.narratorIds.includes(narratorId),
 		);
@@ -1378,7 +1380,7 @@ export class NarratorWSManager {
 	 * ask" from "asked and waiting" before arming a liveness timeout.
 	 */
 	checkAllSubscribedSync(): number {
-		if (this.ws?.readyState !== WebSocket.OPEN) return 0;
+		if (this.ws?.readyState !== 1) return 0;
 		const ids = new Set<string>();
 		for (const record of this.subscriptions.values()) {
 			if (record.kind !== "messages") continue;
@@ -1477,7 +1479,7 @@ export class NarratorWSManager {
 		const tokenQuery = shareAuth
 			? `share=${encodeURIComponent(shareAuth.shareId)}&token=${encodeURIComponent(shareAuth.token)}`
 			: `token=${encodeURIComponent(token ?? "")}`;
-		const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
+		const ws = businessTransport.openSocket("/ws/narrator", tokenQuery);
 		// Binary frames (outline live sessions) arrive as bytes, not Blobs.
 		ws.binaryType = "arraybuffer";
 		this.ws = ws;
@@ -1687,7 +1689,7 @@ export class NarratorWSManager {
 		clearTimeout(this.pingTimeoutTimer);
 		this.pingTimeoutTimer = setTimeout(() => {
 			const ws = this.ws;
-			if (!this.cancelled && ws?.readyState === WebSocket.OPEN) {
+			if (!this.cancelled && ws?.readyState === 1) {
 				// Do not wait for browsers to deliver `close` for a half-open socket.
 				// Detach it and schedule the next connection ourselves; otherwise a stale
 				// OPEN socket can leave the entire application without a retry trigger.
@@ -1738,7 +1740,7 @@ export class NarratorWSManager {
 	 */
 	private _restoreSubscriptions(): void {
 		const ws = this.ws;
-		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		if (!ws || ws.readyState !== 1) return;
 
 		// Restore every handle, not just every narrator. Request-scoped snapshots
 		// (panel runtime / message catch-up) must be delivered to the consumer that
@@ -1929,9 +1931,9 @@ export class NarratorWSManager {
 		this._socketDiscarded = false;
 		const socketState: NarratorForegroundSocketState = !this.ws
 			? "missing"
-			: this.ws.readyState === WebSocket.OPEN
+			: this.ws.readyState === 1
 				? "open"
-				: this.ws.readyState === WebSocket.CONNECTING
+				: this.ws.readyState === 0
 					? "connecting"
 					: "closed";
 		const action = decideNarratorForegroundRecovery({
@@ -1980,7 +1982,7 @@ export class NarratorWSManager {
 		if (narratorIds.length === 0) return;
 		// When the socket isn't OPEN there's nothing to send now; reconnect replays
 		// every active handle via `_restoreSubscriptions`, so we simply drop this.
-		if (this.ws?.readyState !== WebSocket.OPEN) return;
+		if (this.ws?.readyState !== 1) return;
 		queueMicrotask(() => this._sendSubscribe(handle, narratorIds, opts));
 	}
 
@@ -1995,7 +1997,7 @@ export class NarratorWSManager {
 		opts?: { downgrade?: boolean },
 	): void {
 		const ws = this.ws;
-		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		if (!ws || ws.readyState !== 1) return;
 		const record = this.subscriptions.get(handle._id);
 		if (!record) return;
 		const activeNarratorIds = narratorIds.filter((nId) => {

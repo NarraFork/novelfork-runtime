@@ -1,19 +1,36 @@
-import { Alert, Button, Card, Group, Loader, Skeleton, Stack, Text, Title } from "@mantine/core";
+import { ProjectSessionList } from "@frontend/components/project/ProjectSessionList";
+import {
+	Alert,
+	Button,
+	Group,
+	Loader,
+	SegmentedControl,
+	Skeleton,
+	Stack,
+	Text,
+	Title,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconListTree } from "@tabler/icons-react";
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Component, lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import { installProjectAccessListener } from "../../hooks/useProjectAccess";
 import { useProject } from "../../hooks/useProjects";
-import { api } from "../../lib/api";
 import { describeApiError } from "../../lib/api-error";
+import { useOpenOutlinePage } from "../../lib/outline-router";
 
 const CreateNarratorModal = lazy(() =>
 	import("../../components/narrator/CreateNarratorModal").then((m) => ({
 		default: m.CreateNarratorModal,
+	})),
+);
+// The project's task board (outline P2 PR 5): the project space and its sessions' spaces.
+const ProjectTaskBoard = lazy(() =>
+	import("../../components/outline/task-board/TaskBoardViews").then((m) => ({
+		default: m.ProjectTaskBoard,
 	})),
 );
 const ProjectSettingsPanel = lazy(() =>
@@ -49,20 +66,14 @@ function ProjectPage() {
 	const [creating, setCreating] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const outline = useOutlineEnabled();
+	const { t: tOutline } = useTranslation("outline");
+	const [view, setView] = useState<"sessions" | "tasks">("sessions");
+	const showTasks = outline.enabled && view === "tasks";
+	const openOutlinePage = useOpenOutlinePage();
 	const openOutline = useOpenOutlineSpace({
 		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
 		onError: (error) =>
 			notifications.show({ color: "red", message: describeApiError(error, t).message }),
-	});
-	const sessions = useInfiniteQuery({
-		queryKey: ["narrators", "project", projectId],
-		queryFn: ({ pageParam }) =>
-			api.listNarratorsPaginated({ projectId, limit: 30, cursor: pageParam }),
-		initialPageParam: undefined as string | undefined,
-		getNextPageParam: (page) => page.nextCursor ?? undefined,
-		// The request needs only projectId; start it in parallel with the project detail.
-		enabled: !project.isError,
-		gcTime: 60_000,
 	});
 	if (project.isError || (!project.isLoading && !project.data))
 		return <Alert color="red">{t("compatibility.unavailable")}</Alert>;
@@ -100,45 +111,41 @@ function ProjectPage() {
 			) : (
 				<Skeleton height={18} width="70%" />
 			)}
-			<Title order={4}>{t("compatibility.sessions")}</Title>
-			{sessions.isLoading && <Loader size="sm" />}
-			{sessions.isError && <Alert color="red">{t("compatibility.sessionsUnavailable")}</Alert>}
-			{!sessions.isError &&
-				sessions.data?.pages
-					.flatMap((page) => page.items)
-					.map((session) => (
-						<Card key={session.id} withBorder>
-							<Group justify="space-between">
-								<Stack gap={2}>
-									<Text>{session.title || session.id}</Text>
-									<Text size="xs" c="dimmed">
-										{session.cwd}
-									</Text>
-								</Stack>
-								<Link
-									to="/narrators/$narratorId"
-									params={{ narratorId: session.id }}
-									style={{ textDecoration: "none" }}
-								>
-									<Button component="span" variant="light">
-										{t("compatibility.openSession")}
-									</Button>
-								</Link>
-							</Group>
-						</Card>
-					))}
-			{sessions.isSuccess && sessions.data.pages.every((page) => page.items.length === 0) && (
-				<Text c="dimmed">{t("compatibility.noSessions")}</Text>
+			{outline.enabled && (
+				<SegmentedControl
+					size="xs"
+					style={{ alignSelf: "flex-start" }}
+					value={view}
+					onChange={(value) => setView(value as "sessions" | "tasks")}
+					data={[
+						{ value: "sessions", label: t("compatibility.sessions") },
+						{ value: "tasks", label: tOutline("board.projectTitle") },
+					]}
+					data-testid="project-view-switch"
+				/>
 			)}
-			{sessions.hasNextPage && (
-				<Button
-					variant="light"
-					loading={sessions.isFetchingNextPage}
-					onClick={() => void sessions.fetchNextPage()}
-				>
-					{t("compatibility.loadMore")}
-				</Button>
+			{showTasks && (
+				<ProjectToolsBoundary fallback={<Alert color="red">{tOutline("board.loadFailed")}</Alert>}>
+					<Suspense fallback={<Loader size="sm" />}>
+						<ProjectTaskBoard
+							projectId={projectId}
+							onOpenTask={(task) =>
+								openOutlinePage({
+									spaceId: task.spaceId,
+									blockId: task.id,
+									pageId: task.pageId,
+									view: "all",
+								})
+							}
+							onOpenSession={(narratorId) =>
+								void navigate({ to: "/narrators/$narratorId", params: { narratorId } })
+							}
+						/>
+					</Suspense>
+				</ProjectToolsBoundary>
 			)}
+			{!showTasks && <Title order={4}>{t("compatibility.sessions")}</Title>}
+			{!showTasks && <ProjectSessionList projectId={projectId} enabled={!project.isError} />}
 			<details onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
 				<summary>{t("advancedSettings")}</summary>
 				{settingsOpen && (

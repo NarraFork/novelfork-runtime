@@ -1,4 +1,5 @@
 import { useMobileViewport } from "@frontend/hooks/useMobileViewport";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import {
@@ -18,6 +19,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { parseProviderWaitInfo } from "@shared/agent-protocol/quota-exhausted";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
 import type {
@@ -84,17 +86,19 @@ import {
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
-import { useSpecTasks } from "../../hooks/useSpec";
+import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	useUpdateExecutionDevice,
 	useWorkspaceContext,
+	workspaceDirectoryRequiredDeviceId,
 	workspaceFileTarget,
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
+import type { SpecTaskItem } from "../../lib/api/spec";
 import { describeApiError } from "../../lib/api-error";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
@@ -115,6 +119,7 @@ import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
 	invalidateRevertQueries,
+	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "../../lib/revert-result";
 import { formatRevertWarnings } from "../../lib/revert-warnings";
@@ -128,6 +133,7 @@ import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
+import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
@@ -147,6 +153,7 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { DeviceDirectoryDialog } from "./header/DeviceDirectoryDialog";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -178,9 +185,11 @@ import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions"
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
+import { useSubagentSessionOpener } from "./interaction/use-subagent-session-opener";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { AgentReferenceOpenerContext } from "./markdown/AgentReferenceLink";
 import { inputBlockIdOf } from "./message/block-target";
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
@@ -218,6 +227,7 @@ import {
 import { filePanelBaseName } from "./panels/panel-kind";
 import { preloadPendingPanelTail } from "./preload-panel-tail";
 import { compactProgressLabel } from "./progress-label";
+import { RemoteUnsupported } from "./RemoteUnsupported";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
 import { type SwipeAnchorInfo, setGlobalOnSwipeAnchorInfo } from "./scroll/swipeState";
@@ -234,25 +244,29 @@ import { useWorkspaceDock } from "./workspace/workspace-dock";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
-const SaveDumpModal = lazy(() =>
-	import("./SaveDumpModal").then((m) => ({ default: m.SaveDumpModal })),
-);
+const SaveDumpModal = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() => import("./SaveDumpModal").then((m) => ({ default: m.SaveDumpModal })));
 
-const NarratorDetailsPanel = lazy(() =>
-	import("./details/NarratorDetailsPanel").then((module) => ({
-		default: module.NarratorDetailsPanel,
-	})),
-);
+const NarratorDetailsPanel = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() =>
+			import("./details/NarratorDetailsPanel").then((module) => ({
+				default: module.NarratorDetailsPanel,
+			})),
+		);
 
-const SpecPanel = lazy(() =>
-	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
-);
+const SpecPanel = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() => import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })));
 // The drawer and dock use the same editor / binary-preview entry.
-const FilePanelContent = lazy(() =>
-	import("./file-panel/FilePanelContent").then((module) => ({
-		default: module.FilePanelContent,
-	})),
-);
+const FilePanelContent = REMOTE_BUILD
+	? RemoteUnsupported
+	: lazy(() =>
+			import("./file-panel/FilePanelContent").then((module) => ({
+				default: module.FilePanelContent,
+			})),
+		);
 
 // Flag-gated pretext virtualized list. Now the default renderer, but still lazily
 // imported so an explicit opt-out (Virtual OFF) never bundles vlist; the isolation
@@ -405,6 +419,7 @@ function NarratorPanelBody({
 	const {
 		visibleWithDefault: allModels,
 		groupedModels,
+		modelOptionsFilter,
 		defaultModelValue,
 		summaryModelValue,
 		settingsData,
@@ -451,6 +466,7 @@ function NarratorPanelBody({
 	const permissionReflections = narratorPermissionsCapability.reflections;
 	const planReflectionSupported = permissionReflections.includes("plan");
 	const dangerReflectionSupported = permissionReflections.includes("danger");
+	const questionReflectionSupported = permissionReflections.includes("question");
 	const planModeCapability = useNarratorPlanModeCapability();
 	const planModeSupported = planModeCapability.supported;
 	const planModeUnsupportedReason = planModeSupported
@@ -501,13 +517,26 @@ function NarratorPanelBody({
 	const executionDevicesQuery = useQuery({
 		queryKey: ["narratorExecutionDevices", narratorId],
 		queryFn: () => api.getNarratorExecutionDevices(narratorId),
-		enabled: !isWorkspacePreview,
+		enabled: !REMOTE_BUILD && !isWorkspacePreview,
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
-	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) =>
-		notifications.show({ color: "red", message: error.message }),
-	);
+	// A device with no recorded directory refuses the switch; that is a prompt, not a
+	// failure, so it opens the directory dialog instead of a red toast. The dialog is
+	// mounted here (outside the header and overflow menus) so both entry points share it.
+	const [directoryDeviceId, setDirectoryDeviceId] = useState<string | null>(null);
+	const requireDeviceDirectory = useCallback((deviceId: string) => {
+		setDirectoryDeviceId(deviceId);
+	}, []);
+	const closeDeviceDirectoryDialog = useCallback(() => setDirectoryDeviceId(null), []);
+	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) => {
+		const missingDirectoryDevice = workspaceDirectoryRequiredDeviceId(error);
+		if (missingDirectoryDevice) {
+			requireDeviceDirectory(missingDirectoryDevice);
+			return;
+		}
+		notifications.show({ color: "red", message: error.message });
+	});
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -558,6 +587,7 @@ function NarratorPanelBody({
 	);
 	const dangerReflectionGlobal = dangerReflectionGlobalLevel !== "off";
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
+	const questionReflectionGlobal = settingsData?.agent?.questionReflectionEnabled ?? false;
 	const reflectionSettingsDisabled =
 		!settingsData || updateSettingsMutation.isPending || reflectionOverridesMutation.isPending;
 	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
@@ -622,6 +652,10 @@ function NarratorPanelBody({
 		onMinimize,
 		onBack,
 	});
+	// The panel is the phone's whole page (the route hands it the horizontal safe areas
+	// for exactly that case), so its header is the top of the screen and carries the
+	// menu button: phones have no header row of their own.
+	const showMobileNav = !REMOTE_BUILD && ownsHorizontalSafeArea && isMobileViewport;
 
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
@@ -635,7 +669,11 @@ function NarratorPanelBody({
 	// status bar (see useStatusBarProps), which is where they are consumed.
 	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
 		useResolvedModel(
-			capabilityModelReference(narrator?.model, narrator?.modelInheritance?.model),
+			capabilityModelReference(
+				narrator?.model,
+				narrator?.modelInheritance?.model,
+				narrator?.runtimeModel,
+			),
 			defaultModelValue,
 			aggregations,
 			allModels,
@@ -680,7 +718,7 @@ function NarratorPanelBody({
 	const commandCodeUsageQuery = useQuery({
 		queryKey: ["commandcode", "usage"],
 		queryFn: () => api.commandCodeUsage(),
-		enabled: commandCodeEnabled,
+		enabled: !REMOTE_BUILD && commandCodeEnabled,
 		refetchInterval: commandCodeEnabled ? 60_000 : false,
 	});
 	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
@@ -705,7 +743,7 @@ function NarratorPanelBody({
 	const { data: kimiUsagesData } = useQuery({
 		queryKey: ["kimi", "usages"],
 		queryFn: api.kimiGetUsages,
-		enabled: currentKimiProviderId != null && firstScreenActivity,
+		enabled: !REMOTE_BUILD && currentKimiProviderId != null && firstScreenActivity,
 		staleTime: 30_000,
 		refetchInterval: 60_000,
 	});
@@ -824,8 +862,24 @@ function NarratorPanelBody({
 					...opts,
 					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});
-				if (!result.ok || (result.revertResult && !isRevertHistoryCommitted(result.revertResult))) {
+				// "Restore available files" leaves the plan's history uncommitted on purpose;
+				// the server then finishes the edit history-only.
+				const availableOnly =
+					!!result.revertResult && isAvailableFilesRestored(result.revertResult);
+				if (
+					!result.ok ||
+					(result.revertResult && !availableOnly && !isRevertHistoryCommitted(result.revertResult))
+				) {
 					throw new ApiError(t("editFailed"), 409, { ...result });
+				}
+				if (availableOnly && result.revertResult) {
+					notifications.show({
+						title: t("revertAvailableFilesRestoredTitle"),
+						message: t("revertAvailableFilesRestored", {
+							count: result.revertResult.files.length,
+						}),
+						color: "blue",
+					});
 				}
 				// File writes and the COW history update have independent outcomes.
 				const warningText = [
@@ -1487,10 +1541,12 @@ function NarratorPanelBody({
 	const [internalSpecOpen, setInternalSpecOpen] = useState(false);
 	const subagentInDock = !!dock && dock.narratorId !== narratorId;
 	const useDockSpec = !!dock && !subagentInDock;
-	const useInternalSpec = !useDockSpec && !onToggleSpecPanel && !isWorkspacePreview;
+	const useInternalSpec =
+		!REMOTE_BUILD && !useDockSpec && !onToggleSpecPanel && !isWorkspacePreview;
 	// Button availability mirrors the render conditions exactly: whenever a spec
 	// surface exists (dock / external / internal), the toolbar entry point exists.
-	const specToolAvailable = useDockSpec || !!onToggleSpecPanel || useInternalSpec;
+	const specToolAvailable =
+		!REMOTE_BUILD && (useDockSpec || !!onToggleSpecPanel || useInternalSpec);
 	const specToolOpened = useDockSpec
 		? dock.openToolTypes.has("spec")
 		: onToggleSpecPanel
@@ -1519,7 +1575,8 @@ function NarratorPanelBody({
 	// Dock tool panels are scoped to the base narrator in context; hide the button
 	// for pushed subagent views so the badge and opened panel never disagree.
 	const tasksPanelMatchesCurrentNarrator = !dock || dock.narratorId === narratorId;
-	const tasksButtonEnabled = !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
+	const tasksButtonEnabled =
+		!REMOTE_BUILD && !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
 	const {
 		supported: tasksSupported,
 		runningCount: tasksRunningCount,
@@ -1530,11 +1587,22 @@ function NarratorPanelBody({
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
 
-	// Dynamic Spec current task, for the compact status bar above the input.
-	const { data: specTasksData } = useSpecTasks(narratorId, firstScreenActivity);
-	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
+	// The current task, for the compact status bar above the input: from the session's task source
+	// (Dynamic Spec or the outline, outline P2 PR 5).
+	const { data: currentTaskData } = useNarratorCurrentTask(narratorId, firstScreenActivity);
+	const currentSpecTask = useMemo<SpecTaskItem | null>(
+		() =>
+			currentTaskData?.current
+				? {
+						text: currentTaskData.current.text,
+						status: "doing",
+						...(currentTaskData.current.protected ? { protected: true as const } : {}),
+					}
+				: null,
+		[currentTaskData],
+	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
-	const terminalToolAvailable = !!dock || !!onToggleTerminal;
+	const terminalToolAvailable = !REMOTE_BUILD && (!!dock || !!onToggleTerminal);
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
@@ -1544,6 +1612,7 @@ function NarratorPanelBody({
 	// through the dock context (writes to the terminal panel if one is open).
 	const dockWriteTerminalStdin = dock?.writeTerminalStdin;
 	const effSendToTerminal = useMemo<((text: string) => void) | undefined>(() => {
+		if (REMOTE_BUILD) return undefined;
 		if (onSendToTerminal) return onSendToTerminal;
 		if (dock && terminalToolOpened && dockWriteTerminalStdin) return dockWriteTerminalStdin;
 		return undefined;
@@ -1698,13 +1767,18 @@ function NarratorPanelBody({
 	 * "waiting for your approval", so it must be checked first to keep the
 	 * attention-colored (yellow) treatment off a wait the user cannot resolve.
 	 */
-	const isWaitingForModel = substatus.includes("model_unavailable");
+	const timedWaitInfo = quotaWaitInfo ?? parseProviderWaitInfo(narrator?.errorMessage);
+	const isTransientWait =
+		timedWaitInfo?.waitKind === "capacity" || timedWaitInfo?.waitKind === "rate_limit";
+	const isWaitingForModel =
+		substatus.includes("model_unavailable") ||
+		(substatus.includes("quota_exhausted") && isTransientWait);
 	/**
 	 * Parked until an exhausted Kimi quota window resets. A sibling of the model
 	 * outage above — also a wait on the machine — kept separate because the label
 	 * and the notice have to say which of the two is happening.
 	 */
-	const isWaitingForQuota = substatus.includes("quota_exhausted");
+	const isWaitingForQuota = substatus.includes("quota_exhausted") && !isTransientWait;
 	const isWaitingForRecovery = isWaitingForModel || isWaitingForQuota;
 	/** Registry-owned accent for that state, so the shade lives in one place. */
 	const modelUnavailableColor = statusRegistry.accentColor(
@@ -2089,22 +2163,7 @@ function NarratorPanelBody({
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
-	const handleVlistViewSubagentSession = useCallback(
-		(subagentNarratorId: string, messageId?: string) => {
-			if (onViewSubagentSession) {
-				onViewSubagentSession(subagentNarratorId, messageId);
-				return;
-			}
-			// Standalone fallback: the narrator page reads `?scrollTo=` as its
-			// highlight target, which is the same jump the dock performs in-place.
-			navigate({
-				to: "/narrators/$narratorId",
-				params: { narratorId: subagentNarratorId },
-				search: messageId ? { scrollTo: messageId } : undefined,
-			});
-		},
-		[onViewSubagentSession, navigate],
-	);
+	const handleVlistViewSubagentSession = useSubagentSessionOpener(onViewSubagentSession);
 
 	/**
 	 * Open the Dynamic Spec panel with one file selected.
@@ -2790,6 +2849,7 @@ function NarratorPanelBody({
 		toggleTerminalTool,
 		toggleSpecTool,
 		updateExecutionDeviceMutation,
+		onRequireDeviceDirectory: requireDeviceDirectory,
 		renderLod,
 		renderLodIsDefault,
 		handleSelectLod,
@@ -2804,6 +2864,7 @@ function NarratorPanelBody({
 		() => ({
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			onRequireDeviceDirectory: requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -2813,6 +2874,7 @@ function NarratorPanelBody({
 		[
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -2881,16 +2943,23 @@ function NarratorPanelBody({
 	const compactProgressFragment = compactProgressText ?? "";
 
 	/**
-	 * Label for a quota wait, with the reset instant when the server reported one.
+	 * Label for a timed provider wait, with the retry instant when reported.
 	 *
-	 * Gated on `isWaitingForQuota` so a stale clock can never survive the wait it
-	 * belongs to: the substatus is the authoritative "still parked" signal and
-	 * `quotaWaitInfo` only supplies the time.
+	 * Gated on the waiting substatus so a stale clock cannot survive its wait.
+	 * Live details take precedence; the persisted payload restores them on reload.
 	 */
 	const quotaWaitText = (() => {
-		const label = t("status_quota_exhausted");
-		const resumeAt = quotaWaitInfo?.resumeAt;
-		if (!isWaitingForQuota || !resumeAt) return label;
+		const label = t(
+			isWaitingForRecovery && timedWaitInfo?.waitKind === "capacity"
+				? "status_capacity"
+				: isWaitingForRecovery && timedWaitInfo?.waitKind === "rate_limit"
+					? "status_rate_limit"
+					: isWaitingForQuota
+						? "status_quota_exhausted"
+						: "status_model_unavailable",
+		);
+		const resumeAt = timedWaitInfo?.resumeAt;
+		if (!isWaitingForRecovery || !resumeAt) return label;
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
@@ -3132,15 +3201,29 @@ function NarratorPanelBody({
 					{...dropZoneProps}
 				>
 					{toolbarController.toolbarOverlays}
-					<NugRechargeDialog
-						opened={nugRechargeOpened}
-						narratorId={narratorId}
-						providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
-						providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
-						paymentRequired={paymentRequired}
-						onClose={closeNugRecharge}
-						onPaymentRequiredChange={setPaymentRequired}
-					/>
+					{!REMOTE_BUILD && (
+						<DeviceDirectoryDialog
+							narratorId={narratorId}
+							deviceId={directoryDeviceId}
+							deviceName={
+								executionDevicesQuery.data?.devices.find(
+									(device) => device.id === directoryDeviceId,
+								)?.name
+							}
+							onClose={closeDeviceDirectoryDialog}
+						/>
+					)}
+					{!REMOTE_BUILD && (
+						<NugRechargeDialog
+							opened={nugRechargeOpened}
+							narratorId={narratorId}
+							providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
+							providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
+							paymentRequired={paymentRequired}
+							onClose={closeNugRecharge}
+							onPaymentRequiredChange={setPaymentRequired}
+						/>
+					)}
 					{/* Drop overlay */}
 					<DropOverlay visible={isDragging} />
 					{/* Header — title-first arithmetic, single flex row, no flex fight:
@@ -3148,6 +3231,7 @@ function NarratorPanelBody({
 					<NarratorHeaderLayout
 						titleFullWidth={headerTitleFullWidth}
 						showBack={showLeadingChrome}
+						showMenu={showMobileNav}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
@@ -3168,6 +3252,8 @@ function NarratorPanelBody({
 										overflow: "hidden",
 									}}
 								>
+									{/* Phones: this row is the top of the screen, so it opens the drawer. */}
+									{showMobileNav && <MobileNavButton />}
 									{showLeadingChrome &&
 										(onBack ? (
 											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
@@ -3336,11 +3422,13 @@ function NarratorPanelBody({
 						onClose={closeCompactSummaryModal}
 					/>
 
-					<NarratorProjectSettingsModal
-						projectId={compatibilityProjectId}
-						opened={compatibilityOpen}
-						onClose={() => setCompatibilityOpen(false)}
-					/>
+					{!REMOTE_BUILD && (
+						<NarratorProjectSettingsModal
+							projectId={compatibilityProjectId}
+							opened={compatibilityOpen}
+							onClose={() => setCompatibilityOpen(false)}
+						/>
+					)}
 
 					<ContextThresholdSettingsModal
 						opened={contextThresholdSettingsOpened}
@@ -3357,7 +3445,7 @@ function NarratorPanelBody({
 					    driven by the `opened` prop, matching the terminal/spec drawers.
 					    All of the panel's data hooks are `opened`-gated, so a mounted-
 					    but-closed drawer fetches nothing. */}
-					{!dock && !onToggleDetailsPanel && (
+					{!REMOTE_BUILD && !dock && !onToggleDetailsPanel && (
 						<Suspense fallback={null}>
 							<NarratorDetailsPanel
 								opened={detailsOpened}
@@ -3422,6 +3510,7 @@ function NarratorPanelBody({
 															onSelectionResolverChange={setChunkSelectionResolver}
 															rowHandlers={vlistRowHandlers}
 															permCb={permCbWithAsyncQuestions}
+															enableOutlineAsk={!isWorkspacePreview}
 															highlightMessageId={highlightMessageId}
 															highlightRequestId={highlightRequestId}
 															highlightNeedle={highlightNeedle}
@@ -3619,6 +3708,13 @@ function NarratorPanelBody({
 								isRetrying,
 								isCompacting,
 								currentSpecTask,
+								awaitingConfirmation: currentTaskData
+									? {
+											total: currentTaskData.awaitingConfirmation,
+											yours: currentTaskData.awaitingYourConfirmation,
+											from: currentTaskData.awaitingFrom,
+										}
+									: null,
 								retryInfo,
 								compactingMarkerMessageId,
 								compactFailure,
@@ -3694,7 +3790,7 @@ function NarratorPanelBody({
 								toolAvailable: terminalToolAvailable,
 								toolOpened: terminalToolOpened,
 								activeCount: activeTerminalCount,
-								onOpenPanel: onOpenTerminalPanel,
+								onOpenPanel: REMOTE_BUILD ? undefined : onOpenTerminalPanel,
 								onToggle: toggleTerminalTool,
 							},
 							promote: {
@@ -3730,11 +3826,14 @@ function NarratorPanelBody({
 							planModeUnsupportedReason,
 							planReflectionSupported,
 							dangerReflectionSupported,
+							questionReflectionSupported,
 							narratorPlanReflectionAutoApproveOverride: narrator.planReflectionAutoApproveOverride,
 							narratorDangerReflectionOverride: narrator.dangerReflectionOverride,
+							narratorQuestionReflectionOverride: narrator.questionReflectionOverride,
 							planReflectionAutoApproveGlobal,
 							dangerReflectionGlobal,
 							dangerReflectionGlobalLevel,
+							questionReflectionGlobal,
 							settingsLoaded: !!settingsData,
 							enterPlanModeMutation,
 							exitPlanModeMutation,
@@ -3833,7 +3932,7 @@ function NarratorPanelBody({
 					    Mounted only while a path is selected (and torn down on close), so a
 					    session that never opens a file pays nothing. Same viewer body the
 					    dock's `file` panel renders. */}
-					{internalFileViewerPath && (
+					{!REMOTE_BUILD && internalFileViewerPath && (
 						<Drawer
 							opened={fileDrawerVisible}
 							keepMounted
@@ -3883,7 +3982,7 @@ function NarratorPanelBody({
 						</Drawer>
 					)}
 					{/* The outline's off-dock host: opened only when no dock took the place. */}
-					{outlineDrawer && (
+					{!REMOTE_BUILD && outlineDrawer && (
 						<OutlineDrawerHost
 							state={outlineDrawer}
 							onChange={setOutlineDrawer}
@@ -3899,7 +3998,7 @@ function NarratorPanelBody({
 					 * point. Mounted only when this panel has no dock to put panels in, so
 					 * a desktop surface keeps using real dockview tabs.
 					 */}
-					{!dock && !isWorkspacePreview && (
+					{!REMOTE_BUILD && !dock && !isWorkspacePreview && (
 						<>
 							<MobileToolPanelHost
 								kind={mobileToolPanel}
@@ -3955,6 +4054,7 @@ function NarratorPanelBody({
 				opened={globalModelEditTarget != null}
 				mode={globalModelEditTarget}
 				groupedModels={groupedModels}
+				modelOptionsFilter={modelOptionsFilter}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
 				onClose={closeGlobalModelModal}
@@ -3964,5 +4064,9 @@ function NarratorPanelBody({
 			/>
 		</PermEnterHintCtx.Provider>
 	);
-	return <OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>;
+	return (
+		<AgentReferenceOpenerContext.Provider value={handleVlistViewSubagentSession}>
+			<OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>
+		</AgentReferenceOpenerContext.Provider>
+	);
 }

@@ -8,6 +8,7 @@ import {
 } from "@server/db/legacy-request-storage";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import {
+	resumeDbWorkerPool,
 	runEphemeralReadTask,
 	runReadTask,
 	shutdownDbWorkerPool,
@@ -30,6 +31,10 @@ import { AppError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { narratorService } from "@server/services/narrator-service";
 import {
+	pauseModelHistorySourceWorkers,
+	resumeModelHistorySourceWorkers,
+} from "./agent-runtime/model-history-source";
+import {
 	buildNarratorCleanupPlan,
 	type CleanupPlanBlockedRoot,
 	type CleanupPlanRoot,
@@ -38,6 +43,7 @@ import {
 	type NarratorCleanupPlan,
 	type NarratorCleanupRecord,
 } from "./database-cleanup-utils";
+import { DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS } from "./storage/database-storage-port";
 // Storage-scan query primitives live in a DB-singleton-free module so the read worker can import
 // them without re-bootstrapping the database. See storage-scan-queries.ts for why that matters.
 import {
@@ -51,6 +57,10 @@ import {
 	type SessionOwnedTableRelation,
 	summarizeToolCallPayloads,
 } from "./storage-scan-queries";
+import {
+	pauseTokenRecalculationWorkers,
+	resumeTokenRecalculationWorkers,
+} from "./token-recalculation-worker-client";
 
 export type {
 	DatabaseCleanupBlockedReasonCode,
@@ -87,6 +97,11 @@ function legacyRequestDumpsRetained(): boolean {
 	return hasRetainedLegacyRequestDump(sqlite);
 }
 const databaseMaintenanceLock = new AsyncMutex();
+
+/** Share the maintenance window with bounded history cleanup batches. */
+export function withDatabaseMaintenance<T>(work: () => Promise<T>): Promise<T> {
+	return databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, work);
+}
 
 const SESSION_OWNED_TABLES: SessionOwnedTableRelation[] = [
 	{ tableName: "narrator_message_refs", alias: "r", narratorColumn: "narrator_id" },
@@ -426,6 +441,7 @@ function isCleanupRootStillEligible(
 async function runCleanupReadTask<T>(
 	params: StorageScanCleanupSummariesParams | StorageScanSessionPreviewParams,
 	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<T> {
 	if (params.kind === "storageScanSessionPreview") {
 		try {
@@ -438,25 +454,32 @@ async function runCleanupReadTask<T>(
 		}
 	}
 	const dbPath = getDbPath();
+	const options = () => ({
+		signal,
+		...(deadlineAt === undefined ? {} : { timeoutMs: Math.max(0, deadlineAt - Date.now()) }),
+	});
 	try {
-		return await runReadTask<T>(dbPath, params, { signal });
+		try {
+			return await runReadTask<T>(dbPath, params, options());
+		} catch (err) {
+			if (signal?.aborted) throw err;
+			if (!(err instanceof WorkersUnavailableError) || err.reason === "pool_shutdown") throw err;
+			// Only inability to start the work justifies another worker. A watchdog or SQL
+			// error after a real read must not repeat the same large payload scan.
+			return await runEphemeralReadTask<T>(dbPath, params, options());
+		}
 	} catch (err) {
 		if (signal?.aborted) throw err;
 		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
-		try {
-			return await runEphemeralReadTask<T>(dbPath, params, { signal });
-		} catch (ephemeralErr) {
-			if (signal?.aborted) throw ephemeralErr;
-			logger.warn("Database cleanup read workers unavailable", {
-				task: params.kind,
-				reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
-			});
-			throw new AppError(
-				"Database cleanup statistics are unavailable: read workers failed",
-				503,
-				"DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
-			);
-		}
+		logger.warn("Database cleanup read workers unavailable", {
+			task: params.kind,
+			reason: err instanceof Error ? err.message : String(err),
+		});
+		throw new AppError(
+			"Database cleanup statistics are unavailable: read workers failed",
+			503,
+			"DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
+		);
 	}
 }
 
@@ -741,6 +764,7 @@ function cleanupSummariesFromAggregates(
  */
 async function measureCleanupCandidatesOffThread(
 	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<DatabaseStorageBreakdown["cleanupCandidates"]> {
 	const cleanupContext = await loadCleanupNarratorContext();
 	const archivedPlan = buildNarratorCleanupPlan("archivedSessions", cleanupContext.narrators, {
@@ -763,7 +787,11 @@ async function measureCleanupCandidatesOffThread(
 		relations: SESSION_OWNED_TABLES,
 		toolCallCutoffIso: getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS),
 	};
-	const aggregates = await runCleanupReadTask<StorageScanCleanupSummariesResult>(params, signal);
+	const aggregates = await runCleanupReadTask<StorageScanCleanupSummariesResult>(
+		params,
+		signal,
+		deadlineAt,
+	);
 	return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
 }
 
@@ -784,20 +812,26 @@ export const databaseCleanupService = {
 		const startedAt = performance.now();
 		let executedOn: ParallelScanOutcome["executedOn"] = "workers";
 		if (options.signal?.aborted) throw new Error("database storage scan aborted");
-		const cleanup = measureCleanupCandidatesOffThread(options.signal);
+		const deadlineAt = Date.now() + DEFAULT_DATABASE_STORAGE_SCAN_BUDGET_MS;
+		const scope = new AbortController();
+		const signal = options.signal ? AbortSignal.any([options.signal, scope.signal]) : scope.signal;
+		const cleanup = measureCleanupCandidatesOffThread(signal, deadlineAt);
 		// It runs concurrently with the object scan, which may outlive a fast worker failure.
 		cleanup.catch(() => {});
 		try {
 			const fileSizes = await getDatabaseFileSizes();
-			const objectStorage = await runParallelObjectStorageScan({
-				sqlite,
-				dbPath: getDbPath(),
-				mainBytes: fileSizes.mainBytes,
-				onProgress: options.onProgress,
-				signal: options.signal,
-			});
+			const [objectStorage, cleanupCandidates] = await Promise.all([
+				runParallelObjectStorageScan({
+					sqlite,
+					dbPath: getDbPath(),
+					mainBytes: fileSizes.mainBytes,
+					onProgress: options.onProgress,
+					signal,
+					budgetMs: Math.max(0, deadlineAt - Date.now()),
+				}),
+				cleanup,
+			]);
 			executedOn = objectStorage.executedOn;
-			const cleanupCandidates = await cleanup;
 			const { executedOn: _executedOn, workerCount, durationMs, ...storage } = objectStorage;
 			logger.info("Database storage scan completed", {
 				executedOn: objectStorage.executedOn,
@@ -815,6 +849,8 @@ export const databaseCleanupService = {
 			cleanup.catch(() => {});
 			throw err;
 		} finally {
+			// Either branch failing must release the other's read workers, not leave an orphan scan.
+			scope.abort();
 			logSlowDatabaseStep("scanDatabaseBreakdown", startedAt, { executedOn });
 		}
 	},
@@ -964,98 +1000,122 @@ export const databaseCleanupService = {
 		const startedAt = performance.now();
 		try {
 			return await databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, async () => {
-				// The maintenance lock only serialises callers inside this process. Read workers hold
-				// their OWN connections, and a worker mid-scan keeps a read transaction open — which
-				// makes VACUUM's exclusive lock fail with SQLITE_BUSY. Terminate the pool first so the
-				// maintenance window really is exclusive. The pool respawns lazily on the next scan.
-				shutdownDbWorkerPool();
-				const beforeSizes = await getDatabaseFileSizes();
-				const beforeBytes = totalDatabaseBytes(beforeSizes);
-				// Pragmas only. A full object scan here would read every table just to keep one number,
-				// and would itself contend with the writer we are about to hand an exclusive lock to.
-				//
-				// A refusal rather than a silent zero: an operator who explicitly asked for space
-				// reclamation must be told the backend cannot measure it, not handed a report full of
-				// zeroes that reads like "nothing to reclaim".
-				const beforeStorage = requireReusableSpace(beforeSizes.mainBytes);
-				let checkpointRan = false;
-				let optimized = false;
+				// The lock is process-local; each SQLite worker owns an independent connection.
+				// First let the token owner finish an already-committing batch, then drain readers.
+				let resumeFailures: unknown[] = [];
+				const result = await (async () => {
+					try {
+						await pauseTokenRecalculationWorkers();
+						await pauseModelHistorySourceWorkers();
+						await shutdownDbWorkerPool({ pause: true });
+						const beforeSizes = await getDatabaseFileSizes();
+						const beforeBytes = totalDatabaseBytes(beforeSizes);
+						// Pragmas only. A full object scan here would read every table just to keep one number,
+						// and would itself contend with the writer we are about to hand an exclusive lock to.
+						//
+						// A refusal rather than a silent zero: an operator who explicitly asked for space
+						// reclamation must be told the backend cannot measure it, not handed a report full of
+						// zeroes that reads like "nothing to reclaim".
+						const beforeStorage = requireReusableSpace(beforeSizes.mainBytes);
+						let checkpointRan = false;
+						let optimized = false;
 
-				/**
-				 * Whether the step actually did its work.
-				 *
-				 * `supported` alone is not enough: the port reports a best-effort step that FAILED as
-				 * `supported: { ok: false }`, because an absent capability and a failed one are different
-				 * facts. Reporting `checkpointRan: true` for a checkpoint that threw would tell the
-				 * operator the WAL was flushed when it was not.
-				 */
-				const ran = (result: ReturnType<typeof databaseMaintenance.checkpoint>): boolean =>
-					result.supported && result.value.ok;
+						/**
+						 * Whether the step actually did its work.
+						 *
+						 * `supported` alone is not enough: the port reports a best-effort step that FAILED as
+						 * `supported: { ok: false }`, because an absent capability and a failed one are different
+						 * facts. Reporting `checkpointRan: true` for a checkpoint that threw would tell the
+						 * operator the WAL was flushed when it was not.
+						 */
+						const ran = (result: ReturnType<typeof databaseMaintenance.checkpoint>): boolean =>
+							result.supported && result.value.ok;
 
-				// Truncating checkpoint before the rewrite: PASSIVE cannot shrink the WAL, and WAL bytes
-				// left behind would show up as "freed nothing" after a VACUUM that did work.
-				checkpointRan = ran(databaseMaintenance.checkpoint({ truncate: true }));
+						// Truncating checkpoint before the rewrite: PASSIVE cannot shrink the WAL, and WAL bytes
+						// left behind would show up as "freed nothing" after a VACUUM that did work.
+						checkpointRan = ran(databaseMaintenance.checkpoint({ truncate: true }));
 
-				try {
-					const reclaimed = databaseMaintenance.reclaimSpace();
-					if (!reclaimed.supported) {
-						// "This backend cannot reclaim space" is a different answer from "the rewrite
-						// failed", and conflating them would tell the operator to retry something that will
-						// never work. 501 rather than 500: the request was valid, the capability is absent.
-						logger.warn("Database space reclamation is unavailable on this backend", {
-							code: reclaimed.code,
-							reason: reclaimed.reason,
+						try {
+							const reclaimed = databaseMaintenance.reclaimSpace();
+							if (!reclaimed.supported) {
+								// "This backend cannot reclaim space" is a different answer from "the rewrite
+								// failed", and conflating them would tell the operator to retry something that will
+								// never work. 501 rather than 500: the request was valid, the capability is absent.
+								logger.warn("Database space reclamation is unavailable on this backend", {
+									code: reclaimed.code,
+									reason: reclaimed.reason,
+								});
+								throw new AppError(
+									`Space reclamation is unavailable: ${describeUnsupported(reclaimed)}`,
+									501,
+									"DATABASE_VACUUM_UNSUPPORTED",
+								);
+							}
+						} catch (error) {
+							if (error instanceof AppError) throw error;
+							// Previously unguarded, so a lock conflict surfaced as a bare 500. The port classifies
+							// the failure so this decision no longer depends on SQLite error strings.
+							const failure = databaseMaintenance.classifyFailure(error);
+							logger.warn("Database space reclamation failed", {
+								kind: failure.kind,
+								error: failure.message,
+							});
+							throw new AppError(
+								`VACUUM could not run: ${failure.message}`,
+								failure.kind === "conflict" ? 409 : 500,
+								"DATABASE_VACUUM_FAILED",
+							);
+						}
+
+						optimized = ran(databaseMaintenance.refreshPlannerStatistics());
+						// Checkpoint again: VACUUM leaves its work in the WAL, so without this the file on disk
+						// has not actually shrunk yet and the after-size would understate what was reclaimed.
+						// `||` keeps the flag true when the first checkpoint succeeded and this one did not:
+						// the field means "a checkpoint ran", matching the pre-refactor behaviour.
+						checkpointRan =
+							ran(databaseMaintenance.checkpoint({ truncate: true })) || checkpointRan;
+
+						const afterSizes = await getDatabaseFileSizes();
+						const afterBytes = totalDatabaseBytes(afterSizes);
+						const afterStorage = requireReusableSpace(afterSizes.mainBytes);
+						const result: DatabaseVacuumResult = {
+							ok: true,
+							beforeBytes,
+							afterBytes,
+							freedBytes: Math.max(0, beforeBytes - afterBytes),
+							freelistBeforeBytes: beforeStorage.freelistBytes,
+							freelistAfterBytes: afterStorage.freelistBytes,
+							vacuumRan: true,
+							checkpointRan,
+							optimized,
+							durationMs: Math.round(performance.now() - startedAt),
+						};
+						logger.info("Database VACUUM completed", {
+							freedBytes: result.freedBytes,
+							freelistBeforeBytes: result.freelistBeforeBytes,
+							freelistAfterBytes: result.freelistAfterBytes,
+							durationMs: result.durationMs,
 						});
-						throw new AppError(
-							`Space reclamation is unavailable: ${describeUnsupported(reclaimed)}`,
-							501,
-							"DATABASE_VACUUM_UNSUPPORTED",
+						return result;
+					} finally {
+						// Try every owner even after a partial pause failure. Permanent/uncertain owners
+						// reject resume rather than recreating resources behind their lifecycle barrier.
+						const resumed = await Promise.allSettled([
+							Promise.resolve().then(resumeDbWorkerPool),
+							Promise.resolve().then(resumeModelHistorySourceWorkers),
+							Promise.resolve().then(resumeTokenRecalculationWorkers),
+						]);
+						resumeFailures = resumed.flatMap((result) =>
+							result.status === "rejected" ? [result.reason] : [],
 						);
+						if (resumeFailures.length)
+							logger.warn("Database worker owners could not all resume", {
+								failedCount: resumeFailures.length,
+							});
 					}
-				} catch (error) {
-					if (error instanceof AppError) throw error;
-					// Previously unguarded, so a lock conflict surfaced as a bare 500. The port classifies
-					// the failure so this decision no longer depends on SQLite error strings.
-					const failure = databaseMaintenance.classifyFailure(error);
-					logger.warn("Database space reclamation failed", {
-						kind: failure.kind,
-						error: failure.message,
-					});
-					throw new AppError(
-						`VACUUM could not run: ${failure.message}`,
-						failure.kind === "conflict" ? 409 : 500,
-						"DATABASE_VACUUM_FAILED",
-					);
-				}
-
-				optimized = ran(databaseMaintenance.refreshPlannerStatistics());
-				// Checkpoint again: VACUUM leaves its work in the WAL, so without this the file on disk
-				// has not actually shrunk yet and the after-size would understate what was reclaimed.
-				// `||` keeps the flag true when the first checkpoint succeeded and this one did not:
-				// the field means "a checkpoint ran", matching the pre-refactor behaviour.
-				checkpointRan = ran(databaseMaintenance.checkpoint({ truncate: true })) || checkpointRan;
-
-				const afterSizes = await getDatabaseFileSizes();
-				const afterBytes = totalDatabaseBytes(afterSizes);
-				const afterStorage = requireReusableSpace(afterSizes.mainBytes);
-				const result: DatabaseVacuumResult = {
-					ok: true,
-					beforeBytes,
-					afterBytes,
-					freedBytes: Math.max(0, beforeBytes - afterBytes),
-					freelistBeforeBytes: beforeStorage.freelistBytes,
-					freelistAfterBytes: afterStorage.freelistBytes,
-					vacuumRan: true,
-					checkpointRan,
-					optimized,
-					durationMs: Math.round(performance.now() - startedAt),
-				};
-				logger.info("Database VACUUM completed", {
-					freedBytes: result.freedBytes,
-					freelistBeforeBytes: result.freelistBeforeBytes,
-					freelistAfterBytes: result.freelistAfterBytes,
-					durationMs: result.durationMs,
-				});
+				})();
+				if (resumeFailures.length)
+					throw new AggregateError(resumeFailures, "Database worker owners could not all resume");
 				return result;
 			});
 		} finally {

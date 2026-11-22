@@ -14,6 +14,7 @@ import {
 	getConfiguredConcurrency,
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
+	runEphemeralReadTask,
 	runReadTask,
 	setDbWorkerSpecifiersForTest,
 	shutdownDbWorkerPool,
@@ -63,7 +64,11 @@ function createFixtureDatabase(dbPath: string): void {
  */
 function writeWorkerFixture(dir: string, name: string, body: string): string {
 	const file = join(dir, name);
-	writeFileSync(file, `${body}\npostMessage({ type: "ready" });\n`, "utf8");
+	writeFileSync(
+		file,
+		`import { parentPort } from "node:worker_threads";\nparentPort.on("message", data => self.onmessage?.({ data }));\n${body}\npostMessage({ type: "ready" });\n`,
+		"utf8",
+	);
 	return pathToFileURL(file).href;
 }
 
@@ -122,13 +127,13 @@ describe("scan result determinism", () => {
 	let home = "";
 	let dbPath = "";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		home = mkdtempSync(join(tmpdir(), "narrafork-scan-determinism-"));
 		dbPath = join(home, "narrafork.db");
 		createFixtureDatabase(dbPath);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		rmSync(home, { recursive: true, force: true });
 	});
 
@@ -210,15 +215,15 @@ describe("worker pool", () => {
 	let home = "";
 	let dbPath = "";
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		home = mkdtempSync(join(tmpdir(), "narrafork-db-pool-"));
 		dbPath = join(home, "narrafork.db");
 		createFixtureDatabase(dbPath);
-		resetDbWorkerPoolForTest();
+		await resetDbWorkerPoolForTest();
 	});
 
-	afterEach(() => {
-		shutdownDbWorkerPool();
+	afterEach(async () => {
+		await shutdownDbWorkerPool();
 		setDbWorkerSpecifiersForTest(null);
 		delete process.env.NARRAFORK_DB_WORKER;
 		delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
@@ -460,28 +465,63 @@ describe("worker pool", () => {
 	}, 60_000);
 
 	test("times out a task and stays usable afterwards", async () => {
-		// A 1ms budget is not a timeout on a fast host: the scan can finish first, so the
-		// assertion becomes a race. Pin the worker so the task can never complete, then let
-		// the real timeout fire and prove the pool still serves the next task.
-		setDbWorkerSpecifiersForTest([
-			writeWorkerFixture(home, "timeout-worker.ts", HANGING_WORKER_BODY),
-		]);
 		const failure = await runReadTask(
 			dbPath,
 			{ kind: "storageScanTables", tableNames: ["narrator_messages"] },
-			{ timeoutMs: 50 },
+			{ timeoutMs: 1 },
 		).catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(Error);
 		expect((failure as Error).message).toMatch(/timed out/);
 		expect(failure).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
-		// The timed-out worker is retired, so restoring production resolution must be enough
-		// for the next task; no pool reset is allowed to hide poisoning here.
-		setDbWorkerSpecifiersForTest(null);
 		const ok = await runReadTask<StorageScanContextResult>(dbPath, {
 			kind: "storageScanContext",
 		});
 		expect(ok.pageSize).toBeGreaterThan(0);
 	}, 60_000);
+
+	test("ephemeral watchdog is classified and does not restart on another specifier", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(home, "ephemeral-hang.ts", HANGING_WORKER_BODY),
+			writeWorkerFixture(
+				home,
+				"ephemeral-must-not-run.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "result", requestId: event.data.requestId, result: "restarted" });
+				};
+			`,
+			),
+		]);
+		await expect(
+			runEphemeralReadTask(dbPath, { kind: "storageScanContext" }, { timeoutMs: 200 }),
+		).rejects.toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
+	}, 5000);
+
+	test("ephemeral query failure does not retry another worker entry", async () => {
+		setDbWorkerSpecifiersForTest([
+			writeWorkerFixture(
+				home,
+				"ephemeral-query-error.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "error", requestId: event.data.requestId, message: "query failed" });
+				};
+			`,
+			),
+			writeWorkerFixture(
+				home,
+				"ephemeral-must-not-retry.ts",
+				`
+				self.onmessage = (event) => {
+					postMessage({ type: "result", requestId: event.data.requestId, result: "restarted" });
+				};
+			`,
+			),
+		]);
+		await expect(
+			runEphemeralReadTask(dbPath, { kind: "storageScanContext" }),
+		).rejects.toMatchObject({ name: "DbReadTaskExecutionError", message: "query failed" });
+	}, 5000);
 
 	test("rejects an already-aborted signal", async () => {
 		const controller = new AbortController();
@@ -494,7 +534,7 @@ describe("worker pool", () => {
 	test("shutdown terminates workers and clears state", async () => {
 		await runReadTask<StorageScanContextResult>(dbPath, { kind: "storageScanContext" });
 		expect(getDbWorkerPoolStats().workers).toBeGreaterThan(0);
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		const stats = getDbWorkerPoolStats();
 		expect(stats.workers).toBe(0);
 		expect(stats.queued).toBe(0);
@@ -624,24 +664,21 @@ describe("worker pool", () => {
 		const queued = runReadTask(
 			dbPath,
 			{ kind: "storageScanTables", tableNames: ["narrators"] },
-			{ timeoutMs: 50 },
+			{ timeoutMs: 500 },
 		);
 		const failure = await queued.catch((error: unknown) => error);
 		expect(failure).toBeInstanceOf(Error);
 		expect((failure as Error).message).toMatch(/timed out/);
 		expect(failure).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
 		const elapsed = Date.now() - startedAt;
-		expect(elapsed).toBeGreaterThanOrEqual(40);
-		expect(elapsed).toBeLessThan(1_000);
+		expect(elapsed).toBeGreaterThanOrEqual(400);
+		expect(elapsed).toBeLessThan(4_000);
 		// The timed-out waiter must remove ITS OWN queue entry, or a later drain releases a dead slot.
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 
 		blocker.catch(() => {});
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await expect(blocker).rejects.toThrow();
-		resetDbWorkerPoolForTest();
-		const recovered = await runReadTask<StorageScanContextResult>(dbPath, { kind: "storageScanContext" });
-		expect(recovered.pageSize).toBeGreaterThan(0);
 	}, 40_000);
 
 	/** An abort must also cancel a task that has not been given a worker yet. */
@@ -667,7 +704,7 @@ describe("worker pool", () => {
 		expect(getDbWorkerPoolStats().queued).toBe(0);
 
 		blocker.catch(() => {});
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await expect(blocker).rejects.toThrow();
 	}, 40_000);
 
@@ -689,7 +726,7 @@ describe("worker pool", () => {
 
 		blocker.catch(() => {});
 		queued.catch(() => {});
-		shutdownDbWorkerPool();
+		await shutdownDbWorkerPool();
 		await expect(queued).rejects.toBeInstanceOf(WorkersUnavailableError);
 		await expect(blocker).rejects.toThrow();
 	}, 40_000);

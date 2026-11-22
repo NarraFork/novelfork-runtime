@@ -97,6 +97,7 @@ mock.module("@mantine/notifications", () => ({
 }));
 mock.module("../../hooks/useGitIdentities", () => ({
 	useGitIdentities: () => ({ data: [], isLoading: false, isError: false }),
+	useFolderGitIdentity: () => ({ data: undefined }),
 	narratorGitIdentityQueryKey: (narratorId: string) => [
 		"auth",
 		"git-identities",
@@ -149,6 +150,9 @@ mock.module("../../hooks/useProjects", () => ({
 }));
 mock.module("../../lib/api", () => ({
 	api: { getSettings: mock(() => {}), listDevices: mock(() => {}) },
+	// Device selection reaches the narrator socket manager, which needs the session
+	// accessor at import time.
+	getToken: () => null,
 }));
 mock.module("../permissions/PermissionRuleEditor", () => ({ PermissionRuleEditor: box }));
 mock.module("../settings/TraitLayerEditor", () => ({ TraitLayerEditor: box }));

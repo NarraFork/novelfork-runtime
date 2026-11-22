@@ -28,56 +28,18 @@ export type PrefixSnapshotOperation =
 	| "collect";
 export interface PrefixSnapshotRequest {
 	action: "task";
+	requestId: string;
 	backend: PrefixSnapshotBackend;
 	operation: PrefixSnapshotOperation;
 	value: unknown;
-	cacheBytes: number;
 	deadline: number;
-}
-
-/** Cache capacity is NOT a snapshot size limit. Oversized values simply bypass the cache. */
-export class PrefixSnapshotCache {
-	private entries = new Map<string, { text: string; bytes: number }>();
-	private bytes = 0;
-	constructor(private budget: number) {}
-	get retainedBytes() {
-		return this.bytes;
-	}
-	get size() {
-		return this.entries.size;
-	}
-	get(hash: string): string | undefined {
-		const entry = this.entries.get(hash);
-		if (!entry) return;
-		this.entries.delete(hash);
-		this.entries.set(hash, entry);
-		return entry.text;
-	}
-	set(hash: string, text: string, byteSize: number): void {
-		const previous = this.entries.get(hash);
-		if (previous) {
-			this.bytes -= previous.bytes;
-			this.entries.delete(hash);
-		}
-		// Charge UTF-16 backing storage as well as UTF-8 and bounded metadata per entry.
-		const bytes = Math.max(byteSize, text.length * 2) + 256;
-		if (bytes > this.budget) return;
-		while (this.bytes + bytes > this.budget) {
-			const oldest = this.entries.entries().next().value;
-			if (!oldest) break;
-			this.entries.delete(oldest[0]);
-			this.bytes -= oldest[1].bytes;
-		}
-		this.entries.set(hash, { text, bytes });
-		this.bytes += bytes;
-	}
 }
 
 const port = parentPort;
 let sqlite: Database | undefined;
 let postgres: SQL | undefined;
-let cache: PrefixSnapshotCache | undefined;
 let collector: PrefixSnapshotCollector | undefined;
+let backendIdentity: PrefixSnapshotBackend | undefined;
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 
 /**
@@ -104,7 +66,18 @@ const SLOW_WRITE_MS = 25;
 const WRITE_STATEMENT = /^\s*(INSERT|UPDATE|DELETE)\b(?:\s+INTO|\s+FROM)?\s+(\w+)/i;
 
 async function connect(request: PrefixSnapshotRequest): Promise<void> {
-	cache ??= new PrefixSnapshotCache(request.cacheBytes);
+	if (
+		backendIdentity &&
+		(backendIdentity.backend !== request.backend.backend ||
+			(backendIdentity.backend === "sqlite" &&
+				request.backend.backend === "sqlite" &&
+				backendIdentity.path !== request.backend.path) ||
+			(backendIdentity.backend === "postgres" &&
+				request.backend.backend === "postgres" &&
+				backendIdentity.url !== request.backend.url))
+	)
+		throw new Error("Prefix snapshot database identity changed");
+	backendIdentity ??= { ...request.backend };
 	if (request.backend.backend === "sqlite") {
 		if (sqlite) return;
 		if (!request.backend.path || request.backend.path === ":memory:")
@@ -126,12 +99,17 @@ async function query<T>(statement: string, parameters: Array<string | number>): 
 			// Autocommit: the statement's duration is how long the main connection was locked
 			// out (plus any time it waited for the lock itself, up to busy_timeout).
 			const write = WRITE_STATEMENT.exec(statement);
-			if (write)
-				logger.warn("Prefix snapshot write held the database write lock", {
-					statement: `${write[1].toUpperCase()} ${write[2]}`,
-					elapsedMs: Math.round(elapsedMs),
-					rows: rows.length,
-				});
+			if (write) {
+				try {
+					logger.warn("Prefix snapshot write held the database write lock", {
+						statement: `${write[1].toUpperCase()} ${write[2]}`,
+						elapsedMs: Math.round(elapsedMs),
+						rows: rows.length,
+					});
+				} catch {
+					// Logging a completed write must not turn it into a failed/replayed operation.
+				}
+			}
 		}
 		return rows;
 	}
@@ -150,7 +128,10 @@ async function retry<T>(request: PrefixSnapshotRequest, action: () => Promise<T>
 			return await action();
 		} catch (error) {
 			const code = (error as { code?: string }).code;
-			if (code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED" && code !== "55P03") throw error;
+			// BUSY_SNAPSHOT/RECOVERY read the same "database is locked" but carry a suffixed
+			// code. Every statement here is autocommit, so a retry opens a fresh snapshot.
+			if (!code?.startsWith("SQLITE_BUSY") && code !== "SQLITE_LOCKED" && code !== "55P03")
+				throw error;
 			await Bun.sleep(Math.min(250, 10 * 2 ** Math.min(attempts++, 5)));
 		}
 	}
@@ -165,22 +146,24 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 		const result = await retry(request, () =>
 			current.step(request.value as PrefixSnapshotGcOptions),
 		);
-		if (result.deleted) cache = new PrefixSnapshotCache(request.cacheBytes);
 		return result;
 	}
 	if (request.operation === "lease") {
 		const roots = request.value as string[];
 		const hashes = new Set(roots);
 		for (const hash of roots) {
-			const rows = await query<{ prefix: string }>(
-				"SELECT substr(text, 1, 1) AS prefix FROM narrator_text_snapshots WHERE sha256 = ?",
-				[hash],
+			const rows = await retry(request, () =>
+				query<{ prefix: string }>(
+					"SELECT substr(text, 1, 1) AS prefix FROM narrator_text_snapshots WHERE sha256 = ?",
+					[hash],
+				),
 			);
 			if (!rows[0]) throw new Error("Prefix snapshot publication target is missing");
 			if (/^[{\s]$/.test(rows[0].prefix)) {
-				const [content] = await query<{ text: string }>(
-					"SELECT text FROM narrator_text_snapshots WHERE sha256 = ?",
-					[hash],
+				const [content] = await retry(request, () =>
+					query<{ text: string }>("SELECT text FROM narrator_text_snapshots WHERE sha256 = ?", [
+						hash,
+					]),
 				);
 				if (!content) throw new Error("Prefix snapshot publication target is missing");
 				let manifest: unknown;
@@ -253,7 +236,6 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 			);
 		}
 		await execute({ ...request, operation: "touch", value: entries.map((entry) => entry.hash) });
-		for (const entry of entries) cache?.set(entry.hash, entry.text, entry.byteSize);
 		return entries.map(({ hash, byteSize }) => ({ hash, byteSize }));
 	}
 	if (request.operation === "getJsonBatch") {
@@ -315,44 +297,52 @@ async function execute(request: PrefixSnapshotRequest): Promise<unknown> {
 		}
 		// created_at is also the durable publication-grace clock; content/hash never change.
 		await execute({ ...request, operation: "touch", value: [hash] });
-		cache?.set(hash, text, byteSize);
 		return hash;
 	}
 	const hash = request.value;
 	if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash))
 		throw new Error("Prefix snapshot hash is invalid");
-	let text = cache?.get(hash);
-	if (text === undefined) {
-		const rows = await retry(request, () =>
-			query<{ text: string; byte_size: number }>(
-				"SELECT text, byte_size FROM narrator_text_snapshots WHERE sha256 = ?",
-				[hash],
-			),
-		);
-		if (!rows[0]) throw new Error("Prefix snapshot not found");
-		text = rows[0].text;
-		if (digest(text) !== hash || Buffer.byteLength(text) !== Number(rows[0].byte_size))
-			throw new Error("Prefix snapshot integrity mismatch");
-		cache?.set(hash, text, Number(rows[0].byte_size));
-	}
+	const rows = await retry(request, () =>
+		query<{ text: string; byte_size: number }>(
+			"SELECT text, byte_size FROM narrator_text_snapshots WHERE sha256 = ?",
+			[hash],
+		),
+	);
+	if (!rows[0]) throw new Error("Prefix snapshot not found");
+	const text = rows[0].text;
+	if (digest(text) !== hash || Buffer.byteLength(text) !== Number(rows[0].byte_size))
+		throw new Error("Prefix snapshot integrity mismatch");
 	return request.operation === "getJson"
 		? { json: JSON.parse(text), byteSize: Buffer.byteLength(text) }
 		: text;
 }
 
-// The client admits one task at a time, so PG awaits cannot introduce concurrent writes.
+// The actor admits one task at a time. Reject a broken client rather than interleave PG awaits
+// or run two collector slices against the same scratch tables.
+let busy = false;
 port?.on("message", async (request: PrefixSnapshotRequest | { action: "ping" }) => {
-	if (request.action === "ping") {
+	if (request?.action === "ping") {
 		port.postMessage({ ready: true });
 		return;
 	}
+	if (!request || request.action !== "task" || typeof request.requestId !== "string") return;
+	if (busy) {
+		port.postMessage({ requestId: request.requestId, error: "Prefix snapshot actor is busy" });
+		return;
+	}
+	busy = true;
 	try {
-		port.postMessage({ value: await execute(request) });
+		if (!Number.isFinite(request.deadline) || Date.now() >= request.deadline)
+			throw new Error("Prefix snapshot operation timed out");
+		port.postMessage({ requestId: request.requestId, value: await execute(request) });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "";
 		// SQL/driver failures can contain credentials or snapshot text; do not forward them.
 		port.postMessage({
+			requestId: request.requestId,
 			error: message.startsWith("Prefix snapshot") ? message : "Prefix snapshot worker failed",
 		});
+	} finally {
+		busy = false;
 	}
 });

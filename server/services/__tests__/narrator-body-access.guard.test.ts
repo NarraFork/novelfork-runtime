@@ -13,10 +13,11 @@
  *
  * `RAW_BODY_ACCESS` counts what each file still does to the column directly: the body
  * layer; readers where the column is the body (legacy envelopes, PG, the block read switch
- * off); and writes whose rows the sync queue builds from the column. The counts only go
- * down:
- *   - a raw access in an unlisted file, or more than its count, fails — read and write
- *     through the body layer instead;
+ * off); and writes whose rows the sync queue builds from the column. Ordinary readers and
+ * writers must use the body layer; a specialized body-layer owner needs an explicit audit
+ * and an exact inventory entry (retention's worker-prepared selective rewrite cannot run
+ * whole-envelope sync without reading unrelated tool payloads).
+ *   - a raw access in an unlisted file, or more than its audited count, fails;
  *   - fewer than its count fails too — lower it (drop the entry at zero).
  *
  * The scan is lexical over comment-stripped source: the column named in SQL
@@ -27,9 +28,11 @@
  * whose `set` names `contentJson` or is not an object literal). A floor, not a proof.
  */
 
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import { hasBodyRevisions, legacyBodyTextMatches } from "../../lib/narrator-bodies";
 
 const ROOT = join(import.meta.dir, "..", "..", "..");
 
@@ -38,10 +41,21 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// The body layer.
 	"server/services/narrator-body-writes.ts": { count: 6, why: "body writes" },
 	"server/services/narrator-block-sync.ts": {
-		count: 4,
-		why: "the dual-write audit, column resync, the queued sync's column hash",
+		count: 7,
+		why: "dual-write audit, resync, queued column hash and three bounded retention-marker probes",
 	},
-	"server/lib/narrator-bodies.ts": { count: 6, why: "body reads off the main thread" },
+	"server/services/storage-history-mutations.ts": {
+		count: 1,
+		why: "worker-prepared adopted payload rewrite under fence/admission/CAS; no whole-body sync",
+	},
+	"server/lib/db-worker/storage-history-query.ts": {
+		count: 6,
+		why: "isolated retention bytes/markers, pre-read budgets and legacy/queued body preparation",
+	},
+	"server/lib/narrator-bodies.ts": {
+		count: 7,
+		why: "body reads and final synchronous equality for an already-budgeted legacy body",
+	},
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
 	"server/services/narrator-block-scans.ts": { count: 5, why: "scans: column fallback" },
 	"server/services/narrator-block-targets.ts": { count: 2, why: "legacy envelopes' ids" },
@@ -58,7 +72,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/db/postgres-schema.ts": { count: 8, why: "PG: the column is the body" },
 	"server/services/agent-runtime/model-history-revision-sql.ts": { count: 3, why: "triggers" },
 	"server/services/agent-runtime/model-history-fixture.ts": { count: 1, why: "trigger fixture" },
-	"server/lib/settings/defaults.ts": { count: 5, why: "switch descriptions" },
+	"server/lib/settings/defaults.ts": { count: 3, why: "switch descriptions" },
 	"server/db/test-role-migration.ts": { count: 4, why: "one-off role migration check" },
 	// Readers whose column branch serves block reads off (or PG), where it is the body.
 	"server/services/narrator-question-service.ts": { count: 3, why: "read switch off" },
@@ -178,6 +192,51 @@ function scan(): Map<string, string[]> {
 describe("raw access to an envelope's body", () => {
 	const hits = scan();
 
+	test("the body layer fences a legacy body's exact text without mutating it", () => {
+		const database = new Database(":memory:");
+		try {
+			database.run("CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, content_json TEXT)");
+			const expected = '[{"type":"text","text":"a"}]';
+			database.query("INSERT INTO narrator_messages VALUES(?,?)").run("message", expected);
+			const changes = () =>
+				database.query<{ n: number }, []>("SELECT total_changes() AS n").get()?.n;
+			const before = changes();
+			expect(legacyBodyTextMatches(database, "message", expected)).toBe(true);
+			expect(legacyBodyTextMatches(database, "missing", expected)).toBe(false);
+			expect(legacyBodyTextMatches(database, "message", "[]")).toBe(false);
+			expect(changes()).toBe(before);
+			database
+				.query("UPDATE narrator_messages SET content_json=? WHERE id=?")
+				.run(expected.replace('"a"', '"b"'), "message");
+			expect(legacyBodyTextMatches(database, "message", expected)).toBe(false);
+			database.query("DELETE FROM narrator_messages WHERE id=?").run("message");
+			expect(legacyBodyTextMatches(database, "message", expected)).toBe(false);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("body revision capabilities are cached per connection, not inferred from another schema", () => {
+		const legacy = new Database(":memory:");
+		const current = new Database(":memory:");
+		const incomplete = new Database(":memory:");
+		try {
+			legacy.run("CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, content_json TEXT)");
+			current.run(
+				"CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, body_revision INTEGER, state_revision INTEGER)",
+			);
+			incomplete.run("CREATE TABLE narrator_messages(id TEXT PRIMARY KEY, body_revision INTEGER)");
+			expect(hasBodyRevisions(legacy)).toBe(false);
+			expect(hasBodyRevisions(current)).toBe(true);
+			expect(hasBodyRevisions(incomplete)).toBe(false);
+			expect(hasBodyRevisions(legacy)).toBe(false);
+		} finally {
+			legacy.close();
+			current.close();
+			incomplete.close();
+		}
+	});
+
 	test("no file reads or writes the column as the body beyond its count", () => {
 		const over = [...hits]
 			.filter(([path, found]) => found.length > (RAW_BODY_ACCESS[path]?.count ?? 0))
@@ -185,7 +244,7 @@ describe("raw access to an envelope's body", () => {
 		expect(over, "read and write through narrator-body-reads/-writes instead").toEqual([]);
 	});
 
-	test("every count is current (the list only shrinks)", () => {
+	test("every audited owner count matches its current accesses", () => {
 		const stale = Object.entries(RAW_BODY_ACCESS)
 			.filter(([path, entry]) => (hits.get(path)?.length ?? 0) < entry.count)
 			.map(([path, entry]) => `${path}: ${hits.get(path)?.length ?? 0} < ${entry.count}`);

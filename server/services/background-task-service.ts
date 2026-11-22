@@ -59,6 +59,10 @@ import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { discardBackgroundBashResult, prepareBackgroundBashResult } from "./background-bash-result";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { TRANSFER_RESTART_PAUSE_NOTICE } from "./device-transfer-task-store";
+import { TERMINAL_WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
+
+const TERMINAL_WATCH_RESTART_NOTICE =
+	"Terminal watch ended because the server restarted; it is not resumed. Check the terminal before continuing.";
 
 // === Types ===
 
@@ -860,10 +864,18 @@ class BackgroundTaskService {
 			this.parentNarratorCache.set(opts.id, opts.parentNarratorId);
 			if (existing.status === "running") return existing;
 
-			// Restart: get the EXISTING run (getAgentRun reads narrators through
-			// the queue adapter on PG; on SQLite it's a sync read), then CAS the
-			// task row back to "running" via the named restartAgentTask composite.
-			const publicationRun = await pub.getAgentRun(opts.subagentNarratorId, opts.parentNarratorId);
+			// Restart: register the run this task now projects, then CAS the task row
+			// back to "running" for it. A run that still holds its unconsumed terminal
+			// reservation (a run being detached or projected right now) is adopted; an
+			// ended run already spent its terminal slot on its own result, so the task
+			// gets a new run with fresh slots. Reusing the ended run would leave its next
+			// terminal with no reservation to commit into.
+			const { binding: registered } = await pub.startRun({
+				narratorId: opts.subagentNarratorId,
+				binding: opts.binding,
+				adoptRegisteredRun: true,
+			});
+			const publicationRun = { logicalRunId: registered.logicalRunId };
 			const restarted = await pub.restartAgentTask({
 				taskId: opts.id,
 				logicalRunId: publicationRun.logicalRunId,
@@ -3425,6 +3437,8 @@ class BackgroundTaskService {
 							logicalRunId: backgroundTasks.logicalRunId,
 							toolCallId: backgroundTasks.toolCallId,
 							executionAttempt: backgroundTasks.executionAttempt,
+							command: backgroundTasks.command,
+							backgroundKind: backgroundTasks.backgroundKind,
 						})
 						.from(backgroundTasks)
 						.where(
@@ -3471,12 +3485,21 @@ class BackgroundTaskService {
 			// fall through and publish a different terminal for the same run.
 			restoredTerminals.add(task.id);
 		}
+		// Durable services survive a planned restart: re-attach to the ones still running,
+		// and settle the ones that ended while no server was watching from their own exit
+		// file instead of the generic "outcome unknown".
+		const settledServices = new Set<string>();
+		for (const task of scanned) {
+			if (task.type !== "bash" || task.backgroundKind !== "service") continue;
+			if (await this.recoverDurableService(task.id, task.parentNarratorId))
+				settledServices.add(task.id);
+		}
 		const staleTasks = scanned
-			.filter((task) => !restoredTerminals.has(task.id))
+			.filter((task) => !restoredTerminals.has(task.id) && !settledServices.has(task.id))
 			// Only an agent row can be protected — see the note above on why a bash row
 			// has no resume path to protect.
 			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));
-		if (staleTasks.length === 0) return nextPage();
+		if (staleTasks.length === 0) return settledServices.size + (await nextPage());
 
 		const now = new Date().toISOString();
 		// A transfer is the one kind that SURVIVES a restart. Its owning
@@ -3517,7 +3540,11 @@ class BackgroundTaskService {
 				if (task.type === "transfer") continue;
 				const text =
 					task.type === "bash"
-						? "Execution outcome unknown after restart; the command was not rerun."
+						? "command" in task &&
+							typeof task.command === "string" &&
+							task.command.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)
+							? TERMINAL_WATCH_RESTART_NOTICE
+							: "Execution outcome unknown after restart; the command was not rerun."
 						: "Background task was interrupted by a server restart.";
 				const eventKind = (task.type === "bash" ? "failed" : "cancelled") as "failed" | "cancelled";
 
@@ -3660,7 +3687,95 @@ class BackgroundTaskService {
 			// how an operator tells "work was destroyed" from "work is resumable".
 			transferPaused: transferIds.length,
 		});
-		return staleTasks.length + (await nextPage());
+		return staleTasks.length + settledServices.size + (await nextPage());
+	}
+
+	/**
+	 * Recover one `running` service row a previous server process left behind.
+	 *
+	 * Returns true when the row was handled here (re-attached, or settled from the service's
+	 * own exit record); false leaves it to the generic stale-task path — the service predates
+	 * durable services or its manifest was never written, so nothing proves its outcome.
+	 */
+	private async recoverDurableService(taskId: string, parentNarratorId: string): Promise<boolean> {
+		const durable = await import("../lib/agent/execution/durable-service");
+		if (!durable.isDurableServiceSupported()) return false;
+		let adopted: Awaited<ReturnType<typeof durable.adoptDurableService>>;
+		try {
+			adopted = await durable.adoptDurableService(taskId);
+		} catch (error) {
+			logger.warn("Background service adoption failed", { taskId, error: String(error) });
+			return false;
+		}
+		if (adopted) {
+			const { handle, manifest } = adopted;
+			const ctrl = new AbortController();
+			this.outputChunks.set(taskId, []);
+			this.outputByteCounts.set(taskId, 0);
+			this.parentNarratorCache.set(taskId, parentNarratorId);
+			this.registerAbortController(taskId, ctrl);
+			const remaining =
+				manifest.timeoutMs === undefined
+					? undefined
+					: manifest.startedAt + manifest.timeoutMs - Date.now();
+			const { monitorBackgroundBash } = await import("../lib/agent/tools/bash");
+			void monitorBackgroundBash({
+				taskId,
+				handle,
+				bgAbort: ctrl,
+				backgroundKind: "service",
+				timeoutMs: remaining,
+			}).catch((error) =>
+				logger.warn("Adopted background service monitor failed", {
+					taskId,
+					error: String(error),
+				}),
+			);
+			this.queueTaskUpsert(parentNarratorId, taskId);
+			logger.info("Re-attached background service after restart", {
+				taskId,
+				pid: manifest.pid,
+			});
+			return true;
+		}
+
+		const outcome = await durable.readOrphanedServiceOutcome(taskId);
+		if (!outcome.hasManifest || outcome.exitCode === null) {
+			// No proof of how it ended (legacy pipe-backed service, or killed before the
+			// wrapper could record a status). The generic path reports "outcome unknown".
+			await durable.removeServiceArtifacts(taskId);
+			return false;
+		}
+		this.parentNarratorCache.set(taskId, parentNarratorId);
+		const text =
+			`${outcome.logTail}\n[exit code: ${outcome.exitCode}]\n` +
+			`Background service exited while NarraFork was restarting (exit code: ${outcome.exitCode}).`;
+		await this.markFailed(taskId, text, outcome.exitCode);
+		await durable.removeServiceArtifacts(taskId);
+		return true;
+	}
+
+	/**
+	 * Remove leftover service directories that no running service row references (the row
+	 * was deleted, or a crash happened between settle and cleanup). Bounded and best effort.
+	 */
+	async sweepOrphanedServiceArtifacts(): Promise<void> {
+		const durable = await import("../lib/agent/execution/durable-service");
+		if (!durable.isDurableServiceSupported()) return;
+		if (resolveRuntimeQueueBackend() === "postgres") return;
+		const running = await db
+			.select({ id: backgroundTasks.id })
+			.from(backgroundTasks)
+			.where(
+				and(
+					eq(backgroundTasks.status, "running"),
+					eq(backgroundTasks.type, "bash"),
+					eq(backgroundTasks.backgroundKind, "service"),
+				),
+			)
+			.limit(1_000)
+			.all();
+		await durable.sweepServiceArtifacts(new Set(running.map((row) => row.id)));
 	}
 
 	/**
@@ -3876,15 +3991,25 @@ class BackgroundTaskService {
 		});
 	}
 
-	async killAll(): Promise<void> {
-		// Cancel all running tasks in DB
+	async killAll(options: { preserveAgents?: boolean } = {}): Promise<void> {
 		const running = await db
 			.select()
 			.from(backgroundTasks)
-			.where(eq(backgroundTasks.status, "running"))
+			.where(
+				and(
+					eq(backgroundTasks.status, "running"),
+					options.preserveAgents ? ne(backgroundTasks.type, "agent") : undefined,
+				),
+			)
 			.all();
 
 		for (const task of running) {
+			// A terminal watch has no process to kill. Leave its row running so restart
+			// recovery tells the session the watch ended, instead of cancelling it silently.
+			if (task.type === "bash" && task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)) {
+				this.cleanupRuntime(task.id);
+				continue;
+			}
 			const ctrl = this.abortControllers.get(task.id);
 			if (ctrl) {
 				try {
@@ -3913,7 +4038,10 @@ class BackgroundTaskService {
 			}
 		}
 
-		logger.info("Killed all background tasks", { count: running.length });
+		logger.info("Background tasks stopped", {
+			count: running.length,
+			preserveAgents: options.preserveAgents ?? false,
+		});
 	}
 
 	// ── Private helpers ─────────────────────────────────────────────────

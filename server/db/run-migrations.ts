@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { logger } from "../lib/logger";
+import { isCompiledRuntime } from "../lib/runtime-target";
+import { reportStartupStep } from "../lib/startup-status";
 import {
 	MODEL_HISTORY_REVISION_CONTRACT,
 	MODEL_HISTORY_REVISION_CONTRACT_V1,
@@ -58,40 +60,49 @@ function materializeEmbeddedMigrations(data: EmbeddedMigrationDataModule): {
 	folder: string;
 	cleanup: () => void;
 } {
+	const journal = JSON.parse(data.embeddedMigrationJournalJson);
+	if (journal.dialect !== "sqlite" || !Array.isArray(journal.entries) || !journal.entries.length) {
+		throw new Error("Invalid or empty embedded SQLite migration journal");
+	}
 	const tempRoot = mkdtempSync(join(tmpdir(), "narrafork-migrations-"));
 	const migrationsRoot = join(tempRoot, "drizzle");
-	const metaDir = join(migrationsRoot, "meta");
-	mkdirSync(metaDir, { recursive: true });
-
-	writeFileSync(join(metaDir, "_journal.json"), data.embeddedMigrationJournalJson);
-	for (const file of data.embeddedMigrationSqlFiles) {
-		writeFileSync(join(migrationsRoot, file.name), file.content);
+	const cleanup = () => rmSync(tempRoot, { recursive: true, force: true });
+	try {
+		const metaDir = join(migrationsRoot, "meta");
+		mkdirSync(metaDir, { recursive: true });
+		writeFileSync(join(metaDir, "_journal.json"), data.embeddedMigrationJournalJson);
+		for (const file of data.embeddedMigrationSqlFiles) {
+			writeFileSync(join(migrationsRoot, file.name), file.content);
+		}
+		// Detect incomplete build materials before opening the migration transaction.
+		readMigrationFiles({ migrationsFolder: migrationsRoot });
+		return { folder: migrationsRoot, cleanup };
+	} catch (error) {
+		cleanup();
+		throw error;
 	}
-
-	return {
-		folder: migrationsRoot,
-		cleanup: () => {
-			rmSync(tempRoot, { recursive: true, force: true });
-		},
-	};
 }
 
 export async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolder> {
-	// Prefer filesystem migrations in source/dev mode so the latest SQL is always used.
+	// Only source development may pick up SQL from a mutable checkout. A compiled
+	// process and its workers must use the migrations that were built with them.
+	// Fork layer: in source mode a host may point at immutable migration assets
+	// (NARRAFORK_MIGRATIONS_DIR / runtime-migrations) before the bundled ./drizzle.
+	const compiled = isCompiledRuntime();
 	const filesystemMigrationsFolder = resolveFilesystemMigrationsFolder();
-	if (existsSync(join(filesystemMigrationsFolder, "meta", "_journal.json"))) {
+	if (!compiled && existsSync(join(filesystemMigrationsFolder, "meta", "_journal.json"))) {
 		return { folder: filesystemMigrationsFolder, source: "filesystem" };
 	}
 
-	// Compiled single-binary mode: only a static alias import lets Bun embed the
-	// generated migration data. A runtime-computed module path is never bundled.
+	// Mandatory for compiled builds; source mode also supports embedded-only installs.
 	try {
 		const generatedModule = (await import("@server/generated/embedded-migrations-data")) as
 			| EmbeddedMigrationDataModule
 			| undefined;
 		if (
 			typeof generatedModule?.embeddedMigrationJournalJson === "string" &&
-			Array.isArray(generatedModule.embeddedMigrationSqlFiles)
+			Array.isArray(generatedModule.embeddedMigrationSqlFiles) &&
+			generatedModule.embeddedMigrationSqlFiles.length > 0
 		) {
 			const materialized = materializeEmbeddedMigrations(generatedModule);
 			return {
@@ -100,8 +111,11 @@ export async function resolveMigrationsFolder(): Promise<ResolvedMigrationsFolde
 				cleanup: materialized.cleanup,
 			};
 		}
-	} catch {
-		// No embedded migration data module available.
+		throw new Error("Invalid or empty embedded SQLite migration data");
+	} catch (cause) {
+		if (compiled) {
+			throw new Error("SQLite migrations blocked: no valid embedded migration data", { cause });
+		}
 	}
 
 	return { folder: filesystemMigrationsFolder, source: "filesystem" };
@@ -205,16 +219,17 @@ export async function resolveMigrationsForDriver(
 	if (driver === "sqlite") return resolveMigrationsFolder();
 	if (driver !== "postgresql") throw new Error(`Unsupported migration driver: ${driver}`);
 	const folder = postgres.folder ?? "./drizzle-postgres";
-	if (existsSync(folder)) {
+	if (!isCompiledRuntime() && existsSync(folder)) {
 		// Validate the journal and its exact SQL set before handing it to a PG runner.
 		collectPostgresMigrationData(folder);
 		return { folder, source: "filesystem" };
 	}
 	try {
-		const generatedPostgresModulePath = "../generated/embedded-postgres-migrations-data";
 		const data = postgres.loadEmbedded
 			? await postgres.loadEmbedded()
-			: ((await import(generatedPostgresModulePath)) as PostgresMigrationData);
+			: ((await import(
+					"@server/generated/embedded-postgres-migrations-data"
+				)) as PostgresMigrationData);
 		return materializePostgresMigrations(data);
 	} catch (cause) {
 		throw new Error("PostgreSQL migrations blocked: no valid PostgreSQL migration data", { cause });
@@ -563,8 +578,11 @@ function rewriteOutsideSqlStrings(sql: string, rewrite: (chunk: string) => strin
  * `error in table x after rename: no such column: __new_x.col` — the 0.6.6→0.7.2
  * `file_attributions` crash. Strip only a qualifier that names this same `__new_*`
  * table, so the CHECK survives a rename without rewriting committed migration hashes.
+ *
+ * Exported so the test harness replays the journal through this same protection instead of
+ * re-deriving it.
  */
-function rewriteQualifiedNewTableChecks(stmt: string): string {
+export function rewriteQualifiedNewTableChecks(stmt: string): string {
 	const match = CREATE_NEW_TABLE.exec(stmt);
 	if (!match) return stmt;
 	const tableName = normalizeObjectName(match[1]);
@@ -1133,7 +1151,10 @@ function legacyRequestRetirementReceipt(statements: readonly string[]): string |
  * their book binding on upgrade. Runs inside the apply transaction, keeps migration files byte
  * identical to upstream, and is a no-op once `chapters` or `narrators.chapter_id` is gone.
  */
-function carryChapterProjectsBeforeRetirement(sqlite: Database, statements: readonly string[]): number {
+function carryChapterProjectsBeforeRetirement(
+	sqlite: Database,
+	statements: readonly string[],
+): number {
 	if (!migrationDropsRealTables(statements).some((table) => sameObjectName(table, "chapters"))) {
 		return 0;
 	}
@@ -1193,7 +1214,9 @@ function isLaterRetiredColumnIndexError(
 	).exec(maskSqlLiteralsAndComments(stmt));
 	if (!match) return false;
 	const table = normalizeObjectName(match[1]);
-	const columns = (match[2].match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? []).map(normalizeObjectName);
+	const columns = (match[2].match(new RegExp(SQLITE_IDENTIFIER, "g")) ?? []).map(
+		normalizeObjectName,
+	);
 	if (!columns.some((column) => sameObjectName(column, missingColumn))) return false;
 	if (!tableExists(sqlite, table) || columnExists(sqlite, table, missingColumn)) return false;
 	const dropColumn = new RegExp(
@@ -1323,7 +1346,8 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 					? modelHistoryCandidate.index
 					: -1;
 			const effectiveLastAppliedIndex = Math.max(lastAppliedIndex, installedModelHistoryIndex);
-			for (const { migration, index } of pending) {
+			for (const [position, { migration, index }] of pending.entries()) {
+				reportStartupStep({ key: "migrating", current: position + 1, total: pending.length });
 				const statements = migration.sql.map((stmt) => stmt.trim()).filter(Boolean);
 				const retirementReceipt = legacyRequestRetirementReceipt(statements);
 				const deferPhysicalCleanup =

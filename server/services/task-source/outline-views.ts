@@ -45,21 +45,46 @@ import {
 	getOutlineTasksViewHeading,
 	getOutlineTasksViewMore,
 	getOutlineTasksViewSection,
+	getOutlineViewDelegatedLine,
 	getOutlineViewTaskLine,
 	getUserLanguage,
 	type Locale,
+	type OutlineTaskPromptTask,
 	type OutlineTasksViewSection,
+	type OutlineViewAgent,
 	type OutlineViewTask,
 } from "@server/lib/prompt-i18n";
 import { blockTitle } from "@shared/outline";
-import type { ContextPart } from "@shared/prefix-context";
-import { readNarrator } from "../outline/access-reads";
+import {
+	boundOutlineTasksViewStates,
+	coerceOutlineTasksViewDisplay,
+	OUTLINE_TASKS_VIEW_KEY,
+	type OutlineTasksViewDisplay,
+	type OutlineTasksViewTask,
+} from "@shared/outline-task-notice";
+import {
+	diffOutlineTasksViews,
+	type OutlineTasksViewFact,
+	outlineTasksViewDeltasToRead,
+	settleOutlineTasksViewChanges,
+} from "@shared/outline-tasks-view-diff";
+import {
+	CONTEXT_UPDATE_DISPLAY_MAX_BYTES,
+	type ContextPart,
+	contextDisplayBytes,
+} from "@shared/prefix-context";
+import { registerContextDisplayRefiner } from "../context-display-refiners";
+import { readDisplayNames, readNarrator } from "../outline/access-reads";
+import { listOutlineAssignedTasks } from "../outline/assigned";
 import { loadBodies, readSubtree } from "../outline/read";
 import { renderOutline } from "../outline/render";
 import { outlineStore } from "../outline/store";
+import { isOpenTask } from "../outline/task-json";
+import { isClaimLive } from "../outline/tasks";
 import { breadthFirst, type OutlineNode } from "../outline/tree";
 import { readTaskSession } from "./backend";
 import {
+	dropSpecLossAttachBlocks,
 	findBehaviorPage,
 	graphemeBoundary,
 	importLeftover,
@@ -81,8 +106,14 @@ export const OUTLINE_VIEW_KEYS = {
 export const OUTLINE_VIEW_LIMITS = {
 	/** Tasks in progress the current-tasks view lists. */
 	doing: 5,
+	/** Tasks the session's subagents are doing (outline P2 PR 9b) the view lists. */
+	delegated: 10,
+	/** Claims of the session's subagents read for that section (one more tells there are more). */
+	delegatedRead: 20,
 	/** Waiting tasks it lists. */
 	waiting: 5,
+	/** Tasks assigned to the session by name that it has not started (outline P2 PR 10a). */
+	assigned: 5,
 	/** Characters of the current-tasks view. */
 	tasksChars: 1500,
 	/** Characters of a task title in a view. */
@@ -131,6 +162,8 @@ interface ViewDeps {
 
 interface CachedView extends ViewDeps {
 	text: string | null;
+	/** The reader's summary of the view (`ContextPart.display`), when the view has one. */
+	display?: OutlineTasksViewDisplay;
 	at: number;
 	/**
 	 * A change it depends on landed: read again before serving it, but keep it to serve should
@@ -141,6 +174,8 @@ interface CachedView extends ViewDeps {
 
 /** Changes seen while a view was being read: one that hits its dependencies makes it stale. */
 interface ReadTracker {
+	/** The view being read (a change can name the kind of view it concerns by key prefix). */
+	key: string;
 	spaces: Set<string>;
 	narrators: Set<string>;
 	commits: number;
@@ -159,9 +194,12 @@ function hits(view: ViewDeps, spaceId: string | null, narratorId: string | null)
 	);
 }
 
-function dropWhere(spaceId: string | null, narratorId: string | null): void {
-	for (const view of cache.values()) if (hits(view, spaceId, narratorId)) view.stale = true;
+/** The views (only those whose key starts with `only`) a change hits read again. */
+function dropWhere(spaceId: string | null, narratorId: string | null, only = ""): void {
+	for (const [key, view] of cache)
+		if (key.startsWith(only) && hits(view, spaceId, narratorId)) view.stale = true;
 	for (const tracker of reads) {
+		if (!tracker.key.startsWith(only)) continue;
 		if (spaceId !== null) {
 			tracker.spaces.add(spaceId);
 			tracker.commits++;
@@ -182,6 +220,19 @@ if (hotOnce("narrafork.outlineViews.listeners")) {
 	});
 }
 
+// A subagent starting or ending changes what the session has delegated (outline P2 PR 9b; its
+// claim passes to its parent when a run ends, which is no commit): the current-tasks views that
+// depend on the parent (the session's own: `tasks:<root>:*`) or list the subagent read again, in
+// every language. Behavior views do not depend on it and stay.
+if (hotOnce("narrafork.outlineViews.subagentListeners")) {
+	const dropTasks = (event: { narratorId: string; parentNarratorId: string }) => {
+		dropWhere(null, event.parentNarratorId, "tasks:");
+		dropWhere(null, event.narratorId, "tasks:");
+	};
+	eventBus.on("narrator:subagent_started", dropTasks);
+	eventBus.on("narrator:subagent_completed", dropTasks);
+}
+
 /**
  * A view's read failed again within `failureBackoffMs` of a failure that was logged: the caller
  * marks the part unreadable without logging it again.
@@ -200,15 +251,32 @@ export function resetOutlineViewCache(now?: () => number): void {
 	clock.now = now ?? (() => Date.now());
 }
 
+/** A view as read: its text (the change key), and the reader's summary when it has one. */
+interface ViewRead {
+	text: string | null;
+	display?: OutlineTasksViewDisplay;
+}
+
 async function cachedView(
 	key: string,
 	read: (deps: ViewDeps) => Promise<string | null>,
 ): Promise<string | null> {
+	return (await cachedViewRead(key, async (deps) => ({ text: await read(deps) }))).text;
+}
+
+async function cachedViewRead(
+	key: string,
+	read: (deps: ViewDeps) => Promise<ViewRead>,
+): Promise<ViewRead> {
+	const shown = (view: CachedView): ViewRead => ({
+		text: view.text,
+		...(view.display ? { display: view.display } : {}),
+	});
 	const hit = cache.get(key);
 	if (hit && !hit.stale && clock.now() - hit.at < OUTLINE_VIEW_LIMITS.maxAgeMs) {
 		cache.delete(key);
 		cache.set(key, hit);
-		return hit.text;
+		return shown(hit);
 	}
 	// Within the backoff of a failed read, what was shown is served without reading again. A
 	// view never shown is read on every request (the part is missing until it is), but its
@@ -216,15 +284,15 @@ async function cachedView(
 	const failedAt = failures.get(key);
 	const backingOff =
 		failedAt !== undefined && clock.now() - failedAt < OUTLINE_VIEW_LIMITS.failureBackoffMs;
-	if (backingOff && hit) return hit.text;
-	const tracker: ReadTracker = { spaces: new Set(), narrators: new Set(), commits: 0 };
+	if (backingOff && hit) return shown(hit);
+	const tracker: ReadTracker = { key, spaces: new Set(), narrators: new Set(), commits: 0 };
 	reads.add(tracker);
 	try {
 		const deps: ViewDeps = { spaces: new Set(), narrators: new Set(), anySpace: false };
 		const startedAt = clock.now();
-		let text: string | null;
+		let fresh: ViewRead;
 		try {
-			text = await read(deps);
+			fresh = await read(deps);
 		} catch (error) {
 			if (backingOff) throw new OutlineViewBackoffError(key, error);
 			failures.set(key, clock.now());
@@ -241,7 +309,7 @@ async function cachedView(
 					key,
 					error: String(error),
 				});
-				return hit.text;
+				return shown(hit);
 			}
 			throw error;
 		}
@@ -252,13 +320,19 @@ async function cachedView(
 		failures.delete(key);
 		// Read while a change it depends on landed: kept (for a failing read) but read again next.
 		cache.delete(key);
-		cache.set(key, { ...deps, text, at: startedAt, stale });
+		cache.set(key, {
+			...deps,
+			text: fresh.text,
+			...(fresh.display ? { display: fresh.display } : {}),
+			at: startedAt,
+			stale,
+		});
 		while (cache.size > OUTLINE_VIEW_LIMITS.cached) {
 			const oldest = cache.keys().next().value;
 			if (oldest === undefined) break;
 			cache.delete(oldest);
 		}
-		return text;
+		return fresh;
 	} finally {
 		reads.delete(tracker);
 	}
@@ -349,19 +423,139 @@ export function viewTaskOf(
 	};
 }
 
+/** A task one of the session's subagents is doing (a delegation, outline P2 PR 9b). */
+interface DelegatedEntry {
+	task: OutlineTaskPromptTask & { address: string };
+	agent: OutlineViewAgent;
+}
+
+/**
+ * The open tasks the session's subagents hold with a live lease (a delegation: a subagent's claim
+ * lives while it runs, and passes to the session when the run ends), oldest claim first: at most
+ * {@link OUTLINE_VIEW_LIMITS.delegatedRead} claims through the narrators' root index and the
+ * holder index, their blocks by id, their titles as the head of their content, the subagents'
+ * titles in one read. Their spaces and the subagents become dependencies of the view.
+ */
+export async function readDelegated(
+	session: OutlineSession,
+	deps: ViewDeps = { spaces: new Set(), narrators: new Set(), anySpace: false },
+): Promise<{ entries: DelegatedEntry[]; more: boolean }> {
+	const root = session.sessionNarratorId;
+	if (session.subagent || root === null) return { entries: [], more: false };
+	const limit = OUTLINE_VIEW_LIMITS.delegatedRead;
+	const rows = await outlineStore.listSessionTaskClaims(root, limit + 1, { subagentsOnly: true });
+	const now = new Date().toISOString();
+	const held = rows
+		.slice(0, limit)
+		.filter(
+			({ claim }) =>
+				claim.holderNarratorId !== null &&
+				claim.holderNarratorId !== root &&
+				isClaimLive(claim, now),
+		);
+	if (held.length === 0) return { entries: [], more: false };
+	const ids = held.map(({ claim }) => claim.taskBlockId);
+	const [metas, heads] = await Promise.all([
+		outlineStore.getBlockMetasByIds(ids),
+		outlineStore.getBlockHeads(ids),
+	]);
+	const open = new Map(
+		metas.filter((m) => !m.deleted && isOpenTask(m.taskJson)).map((m) => [m.id, m]),
+	);
+	const titles = new Map(heads.map((h) => [h.id, blockTitle(h.contentHead)]));
+	const keys = new Map<string, string>();
+	for (const spaceId of new Set([...open.values()].map((m) => m.spaceId))) {
+		deps.spaces.add(spaceId);
+		const space = await outlineStore.getSpace(spaceId);
+		if (space) keys.set(spaceId, space.key);
+	}
+	const agents = [...new Set(held.map(({ claim }) => claim.holderNarratorId as string))];
+	for (const id of agents) deps.narrators.add(id);
+	const names = await readDisplayNames({ narratorIds: agents });
+	const entries: DelegatedEntry[] = [];
+	for (const { claim } of held) {
+		const meta = open.get(claim.taskBlockId);
+		const key = meta ? keys.get(meta.spaceId) : undefined;
+		if (!meta || !key) continue;
+		const agentId = claim.holderNarratorId as string;
+		const title = names.narrators.get(agentId);
+		entries.push({
+			task: {
+				text: clip(titles.get(meta.id) || meta.sid, OUTLINE_VIEW_LIMITS.titleChars),
+				address: `${key}/${meta.sid}`,
+				humanCreated: meta.taskJson?.humanCreated === true,
+			},
+			agent: {
+				id: agentId,
+				title: title ? clip(title, OUTLINE_VIEW_LIMITS.titleChars) : null,
+			},
+		});
+	}
+	return { entries, more: rows.length > limit };
+}
+
+/**
+ * The tasks assigned to the session by name that it has not started (`outline/assigned.ts`: what
+ * its team notices told it of, checked by primary key), at most
+ * {@link OUTLINE_VIEW_LIMITS.assigned}, those the session's own read lists already left out.
+ * Their spaces become dependencies of the view; a new assignment makes the view read again
+ * ({@link invalidateOutlineTasksView}).
+ */
+async function readAssigned(
+	session: OutlineSession,
+	deps: ViewDeps,
+): Promise<Array<OutlineTaskPromptTask & { address: string }>> {
+	const root = session.sessionNarratorId;
+	if (session.subagent || root === null) return [];
+	const metas = (await listOutlineAssignedTasks(root)).slice(0, OUTLINE_VIEW_LIMITS.assigned);
+	if (metas.length === 0) return [];
+	const heads = new Map(
+		(await outlineStore.getBlockHeads(metas.map((m) => m.id))).map((h) => [h.id, h.contentHead]),
+	);
+	const keys = new Map<string, string>();
+	const out: Array<OutlineTaskPromptTask & { address: string }> = [];
+	for (const meta of metas) {
+		// A task of its own space is among its own tasks already.
+		if (meta.spaceId === session.spaceId) continue;
+		deps.spaces.add(meta.spaceId);
+		if (!keys.has(meta.spaceId)) {
+			const space = await outlineStore.getSpace(meta.spaceId);
+			if (space) keys.set(meta.spaceId, space.key);
+		}
+		const key = keys.get(meta.spaceId);
+		if (!key) continue;
+		out.push({
+			text: clip(blockTitle(heads.get(meta.id) ?? "") || meta.sid, OUTLINE_VIEW_LIMITS.titleChars),
+			address: `${key}/${meta.sid}`,
+			humanCreated: meta.taskJson?.humanCreated === true,
+		});
+	}
+	return out;
+}
+
+/** A task was assigned to session `narratorId` (a root): its current-tasks view is read again. */
+export function invalidateOutlineTasksView(narratorId: string): void {
+	dropWhere(null, narratorId, "tasks:");
+}
+
 async function readTasksView(
 	narratorId: string,
 	locale: Locale,
 	deps: ViewDeps,
-): Promise<string | null> {
+): Promise<ViewRead> {
 	const session = await readOutlineSession(narratorId);
 	if (session.sessionNarratorId) deps.narrators.add(session.sessionNarratorId);
 	if (session.spaceId) deps.spaces.add(session.spaceId);
 	else deps.anySpace = true;
-	if (session.subagent) return null;
-	const read = await readOpen(session);
+	if (session.subagent) return { text: null };
+	const [read, delegated, assigned] = await Promise.all([
+		readOpen(session),
+		readDelegated(session, deps),
+		readAssigned(session, deps),
+	]);
 	for (const entry of read.entries) deps.spaces.add(entry.ref.spaceId);
-	if (read.entries.length === 0) return null;
+	if (read.entries.length === 0 && delegated.entries.length === 0 && assigned.length === 0)
+		return { text: null };
 
 	const doing = read.entries
 		.filter((entry) => entry.status === "doing")
@@ -379,6 +573,7 @@ async function readTasksView(
 	const titles = await titlesOf(listed);
 	const prerequisites = await readPrerequisites(waiting, session, deps);
 	const task = (entry: OpenEntry) => viewTaskOf(entry, titles, prerequisites);
+	const handedOut = delegated.entries.slice(0, OUTLINE_VIEW_LIMITS.delegated);
 
 	// Sections in order; lines that do not fit the budget are counted in the last line instead.
 	const heading = getOutlineTasksViewHeading(locale);
@@ -386,7 +581,27 @@ async function readTasksView(
 	let used = heading.length;
 	let shown = 0;
 	const room = OUTLINE_VIEW_LIMITS.tasksChars - getOutlineTasksViewMore(99, locale).length - 1;
+	// The entries whose lines the text holds: the reader's summary names these and no others.
+	const printed = new Set<OpenEntry>();
+	const printedDelegated: DelegatedEntry[] = [];
 	for (const { section, entries } of sections) {
+		// What the session's subagents are doing comes right after its own work in progress.
+		if (section === "waiting" && handedOut.length > 0) {
+			const sectionLine = getOutlineTasksViewSection("delegated", locale);
+			const delegatedLines = handedOut.map((entry) =>
+				getOutlineViewDelegatedLine(entry.task, entry.agent, locale),
+			);
+			if (used + sectionLine.length + (delegatedLines[0] as string).length + 2 <= room) {
+				lines.push(sectionLine);
+				used += sectionLine.length + 1;
+				for (const [index, line] of delegatedLines.entries()) {
+					if (used + line.length + 1 > room) break;
+					lines.push(line);
+					used += line.length + 1;
+					printedDelegated.push(handedOut[index] as DelegatedEntry);
+				}
+			}
+		}
 		if (entries.length === 0) continue;
 		const sectionLine = getOutlineTasksViewSection(section, locale);
 		const taskLines = entries.map((entry) => getOutlineViewTaskLine(task(entry), locale));
@@ -394,18 +609,177 @@ async function readTasksView(
 		if (used + sectionLine.length + first.length + 2 > room) break;
 		lines.push(sectionLine);
 		used += sectionLine.length + 1;
-		for (const line of taskLines) {
+		for (const [index, line] of taskLines.entries()) {
 			if (used + line.length + 1 > room) break;
 			lines.push(line);
 			used += line.length + 1;
 			shown++;
+			printed.add(entries[index] as OpenEntry);
 		}
 	}
-	const hidden = read.entries.length - shown;
-	if (read.truncated) lines.push(getOutlineTasksViewMore(null, locale));
+	// Last: what was assigned to the session by name and it has not started (outline P2 PR 10a).
+	// Only in the model's text: the reader's summary below lists the session's own tasks.
+	if (assigned.length > 0) {
+		const sectionLine = getOutlineTasksViewSection("assigned", locale);
+		const assignedLines = assigned.map((task) =>
+			getOutlineViewTaskLine({ ...task, checkbox: "todo", wait: null }, locale),
+		);
+		if (used + sectionLine.length + (assignedLines[0] as string).length + 2 <= room) {
+			lines.push(sectionLine);
+			used += sectionLine.length + 1;
+			for (const line of assignedLines) {
+				if (used + line.length + 1 > room) break;
+				lines.push(line);
+				used += line.length + 1;
+			}
+		}
+	}
+	const hidden = read.entries.length - shown + delegated.entries.length - printedDelegated.length;
+	if (read.truncated || delegated.more) lines.push(getOutlineTasksViewMore(null, locale));
 	else if (hidden > 0) lines.push(getOutlineTasksViewMore(hidden, locale));
-	return lines.join("\n");
+	// The reader's summary of the same read: the tasks the text lists, per section and titled (never
+	// one the budget left out of the text), and how many are open of each kind. Prerequisites are
+	// left out (D9: their space may not be readable by every reader of the session).
+	const viewTask = (entry: OpenEntry): OutlineTasksViewTask => {
+		const named = task(entry);
+		return {
+			address: named.address ?? entry.ref.address,
+			title: named.text,
+			...(named.humanCreated ? { humanCreated: true as const } : {}),
+		};
+	};
+	const counted = (status: OpenEntry["status"]) =>
+		read.entries.filter((entry) => entry.status === status).length;
+	const inText = (entries: readonly OpenEntry[]) =>
+		entries.filter((entry) => printed.has(entry)).map(viewTask);
+	const display: OutlineTasksViewDisplay = {
+		doing: inText(doing),
+		waiting: inText(waiting),
+		next: inText(next ? [next] : []),
+		...(printedDelegated.length > 0
+			? {
+					delegated: printedDelegated.map((entry) => ({
+						address: entry.task.address,
+						title: entry.task.text,
+						...(entry.task.humanCreated ? { humanCreated: true as const } : {}),
+					})),
+				}
+			: {}),
+		counts: {
+			doing: counted("doing"),
+			waiting: counted("blocked"),
+			todo: counted("todo"),
+			...(delegated.entries.length > 0 ? { delegated: delegated.entries.length } : {}),
+		},
+		...(read.truncated || delegated.more ? { more: true as const } : {}),
+	};
+	// Every open task read, by address under its state: what the next update is compared with
+	// (`refineTasksViewDisplay`). The two reads do not overlap: a task a subagent holds on a live
+	// lease is delegated and is not among the session's own (`findContinuationCandidates` leaves
+	// out what another holder has claimed), so no address needs choosing between two states.
+	const table = boundOutlineTasksViewStates({
+		doing: addressesOf(read.entries, "doing"),
+		delegated: delegated.entries.map((entry) => entry.task.address),
+		waiting: addressesOf(read.entries, "blocked"),
+		todo: addressesOf(read.entries, "todo"),
+	});
+	display.states = table.states;
+	if (table.cut || read.truncated || delegated.more) display.statesMore = true;
+	return { text: lines.join("\n"), display };
 }
+
+function addressesOf(entries: readonly OpenEntry[], status: OpenEntry["status"]): string[] {
+	return entries.filter((entry) => entry.status === status).map((entry) => entry.ref.address);
+}
+
+/** A task as its block says it is now: what became of one that left the view. */
+async function readTaskFact(
+	address: string,
+	spaces: Map<string, string | null>,
+): Promise<OutlineTasksViewFact | null> {
+	const slash = address.indexOf("/");
+	if (slash <= 0) return null;
+	const key = address.slice(0, slash);
+	const sid = address.slice(slash + 1);
+	if (!spaces.has(key)) spaces.set(key, (await outlineStore.getSpaceByKey(key))?.id ?? null);
+	const spaceId = spaces.get(key);
+	if (!spaceId) return { fate: "removed" };
+	// Its fields and the head of its content (enough for a title), never its whole body.
+	const [block] = await outlineStore.getBlockMetas(spaceId, { sids: [sid] });
+	const [head] = block ? await outlineStore.getBlockHeads([block.id]) : [];
+	const named = clip(blockTitle(head?.contentHead ?? ""), OUTLINE_VIEW_LIMITS.titleChars);
+	if (!block || block.deleted || !block.taskJson) {
+		// Its title is still worth naming when the block is there (no longer a task, or deleted).
+		return { fate: "removed", ...(named ? { title: named } : {}) };
+	}
+	const title = named || block.sid;
+	const status = block.taskJson.status;
+	return {
+		fate: status === "done" ? "done" : status === "cancelled" ? "cancelled" : "open",
+		title,
+	};
+}
+
+/** Bytes the current-tasks summary may take of a row's display (its limit, less some room). */
+const TASKS_DISPLAY_BYTES = CONTEXT_UPDATE_DISPLAY_MAX_BYTES - 256;
+
+/**
+ * The current-tasks summary a `context_update` row stores, saying what changed since the view the
+ * session was last shown (`previous`: that row's summary; `null` when it removed the view;
+ * `undefined` when there is none to compare with).
+ *
+ * Two state tables of at most {@link OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.states} addresses are
+ * compared in memory; at most {@link OUTLINE_TASKS_VIEW_DISPLAY_LIMITS.changes} blocks are read by
+ * address (the tasks that left the list: finished, cancelled or deleted; and changed tasks no
+ * view titled). Nothing here reaches the model.
+ *
+ * A view that goes away (`current === null`) keeps `null` unless the comparison names what
+ * emptied it (the last task finished), which is then stored as an empty list with its changes.
+ */
+export async function refineTasksViewDisplay(input: {
+	previous: unknown;
+	current: unknown;
+}): Promise<unknown> {
+	const current = coerceOutlineTasksViewDisplay(input.current);
+	if (current === undefined) return input.current;
+	const previous = coerceOutlineTasksViewDisplay(input.previous);
+	if (previous === undefined) return input.current;
+	const deltas = diffOutlineTasksViews(previous, current);
+	if (!deltas) return input.current;
+	const facts = new Map<string, OutlineTasksViewFact>();
+	const spaces = new Map<string, string | null>();
+	for (const address of outlineTasksViewDeltasToRead(deltas)) {
+		try {
+			const fact = await readTaskFact(address, spaces);
+			if (fact) facts.set(address, fact);
+		} catch (error) {
+			// Unread, the task is counted (or left out when the table is cut), never guessed.
+			logger.warn("Outline task could not be read for the view's changes", {
+				address,
+				error: String(error),
+			});
+		}
+	}
+	const settled = settleOutlineTasksViewChanges(deltas, facts);
+	if (current === null) {
+		if (settled.changed === 0) return null;
+		return {
+			doing: [],
+			waiting: [],
+			next: [],
+			counts: { doing: 0, waiting: 0, todo: 0 },
+			states: {},
+			...settled,
+		} satisfies OutlineTasksViewDisplay;
+	}
+	const refined: OutlineTasksViewDisplay = { ...current, ...settled };
+	// Long titles: the changes give way before the list does (the row then reads as a first view).
+	return contextDisplayBytes(refined) <= TASKS_DISPLAY_BYTES ? refined : input.current;
+}
+
+// Registered on every load of this module: a dev hot reload replaces the refiner with the new code
+// (the registry is a keyed map, so there is never more than one).
+registerContextDisplayRefiner(OUTLINE_TASKS_VIEW_KEY, (input) => refineTasksViewDisplay(input));
 
 /**
  * The current-tasks view of an outline root session: in progress (at most five), waiting (at most
@@ -413,7 +787,12 @@ async function readTasksView(
  * has no tasks of its own, D27c), and when the session cannot be read.
  */
 export async function outlineTasksView(narratorId: string, locale: Locale): Promise<string | null> {
-	return await cachedView(`tasks:${narratorId}:${locale}`, (deps) =>
+	return (await outlineTasksViewRead(narratorId, locale)).text;
+}
+
+/** The current-tasks view with its reader summary (`ContextPart.display`). */
+async function outlineTasksViewRead(narratorId: string, locale: Locale): Promise<ViewRead> {
+	return await cachedViewRead(`tasks:${narratorId}:${locale}`, (deps) =>
 		readTasksView(narratorId, locale, deps),
 	);
 }
@@ -540,6 +919,10 @@ async function renderBehaviorPage(
 	const subtree = await readSubtree(pageId);
 	if (!subtree) return null;
 	const { state, root } = subtree;
+	// Content the swallowed-content scan attached is never shown as a rule (outline P2 PR 12c): a
+	// rule a person removed must not apply again because a check found it.
+	// Of content a person confirmed as rules, the content only: its header speaks to the person.
+	dropSpecLossAttachBlocks(root, { rulesOnly: true });
 	const min = OUTLINE_VIEW_LIMITS.behaviorBlockMinChars;
 	const order = breadthFirst(root, "all", maxBlocks);
 	// A character is at most three UTF-8 bytes in the text a page holds.
@@ -706,10 +1089,10 @@ export async function outlineContextParts(
 	options: { tasks: boolean },
 ): Promise<ContextPart[]> {
 	const parts: ContextPart[] = [];
-	const add = async (key: string, view: () => Promise<string | null>) => {
+	const add = async (key: string, view: () => Promise<ViewRead>) => {
 		try {
-			const text = await view();
-			if (text) parts.push({ key, text });
+			const { text, display } = await view();
+			if (text) parts.push({ key, text, ...(display ? { display } : {}) });
 		} catch (error) {
 			// Logged when a read failed, not again for each failure within its backoff.
 			if (!(error instanceof OutlineViewBackoffError)) {
@@ -719,9 +1102,11 @@ export async function outlineContextParts(
 		}
 	};
 	if (options.tasks) {
-		await add(OUTLINE_VIEW_KEYS.tasks, () => outlineTasksView(narratorId, locale));
+		await add(OUTLINE_VIEW_KEYS.tasks, () => outlineTasksViewRead(narratorId, locale));
 	}
-	await add(OUTLINE_VIEW_KEYS.behavior, () => outlineBehaviorView(narratorId, locale));
+	await add(OUTLINE_VIEW_KEYS.behavior, async () => ({
+		text: await outlineBehaviorView(narratorId, locale),
+	}));
 	return parts;
 }
 

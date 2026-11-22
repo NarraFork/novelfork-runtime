@@ -10,6 +10,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { parseSubstatus } from "../lib/narrator-utils";
+import type { Locale } from "../lib/prompt-i18n";
 import type { RunDeliverTo } from "../lib/validators/runtime-registration";
 import { narratorPersistence } from "./narrator-persistence";
 import {
@@ -53,6 +54,8 @@ interface RestartManifest {
 export interface RestartStartupRecovery {
 	manifest: RestartManifest | null;
 	protection: ToolContinuationProtectionSets;
+	/** This cold-start pass only; never persisted or reused for a later explicit hydration. */
+	heldRunIds?: ReadonlySet<string>;
 }
 const processState = hotSafe("restart-recovery", () => ({
 	prepared: false,
@@ -289,9 +292,13 @@ export function mergeStartupProtection(
 /** A restored user hold protects facts, not permission to automatically execute them. */
 export async function protectHeldRunFacts(
 	protection: ToolContinuationProtectionSets,
+	hydratedRunIds?: ReadonlySet<string>,
 ): Promise<Set<string>> {
-	const { hydrateRunHolds } = await import("./agent-runtime/run");
-	const held = await hydrateRunHolds();
+	// Share only the snapshot explicitly passed by this cold-start orchestration. A later
+	// standalone caller must still read current durable holds, including newly taken-over runs.
+	const held = hydratedRunIds
+		? new Set(hydratedRunIds)
+		: await import("./agent-runtime/run").then(({ hydrateRunHolds }) => hydrateRunHolds());
 	for (const id of held) {
 		protection.narratorIds.add(id);
 		for (let after = ""; ; ) {
@@ -363,6 +370,7 @@ export async function prepareOrdinaryRestartRecovery(
 	if (processState.prepared) return empty; // Hot reload must not mount duplicate runtimes.
 	processState.prepared = true;
 	const held = await protectHeldRunFacts(empty.protection);
+	empty.heldRunIds = held;
 	const saved = await readManifest();
 	// A v3 planned root already owns this source; never load the ordinary file a second time.
 	const previous = saved && !getRecoverySource(saved.snapshot.updateEpoch) ? saved : null;
@@ -405,38 +413,51 @@ export async function prepareOrdinaryRestartRecovery(
 	const publication = getRuntimePublicationService();
 	const rows: typeof candidates = [];
 	for (const row of candidates) {
-		const result =
+		const run =
 			row.logicalRunId && row.deliverTo
-				? await publication.readAgentTerminalResult(
-						{
-							producerKind: "agent",
-							taskId: row.id,
-							logicalRunId: row.logicalRunId,
-							recipientId: row.deliverTo.narratorId,
-						},
-						{ includeEventKind: true },
-					)
+				? {
+						producerKind: "agent" as const,
+						taskId: row.id,
+						logicalRunId: row.logicalRunId,
+						recipientId: row.deliverTo.narratorId,
+					}
 				: null;
-		if (!result) {
+		const publicationState = run
+			? await publication.readRunPublicationState(run)
+			: { state: "none" as const };
+		if (publicationState.state !== "settled") {
 			// Idle rows entered this set only through the verified retained manifest.
 			if (restartEligible(row) || row.status === "idle") rows.push(row);
 			continue;
 		}
+		const result = run
+			? await publication.readAgentTerminalResult(run, { includeEventKind: true })
+			: null;
 		// A crash after the terminal transaction but before idle needs delivery only.
-		// The durable snapshot/intent is authoritative; never execute the model again.
+		// The durable terminal evidence is authoritative; never execute the model again,
+		// even when the result snapshot itself can no longer be read.
+		const eventKind = result?.eventKind ?? publicationState.eventKind;
 		await db
 			.update(narrators)
 			.set({
 				status: "idle",
 				substatus: JSON.stringify([
-					result.eventKind === "failed"
-						? "error"
-						: result.eventKind === "timed_out"
-							? "timeout"
-							: result.eventKind === "cancelled"
-								? "interrupted"
-								: "unread",
+					!eventKind
+						? "interrupted"
+						: eventKind === "failed"
+							? "error"
+							: eventKind === "timed_out"
+								? "timeout"
+								: eventKind === "cancelled"
+									? "interrupted"
+									: "unread",
 				]),
+				...(!result
+					? {
+							errorMessage:
+								"Run had already published its terminal result before restart; the stored result is no longer readable, so it was not rerun.",
+						}
+					: {}),
 			})
 			.where(and(eq(narrators.id, row.id), eq(narrators.logicalRunId, row.logicalRunId as string)));
 		publication.schedule();
@@ -450,10 +471,27 @@ export async function prepareOrdinaryRestartRecovery(
 			if (call && call.status !== "success" && call.status !== "fail") rows.push(row);
 		}
 	}
+	// A live loop recorded at shutdown also authorizes its own unchanged run, even
+	// when it delivers to nobody. Historical active rows (or rows without a run ID) do not.
+	const recordedRuns = new Map(
+		previous?.targets
+			.filter(
+				(target) =>
+					target.logicalRunId &&
+					previous.snapshot.narrators.some((entry) => entry.narratorId === target.narratorId),
+			)
+			.map((target) => [target.narratorId, target.logicalRunId]),
+	);
+	const explicitIds = new Set(
+		rows
+			.filter((row) => row.logicalRunId && recordedRuns.get(row.id) === row.logicalRunId)
+			.map((row) => row.id),
+	);
 	// A run that delivers its result is resumed; the session it delivers to (and so on
 	// up) is selected too, because it waits for that result exactly once.
 	const delegated = rows.filter((row) => row.deliverTo);
 	const selectedIds = new Set([
+		...explicitIds,
 		...delegated.map((row) => row.id),
 		...rows.filter((row) => unfinishedOwners.has(row.id)).map((row) => row.id),
 	]);
@@ -475,13 +513,16 @@ export async function prepareOrdinaryRestartRecovery(
 		version: 2,
 		updateEpoch: previous?.snapshot.updateEpoch ?? `restart-${generateId()}`,
 		capturedAt: previous?.snapshot.capturedAt ?? new Date().toISOString(),
-		narrators: selected.map(
-			(row) =>
-				previous?.snapshot.narrators.find((target) => target.narratorId === row.id) ?? {
-					narratorId: row.id,
-					locale: "en",
-				},
-		),
+		narrators: selected.flatMap((row) => {
+			const saved = previous?.targets.some(
+				(target) => target.narratorId === row.id && target.logicalRunId === row.logicalRunId,
+			)
+				? previous.snapshot.narrators.find((target) => target.narratorId === row.id)
+				: undefined;
+			// Caller discovery is not evidence that its independent loop was live. Keep
+			// its continuation, but do not manufacture standalone restart authorization.
+			return saved ? [saved] : row.deliverTo ? [{ narratorId: row.id, locale: "en" }] : [];
+		}),
 	};
 	const manifest: RestartManifest = {
 		version: 1,
@@ -496,7 +537,13 @@ export async function prepareOrdinaryRestartRecovery(
 			updateEpoch: snapshot.updateEpoch,
 			kind: "ordinary",
 			capturedAt: snapshot.capturedAt,
-			narrators: snapshot.narrators,
+			narrators: selected.map(
+				(row) =>
+					snapshot.narrators.find((target) => target.narratorId === row.id) ?? {
+						narratorId: row.id,
+						locale: "en",
+					},
+			),
 			pendingNarratorIds: manifest.targets.map((target) => target.narratorId),
 			logicalRuns: manifest.targets,
 		},
@@ -624,10 +671,18 @@ export async function prepareOrdinaryRestartRecovery(
 			.map((record) => record.narratorId),
 	);
 	for (const row of selected) {
-		if (!row.deliverTo && !queuedOwners.has(row.id)) {
+		if (!row.deliverTo && !queuedOwners.has(row.id) && !explicitIds.has(row.id)) {
 			protection.narratorIds.delete(row.id);
 		}
 	}
+	// Ancestors discovered through a historical/finished Agent call have no loop to
+	// mount. Keep their run facts for tool adoption, but not as pending standalone work.
+	const source = getRegisteredRecoverySource(snapshot.updateEpoch);
+	if (source)
+		registerRecoverySource(source).update({
+			...source,
+			pendingNarratorIds: source.pendingNarratorIds.filter((id) => protection.narratorIds.has(id)),
+		});
 	// Represented children are driven by Agent continuations; standalone children mount independently.
 	logger.info("Prepared ordinary restart recovery", {
 		targetCount: selected.length,
@@ -635,12 +690,12 @@ export async function prepareOrdinaryRestartRecovery(
 		toolCount: protection.toolCallIds.size,
 		automaticResume: automaticResumeEnabled(),
 	});
-	const prepared = { manifest, protection };
+	const prepared = { manifest, protection, heldRunIds: held };
 	if (!automaticResumeEnabled()) {
 		processState.pausedRecovery = prepared;
 		// A disabled recovery has no runtime owner: show an honest interrupted/resting state,
 		// while keeping permission/tool records protected and available for a manual resume.
-		return { manifest, protection: { ...protection, narratorIds: held } };
+		return { manifest, protection: { ...protection, narratorIds: held }, heldRunIds: held };
 	}
 	return prepared;
 }
@@ -750,24 +805,25 @@ export async function restoreCarriedOrdinaryTargets(
 					where: eq(narrators.id, target.narratorId),
 					columns: { id: true, logicalRunId: true, status: true, substatus: true },
 				});
+				const saved = current.narrators.find((entry) => entry.narratorId === target.narratorId);
 				const valid =
 					row &&
 					row.logicalRunId === target.logicalRunId &&
-					!!(await deliverToOf(row.id)) &&
+					(!!(await deliverToOf(row.id)) || (!!target.logicalRunId && !!saved)) &&
 					(restartEligible(row) ||
 						(row.status === "idle" &&
 							parseSubstatus(row.substatus).includes("interrupted") &&
 							!parseSubstatus(row.substatus).some((tag) =>
-								["error", "taken_over", "cancelled"].includes(tag),
+								["error", "taken_over", "manual_override", "cancelled"].includes(tag),
 							)));
 				if (valid) {
-					// The same persisted run continues (deadline kept); its result was already
-					// owed through its own task/tool call, so recovery does not deliver it again.
+					// Keep the persisted run/deadline and original reply options. A delegated
+					// run's task/tool call already owns delivery; recovery must not deliver twice.
 					const resumed = await continueNarrator(
 						row.id,
-						"en",
-						false,
-						undefined,
+						(saved?.locale ?? "en") as Locale,
+						saved?.replyInUserLanguage ?? false,
+						saved?.userId,
 						{
 							resumeRunId: row.logicalRunId ?? undefined,
 							recovered: true,
@@ -775,7 +831,7 @@ export async function restoreCarriedOrdinaryTargets(
 						},
 						humanReplyContext?.narratorId === row.id ? humanReplyContext.context : undefined,
 					);
-					if (!resumed.ok) throw new Error("Standalone delivering run recovery did not start");
+					if (!resumed.ok) throw new Error("Standalone run recovery did not start");
 				}
 				const original = getRegisteredRecoverySource(source.updateEpoch);
 				if (original)
@@ -786,7 +842,7 @@ export async function restoreCarriedOrdinaryTargets(
 			});
 		} catch (error) {
 			failures.push(target.narratorId);
-			logger.error("Could not resume interrupted standalone subagent", {
+			logger.error("Could not resume interrupted standalone narrator", {
 				narratorId: target.narratorId,
 				error: String(error),
 			});

@@ -6,14 +6,16 @@
  * newly-selected image thumb, removable text-file chip).
  */
 
+import { readBoundedBlob } from "@frontend/lib/bounded-blob";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import { Box, CloseButton, Group, Image, Skeleton, Text } from "@mantine/core";
 import { formatFileSize } from "@shared/text-file-types";
 import { IconFile } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUploadCapability } from "../../../hooks/usePlatform";
-import { clearTokenOnSessionFailure, getToken } from "../../../lib/api";
-import { apiUrl } from "../../../lib/base-path";
+import { authorizedFetch, clearTokenOnSessionFailure, getUploadedImageUrl } from "../../../lib/api";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "./image-clipboard";
 
@@ -30,6 +32,7 @@ function useUploadedImageBlobUrl(
 	uploadNarratorId: string | undefined,
 	imageId: string | undefined,
 	enabled: boolean,
+	contextNarratorId?: string,
 ): string | null {
 	const uploadCapability = useUploadCapability();
 	const supported = uploadCapability.serveNarratorImages.supported;
@@ -37,18 +40,22 @@ function useUploadedImageBlobUrl(
 
 	useEffect(() => {
 		if (!enabled || !supported || !uploadNarratorId || !imageId) return;
-		const token = getToken();
-		const headers: Record<string, string> = {};
-		if (token) headers.Authorization = `Bearer ${token}`;
+		const controller = new AbortController();
+		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
 		let cancelled = false;
 		let objectUrl: string | null = null;
-		fetch(apiUrl(`/uploads/${uploadNarratorId}/${imageId}`), { headers })
+		setBlobUrl(null);
+		authorizedFetch(getUploadedImageUrl(uploadNarratorId, imageId, contextNarratorId), { signal })
 			.then(async (res) => {
 				if (!res.ok) {
-					await clearTokenOnSessionFailure(res);
+					await clearTokenOnSessionFailure(res.clone());
 					return null;
 				}
-				return res.blob();
+				return readBoundedBlob(
+					res,
+					REMOTE_BUILD ? 8 * 1024 * 1024 : MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES,
+					signal,
+				);
 			})
 			.then((blob) => {
 				if (blob && !cancelled && blob.size <= MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES) {
@@ -59,9 +66,10 @@ function useUploadedImageBlobUrl(
 			.catch(() => {});
 		return () => {
 			cancelled = true;
+			controller.abort();
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [uploadNarratorId, imageId, enabled, supported]);
+	}, [uploadNarratorId, imageId, enabled, supported, contextNarratorId]);
 
 	return blobUrl;
 }
@@ -77,15 +85,18 @@ export function QueuedImageThumb({
 	imageId,
 	filename,
 	uploadNarratorId,
+	contextNarratorId,
 	size = 20,
 }: {
 	imageId: string;
 	filename?: string | null;
 	uploadNarratorId?: string;
+	/** The narrator whose queue shows the image; the reference context for a fork's image. */
+	contextNarratorId?: string;
 	size?: number;
 }) {
 	const openImageViewer = useImageViewer();
-	const src = useUploadedImageBlobUrl(uploadNarratorId, imageId, true);
+	const src = useUploadedImageBlobUrl(uploadNarratorId, imageId, true, contextNarratorId);
 	const alt = filename ?? "image";
 
 	if (!src) return <Skeleton h={size} w={size} radius="sm" />;
@@ -128,9 +139,18 @@ export function EditExistingImageThumb({
 	const openImageViewer = useImageViewer();
 	const uploadNarratorId =
 		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
-	const blobUrl = useUploadedImageBlobUrl(uploadNarratorId, block.imageId, !block.previewUrl);
+	const previewUrl =
+		typeof block.previewUrl === "string" && (!REMOTE_BUILD || isRemoteInlineImage(block.previewUrl))
+			? block.previewUrl
+			: undefined;
+	const blobUrl = useUploadedImageBlobUrl(
+		uploadNarratorId,
+		block.imageId,
+		!previewUrl,
+		imageNarratorId,
+	);
 
-	const src = block.previewUrl ?? blobUrl;
+	const src = previewUrl ?? blobUrl;
 
 	return (
 		<Box pos="relative" style={{ display: "inline-block" }}>

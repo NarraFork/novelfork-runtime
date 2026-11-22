@@ -79,6 +79,12 @@ export const createNarratorSchema = z.object({
 	permissionMode: permissionModeSchema.optional(),
 	startInPlanMode: z.boolean().optional(),
 	cwd: z.string().min(1).max(4096).optional(),
+	/**
+	 * Execution device the session starts on. Null/"local" (and omission) mean the
+	 * NarraFork server; a remote id must be one the caller can see and that is online,
+	 * and `cwd` is then an absolute path on that device, in its own grammar.
+	 */
+	deviceId: z.string().trim().min(1).max(128).nullish(),
 	reasoningEffort: reasoningEffortSchema.nullable().optional(),
 	/** @deprecated Use fastModeOverride. Kept so older clients keep working. */
 	fastMode: z.boolean().optional(),
@@ -86,6 +92,7 @@ export const createNarratorSchema = z.object({
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
+	questionReflectionOverride: booleanOverrideSchema.optional(),
 	autoContinuationOverride: autoContinuationOverrideSchema.optional(),
 	behaviorFenceIntervalOverride: z
 		.number()
@@ -145,6 +152,8 @@ export const codexUpdateCredentialSchema = z.object({
 	displayName: z.string().optional(),
 	priority: z.number().optional(),
 	useCreditQuota: z.boolean().optional(),
+	/** Network identity; validated by `normalizeCredentialNetwork`. `null` clears it. */
+	network: z.unknown().optional(),
 });
 
 export const codexUseWebSocketSchema = z.object({
@@ -640,6 +649,17 @@ export const narratorExportQuerySchema = z.object({
 	scope: z.enum(["full", "visible"]).default("visible"),
 	includeToolIO: exportBooleanSchema.default(true),
 	lang: z.enum(["en", "zh-CN"]).default("en"),
+	/** `1,2,3-10,15,21`；省略表示导出当前 scope 的全部消息。 */
+	range: z
+		.string()
+		.max(512)
+		.optional()
+		.transform((value) => value ?? ""),
+});
+
+/** 导出范围选择弹窗读取的轮次摘要；scope 与导出保持一致。 */
+export const narratorExportTurnsQuerySchema = z.object({
+	scope: z.enum(["full", "visible"]).default("visible"),
 });
 
 /**

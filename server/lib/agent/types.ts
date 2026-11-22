@@ -16,7 +16,7 @@ import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
-import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
+import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
 
 // === API error and bounded diagnostics ===
 
@@ -367,6 +367,11 @@ export interface ToolResult {
 	fatal?: boolean;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Images already persisted by the tool; do not load their bytes in the loop. */
+	imageRefs?: Extract<
+		import("@shared/agent-protocol/tool-output").ToolOutputImageRef,
+		{ uploadNarratorId: string }
+	>[];
 	/** Actual bytes for the next provider request, never persisted in events. */
 	media?: NativeMediaInput[];
 	/** Durable asset references used to reconstruct native media on history replay. */
@@ -525,6 +530,11 @@ export type AgentEvent =
 			metadata?: Record<string, unknown>;
 			/** Images the tool returned; the consumer saves them and stores references. */
 			images?: Array<{ format: string; base64: string }>;
+			/** Images already persisted by the tool; preserve references without loading bytes. */
+			imageRefs?: Extract<
+				import("@shared/agent-protocol/tool-output").ToolOutputImageRef,
+				{ uploadNarratorId: string }
+			>[];
 	  }
 	/**
 	 * The tool passed its permission gate and final admission — execution begins NOW.
@@ -742,7 +752,7 @@ export type AgentEvent =
 			/** `channel:bareModel` id used to match this model in `/v1/models`. */
 			nugModelId?: string;
 			/** How recovery is awaited; `credentials` when omitted. */
-			waitKind?: "credentials" | "quota";
+			waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 			/** Which plan a `quota` wait belongs to; `kimi` when omitted (older events). */
 			quotaProvider?: import("@shared/agent-protocol/quota-exhausted").QuotaProviderKind;
 			/** Window that refused (`fiveHour`, `weekly`, `monthly`, `rateLimit`, …). */
@@ -810,7 +820,10 @@ export type AgentEvent =
 	| {
 			type: "image_generation";
 			id: string;
+			/** `completed` is authoritative only when a final payload has a result. */
 			status: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			partialImageIndex?: number;
@@ -820,6 +833,7 @@ export type AgentEvent =
 			width?: number;
 			height?: number;
 			outputIndex?: number;
+			final?: boolean;
 	  }
 	| {
 			type: "model_switched";
@@ -851,9 +865,13 @@ export type AgentEvent =
 				cacheCreationInputTokens?: number;
 				cacheCreation5mTokens?: number;
 				cacheCreation1hTokens?: number;
+				/** See ParsedStreamEvent.usage.cacheReported. */
+				cacheReported?: boolean;
 			};
 			ttftMs?: number;
 			durationMs?: number;
+			/** First persistable content → request end; absent when no content arrived. */
+			decodeMs?: number;
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
@@ -920,11 +938,15 @@ export type ContentBlock =
 	| {
 			type: "image_generation";
 			id: string;
+			status?: string;
+			error?: string;
+			errorCode?: string;
 			revisedPrompt?: string;
 			result?: string;
 			savedPath?: string;
 			partialSavedPath?: string;
 			partialImageIndex?: number;
+			partialImageB64?: string;
 			outputIndex?: number;
 			width?: number;
 			height?: number;
@@ -961,6 +983,8 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	...OUTLINE_READ_TOOLS,
 	// Planning writes the outline: OutlineEdit then writes only the session's own space.
 	OUTLINE_EDIT_TOOL,
+	// A question for a person is no change to the plan (outline P2 PR 7).
+	OUTLINE_ASK_TOOL,
 ]);
 
 // === Agent config ===
@@ -1046,6 +1070,12 @@ export interface AgentConfig {
 	 * instead, and taskReflection never runs. Absent means spec.
 	 */
 	taskBackend?: "spec" | "outline";
+	/**
+	 * With `taskBackend` `outline`: the session is one the Dynamic Spec import moved into the
+	 * outline (outline P2 PR 12b2), so a `spec://` call is answered with where its old tasks,
+	 * notes and behavior boundary went.
+	 */
+	specImported?: boolean;
 	/**
 	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
 	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read

@@ -37,10 +37,40 @@ let setAsDefault: string[];
 let setAsSummary: string[];
 let editDefault: number;
 let editSummary: number;
+let setNativeValue: (input: HTMLInputElement, value: string) => void;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
+const previousInputPrototype = new Map<string, PropertyDescriptor | undefined>();
+let inputPrototype: object;
 
 beforeEach(async () => {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	// linkedom gaps in React's change-event pipeline (details in ProxyOverrideField.test.tsx):
+	// an untyped input reports `type` null, and the legacy value watcher needs attachEvent.
+	const inputProto = window.HTMLInputElement.prototype;
+	inputPrototype = inputProto;
+	for (const key of ["type", "attachEvent", "detachEvent", "select", "setSelectionRange"]) {
+		previousInputPrototype.set(key, Object.getOwnPropertyDescriptor(inputProto, key));
+	}
+	const valueSetter = Object.getOwnPropertyDescriptor(inputProto, "value")?.set;
+	if (!valueSetter) throw new Error("HTMLInputElement.prototype.value has no setter");
+	setNativeValue = (input, value) => valueSetter.call(input, value);
+	const typeDescriptor = Object.getOwnPropertyDescriptor(inputProto, "type");
+	if (typeDescriptor?.get) {
+		const nativeGet = typeDescriptor.get;
+		Object.defineProperty(inputProto, "type", {
+			...typeDescriptor,
+			get(this: HTMLInputElement) {
+				return nativeGet.call(this) ?? "text";
+			},
+		});
+	}
+	(window.document as unknown as Record<string, unknown>).oninput = null;
+	Object.defineProperties(inputProto, {
+		attachEvent: { value: () => {}, configurable: true },
+		detachEvent: { value: () => {}, configurable: true },
+		select: { value: () => {}, configurable: true },
+		setSelectionRange: { value: () => {}, configurable: true },
+	});
 	frames = new Map();
 	nextFrame = 0;
 	selected = [];
@@ -67,6 +97,12 @@ beforeEach(async () => {
 			frames.delete(id);
 		},
 		IS_REACT_ACT_ENVIRONMENT: true,
+		// Old-list tests render in provider mode; browser tests opt into model mode per render.
+		localStorage: {
+			getItem: (key: string) => (key === "narrafork_model_menu_mode" ? menuMode : null),
+			setItem() {},
+			removeItem() {},
+		},
 	};
 	for (const [key, value] of Object.entries(globals)) {
 		previousGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -89,12 +125,19 @@ beforeEach(async () => {
 afterEach(async () => {
 	await act(async () => root.unmount());
 	host.remove();
+	for (const [key, descriptor] of previousInputPrototype) {
+		if (descriptor) Object.defineProperty(inputPrototype, key, descriptor);
+		else Reflect.deleteProperty(inputPrototype, key);
+	}
+	previousInputPrototype.clear();
 	for (const [key, descriptor] of previousGlobals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
 	}
 	previousGlobals.clear();
 });
+
+let menuMode: "model" | "provider" = "provider";
 
 async function render(
 	currentModel: string | null,
@@ -109,9 +152,11 @@ async function render(
 		summaryModelValue?: string | null;
 		canFollowParent?: boolean;
 		inheritance?: SubagentModelInheritance | null;
+		mode?: "model" | "provider";
 		extraProps?: Partial<Parameters<typeof ModelMenuItems>[0]>;
 	},
 ) {
+	menuMode = options?.mode ?? "provider";
 	const withGlobalRoleActions = options?.withGlobalRoleActions ?? false;
 	const withRoleEditors = options?.withRoleEditors ?? false;
 	await act(async () => {
@@ -168,6 +213,7 @@ function button(text: string) {
 	if (!found) throw new Error(`Missing menu item: ${text}`);
 	return found;
 }
+
 function prepareGeometry() {
 	const dropdown = host.querySelector<HTMLElement>("[data-model-menu-scroll]");
 	if (!dropdown) throw new Error("Missing dropdown");
@@ -191,11 +237,24 @@ async function flushFrames() {
 		for (const callback of callbacks) callback(0);
 	});
 }
+/** Type into the model filter, driving both of React's change pipelines. */
+async function typeFilter(text: string, placeholder = narratorLocale.modelFilterPlaceholder) {
+	const input = host.querySelector<HTMLInputElement>(`input[placeholder="${placeholder}"]`);
+	if (!input) throw new Error("Missing model filter input");
+	await act(async () => {
+		input.dispatchEvent(new window.Event("focusin", { bubbles: true }));
+	});
+	await act(async () => {
+		setNativeValue(input, text);
+		input.dispatchEvent(new window.Event("input", { bubbles: true }));
+		input.dispatchEvent(new window.Event("keyup", { bubbles: true }));
+	});
+}
 
 describe("follow parent selection", () => {
 	test.each([
-		["en", "Follow parent"],
-		["zh-CN", "跟随主代理"],
+		["en", narratorLocale.followParent],
+		["zh-CN", narratorZhLocale.followParent],
 	])("shows an honest follow label in %s and keeps concrete selection working", async (language, label) => {
 		await instance.changeLanguage(language);
 		await render(FOLLOW_PARENT_MODEL, models, true, true, {
@@ -325,7 +384,7 @@ describe("provider group header", () => {
 
 describe("group ordering", () => {
 	test("pins default, summary, and aggregations, then sorts providers by label", async () => {
-		// zh-CN titles put 聚合 after every Latin provider label under the default
+		// The translated aggregation title sorts after every Latin provider label under the default
 		// collation, so this header position only holds when the group is pinned.
 		// Insertion order is scrambled and is neither prefix order nor label order.
 		await instance.changeLanguage("zh-CN");
@@ -433,7 +492,7 @@ describe("per-model global role actions", () => {
 });
 
 describe("provider prefix on default/summary rows", () => {
-	test("shows the resolved target's provider prefix as a secondary line", async () => {
+	test("role rows stay compact and do not repeat the provider as a second line", async () => {
 		const withRoles: ModelOption[] = [
 			{ value: "__default__", label: "gpt-6-astra", provider: "__default__" },
 			{ value: "__summary__", label: "mimo-v2.6-pro", provider: "__summary__" },
@@ -445,8 +504,9 @@ describe("provider prefix on default/summary rows", () => {
 			summaryModelValue: "xiaomi:mimo-v2.6-pro",
 		});
 		expect(host.textContent).toContain("codex");
-		expect(host.textContent).toContain("xiaomi");
-		// The prefix is a secondary line under the role row label, not a group header.
+		// The provider appears as the group label / concrete model value, not as a second line
+		// under each role row (that extra line is what made the role slots look oversized).
+		expect(host.textContent).toContain("Xiaomi");
 		const roleRows = Array.from(host.querySelectorAll("[data-menu-item]")).filter(
 			(item) =>
 				item.textContent?.includes("gpt-6-astra") || item.textContent?.includes("mimo-v2.6-pro"),
@@ -479,6 +539,70 @@ describe("aggregation choices inside model menu", () => {
 	test("does not show aggregation members for ordinary models", async () => {
 		await render("a:one");
 		expect(host.textContent).not.toContain("Provider A · One");
+	});
+});
+
+describe("auto:<model> rows", () => {
+	const autoModels: ModelOption[] = [
+		...models,
+		{
+			value: "auto:gpt-5.5",
+			label: "GPT-5.5",
+			provider: "__auto__",
+			autoSources: [
+				{ value: "codex:gpt-5.5", provider: "codex", available: false, subscription: true },
+				{ value: "a:gpt-5.5", provider: "a", available: true, subscription: false },
+			],
+		},
+	];
+
+	test("the source auto would use is marked on its own row, not in a sentence", async () => {
+		await render("auto:gpt-5.5", autoModels, true, true, { mode: "model" });
+		expect(host.textContent).toContain(narratorLocale.modelGroupFamilyOther);
+		const inUse = (value: string) =>
+			host
+				.querySelector(`[data-model-source="${value}"]`)
+				?.querySelector('[role="img"][aria-label="In use"]');
+		// Provider A can serve; codex cannot, so only Provider A carries the in-use marker.
+		expect(inUse("a:gpt-5.5")).toBeTruthy();
+		expect(inUse("codex:gpt-5.5")).toBeFalsy();
+	});
+
+	test("the focused model lists automatic and every source, and picks keep their values", async () => {
+		await render("auto:gpt-5.5", autoModels, true, true, { mode: "model" });
+		expect(host.querySelector('[data-model-source="codex:gpt-5.5"]')).toBeTruthy();
+		expect(host.querySelector('[data-model-source="a:gpt-5.5"]')).toBeTruthy();
+		expect(host.textContent).toContain(narratorLocale.autoSourceSubscription);
+		await act(async () =>
+			host.querySelector<HTMLButtonElement>('[data-model-source="codex:gpt-5.5"]')?.click(),
+		);
+		await act(async () =>
+			host.querySelector<HTMLButtonElement>('[data-model-auto="auto:gpt-5.5"]')?.click(),
+		);
+		expect(selected).toEqual(["codex:gpt-5.5", "auto:gpt-5.5"]);
+	});
+
+	test("the provider view still lists a model its auto row also offers", async () => {
+		// The provider view renders no auto groups, so hiding covered models there would make
+		// them (and a service whose every model is covered) disappear from the picker.
+		const withDuplicate: ModelOption[] = [
+			...autoModels,
+			{ value: "a:gpt-5.5", label: "GPT-5.5 on A", provider: "a" },
+		];
+		await render("a:one", withDuplicate);
+		expect(host.textContent).toContain("GPT-5.5 on A");
+		expect(host.textContent).toContain("One");
+	});
+
+	test("a pinned source focuses its auto model and is the checked source", async () => {
+		await render("a:gpt-5.5", autoModels, true, true, { mode: "model" });
+		const hasVisibleCheck = (element: Element | null) =>
+			!!element &&
+			Array.from(element.querySelectorAll("svg")).some(
+				(icon) => (icon as SVGElement).style.visibility === "visible",
+			);
+		expect(hasVisibleCheck(host.querySelector('[data-model-source="a:gpt-5.5"]'))).toBe(true);
+		expect(hasVisibleCheck(host.querySelector('[data-model-auto="auto:gpt-5.5"]'))).toBe(false);
 	});
 });
 
@@ -536,5 +660,133 @@ describe("opening selection positioning", () => {
 		await render("a:two", models, false);
 		await flushFrames();
 		expect(dropdown.scrollTop).toBe(0);
+	});
+});
+
+describe("model filter input", () => {
+	// Rendered with providerLabels { a: "Provider A", xiaomi: "Xiaomi" }.
+	const filterModels: ModelOption[] = [
+		{ value: "__default__", label: "Follow default", provider: "__default__" },
+		{ value: "a:one", label: "One", provider: "a" },
+		{ value: "xiaomi:mimo-v2.6-pro", label: "MiMo Pro", provider: "xiaomi" },
+	];
+	const rows = () => buttons().map((item) => item.textContent);
+
+	test("finds the Default row through its target provider's display name", async () => {
+		await render("a:one", filterModels, true, true, { defaultModelValue: "a:one" });
+		await typeFilter("provider a");
+		// The upstream layout moved provider metadata out of the role row label.
+		expect(rows()).toEqual(["Follow default", "One"]);
+	});
+
+	test("multi-word queries match terms across fields", async () => {
+		await render("a:one", filterModels, true, true, {
+			defaultModelValue: "xiaomi:mimo-v2.6-pro",
+		});
+		// No single field contains "xiaomi pro"; the provider and the label do.
+		await typeFilter("xiaomi pro");
+		expect(rows()).toEqual(["Follow default", "MiMo Pro"]);
+	});
+
+	test("finds models by provider prefix and by model id", async () => {
+		await render("a:one", filterModels, true, true);
+		await typeFilter("xiaomi");
+		expect(rows()).toEqual(["MiMo Pro"]);
+		await typeFilter("mimo-v2.6");
+		expect(rows()).toEqual(["MiMo Pro"]);
+	});
+
+	test("matches the translated group header", async () => {
+		await instance.changeLanguage("zh-CN");
+		await render("a:one", filterModels, true, true);
+		await typeFilter(narratorZhLocale.modelGroupDefault, narratorZhLocale.modelFilterPlaceholder);
+		expect(rows()).toEqual(["Follow default"]);
+	});
+
+	test("shows the empty state and restores every row once cleared", async () => {
+		await render("a:one", filterModels, true, true);
+		await typeFilter("nothing-here");
+		expect(rows()).toEqual([]);
+		expect(host.textContent).toContain(narratorLocale.noModelMatches);
+		await typeFilter("");
+		expect(rows()).toEqual(["Follow default", "One", "MiMo Pro"]);
+	});
+});
+
+describe("shared search across model and provider views", () => {
+	const catalog: ModelOption[] = [
+		{ value: "__default__", label: "Follow default", provider: "__default__" },
+		{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
+		{
+			value: "auto:gpt-6-astra",
+			label: "GPT 6 Astra",
+			provider: "__auto__",
+			family: "gpt",
+			autoSources: [
+				{ value: "edge:gpt-6-astra", provider: "edge", available: true, subscription: false },
+			],
+		},
+		{ value: "edge:gpt-6-astra", label: "GPT 6 Astra", provider: "edge" },
+		{
+			value: "nug:opaque-id",
+			label: "Friendly display name",
+			provider: "nug",
+			bareModel: "kimi-k3",
+			channel: "moonshot",
+		},
+	];
+	const options = {
+		defaultModelValue: "auto:gpt-6-astra",
+		summaryModelValue: "__default__",
+		extraProps: { providerLabels: { edge: "Example Cloud", nug: "Gateway Hub" } },
+	};
+	const rows = () => buttons().map((item) => item.textContent);
+	async function switchMode(mode: "model" | "provider") {
+		const target = host.querySelector<HTMLElement>(`[data-model-menu-mode="${mode}"]`);
+		if (!target) throw new Error(`Missing mode control: ${mode}`);
+		await act(async () => target.click());
+	}
+
+	test("preserves a multi-term query across view switches and keeps auto selection values", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("Example Cloud GPT");
+		expect(rows()).toEqual(["Follow default", "Follow summary", "GPT 6 Astra"]);
+		await switchMode("model");
+		expect(host.querySelectorAll("[data-model-left]").length).toBe(1);
+		const auto = host.querySelector<HTMLElement>('[data-model-left="auto:gpt-6-astra"]');
+		expect(auto).not.toBeNull();
+		expect(host.querySelector("input")?.value).toBe("Example Cloud GPT");
+		expect(selected).toEqual([]);
+		await act(async () => auto?.click());
+		expect(selected).toEqual(["auto:gpt-6-astra"]);
+		await switchMode("provider");
+		expect(rows()).toEqual(["Follow default", "Follow summary", "GPT 6 Astra"]);
+	});
+
+	test("requires every term in both views", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("Example Cloud kimi");
+		expect(rows()).toEqual([]);
+		await switchMode("model");
+		expect(host.querySelectorAll("[data-model-left]").length).toBe(0);
+		expect(host.textContent).toContain(narratorLocale.noModelMatches);
+	});
+
+	test("provider view keeps matching bare ids and channels", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("MOONSHOT kimi-k3");
+		expect(rows()).toEqual(["Friendly display name"]);
+	});
+
+	test("provider renaming rebuilds the search index without clearing the query", async () => {
+		await render("edge:gpt-6-astra", catalog, true, true, options);
+		await typeFilter("Example Cloud gpt");
+		await render("edge:gpt-6-astra", catalog, true, true, {
+			...options,
+			extraProps: { providerLabels: { edge: "Renamed Cloud", nug: "Gateway Hub" } },
+		});
+		expect(rows()).toEqual([]);
+		await typeFilter("Renamed Cloud gpt");
+		expect(rows()).toEqual(["Follow default", "Follow summary", "GPT 6 Astra"]);
 	});
 });

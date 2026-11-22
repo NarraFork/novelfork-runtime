@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
-import { quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
+import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
+import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
@@ -37,7 +38,7 @@ import {
 	subagentMayUseDefaultOffTool,
 } from "../../lib/agent/tools/default-off-tools";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
-import { OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
+import { OUTLINE_ASK_TOOL, OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
 import type { ToolDefinition } from "../../lib/agent/types";
@@ -222,7 +223,11 @@ import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
-import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease-keeper";
+import {
+	keepOutlineTaskLeases,
+	type OutlineLeaseKeeper,
+	outlinePersonHourRunning,
+} from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import {
 	isProductRuntimeToolVisible,
@@ -243,7 +248,8 @@ import {
 	shouldResumeAfterCompact,
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
-import { registerNarratorLoop } from "../update-coordinator";
+import { registerNarratorLoop, waitForRestartBeforeFailure } from "../update-coordinator";
+import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
@@ -404,6 +410,24 @@ export async function runAgentLoopUnlocked(
 	let continuationStopNote: string | null = null;
 	let abortedBeforeCleanup: boolean | undefined;
 	let freshInput = false;
+	// A person's message started this run or joined it (outline: such a run keeps the session's
+	// unfinished team tasks for a while; one the system started gives them back when it ends).
+	// Said by the run's entry point, never read off the input (a Retry or a Continue carries no
+	// text): unset is a person. A person's queued message taken up later makes it theirs too, and
+	// so does a person acting inside it (`_runPersonActed`: a permission, a plan, a question
+	// resolved, an asynchronous answer taken up).
+	let personSpoke = active._runInitiatedBy !== "system";
+	const runForTaskId = active._runForTaskId ?? null;
+	active._runInitiatedBy = undefined;
+	active._runForTaskId = undefined;
+	active._runPersonActed = false;
+	const personRun = () => personSpoke || active._runPersonActed === true;
+	/** What the finalizer restarts the session for, and what will wake it when it finishes. */
+	const workPendingAtEnd = async (): Promise<boolean> =>
+		(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
+		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
+		// A question a person has yet to answer: their answer wakes the session.
+		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -646,6 +670,7 @@ export async function runAgentLoopUnlocked(
 			throw error;
 		}
 		if (buffered) {
+			personSpoke = true;
 			const bufferedClaim = buffered._mailboxClaim;
 			if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
 			active._bufferSoftStopTaken = false;
@@ -755,7 +780,7 @@ export async function runAgentLoopUnlocked(
 					goalCommand.objective,
 				);
 				if (refused) {
-					// An outline session's queued /goal was dropped unsaved; drain on.
+					// A queued /goal an outline subagent cannot take was dropped unsaved; drain on.
 					pendingBufferedDelivery = undefined;
 					if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
 						runState.wasInterrupted = true;
@@ -1022,6 +1047,13 @@ export async function runAgentLoopUnlocked(
 				},
 			);
 			const outlineEditCore = taskBackend === "outline" && freshNarrator.type !== "subagent";
+			// A root session the Dynamic Spec import moved: its `spec://` calls are told where the
+			// old files went (outline P2 PR 12b2). One cached primary-key read per session.
+			const specImported =
+				outlineEditCore &&
+				(await import("../outline/spec-import/state").then(({ isSpecImportedSession }) =>
+					isSpecImportedSession(narratorId),
+				));
 			{
 				if (active._workspaceInstallFailed)
 					throw new Error("Workspace context installation requires session recovery");
@@ -1151,6 +1183,8 @@ export async function runAgentLoopUnlocked(
 				if (tool.name === "SwitchDevice")
 					return turnSessionDevices.some((device) => device.online) || !!active._defaultDeviceId;
 				if (tool.name === "TransferFile") return turnSessionDevices.some((device) => device.online);
+				// Questions live under outline tasks: offered where OutlineEdit is a core tool.
+				if (tool.name === OUTLINE_ASK_TOOL) return outlineEditCore;
 				if (tool.name.startsWith("mcp__")) {
 					const server = settings.mcpServers?.find(
 						(item) => item.id === tool.metadata?.mcpServerId,
@@ -1201,7 +1235,15 @@ export async function runAgentLoopUnlocked(
 				} else {
 					active._modelRef = modelSelectionRef;
 					active._settingsRevision = getSettingsRevision();
-					active.model = resolveEffectiveModel(modelSelectionRef, active.provider);
+					// Right after a compact an auto: value picks afresh (new epoch, nothing cached
+					// to keep); otherwise it stays on the source it is on.
+					const reselect =
+						active._autoReselectOnNextTurn === true && isAutoModelValue(modelSelectionRef);
+					active._autoReselectOnNextTurn = undefined;
+					active.model = resolveEffectiveModel(
+						modelSelectionRef,
+						reselect ? undefined : active.provider,
+					);
 					active.provider = resolveProvider(active.model);
 					active.reasoningEffort = resolveRuntimeReasoningEffort(
 						active.provider,
@@ -1289,6 +1331,16 @@ export async function runAgentLoopUnlocked(
 					taskBackend === "outline"
 						? await (await taskSourceForNarrator(narratorId)).contextParts(locale)
 						: undefined;
+				// An outline root session plans in the outline (outline P2 PR 8): plan mode names its
+				// plan root (its address only, review round 1 S4) instead of a plan file. A plan-file
+				// cycle begun before PR 8 keeps the file (S7).
+				const outlinePlanView =
+					planMode && outlineEditCore
+						? await (await import("../outline-plan-mode")).outlinePlanPromptRoot(narratorId)
+						: null;
+				const outlinePlan = outlinePlanView
+					? { root: outlinePlanView.root, relaxed: relaxedPlan }
+					: undefined;
 				const built = await buildSystemPrompt(
 					narratorId,
 					{
@@ -1313,6 +1365,7 @@ export async function runAgentLoopUnlocked(
 					{
 						taskSection: taskSectionFor(taskBackend, current.type),
 						...(contextParts ? { contextParts } : {}),
+						...(outlinePlan ? { outlinePlan } : {}),
 						workspaceContext: serializeWorkspaceContext(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
@@ -1333,8 +1386,12 @@ export async function runAgentLoopUnlocked(
 							JSON.stringify({
 								planMode,
 								relaxedPlan,
-								planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
-								planFilePath: active._planFilePath,
+								...(outlinePlan
+									? { planRoot: outlinePlan.root?.address ?? null }
+									: {
+											planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
+											planFilePath: active._planFilePath,
+										}),
 								permissionMode: currentOAuth?.permissionMode ?? current.permissionMode,
 								readOnly: runtimePolicy.tools.readOnly,
 							}),
@@ -1461,7 +1518,7 @@ export async function runAgentLoopUnlocked(
 					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
 						narratorId,
 						undefined,
-						{ signal: active.abortController.signal, deadline: Date.now() + 10_000 },
+						{ signal: active.abortController.signal },
 					),
 				});
 			}
@@ -1701,6 +1758,23 @@ export async function runAgentLoopUnlocked(
 							traits: redactDraftTraits(planState.traits),
 						});
 					}
+					// An outline session's plan (outline P2 PR 8): made sure to be approved, whichever
+					// way the approval came, before the restart starts its first step.
+					{
+						const { settleApprovedOutlinePlan } = await import("../outline-plan-mode");
+						const byReview = pendingPlanApproverSource.get(narratorId) === "reflection";
+						active._outlinePlanApproved =
+							(await settleApprovedOutlinePlan({
+								narratorId,
+								toolUseId,
+								locale: active.locale,
+								// A review's approval is never a person's, whatever approver is left
+								// over (D48 ⑦, review round 2 N4).
+								approverUserId: byReview ? null : (pendingPlanApprover.get(narratorId) ?? null),
+								turnUserId: active._currentUserId ?? null,
+								byReview,
+							})) ?? undefined;
+					}
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
 					let approval: "compact" | "continue" | undefined;
 					let planText: string | null | undefined;
@@ -1820,6 +1894,8 @@ export async function runAgentLoopUnlocked(
 
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
+					// Providers may surface teardown errors as events rather than throws.
+					await waitForRestartBeforeFailure(active.abortController.signal);
 					// A plan approval still waiting for its response to finish never restarted
 					// the pass: this ending is an ordinary interruption or failure, and the
 					// partial response must be kept, not cleaned up as an approval abort.
@@ -1835,7 +1911,7 @@ export async function runAgentLoopUnlocked(
 					// Clean up partial message
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
-					if (message === "Aborted") {
+					if (message === "Aborted" || active.abortController.signal.aborted) {
 						if (
 							active._planApprovedContinue === "compact" ||
 							active._planApprovedContinue === "continue"
@@ -1916,6 +1992,7 @@ export async function runAgentLoopUnlocked(
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
 				taskBackend,
+				specImported,
 				bot: isBotNarrator(freshNarrator.traits),
 				narratorId,
 				conversationId: active.conversationId,
@@ -2354,6 +2431,50 @@ export async function runAgentLoopUnlocked(
 			}
 
 			/**
+			 * `auto:` forced switch (agent-runtime/auto-forced-switch.ts): when the source this
+			 * turn used cannot serve for longer than a cache lifetime, move the session to
+			 * another source of the same model instead of waiting or failing. Returns true when
+			 * it moved; the caller then `continue`s and the loop top resolves the new source,
+			 * since the narrator's provider is what `auto:` resolution stays on.
+			 */
+			const switchAutoSource = async (
+				resumeAt?: number,
+				failedProvider: string = resolved.provider,
+			): Promise<boolean> => {
+				if (!active.alive || runState.recovery.autoSwitches >= MAX_AUTO_SWITCHES_PER_RUN) {
+					return false;
+				}
+				const target = autoForcedSwitchTarget({
+					modelRef: turnModelRef,
+					provider: failedProvider,
+					resumeAt,
+				});
+				if (!target) return false;
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				const keptPartial = partialId
+					? await finalizeOrCleanupPartialMessage(partialId, narratorId)
+					: false;
+				if (keptPartial) {
+					runState.input.media = undefined;
+					runState.input.text = "";
+					runState.input.images = undefined;
+				}
+				runState.recovery.autoSwitches += 1;
+				runState.recovery.transientRetries = 0;
+				logger.info("auto: moved to another source", {
+					narratorId,
+					modelRef: turnModelRef,
+					from: resolved.model,
+					to: target,
+					resumeAt,
+				});
+				active.model = target;
+				active.provider = resolveProvider(target);
+				return true;
+			};
+
+			/**
 			 * Suspend this turn until the blocking condition clears, then report
 			 * whether the loop may continue.
 			 *
@@ -2368,8 +2489,8 @@ export async function runAgentLoopUnlocked(
 			 *  - `credentials` (NUG): the credential pool comes back at an unknown time,
 			 *    so the shared availability poller checks the lightweight `/v1/models`
 			 *    list until the model reports available.
-			 *  - `quota` (Kimi): the reset instant is published (`resumeAt`), so this
-			 *    sleeps to it. No polling and no request during the wait.
+			 *  - `quota`, `capacity`, `rate_limit`: upstream publishes `resumeAt`, so
+			 *    this sleeps to it. No polling and no request during the timed wait.
 			 *
 			 * @returns true when recovery happened and the caller should `continue`
 			 * to rebuild history from the DB; false when the caller must `break`
@@ -2391,12 +2512,15 @@ export async function runAgentLoopUnlocked(
 				// The reset clock is what this wait is about, so the status carries the
 				// instant the user is waiting for as well as the tag that says why.
 				const quotaResumeAt =
-					mu.waitKind === "quota" && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
-				const waitingSubstatus = quotaResumeAt ? "quota_exhausted" : "model_unavailable";
+					providerWaitKind(mu) !== "credentials" && typeof mu.resumeAt === "number"
+						? mu.resumeAt
+						: undefined;
+				const waitingSubstatus =
+					providerWaitKind(mu) === "quota" ? "quota_exhausted" : "model_unavailable";
 				await narratorService.updateStatus(narratorId, "waiting", {
 					substatus: [waitingSubstatus],
 					errorMessage: JSON.stringify({
-						type: quotaResumeAt ? "quota_exhausted" : "model_unavailable",
+						type: waitingSubstatus,
 						...mu,
 					}),
 				});
@@ -2510,6 +2634,8 @@ export async function runAgentLoopUnlocked(
 			// unknown is treated as usable, so this never blocks a working model.
 			{
 				const known = resolveKnownUnavailableNugModel(resolved.model, resolved.provider);
+				// A NUG outage has no known end, so an auto: session moves rather than waits.
+				if (known && (await switchAutoSource())) continue;
 				if (known && active.alive) {
 					const resumed = await suspendUntilModelRecovered({
 						message: `Model ${known.model} is recorded as temporarily unavailable; waiting for it to recover before sending the request.`,
@@ -2746,6 +2872,11 @@ export async function runAgentLoopUnlocked(
 				if (placement) {
 					const payment = result.paymentRequired;
 					for (const recipient of [narratorId, placement.parentNarratorId]) {
+						// The parent copy is tagged like every other dual-broadcast frame: a
+						// child running out of balance must not make the parent page open its
+						// own recharge dialog.
+						const isParentCopy =
+							recipient === placement.parentNarratorId && recipient !== narratorId;
 						broadcastToNarrator(recipient, {
 							type: "payment_required",
 							narratorId: recipient,
@@ -2754,6 +2885,7 @@ export async function runAgentLoopUnlocked(
 							balance: payment.balance,
 							required: payment.required,
 							resumeAction: payment.resumeAction,
+							...(isParentCopy && { isSubagent: true }),
 						});
 					}
 				}
@@ -2763,7 +2895,7 @@ export async function runAgentLoopUnlocked(
 
 			// --- Blocked, but recoverable: suspend and wait for recovery ---
 			// Either a NUG model whose credential pool is disabled, or an exhausted
-			// Kimi coding-plan allowance. Instead of replaying the full request
+			// Kimi/OpenCode allowance or a timed upstream capacity/rate limit. Instead of replaying the full request
 			// (re-uploading the entire history) over and over, suspend the narrator and
 			// wait on whatever tells us recovery happened — the availability poller for
 			// credentials, the published reset instant for quota. Then resume by
@@ -2771,10 +2903,12 @@ export async function runAgentLoopUnlocked(
 			// [continuation-source: model-unavailable]
 			if (recovery.kind === "model-unavailable" && result.modelUnavailable && active.alive) {
 				const mu = result.modelUnavailable;
-				const isQuota = mu.waitKind === "quota";
+				const waitKind = providerWaitKind(mu);
+				const isTimedWait = waitKind !== "credentials";
 				const quotaResetAt =
-					isQuota && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
-				const quotaResumeAt = isQuota && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
+					isTimedWait && typeof mu.quotaResetAt === "number" ? mu.quotaResetAt : undefined;
+				const quotaResumeAt =
+					isTimedWait && typeof mu.resumeAt === "number" ? mu.resumeAt : undefined;
 				/**
 				 * Why this quota wall is being reported instead of parked on.
 				 *
@@ -2788,7 +2922,7 @@ export async function runAgentLoopUnlocked(
 				 * only by the reason code — a divergence here would mean one of them silently
 				 * loses the reset instant that makes the error actionable.
 				 */
-				const quotaRefusalReason = !isQuota
+				const quotaRefusalReason = !isTimedWait
 					? undefined
 					: quotaResumeAt === undefined
 						? quotaResetAt === undefined
@@ -2797,6 +2931,11 @@ export async function runAgentLoopUnlocked(
 						: runState.recovery.quotaWaits >= MAX_QUOTA_WAITS_PER_RUN
 							? "wait-budget-spent"
 							: undefined;
+				// An auto: session moves to another source instead of reporting the wall or
+				// waiting past a cache lifetime. A wait it would refuse counts as unbounded.
+				if (await switchAutoSource(quotaRefusalReason ? undefined : quotaResumeAt, mu.provider)) {
+					continue;
+				}
 				if (quotaRefusalReason) {
 					// Serialized as a payload rather than left as the raw upstream text, on
 					// the `payment_required` pattern: `errorMessage` is the only failure
@@ -2806,12 +2945,15 @@ export async function runAgentLoopUnlocked(
 					// distinguishable in logs without changing what the user is told.
 					// `type` names the plan (KIMI_QUOTA_EXHAUSTED / OPENCODE_QUOTA_EXHAUSTED)
 					// so the message says whose allowance is spent.
-					const quotaCode = quotaExhaustedCode(mu.quotaProvider);
+					const quotaCode =
+						waitKind === "quota" ? quotaExhaustedCode(mu.quotaProvider) : "provider_wait_exhausted";
 					terminalStatus = {
 						substatus: ["error"],
 						errorCode: quotaCode,
 						errorMessage: JSON.stringify({
 							type: quotaCode,
+							waitKind,
+							quotaProvider: mu.quotaProvider,
 							reason: quotaRefusalReason,
 							model: mu.model,
 							provider: mu.provider,
@@ -2832,7 +2974,8 @@ export async function runAgentLoopUnlocked(
 					// the client the block cleared and it is resuming, which is false here and
 					// would flash a green "quota restored" notice over the error. The client
 					// drops its waiting notice from the status change this write produces.
-					logger.warn("Quota wall reported instead of waited on", {
+					logger.warn("Timed provider refusal reported instead of waited on", {
+						waitKind,
 						narratorId,
 						quotaProvider: mu.quotaProvider ?? "kimi",
 						providerId: mu.providerId,
@@ -2896,6 +3039,16 @@ export async function runAgentLoopUnlocked(
 				});
 
 				runState.recovery.overflowRetries = overflow.overflowRetries;
+				// A compact can settle concurrently with user/parent interruption. Do not
+				// turn cancellation into a recovery failure or authorize another request.
+				if (active.abortController.signal.aborted) {
+					const next = await applyInterruptedTurnControl(abortedPass(result));
+					if (next === "continue") continue;
+					if (next === "break") break;
+					await finalizeInterruptedRun(active, narratorId, undefined);
+					runState.wasInterrupted = true;
+					break;
+				}
 
 				if (overflow.action === "retry_compacted") {
 					// Keep conversationId stable for prompt-cache affinity. Compact may
@@ -2990,6 +3143,17 @@ export async function runAgentLoopUnlocked(
 				}
 			}
 
+			// A failed turn whose source can no longer serve (every Codex account used up, every
+			// key of a relay out of allowance): an auto: session moves on. Routing keeps the same
+			// source while it still counts as able, so an ordinary error does not switch.
+			if (
+				result.hasError &&
+				!result.maxTurnsExceeded &&
+				!runState.hadError &&
+				(await switchAutoSource())
+			) {
+				continue;
+			}
 			if (result.hasError && active.alive && !runState.hadError) {
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;
@@ -3144,17 +3308,25 @@ export async function runAgentLoopUnlocked(
 					await narratorService.updateStats(narratorId, 0);
 				}
 
-				const continuePrompt = getToolMessage(
-					isCompact ? "planCompactContinue" : "exitPlanModeApproved",
-					locale,
-				);
+				// An outline plan starts from its first step that can start, named in the prompt
+				// (outline P2 PR 8); a plan-file plan gets the prompt it always did.
+				const outlinePlan = active._outlinePlanApproved;
+				active._outlinePlanApproved = undefined;
+				const continuePrompt = outlinePlan
+					? await (await import("../outline-plan-mode")).startApprovedOutlinePlan({
+							narratorId,
+							approved: outlinePlan,
+							locale,
+							compact: isCompact,
+						})
+					: getToolMessage(isCompact ? "planCompactContinue" : "exitPlanModeApproved", locale);
 
 				// If the user edited the plan, append the diff to the prompt
 				// (only for non-compact — compact already has the edited plan in system prompt)
 				const planDiff = pendingPlanDiff.get(narratorId);
 				if (planDiff) pendingPlanDiff.delete(narratorId);
 				const basePrompt =
-					!isCompact && planDiff
+					!isCompact && planDiff && !outlinePlan
 						? getToolMessageWithParams("exitPlanModeApprovedWithDiff", locale, {
 								diff: planDiff,
 							})
@@ -3163,8 +3335,10 @@ export async function runAgentLoopUnlocked(
 				// Check for chained feedback — merge with diff if both exist
 				const fb = pendingFeedback.get(narratorId);
 				if (fb) pendingFeedback.delete(narratorId);
+				// An outline plan's message names the step started for the session: it is kept, the
+				// approver's words follow it.
 				const promptText = fb
-					? basePrompt !== continuePrompt
+					? basePrompt !== continuePrompt || outlinePlan
 						? `${basePrompt}\n\n${fb.feedbackText}`
 						: fb.feedbackText
 					: basePrompt;
@@ -3408,7 +3582,14 @@ export async function runAgentLoopUnlocked(
 				// before the drain (its reads are awaited), and written only once this run has
 				// settled terminal below, so nothing awaited sits between the drain and the
 				// arbitration. The drain or a hold continuing the run drops it.
-				const turnEndNote = await decideOutlineTurnEndNote(active);
+				const turnEndNote = await decideOutlineTurnEndNote(active, {
+					givingBackTeamTasks:
+						!personRun() &&
+						!runState.wasInterrupted &&
+						!active.abortController.signal.aborted &&
+						!outlinePersonHourRunning(narratorId) &&
+						!(await workPendingAtEnd().catch(() => true)),
+				});
 
 				// Drain any queued injection FIRST, before flipping the DB status to idle.
 				// This closes the window where status is already idle (visible to clients /
@@ -3451,6 +3632,9 @@ export async function runAgentLoopUnlocked(
 			break;
 		}
 	} catch (err) {
+		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
+		// Keep the run active for the next process instead of publishing a false failure.
+		await waitForRestartBeforeFailure(active.abortController.signal);
 		if (pendingBufferedDelivery) {
 			try {
 				await restoreBufferedMessage(narratorId, pendingBufferedDelivery);
@@ -3462,33 +3646,49 @@ export async function runAgentLoopUnlocked(
 			}
 			pendingBufferedDelivery = undefined;
 		}
-		const errorMsg = serializeCatalogErrorMessage(err);
-		logger.error("Narrator loop error", {
-			narratorId,
-			error: err instanceof Error ? err.message : String(err),
-		});
-		try {
-			await withDbRetry(
-				() =>
-					updateTerminalStatus({
-						substatus: ["error"],
-						errorMessage: errorMsg,
-					}),
-				{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
-			);
-		} catch (statusErr) {
-			logger.error("Failed to persist narrator error status", {
+		if (active.abortController.signal.aborted) {
+			runState.wasInterrupted = true;
+		} else {
+			const errorMsg = serializeCatalogErrorMessage(err);
+			logger.error("Narrator loop error", {
 				narratorId,
-				error: String(statusErr),
+				error: err instanceof Error ? err.message : String(err),
 			});
+			try {
+				await withDbRetry(
+					() =>
+						updateTerminalStatus({
+							substatus: ["error"],
+							errorMessage: errorMsg,
+						}),
+					{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
+				);
+			} catch (statusErr) {
+				logger.error("Failed to persist narrator error status", {
+					narratorId,
+					error: String(statusErr),
+				});
+			}
+			runState.finalText = errorMsg;
+			runState.hadError = true;
+			active.events.emit("event", { type: "error", data: { message: errorMsg } });
 		}
-		runState.finalText = errorMsg;
-		runState.hadError = true;
-		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
 		// The run ended: the session's claims go on the idle lease while it waits for its next
-		// turn, a subagent's pass to its root (not waited for).
-		void outlineLeases?.stop();
+		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
+		// started that ended by itself are given back with a handoff (not waited for).
+		void outlineLeases?.stop({
+			natural:
+				!freshInput &&
+				!runState.hadError &&
+				!runState.wasInterrupted &&
+				!active.abortController.signal.aborted,
+			// A subagent's run is never a person's hour of its own: its claims pass to its root.
+			person: personRun() && !deliverTo,
+			reply: runState.finalText,
+			forTaskId: runForTaskId,
+			pending: workPendingAtEnd,
+		});
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;
 		unregisterUpdateLoop();

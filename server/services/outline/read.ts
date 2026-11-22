@@ -269,6 +269,19 @@ export interface OutlineReadRequest extends OutlineReadOptions {
 	 * tree (current reads only), the blocks others' touch marked.
 	 */
 	overlay?: OutlinePendingOverlay;
+	/** Note plan roots with their state (default true; see `OutlineRenderOptions.planNotes`). */
+	planNotes?: boolean;
+	/**
+	 * Blocks under the read block left out, with what is under them, as if they were not there
+	 * (a plan review's comments, outline P2 PR 8b: shown on their own, not as the plan).
+	 */
+	omit?: ReadonlySet<string>;
+	/**
+	 * Also return the tree read (`tree`): its blocks with their content, as far as the budget
+	 * loaded them (all of them when the read is not `truncated`). The plan submission checks the
+	 * plan's format on it (plan readability).
+	 */
+	withTree?: boolean;
 }
 
 export interface OutlineReadResult extends OutlineRenderResult {
@@ -282,6 +295,19 @@ export interface OutlineReadResult extends OutlineRenderResult {
 	truncated: boolean;
 	/** The root's ancestors, the page first. */
 	path: Array<{ id: string; sid: string; title: string }>;
+	/** The tree read, the root with its children (only with `withTree`). */
+	tree?: OutlineNode;
+}
+
+/** Leave the blocks in `omit` (and what is under them) out of the tree under `root`. */
+function omitUnder(root: OutlineNode, omit: ReadonlySet<string>): void {
+	const stack = [root];
+	while (stack.length > 0) {
+		const node = stack.pop() as OutlineNode;
+		if (node.children.some((child) => omit.has(child.id)))
+			node.children = node.children.filter((child) => !omit.has(child.id));
+		for (const child of node.children) stack.push(child);
+	}
 }
 
 /**
@@ -293,6 +319,8 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 	const subtree = await readSubtree(request.blockId, { asOf: request.asOf, store });
 	if (!subtree) return null;
 	const { state, root, path } = subtree;
+	// The tree is this read's own (built per read), so leaving blocks out edits nothing shared.
+	if (request.omit && request.omit.size > 0) omitUnder(root, request.omit);
 	const overlay = state.current ? request.overlay : undefined;
 	overlay?.prepare(state);
 	const view = effectiveView(root, request.view ?? "facts");
@@ -313,6 +341,7 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 		label: request.label,
 		display,
 		annotate: overlay ? (node) => overlay.annotate(node) : undefined,
+		planNotes: request.planNotes,
 		truncatedRead: state.truncated ? { blocksRead: state.nodes.size } : undefined,
 	});
 	return {
@@ -328,6 +357,7 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 			sid: node.sid,
 			title: blockTitle(node.content ?? ""),
 		})),
+		...(request.withTree ? { tree: root } : {}),
 	};
 }
 

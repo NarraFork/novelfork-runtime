@@ -42,12 +42,19 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	outline: {
 		enabled: false,
+		// Owner decision 2026-11-12: "auto" once the import state, the model's notice, the admin
+		// tools and the read-only line on the old files exist (outline P2 PR 12b2).
+		specImport: "auto",
 	},
 	requestEvidence: {
 		ringEnabled: true,
 		ringRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
 		ringResponseBytes: DEFAULT_RECORDING_RESPONSE_BYTES,
 		autoPin: "off",
+	},
+	storageRetention: {
+		toolCallPayloads: { retentionDays: null, autoCleanup: false },
+		messageHistory: { retentionDays: null, autoCleanup: false },
 	},
 	plugins: {
 		enabled: true,
@@ -131,7 +138,9 @@ export const DEFAULTS: NarraForkSettings = {
 	narratorBlocks: {
 		write: true,
 		read: true,
-		compactJson: false,
+		compactJson: true,
+		singleCopyDefaultsVersion: 1,
+		singleCopyBackfillResumeVersion: 0,
 	},
 	editor: {
 		type: "vscode",
@@ -140,6 +149,13 @@ export const DEFAULTS: NarraForkSettings = {
 		jwtSecret: "",
 		registrationOpen: true,
 		trustedProxyCidrs: ["127.0.0.0/8", "::1/128"],
+		// Only the two fields that mean anything before the admin fills the rest in.
+		// Every other LDAP field stays optional so a fresh install carries no
+		// half-configured directory.
+		ldap: {
+			enabled: false,
+			url: "",
+		},
 	},
 	oauth: {
 		externalWebSocket: {
@@ -192,6 +208,16 @@ export const DEFAULTS: NarraForkSettings = {
 		maxOutputChars: 24_000,
 	},
 	update: { ...DEFAULT_UPDATE_SETTINGS },
+	remoteAccess: {
+		enabled: false,
+		signalUrl: "",
+		stunUrls: [],
+		iceIPAllowlist: [],
+		iceInterfaceAllowlist: [],
+		iceNetworkTypes: ["udp4", "udp6"],
+		allowLocalhost: false,
+		leaseSeconds: 300,
+	},
 	vnet: {
 		enabled: true,
 		allowAnonymousRelay: false,
@@ -399,9 +425,18 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── outline ─────────────────────────────────────────────────────────
 	"outline.enabled": {
-		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示；现有的 spec:// 和知识库不受影响。",
+		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示，所有会话都按 Dynamic Spec（spec://）会话运行。打开后新建的根会话把任务记在大纲里；还在用 spec:// 的旧会话按 outline.specImport 导入大纲（导入后改用大纲记任务，spec:// 的数据保留不删）。知识库不受影响。",
 		type: "boolean",
 		valid: "true / false，默认 false",
+	},
+	"outline.specImport": {
+		desc: "大纲开关打开后，还在用 Dynamic Spec（spec://）记任务的旧会话怎样导入大纲。导入把会话当前的 spec 文件、任务和行为边界写进会话的大纲空间，逐条核对后把会话改成用大纲记任务；Dynamic Spec 的数据保留不删。auto（默认）：在会话下一次开始运行前（小会话）和后台在会话空闲时导入，也可以在 Spec 面板点「现在导入」；manual：只在 Spec 面板点「现在导入」（或管理员在设置页「大纲导入」重导）时导入；off：不导入。导入的状态、需要处理的会话、按会话重导和退回见设置页「大纲导入」。",
+		type: "string",
+		valid: "auto / manual / off，默认 auto",
+	},
+	"outline.specLossCutoff": {
+		desc: "「旧 Spec 面板可能吞掉的内容」排查第一次在本机运行的时间（系统内部使用，由排查自己写入，不要手动修改）。这个时间之后人在 Spec 面板的保存用的是修复后的编辑器，删掉的内容算有意删除，排查不再看。",
+		type: "string",
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────
@@ -426,6 +461,20 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 
+	"remoteAccess.enabled": {
+		desc: "启用已安装并验证的远程访问组件；默认关闭，不自动下载。",
+		type: "boolean",
+	},
+	"remoteAccess.signalUrl": { desc: "显式配置的 WSS 信令协调服务地址。", type: "string" },
+	"remoteAccess.stunUrls": { desc: "STUN 地址列表；不支持 TURN 或业务中继。", type: "string[]" },
+	"remoteAccess.iceIPAllowlist": { desc: "限制 ICE 绑定的本机 IP 列表。", type: "string[]" },
+	"remoteAccess.iceInterfaceAllowlist": { desc: "限制 ICE 绑定的网络接口。", type: "string[]" },
+	"remoteAccess.iceNetworkTypes": { desc: "允许的 UDP 网络类型 udp4/udp6。", type: "string[]" },
+	"remoteAccess.allowLocalhost": {
+		desc: "仅用于显式本机测试的 loopback ICE 与 ws 信令选项。",
+		type: "boolean",
+	},
+	"remoteAccess.leaseSeconds": { desc: "信令发现租约秒数（60–3600）。", type: "number" },
 	// ── vnet ────────────────────────────────────────────────────────────
 	"vnet.enabled": {
 		desc: "启用应用层虚拟网络 relay。用于 Bun 应用间通过虚拟地址通信。",
@@ -793,7 +842,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── narratorBlocks ──────────────────────────────────────────────────
 	"narratorBlocks.write": {
-		desc: "新消息是否以原生块存储（narrator_blocks 表），同时写入兼容的 content_json。关闭后新消息回到只写 content_json 的旧格式；已是块格式的消息仍按块维护。默认 true。",
+		desc: "新消息是否以原生块存储（narrator_blocks 表），默认配合 compactJson 只存一份正文。关闭仅用于回滚，新消息回到只写 content_json 的旧格式；已有块格式仍按块维护。默认 true。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},
@@ -803,9 +852,33 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 true",
 	},
 	"narratorBlocks.compactJson": {
-		desc: "新写入的块格式消息是否只把正文存在块表里（content_json 写 []，body_rows_only 置 1），省去重复的兼容投影。只在 SQLite 且 write、read 都开启时生效。关闭后新消息恢复写完整的 content_json；已是只存块的消息保持不变，需要回退时先在存储页运行「恢复副本」。默认 false。",
+		desc: "块格式消息默认只在块表保存一份正文（content_json 写 []，body_rows_only 置 1），compact 标记保留兼容投影。只在 SQLite 且 write、read 都开启时生效；旧投影经后台转换、校验和重建索引后自动清理。关闭仅用于显式回滚，新消息恢复兼容投影，既有块正文保持不变。默认 true。",
 		type: "boolean",
-		valid: "true / false，默认 false",
+		valid: "true / false，默认 true",
+	},
+	"narratorBlocks.singleCopyDefaultsVersion": {
+		desc: "稳定单份块存储默认值的一次性迁移版本（系统内部使用）。",
+		type: "number",
+	},
+	"narratorBlocks.singleCopyBackfillResumeVersion": {
+		desc: "旧暂停块迁移任务已在后台启动时恢复的一次性收据，默认 0；系统完成恢复后置 1，之后保留显式暂停。",
+		type: "number",
+	},
+	"storageRetention.toolCallPayloads.retentionDays": {
+		desc: "工具调用详情保留天数，范围 1..36500；null 永久保留。独立于消息正文策略。",
+		type: "number | null",
+	},
+	"storageRetention.toolCallPayloads.autoCleanup": {
+		desc: "自动清理过期工具调用详情，默认关闭；保留天数为 null 时不清理。",
+		type: "boolean",
+	},
+	"storageRetention.messageHistory.retentionDays": {
+		desc: "消息历史正文保留天数，范围 1..36500；null 永久保留。独立于工具调用详情策略。",
+		type: "number | null",
+	},
+	"storageRetention.messageHistory.autoCleanup": {
+		desc: "自动清理过期消息正文，默认关闭；保留天数为 null 时不清理。",
+		type: "boolean",
 	},
 
 	// ── editor ──────────────────────────────────────────────────────────
@@ -823,6 +896,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"auth.trustedProxyCidrs": {
 		desc: "认证限流可信任的反向代理 IP/CIDR。仅这些代理提供的 X-Forwarded-For 或 X-Real-IP 会用于识别客户端；默认只信任本机回环代理。",
 		type: "string[]",
+	},
+	"auth.ldap.enabled": {
+		desc: "是否启用 LDAP / Active Directory 目录认证。开启后，本地密码校验失败的登录会回退到目录校验；本地账户仍是授权主体（角色、会话、第二因素不变）。",
+		type: "boolean",
+	},
+	"auth.ldap.url": {
+		desc: "LDAP 服务器地址，形如 ldaps://dc1.corp.example.com:636 或 ldap://dc1.corp.example.com:389。地址中不要包含凭据或基准 DN。",
+		type: "string",
 	},
 
 	// ── oauth.externalWebSocket ─────────────────────────────────────────

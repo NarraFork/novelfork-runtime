@@ -1,6 +1,7 @@
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { matchedRoutes } from "hono/route";
 import type { UnofficialStatusCode } from "hono/utils/http-status";
 import { db } from "./db";
 import { users } from "./db/schema";
@@ -14,9 +15,11 @@ import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
 import { getRuntimeProductIntegration } from "./lib/product-host";
+import { setProviderBalanceEngine } from "./lib/provider-balance-engine";
 import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
+import { runInSqlTraceSpan, startSqlTraceSpan } from "./lib/sql-trace";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
 import { requireSessionAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
@@ -29,6 +32,7 @@ import { chatRoutes } from "./routes/chat";
 import { codexRoutes } from "./routes/codex";
 import { commandCodeRoutes } from "./routes/commandcode";
 import { containerRoutes } from "./routes/containers";
+import { credentialTransferRoutes } from "./routes/credential-transfer";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
 import { deepseekRoutes } from "./routes/deepseek";
@@ -54,6 +58,7 @@ import { learningRoutes } from "./routes/learning";
 import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { narratorAttachmentRoutes } from "./routes/narrator-attachments";
 import { narratorTimelineRoutes } from "./routes/narrator-timeline";
 import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
@@ -73,10 +78,12 @@ import { promptLibraryRoutes } from "./routes/prompt-library";
 import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
+import { providerKeyRoutes } from "./routes/provider-keys";
 import {
 	publicNarratorShareManagementRoutes,
 	publicNarratorShareRoutes,
 } from "./routes/public-narrator-shares";
+import { remoteAccessRoutes } from "./routes/remote-access";
 import { routineRoutes } from "./routes/routines";
 import { runtimeRoutes } from "./routes/runtime";
 import { scheduledTaskRoutes } from "./routes/scheduled-tasks";
@@ -102,7 +109,12 @@ import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { workspaceRoutes } from "./routes/workspaces";
+import {
+	builtinApikeyQuotaEngine,
+	setApikeyQuotaActivation,
+} from "./services/apikey-quota-plugin-engine";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
+import { pluginManager } from "./services/plugin-manager";
 
 export interface AppEnv {
 	Bindings: {
@@ -113,8 +125,11 @@ export interface AppEnv {
 	};
 }
 
-const app = new Hono();
+const app = new Hono<AppEnv>();
 const productIntegration = getRuntimeProductIntegration();
+// The product-host contract mounts onto a plain Hono app; product routes read no AppEnv
+// variables, so the Runtime's typed app is handed over as that structural view.
+const productApp = app as unknown as Hono;
 
 const SLOW_API_REQUEST_MS = 1_000;
 
@@ -235,9 +250,29 @@ app.use(
 app.use("/api/*", async (c, next) => {
 	const startedAt = performance.now();
 	const done = trackInFlight(`${c.req.method} ${c.req.path}`);
+	// SQL tracing (NF_SQL_TRACE): every statement this request runs is attributed to this span.
+	// The label is refined to the matched route pattern once routing has happened.
+	const sqlSpan = startSqlTraceSpan("http", c.req.method, { path: c.req.path });
 	try {
-		await next();
+		await runInSqlTraceSpan(sqlSpan, next);
 	} finally {
+		if (sqlSpan) {
+			// The handler is the last concrete-method route; `ALL` entries are middleware.
+			const handler = matchedRoutes(c).findLast((route) => route.method !== "ALL");
+			// Unmatched paths fall back to the raw path with id-like segments collapsed, so 404s
+			// and wildcard routes do not create one label per resource id.
+			sqlSpan.label = `${c.req.method} ${
+				handler && !handler.path.endsWith("*")
+					? handler.path
+					: c.req.path.replace(/\/(?=[^/]*\d)[A-Za-z0-9_-]{8,}(?=\/|$)/g, "/:id")
+			}`;
+			sqlSpan.end({ status: c.res.status, ...stallTimeBetween(startedAt, performance.now()) });
+			try {
+				c.res.headers.append("Server-Timing", sqlSpan.serverTiming());
+			} catch {
+				// Immutable headers (e.g. a proxied Response): the header is diagnostic only.
+			}
+		}
 		done();
 		const endedAt = performance.now();
 		const durationMs = Math.round((endedAt - startedAt) * 100) / 100;
@@ -343,6 +378,15 @@ app.route("/api/auth/sso", ssoRoutes);
 // endpoints inside pluginUiRoutes still apply session-only authentication explicitly.
 app.route("/api/plugins", pluginUiRoutes);
 
+// Provider balance (API-key quota) querying is answered by the built-in `apikey-quota`
+// plugin, which ships with the app and is enabled by default. It is a normal plugin: the tool
+// goes through `pluginToolRegistry`, so its process lifecycle, capabilities and health are the
+// shared ones. The plugin owns the capability, so disabling it in the plugin list turns quota
+// querying off: the snapshot then reports `plugin_not_enabled` instead of quietly answering
+// from the bundled adapters, and re-enabling it restores the value on the next discovery.
+setApikeyQuotaActivation(pluginManager);
+setProviderBalanceEngine(builtinApikeyQuotaEngine);
+
 // Public: OAuth 2.0 provider endpoints. NarraFork is the authorization server
 // here — external apps fetch metadata, exchange codes and revoke tokens without
 // a NarraFork session. Consent explicitly requires a first-party session.
@@ -358,8 +402,8 @@ app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
 // Claimed by the `narrafork://` protocol client, which has no session: the one-time token is the
 // credential (see lib/reveal-protocol.ts).
 app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
-	const path = claimRevealToken(c.req.param("token"));
-	return path ? c.json({ path }) : c.json({ error: "Unknown or expired reveal token" }, 404);
+	const target = claimRevealToken(c.req.param("token"));
+	return target ? c.json(target) : c.json({ error: "Unknown or expired reveal token" }, 404);
 });
 
 // 管理器面板的更新与停止：凭本机回环 + 进程令牌，因此必须注册在全局会话认证之前。
@@ -384,9 +428,10 @@ app.route("/api/fs", fsPublicDownloadRoutes);
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
 app.use("/api/*", requireSessionAuth);
+app.route("/api/remote-access", remoteAccessRoutes);
 
 // An optional host integration can protect or add authenticated product capabilities.
-productIntegration.mountAuthenticatedGuards?.(app);
+productIntegration.mountAuthenticatedGuards?.(productApp);
 
 // When git is not installed, only block routes that are known to execute git.
 // Most settings, account, AI provider, standalone narrator, search, upload, and
@@ -420,7 +465,7 @@ app.use("/api/*", async (c, next) => {
 
 app.route("/api/projects", projectRoutes);
 app.route("/api/containers", containerRoutes);
-productIntegration.mountAuthenticatedRoutes?.(app);
+productIntegration.mountAuthenticatedRoutes?.(productApp);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
@@ -447,6 +492,10 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/model-catalog", modelCatalogRoutes);
 app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
+// Streaming attachment staging. Deliberately outside /api/narrators: the narrator
+// router's body limit and work-admission middleware describe buffered request
+// bodies and narrator work, neither of which an upload is.
+app.route("/api/narrator-attachments", narratorAttachmentRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);
 // Project/user trait layers. Narrator-level traits live under /api/narrators.
@@ -467,6 +516,8 @@ app.route("/api/provider-import", providerImportRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/opencode", opencodeRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/credential-transfer", credentialTransferRoutes);
+app.route("/api/provider-keys", providerKeyRoutes);
 app.route("/api/commandcode", commandCodeRoutes);
 app.route("/api/gemini", geminiRoutes);
 app.route("/api/anthropic", anthropicRoutes);
@@ -479,7 +530,7 @@ app.route("/api/outline", outlineRoutes);
 app.route("/api/storage", storageRoutes);
 app.route("/api/storage", storageTransferRoutes);
 app.route("/api/runtime", runtimeRoutes);
-productIntegration.mountRuntimeBindingRoutes?.(app);
+productIntegration.mountRuntimeBindingRoutes?.(productApp);
 app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/prompt-library", promptLibraryRoutes);
 app.route("/api/routines", routineRoutes);
