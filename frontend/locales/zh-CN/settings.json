@@ -2962,10 +2962,10 @@
 		}
 	},
 	"encryptSecrets": "加密凭据文件",
-	"encryptSecretsDesc": "订阅登录和密钥文件（如 codex-credentials.json）用 NarraFork 数据目录下 secret.key 中的密钥加密保存。它防的是凭据文件被单独拷走（备份、同步盘、误分享）；能读取整个数据目录的人仍可解密。关闭后文件会改写为明文 JSON。",
+	"encryptSecretsDesc": "订阅登录和密钥文件（如 codex-credentials.json）用 {{brand}} 数据目录下 secret.key 中的密钥加密保存。它防的是凭据文件被单独拷走（备份、同步盘、误分享）；能读取整个数据目录的人仍可解密。关闭后文件会改写为明文 JSON。",
 	"credentialTransfer": {
 		"title": "凭据迁移",
-		"desc": "把订阅登录和密钥搬到另一台 NarraFork。导出文件用你设定的口令加密；导出前需要验证密码和两步验证。",
+		"desc": "把订阅登录和密钥搬到另一台 {{brand}}。导出文件用你设定的口令加密；导出前需要验证密码和两步验证。",
 		"export": "导出凭据…",
 		"import": "导入凭据…",
 		"exportTitle": "导出凭据",

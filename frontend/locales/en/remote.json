@@ -1,5 +1,5 @@
 {
-	"title": "NarraFork remote access",
+	"title": "{{brand}} remote access",
 	"unsupported": "This feature is not supported over remote access yet.",
 	"attachmentTooLarge": "Remote messages and attachments must total no more than 7 MiB.",
 	"adminOnly": "Sign in as an administrator. Password and TOTP or backup codes are supported; registration, SSO and passkeys are not available here.",
@@ -24,7 +24,7 @@
 	"failed": "Remote connection failed. Reconnect using your invitation.",
 	"paired": "Paired — sign in to continue",
 	"loginFailed": "Sign-in failed. Check your credentials and connection.",
-	"unsupportedMfa": "This account requires a sign-in method that is unavailable here. Use TOTP or a backup code on the ordinary NarraFork site.",
+	"unsupportedMfa": "This account requires a sign-in method that is unavailable here. Use TOTP or a backup code on the ordinary {{brand}} site.",
 	"empty": "No projects are available.",
 	"loadMore": "Load more"
 }

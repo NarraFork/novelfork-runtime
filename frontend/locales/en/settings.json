@@ -2962,10 +2962,10 @@
 		}
 	},
 	"encryptSecrets": "Encrypt credential files",
-	"encryptSecretsDesc": "Stores subscription logins and keys (such as codex-credentials.json) encrypted with a key in secret.key in the NarraFork data folder. This protects a credential file that is copied on its own, like a backup or a synced folder; it does not protect against someone who can read the whole data folder. Turning it off rewrites the files as plain JSON.",
+	"encryptSecretsDesc": "Stores subscription logins and keys (such as codex-credentials.json) encrypted with a key in secret.key in the {{brand}} data folder. This protects a credential file that is copied on its own, like a backup or a synced folder; it does not protect against someone who can read the whole data folder. Turning it off rewrites the files as plain JSON.",
 	"credentialTransfer": {
 		"title": "Credential transfer",
-		"desc": "Move subscription logins and keys to another NarraFork. Exports are sealed with a passphrase you choose; exporting asks for your password and a second factor.",
+		"desc": "Move subscription logins and keys to another {{brand}}. Exports are sealed with a passphrase you choose; exporting asks for your password and a second factor.",
 		"export": "Export credentials…",
 		"import": "Import credentials…",
 		"exportTitle": "Export credentials",

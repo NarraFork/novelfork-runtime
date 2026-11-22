@@ -1,5 +1,5 @@
 {
-	"title": "NarraFork 远程访问",
+	"title": "{{brand}} 远程访问",
 	"unsupported": "此功能尚不支持远程访问。",
 	"attachmentTooLarge": "远程消息正文与附件合计不能超过 7 MiB。",
 	"adminOnly": "请使用管理员账号登录。支持密码和动态验证码或备用码；此入口不支持注册、单点登录或通行密钥。",
@@ -24,7 +24,7 @@
 	"failed": "远程连接失败，请使用邀请重新连接。",
 	"paired": "已配对，请登录后继续",
 	"loginFailed": "登录失败，请检查凭据和连接。",
-	"unsupportedMfa": "此账号要求的登录方式不受支持，请在普通 NarraFork 入口配置动态验证码或备用码。",
+	"unsupportedMfa": "此账号要求的登录方式不受支持，请在普通 {{brand}} 入口配置动态验证码或备用码。",
 	"empty": "暂无可用项目。",
 	"loadMore": "加载更多"
 }

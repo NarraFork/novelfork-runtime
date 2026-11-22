@@ -53,7 +53,13 @@ function restoreGlobals() {
 const { window } = parseHTML("<!doctype html><html><body></body></html>");
 install("window", window);
 install("document", window.document);
-install("navigator", window.navigator);
+// floating-ui probes the platform when a tooltip mounts, and linkedom has no
+// `navigator.platform`. `window.navigator` builds a new object on every access, so the
+// patched instance is captured and installed as the one navigator.
+const linkedomNavigator = window.navigator;
+Object.defineProperty(linkedomNavigator, "platform", { configurable: true, value: "Linux x86_64" });
+Object.defineProperty(window, "navigator", { configurable: true, value: linkedomNavigator });
+install("navigator", linkedomNavigator);
 install("Document", window.Document);
 install("HTMLElement", window.HTMLElement);
 install("Element", window.Element);
