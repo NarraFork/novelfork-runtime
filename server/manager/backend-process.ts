@@ -5,6 +5,7 @@ import { HANDOFF_COMPLETE_MESSAGE } from "../lib/restart-handoff";
 import { isCompiledRuntime } from "../lib/runtime-target";
 import { parseServiceLogLine } from "./listen-log";
 import { managerFetch } from "./manager-fetch";
+import { getManagerHost } from "./manager-host";
 import { t } from "./manager-i18n";
 
 export type BackendState = "stopped" | "starting" | "running" | "stopping" | "error";
@@ -22,8 +23,11 @@ export interface BackendProcessOptions extends ListenTarget {
 	onLine: (line: string) => void;
 	/** 状态变化；`detail` 用于异常退出等需要说明的情形。 */
 	onState: (state: BackendState, detail?: string) => void;
-	/** 启动状态页开始应答：服务还在启动，但已经可以打开前端看进度。 */
-	onStartupPage?: () => void;
+	/**
+	 * 启动状态页开始应答：服务还在启动，但已经可以打开前端看进度。`url` 是状态页自报的地址
+	 * （与服务稍后监听的同一地址，已按管理令牌解析成具体 IP），比配置里的主机名更可靠。
+	 */
+	onStartupPage?: (url: string) => void;
 }
 
 /** 健康检查间隔；超过提示时间仍未就绪只记一次日志（多半在迁移数据库），不判失败。 */
@@ -200,7 +204,9 @@ export class BackendProcess {
 		this.observedHost = undefined;
 		this.observedPort = 0;
 		this.observedProtocol = undefined;
-		const args = isCompiledRuntime() ? ["--serve"] : ["server/index.ts", "--serve"];
+		const args = isCompiledRuntime()
+			? ["--serve"]
+			: [...(getManagerHost()?.sourceServeArgs ?? ["server/index.ts", "--serve"])];
 		try {
 			this.child = Bun.spawn([process.execPath, ...args], {
 				cwd: process.cwd(),
@@ -309,7 +315,9 @@ export class BackendProcess {
 		}
 		if (event.startupPage) {
 			// 只是状态页在应答（同一地址），健康检查仍要等 `running on`。
-			if (this.state === "starting") this.options.onStartupPage?.();
+			if (this.state === "starting") {
+				this.options.onStartupPage?.(`${event.protocol}://${event.host}:${event.port}`);
+			}
 			return;
 		}
 		this.observedProtocol = event.protocol;

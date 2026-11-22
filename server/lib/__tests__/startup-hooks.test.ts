@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	getRuntimeStartupHooks,
+	hostOpensWindow,
 	notifyStartupHook,
 	registerRuntimeStartupHooks,
 	resetRuntimeStartupHooksForTests,
@@ -19,6 +20,16 @@ describe("runtime startup hooks", () => {
 		expect(getRuntimeStartupHooks()).toBe(hooks);
 		const key = Symbol.for("narrafork.runtimeStartupHooks.v1");
 		expect((globalThis as Record<symbol, unknown>)[key]).toBe(hooks);
+	});
+
+	test("a host that is told where the app answers opens its own window", () => {
+		expect(hostOpensWindow()).toBe(false);
+		registerRuntimeStartupHooks({ beforeServerMain() {} });
+		expect(hostOpensWindow()).toBe(false);
+		registerRuntimeStartupHooks({ onStartupPageListening: () => true });
+		expect(hostOpensWindow()).toBe(true);
+		registerRuntimeStartupHooks({ onServerListening() {} });
+		expect(hostOpensWindow()).toBe(true);
 	});
 
 	test("notify passes the result through and swallows a throwing hook", () => {

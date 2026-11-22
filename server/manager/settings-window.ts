@@ -16,6 +16,7 @@ import {
 	writeNarraForkSettings,
 	writePreferences,
 } from "./manager-config";
+import { getManagerHost } from "./manager-host";
 
 import { MANAGER_LANGUAGES, type ManagerLang, setLanguage, t } from "./manager-i18n";
 import { DEFAULT_BRAND_COLOR, fromColorRef, mixColor, toColorRef } from "./theme";
@@ -168,6 +169,10 @@ export async function showSettingsDialog(
 	const gdi = native?.gdi32;
 
 	// 待保存的主题色（#rrggbb）与最近一次更新检查结果。
+	// 嵌入宿主（NovelFork fork 层）自己开产品窗口时，「启动时如何打开」不起作用，不显示这一行。
+	const showOpenBrowser = !getManagerHost()?.openFrontend;
+	const rowShift = showOpenBrowser ? 0 : 60;
+	const height = HEIGHT - rowShift;
 	let pendingColor = input.narrafork.brandColor || DEFAULT_BRAND_COLOR;
 	let latestCheck: UpdateCheckSummary | undefined;
 	let updateBusy = false;
@@ -184,7 +189,7 @@ export async function showSettingsDialog(
 		title: t("settings.title"),
 		className: "NarraForkSettingsDialog",
 		width: WIDTH,
-		height: HEIGHT,
+		height,
 		resizable: false,
 		owner,
 		defaultButtonId: ID.save,
@@ -327,25 +332,27 @@ export async function showSettingsDialog(
 	comboBoxSelect(controls.language, currentLangIndex >= 0 ? currentLangIndex : 0);
 	addHint(t("settings.languageHint"), y + 30);
 
-	y = 78;
-	addLabel(t("settings.openBrowser"), y, 622);
-	controls.openBrowser = add(
-		"COMBOBOX",
-		"",
-		0x0003,
-		ID.openBrowser,
-		CONTROL_X,
-		y,
-		CONTROL_WIDTH,
-		200,
-		uiFont,
-	);
-	for (const key of OPEN_BROWSER_LABEL_KEYS) comboBoxAddItem(controls.openBrowser, t(key));
-	const modeIndex = OPEN_BROWSER_MODES.indexOf(input.narrafork.openBrowser);
-	comboBoxSelect(controls.openBrowser, modeIndex >= 0 ? modeIndex : 1);
-	addHint(t("settings.openBrowserHint"), y + 30);
+	if (showOpenBrowser) {
+		y = 78;
+		addLabel(t("settings.openBrowser"), y, 622);
+		controls.openBrowser = add(
+			"COMBOBOX",
+			"",
+			0x0003,
+			ID.openBrowser,
+			CONTROL_X,
+			y,
+			CONTROL_WIDTH,
+			200,
+			uiFont,
+		);
+		for (const key of OPEN_BROWSER_LABEL_KEYS) comboBoxAddItem(controls.openBrowser, t(key));
+		const modeIndex = OPEN_BROWSER_MODES.indexOf(input.narrafork.openBrowser);
+		comboBoxSelect(controls.openBrowser, modeIndex >= 0 ? modeIndex : 1);
+		addHint(t("settings.openBrowserHint"), y + 30);
+	}
 
-	y = 138;
+	y = 138 - rowShift;
 	addLabel(t("settings.instanceName"), y, 623);
 	controls.instanceName = add(
 		"EDIT",
@@ -360,7 +367,7 @@ export async function showSettingsDialog(
 	);
 	addHint(t("settings.instanceNameHint"), y + 30);
 
-	y = 198;
+	y = 198 - rowShift;
 	addLabel(t("settings.brandColor"), y, 624);
 	controls.colorButton = add(
 		"BUTTON",
@@ -376,7 +383,7 @@ export async function showSettingsDialog(
 	addHint(t("settings.brandColorHint"), y + 30);
 
 	// ── 管理器偏好（写入 manager.json）────────────────────────────────────
-	y = 258;
+	y = 258 - rowShift;
 	addLabel(t("settings.closeAction"), y, 625);
 	controls.closeAction = add(
 		"COMBOBOX",
@@ -393,7 +400,7 @@ export async function showSettingsDialog(
 	comboBoxAddItem(controls.closeAction, t("settings.closeAction.minimize"));
 	comboBoxSelect(controls.closeAction, input.preferences.closeAction === "minimize" ? 1 : 0);
 
-	y = 292;
+	y = 292 - rowShift;
 	controls.askOnClose = add(
 		"BUTTON",
 		t("settings.askOnClose"),
@@ -409,7 +416,7 @@ export async function showSettingsDialog(
 	checkBoxSetChecked(controls.askOnClose, input.preferences.askOnClose);
 
 	// ── 更新（服务端自带接口，本机回环免认证）─────────────────────────────
-	y = 328;
+	y = 328 - rowShift;
 	add("STATIC", t("settings.update"), SS_LEFT, 626, LABEL_X, y + 4, 120, 20, titleFont);
 	controls.checkUpdate = add(
 		"BUTTON",
@@ -453,7 +460,7 @@ export async function showSettingsDialog(
 		BS_OWNERDRAW,
 		ID.save,
 		CONTROL_X + 40,
-		HEIGHT - 52,
+		height - 52,
 		110,
 		32,
 		buttonFont,
@@ -464,7 +471,7 @@ export async function showSettingsDialog(
 		BS_OWNERDRAW,
 		ID.cancel,
 		CONTROL_X + 162,
-		HEIGHT - 52,
+		height - 52,
 		110,
 		32,
 		buttonFont,
@@ -485,7 +492,9 @@ export async function showSettingsDialog(
 	function saveSettings(): void {
 		const langOption = MANAGER_LANGUAGES[comboBoxSelected(controls.language)];
 		const language: ManagerLang = langOption?.value ?? input.preferences.language;
-		const mode = OPEN_BROWSER_MODES[comboBoxSelected(controls.openBrowser)];
+		const mode = controls.openBrowser
+			? OPEN_BROWSER_MODES[comboBoxSelected(controls.openBrowser)]
+			: undefined;
 		const nextPreferences: ManagerPreferences = {
 			...input.preferences,
 			language,
