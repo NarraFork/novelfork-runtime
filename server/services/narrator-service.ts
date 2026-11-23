@@ -1936,6 +1936,7 @@ export const narratorService = {
 				input.runtimePolicy ??
 				(await compileDelegationCeiling(input.subagentType, {
 					outlineSession: parent.taskBackend === "outline",
+					parentNarratorId: input.parentNarratorId,
 				}));
 			const subTraits = withRuntimePolicyTrait(["standalone"], runtimePolicy);
 			// The delegator is the policy/model source and the controller; the model pool

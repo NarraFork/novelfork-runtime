@@ -5,7 +5,10 @@ import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import type { RuntimePolicyTrait } from "../lib/runtime-policy-trait";
 import type { RuntimeProductSubagentTemplate } from "../lib/product-host/contracts";
-import { getProductSubagentTemplates } from "../lib/product-host/subagent-templates";
+import {
+	getProductSubagentTemplates,
+	resolveDynamicProductSubagentTemplate,
+} from "../lib/product-host/subagent-templates";
 import { narraforkDir } from "../lib/settings";
 import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
 
@@ -208,10 +211,32 @@ async function loadAllUserDefs(): Promise<CustomSubagentDef[]> {
 	return defs;
 }
 
-/** Load a single subagent definition by name; product templates take precedence. */
-export async function loadByName(name: string): Promise<CustomSubagentDef | null> {
+export interface LoadCustomSubagentOptions {
+	/**
+	 * The delegating session. Passed to the product's session-scoped resolver so
+	 * it can project templates bound to that session's resources (e.g. a book's
+	 * custom subagents). Omitted for listing/detail flows without a delegator.
+	 */
+	parentNarratorId?: string;
+}
+
+/**
+ * Load a single subagent definition by name. Resolution order: static product
+ * templates, then the product's session-scoped resolver (when a parent narrator
+ * is known), then the user's `~/.narrafork/subagents/` files.
+ */
+export async function loadByName(
+	name: string,
+	options: LoadCustomSubagentOptions = {},
+): Promise<CustomSubagentDef | null> {
 	const product = findProductTemplate(name);
 	if (product) return productTemplateDef(product);
+	const dynamic = await resolveDynamicProductSubagentTemplate(
+		options.parentNarratorId,
+		name,
+		RESERVED_TEMPLATE_NAMES,
+	);
+	if (dynamic) return productTemplateDef(dynamic);
 	return loadUserDefByName(name);
 }
 
@@ -359,13 +384,13 @@ export async function remove(name: string): Promise<void> {
  */
 export async function compileDelegationCeiling(
 	template: string,
-	options: { outlineSession?: boolean } = {},
+	options: { outlineSession?: boolean; parentNarratorId?: string } = {},
 ): Promise<RuntimePolicyTrait> {
 	return compileDelegationPolicy({
 		template,
 		customDefinition: BUILTIN_DELEGATION_TEMPLATES.has(template)
 			? null
-			: await loadByName(template),
+			: await loadByName(template, { parentNarratorId: options.parentNarratorId }),
 		outlineSession: options.outlineSession,
 	});
 }

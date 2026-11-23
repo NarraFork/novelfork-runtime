@@ -546,6 +546,7 @@ export async function importInterchangeSession(
 				subagentType,
 				ceiling: await compileDelegationCeiling(subagentType, {
 					outlineSession: narrator.taskBackend === "outline",
+					parentNarratorId: narrator.id,
 				}),
 				title: sub.title,
 			});

@@ -118,7 +118,12 @@ async function materialize(row: LegacyRow): Promise<void> {
 	}
 	set.systemPrompt = basePrompt(row.systemPrompt);
 	if (!hasRuntimePolicyTrait(row.traits))
-		set.traits = withRuntimePolicyTrait(row.traits, await compileDelegationCeiling(template));
+		set.traits = withRuntimePolicyTrait(
+			row.traits,
+			await compileDelegationCeiling(template, {
+				parentNarratorId: row.parentNarratorId ?? undefined,
+			}),
+		);
 	await db.update(narrators).set(set).where(eq(narrators.id, row.id));
 }
 

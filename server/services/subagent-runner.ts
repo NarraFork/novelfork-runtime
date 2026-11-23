@@ -205,7 +205,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	// ceiling trait and a base prompt. Neither is read from the template again.
 	const customDef = BUILTIN_DELEGATION_TEMPLATES.has(subagentType)
 		? null
-		: await customSubagentService.loadByName(subagentType);
+		: await customSubagentService.loadByName(subagentType, { parentNarratorId });
 	const systemPrompt = await buildDelegationBasePrompt(
 		subagentType,
 		locale as Locale,

@@ -14,7 +14,11 @@ import {
 	compileDelegationCeiling,
 	customSubagentService,
 } from "../../../services/custom-subagent-service";
-import type { RuntimeProductIntegration, RuntimeProductSubagentTemplate } from "../contracts";
+import type {
+	RuntimeProductIntegration,
+	RuntimeProductNarratorAdapter,
+	RuntimeProductSubagentTemplate,
+} from "../contracts";
 import {
 	registerRuntimeProductIntegration,
 	resetRuntimeProductIntegrationForTests,
@@ -158,5 +162,124 @@ describe("custom subagent service with product templates", () => {
 		registerRuntimeProductIntegration(integrationWith([template()]));
 		const trait = await compileDelegationCeiling("nf-unknown");
 		expect(trait.readOnly).toBe(true);
+	});
+});
+
+describe("session-scoped product subagent templates", () => {
+	const bookTemplate: RuntimeProductSubagentTemplate = {
+		id: "my-book-writer",
+		nameZh: "本书执笔",
+		nameEn: "Book Writer",
+		description: "Book-scoped writer",
+		tools: ["chapter_read"],
+		prompt: "Draft for this book only.",
+	};
+
+	/** A minimal narrator adapter; only resolveSubagentTemplate is under test. */
+	function narratorStub(
+		resolveSubagentTemplate: NonNullable<RuntimeProductNarratorAdapter["resolveSubagentTemplate"]>,
+	): RuntimeProductNarratorAdapter {
+		return {
+			resolve: async () => null,
+			resolveContribution: async () => null,
+			resolveToolNames: async () => [],
+			resolveTrustedPromptRoot: async () => null,
+			toolDefinitions: () => [],
+			isToolAllowed: () => false,
+			resolveSubagentTemplate,
+		};
+	}
+
+	test("resolves a book-scoped template through the parent narrator and wins over a user file", async () => {
+		registerRuntimeProductIntegration({
+			id: "vendor",
+			narrator: narratorStub(async ({ name }) => (name === bookTemplate.id ? bookTemplate : null)),
+		});
+		await writeUserSubagent("my-book-writer", "my-book-writer", "user override attempt");
+
+		const loaded = await customSubagentService.loadByName("my-book-writer", {
+			parentNarratorId: "nar-leader",
+		});
+		expect(loaded).toMatchObject({
+			source: "product",
+			readOnly: true,
+			toolAccess: "custom",
+			customTools: ["chapter_read"],
+			prompt: "Draft for this book only.",
+			nameZh: "本书执笔",
+		});
+	});
+
+	test("a static product template still wins over the dynamic resolver", async () => {
+		registerRuntimeProductIntegration({
+			id: "vendor",
+			subagentTemplates: () => [template()],
+			narrator: narratorStub(async ({ name }) =>
+				name === "nf-writer" ? { ...bookTemplate, id: "nf-writer" } : null,
+			),
+		});
+		const loaded = await customSubagentService.loadByName("nf-writer", { parentNarratorId: "nar-leader" });
+		expect(loaded?.prompt).toBe("You draft prose.");
+	});
+
+	test("no parent narrator skips the resolver and falls through to the user file", async () => {
+		let called = 0;
+		registerRuntimeProductIntegration({
+			id: "vendor",
+			narrator: narratorStub(async () => {
+				called += 1;
+				return bookTemplate;
+			}),
+		});
+		await writeUserSubagent("my-book-writer", "my-book-writer", "user prompt");
+		const loaded = await customSubagentService.loadByName("my-book-writer");
+		expect(called).toBe(0);
+		expect(loaded?.prompt).toBe("user prompt");
+	});
+
+	test("a mismatched id, an invalid name or a throwing resolver yields no template", async () => {
+		registerRuntimeProductIntegration({
+			id: "vendor",
+			narrator: narratorStub(async ({ name }) =>
+				name === "throws" ? Promise.reject(new Error("book gone")) : { ...bookTemplate, id: "other-id" },
+			),
+		});
+		expect(
+			await customSubagentService.loadByName("my-book-writer", { parentNarratorId: "nar-leader" }),
+		).toBeNull();
+		expect(await customSubagentService.loadByName("throws", { parentNarratorId: "nar-leader" })).toBeNull();
+		expect(await customSubagentService.loadByName("not lower", { parentNarratorId: "nar-leader" })).toBeNull();
+	});
+
+	test("reserved names are never offered to the resolver", async () => {
+		const seen: string[] = [];
+		registerRuntimeProductIntegration({
+			id: "vendor",
+			narrator: narratorStub(async ({ name }) => {
+				seen.push(name);
+				return { ...bookTemplate, id: name };
+			}),
+		});
+		expect(await customSubagentService.loadByName("general", { parentNarratorId: "nar-leader" })).toBeNull();
+		expect(seen).toEqual([]);
+	});
+
+	test("the resolver is not called for listing, and its ceiling uses only its tools", async () => {
+		let called = 0;
+		registerRuntimeProductIntegration({
+			id: "vendor",
+			narrator: narratorStub(async () => {
+				called += 1;
+				return bookTemplate;
+			}),
+		});
+		await customSubagentService.loadAll();
+		expect(called).toBe(0);
+
+		const trait = await compileDelegationCeiling("my-book-writer", { parentNarratorId: "nar-leader" });
+		expect(trait.tools).toEqual(["chapter_read"]);
+		const policy = resolveRuntimePolicy([trait]);
+		expect(isRuntimeToolAllowed(policy, "chapter_read")).toBe(true);
+		expect(isRuntimeToolAllowed(policy, "Write")).toBe(false);
 	});
 });

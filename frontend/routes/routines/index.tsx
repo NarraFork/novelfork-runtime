@@ -1553,16 +1553,43 @@ function CustomSubagentsTab() {
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
+	const [viewOpened, { open: openView, close: closeView }] = useDisclosure(false);
 
 	const [editingName, setEditingName] = useState<string | null>(null);
 	const [draft, setDraft] = useState<SubagentDraft>(emptyDraft);
 	const [deleteTarget, setDeleteTarget] = useState("");
+	const [viewTarget, setViewTarget] = useState<CustomSubagentDef | null>(null);
 
 	const handleCreate = useCallback(() => {
 		setEditingName(null);
 		setDraft(emptyDraft);
 		openEdit();
 	}, [openEdit]);
+
+	const handleView = useCallback(
+		(sa: CustomSubagentDef) => {
+			setViewTarget(sa);
+			openView();
+		},
+		[openView],
+	);
+
+	/** Clone a (possibly read-only) definition into the create form as a draft. */
+	const handleCopy = useCallback(
+		(sa: CustomSubagentDef) => {
+			setEditingName(null);
+			setDraft({
+				name: `${sa.name}-custom`,
+				description: sa.description,
+				toolAccess: sa.toolAccess,
+				customTools: sa.customTools,
+				defaultModel: sa.defaultModel,
+				prompt: sa.prompt,
+			});
+			openEdit();
+		},
+		[openEdit],
+	);
 
 	const handleEdit = useCallback(
 		(sa: CustomSubagentDef) => {
@@ -1668,21 +1695,30 @@ function CustomSubagentsTab() {
 								)}
 							</Text>
 						</div>
-						{!sa.readOnly && (
-							<Group gap={4}>
-								<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(sa)}>
-									{t("editSubagent")}
+						<Group gap={4}>
+							<Button variant="subtle" size="compact-xs" onClick={() => handleView(sa)}>
+								{t("viewSubagent")}
+							</Button>
+							{sa.readOnly ? (
+								<Button variant="subtle" size="compact-xs" onClick={() => handleCopy(sa)}>
+									{t("copySubagent")}
 								</Button>
-								<ActionIcon
-									variant="subtle"
-									color="red"
-									size="sm"
-									onClick={() => handleDelete(sa.name)}
-								>
-									<IconTrash size={14} />
-								</ActionIcon>
-							</Group>
-						)}
+							) : (
+								<>
+									<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(sa)}>
+										{t("editSubagent")}
+									</Button>
+									<ActionIcon
+										variant="subtle"
+										color="red"
+										size="sm"
+										onClick={() => handleDelete(sa.name)}
+									>
+										<IconTrash size={14} />
+									</ActionIcon>
+								</>
+							)}
+						</Group>
 					</Group>
 				</Paper>
 			))}
@@ -1781,6 +1817,88 @@ function CustomSubagentsTab() {
 						</Button>
 					</Group>
 				</Stack>
+			</Modal>
+
+			{/* Read-only detail modal — every definition can be inspected; product
+			    templates additionally offer a one-click clone into the create form. */}
+			<Modal
+				opened={viewOpened}
+				onClose={closeView}
+				title={viewTarget ? (viewTarget.nameZh ?? viewTarget.name) : t("viewSubagent")}
+				size="lg"
+			>
+				{viewTarget && (
+					<Stack>
+						<Group gap="xs">
+							<Badge size="sm" variant="light" color="teal">
+								{toolAccessLabel(viewTarget.toolAccess)}
+							</Badge>
+							{viewTarget.source === "product" && (
+								<Badge size="sm" variant="light" color="gray">
+									{t("subagentProductBadge")}
+								</Badge>
+							)}
+						</Group>
+						<Text size="xs" c="dimmed" style={{ fontFamily: "monospace" }}>
+							{viewTarget.name}
+						</Text>
+						{viewTarget.description && <Text size="sm">{viewTarget.description}</Text>}
+						{viewTarget.toolAccess === "custom" && viewTarget.customTools.length > 0 && (
+							<div>
+								<Text size="sm" fw={500} mb={4}>
+									{t("subagentCustomTools")}
+								</Text>
+								<Group gap="xs">
+									{viewTarget.customTools.map((tool) => (
+										<Badge key={tool} size="sm" variant="filled" color="indigo">
+											{tool}
+										</Badge>
+									))}
+								</Group>
+							</div>
+						)}
+						{viewTarget.defaultModel && (
+							<Text size="sm">
+								{t("subagentDefaultModel")}: {viewTarget.defaultModel}
+							</Text>
+						)}
+						<div>
+							<Text size="sm" fw={500} mb={4}>
+								{t("subagentPrompt")}
+							</Text>
+							<Paper
+								component="pre"
+								p="xs"
+								withBorder
+								style={{
+									maxHeight: "40vh",
+									overflow: "auto",
+									whiteSpace: "pre-wrap",
+									fontSize: 12,
+									fontFamily: "monospace",
+								}}
+							>
+								{viewTarget.prompt}
+							</Paper>
+						</div>
+						<Group justify="flex-end" gap="xs">
+							{viewTarget.readOnly && (
+								<Button
+									variant="light"
+									onClick={() => {
+										closeView();
+										handleCopy(viewTarget);
+									}}
+								>
+									{t("copySubagent")}
+								</Button>
+							)}
+							<Button variant="subtle" onClick={closeView}>
+								{t("close")}
+							</Button>
+						</Group>
+					</Stack>
+				)}
 			</Modal>
 
 			{/* Delete Confirm Modal */}

@@ -168,6 +168,18 @@ export interface RuntimeProductNarratorAdapter {
 	getToolPermissionPolicy?(toolName: string): ContributedToolPermissionPolicy | null;
 	/** Optional tool routines grouping the contributed tools (see `RuntimeProductToolRoutineContribution`). */
 	toolRoutines?(): readonly RuntimeProductToolRoutineContribution[];
+	/**
+	 * Session-scoped subagent template resolution. Consulted when a delegation
+	 * template name matches neither a built-in type nor a static
+	 * `subagentTemplates()` entry — e.g. a book-scoped custom subagent defined in
+	 * the resource the *parent* narrator is bound to. Return the template to
+	 * delegate as that name, or null to fall through to a user SUBAGENT.md of the
+	 * same name (and ultimately the read-only fallback). Never cached by the
+	 * Runtime: it is asked fresh on every delegation.
+	 */
+	resolveSubagentTemplate?(
+		input: Readonly<{ parentNarratorId: string; name: string }>,
+	): Promise<RuntimeProductSubagentTemplate | null> | RuntimeProductSubagentTemplate | null;
 }
 
 /**
